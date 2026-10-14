@@ -133,7 +133,10 @@ def build_campaign_summary(
     # Platforms — the resolved behaviour is why we landed here. The reason names the
     # actual chosen platform's feed rather than assuming Meta, so a TikTok-bound plan
     # doesn't read "Meta's feed placements fit best" right under a "TikTok" value.
-    plat_label = ", ".join(_PLATFORM_LABELS.get(p.platform, p.platform.value) for p in plan.platforms)
+    from .adapters.google_visual import PLACEMENT_LABELS
+    _placement = PLACEMENT_LABELS.get((plan.google_keyword_context or {}).get("placement") or "search")
+    plat_label = ", ".join(_placement if p.platform == Platform.GOOGLE else
+                           _PLATFORM_LABELS.get(p.platform, p.platform.value) for p in plan.platforms)
     platforms = ReasonedValue(
         value=plat_label,
         reason=(f"Your customers discover businesses like yours by scrolling, so {plat_label}'s feed "
@@ -162,7 +165,9 @@ def build_campaign_summary(
     # Google Search is paid per click, not per view: what a day buys is clicks,
     # and below ~10 a day Search can't learn which searches work. Say that
     # honestly instead of the feed-ad "clears the minimum" line.
-    is_search = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
+    google_placement = (plan.google_keyword_context or {}).get("placement") or "search"
+    is_search = (bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
+                 and google_placement == "search")
     if is_search:
         from .adapters.google import _DEFAULT_ESTIMATED_CPC_NGN, _MIN_USEFUL_CLICKS_PER_DAY
         clicks_a_day = daily / _DEFAULT_ESTIMATED_CPC_NGN

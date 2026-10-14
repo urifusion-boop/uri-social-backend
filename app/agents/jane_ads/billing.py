@@ -101,6 +101,36 @@ async def reconcile_ad_spend_charges(db) -> dict:
     return result
 
 
+async def _stop_at_paid_budget(db, collection, r, summary, adapter, api_error_cls, notification_service) -> None:
+    """A campaign paid for in full at launch must not spend past what was paid:
+    the platform bills its owner (for Google, URI) for anything more. Pauses it
+    once its spend reaches the ad budget, and says so once."""
+    paid = float(r.get("budget_ngn") or 0)          # the ad spend part of what was charged
+    spent = float(summary.get("spend_ngn") or 0)
+    if not paid or spent < paid or summary.get("delivery") != "Active" or r.get("budget_spent_at"):
+        return
+    claimed = await db[collection].find_one_and_update(
+        {"campaign_id": r["campaign_id"], "budget_spent_at": None},
+        {"$set": {"budget_spent_at": datetime.now(timezone.utc)}},
+    )
+    if claimed is None:
+        return
+    try:
+        await adapter.set_delivery(r["campaign_id"], active=False)
+    except api_error_cls as e:
+        print(f"[billing] could not stop {r['campaign_id']} at its budget: {e}", flush=True)
+        await db[collection].update_one({"campaign_id": r["campaign_id"]}, {"$set": {"budget_spent_at": None}})
+        return
+    name = r.get("display_name") or "Your campaign"
+    await _notify(
+        notification_service, user_id=r.get("user_id"),
+        subject=f"{name} has used its budget",
+        message=(f"{name} spent the ₦{paid:,.0f} you paid for, so I've stopped it. "
+                 "Start a new campaign whenever you're ready for more."),
+        campaign_id=r["campaign_id"],
+    )
+
+
 async def _sweep_platform(db, wallet, notification_service, *, adapter, collection: str, api_error_cls) -> dict:
     """One platform's sweep — the exact loop reconcile_ad_spend_charges always ran,
     now parameterized by adapter/collection/error-class so Meta and TikTok share it
@@ -140,6 +170,7 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
         # status); it just never debits. Records without this key predate
         # charge-at-launch and are still billed as they spend, as they were sold.
         if r.get("charged_upfront_ngn"):
+            await _stop_at_paid_budget(db, collection, r, summary, adapter, api_error_cls, notification_service)
             continue
 
         # Per campaign, not global: the markup this one was SOLD under. A campaign

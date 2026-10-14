@@ -56,17 +56,65 @@ def configured() -> bool:
     return bool(settings.GOOGLE_ADS_DEVELOPER_TOKEN and settings.GOOGLE_ADS_MCC_CUSTOMER_ID)
 
 
-async def is_ready(db, user_id: Optional[str], brand_id: Optional[str]) -> bool:
-    """This brand has a linked Google Ads account, per our own record. No
-    network call — used while planning, where it's asked on every message.
-    The link is re-checked with Google itself at launch."""
+# How a brand's Google ads run — its own choice, in Connected Accounts:
+#   "uri" — in URI's own Google Ads account. Nothing to connect; the whole budget
+#           comes from the URI wallet and URI pays Google. The default.
+#   "own" — in the brand's own Google Ads account. Google bills the brand's card
+#           for the ad spend; the URI wallet pays only URI's fee.
+SETTINGS = "jane_ads_google_settings"
+MODES = ("uri", "own")
+
+
+async def get_mode(db, brand_id: Optional[str]) -> str:
+    if not brand_id:
+        return "uri"
+    doc = await db[SETTINGS].find_one({"brand_id": brand_id, "kind": "google_mode"})
+    return (doc or {}).get("mode") if (doc or {}).get("mode") in MODES else "uri"
+
+
+async def set_mode(db, brand_id: str, mode: str) -> str:
+    if mode not in MODES:
+        raise ValueError("mode must be 'uri' or 'own'")
+    from datetime import datetime, timezone
+    await db[SETTINGS].update_one(
+        {"brand_id": brand_id, "kind": "google_mode"},
+        {"$set": {"mode": mode, "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return mode
+
+
+NOT_AVAILABLE = ("Google ads run by URI aren't available just yet — we're setting them up. "
+                 "You can connect your own Google Ads account instead (Connected Accounts → Google Ads), "
+                 "or run this on Instagram & Facebook.")
+
+
+async def readiness(db, user_id: Optional[str], brand_id: Optional[str]) -> tuple[bool, str]:
+    """(ready, what to tell the owner if not) for the brand's chosen way of
+    running Google ads. No network call — asked on every planning message."""
     if not configured():
-        return False
+        return False, "Google ads aren't available on URI right now. Try Instagram & Facebook instead."
+    mode = await get_mode(db, brand_id)
+    if mode == "own":
+        try:
+            state, _ = await resolve_connection_state(db, user_id, brand_id)
+        except Exception as e:
+            print(f"[google_flow] connection check failed: {e}", flush=True)
+            return False, "Couldn't check your Google Ads account just now. Try again in a minute."
+        if state == ConnectionState.READY:
+            return True, ""
+        return False, (connection_message(state.value) + " Or switch to “Run by URI” there — "
+                       "nothing to connect.")
+    from .google_uri_accounts import available
     try:
-        state, _ = await resolve_connection_state(db, user_id, brand_id)
-    except Exception:
-        return False
-    return state == ConnectionState.READY
+        return (True, "") if await available(db, brand_id) else (False, NOT_AVAILABLE)
+    except Exception as e:
+        print(f"[google_flow] readiness check failed: {e}", flush=True)
+        return False, "Couldn't check Google ads just now. Try again in a minute."
+
+
+async def is_ready(db, user_id: Optional[str], brand_id: Optional[str]) -> bool:
+    return (await readiness(db, user_id, brand_id))[0]
 
 
 _CONNECT_HERE = "Connected Accounts → Google Ads"
@@ -113,9 +161,12 @@ def friendly_error(e: Exception) -> str:
     already wrote for people (currency, budget) pass through; Google's own
     technical text is kept only as a short reference at the end."""
     text = str(e)
-    upper = text.upper()
+    # Match Google's own error codes (the adapter puts them in [BRACKETS]) — never
+    # the free text, where "payments accounts lookup" read as a billing problem.
+    import re as _re
+    codes_found = " ".join(_re.findall(r"\[([A-Z_]+)\]", text))
     for codes, message in _ERROR_MESSAGES:
-        if any(code in upper for code in codes):
+        if codes_found and any(code in codes_found for code in codes):
             return message
     if ":" not in text or text.startswith(("This Google Ads account", "That daily budget")):
         return text
@@ -129,11 +180,22 @@ def raise_http(e: Exception) -> None:
 
 
 async def adapter_for_launch(db, brand_ctx: dict) -> tuple[GoogleAdsAdapter, dict]:
-    """The brand's own adapter, through the pre-flight gate: the link is checked
-    against Google right now and a WhatsApp number must be on file. Raises the
-    HTTP error the launch endpoints return (409 with the connection state)."""
+    """The adapter for wherever this brand's Google ads run: URI's account (given
+    to the brand the first time) or the brand's own linked account, re-checked
+    with Google now. conn["uri_managed"] says which. Raises the HTTP error the
+    launch endpoints return, in words the owner can act on."""
+    from .google_uri_accounts import NoUriAccountAvailable, launch_connection
+
+    brand_id = brand_ctx.get("brand_id")
     try:
-        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+        if await get_mode(db, brand_id) == "own":
+            conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_id)
+            conn = {**conn, "uri_managed": False}
+        else:
+            conn = await launch_connection(db, brand_id)
+    except NoUriAccountAvailable:
+        print(f"[google_flow] no free URI Google Ads account for brand {brand_id}", flush=True)
+        raise HTTPException(status_code=409, detail=NOT_AVAILABLE)
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=connection_message(e.state.value))
     except GoogleAdsConnectionError as e:
@@ -163,6 +225,12 @@ def ads_url(customer_id: str) -> str:
     return f"https://ads.google.com/aw/campaigns?__c={customer_id}"
 
 
+def _markup() -> float:
+    """Ad spend → the budget the owner typed (URI's fee comes out of it)."""
+    from . import constants as C
+    return C.AD_SPEND_MARKUP
+
+
 def budget_too_low(budget_ngn: float, days: int) -> Optional[str]:
     """Why this budget can't work on Google Search, or None when it can. A
     search campaign needs enough clicks a day to learn what's working; below
@@ -172,9 +240,11 @@ def budget_too_low(budget_ngn: float, days: int) -> Optional[str]:
     daily = float(budget_ngn or 0) / days
     if estimate_clicks_per_day(daily, _DEFAULT_ESTIMATED_CPC_NGN) >= _MIN_USEFUL_CLICKS_PER_DAY:
         return None
-    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days
-    return (f"On Google Search, ₦{budget_ngn:,.0f} over {days} day{'s' if days != 1 else ''} is about "
-            f"₦{daily:,.0f} a day — too little to get the ~{_MIN_USEFUL_CLICKS_PER_DAY:.0f} clicks a day a search ad "
+    # Told in the owner's own figures (their budget, URI's fee included), not ad spend.
+    m = _markup()
+    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days * m
+    return (f"On Google Search, ₦{budget_ngn * m:,.0f} over {days} day{'s' if days != 1 else ''} is about "
+            f"₦{daily * m:,.0f} a day — too little to get the ~{_MIN_USEFUL_CLICKS_PER_DAY:.0f} clicks a day a search ad "
             f"needs to work. Raise the budget to about ₦{needed:,.0f}, run it for fewer days, or let me use "
             f"Instagram and Facebook instead.")
 
@@ -226,14 +296,49 @@ def serving_note(summary: dict) -> str:
     return ""
 
 
+# Google's own per-day floors (it refuses to create below them). YouTube &
+# Discover: US$5 a day, confirmed live — ₦8,000 covers it at our exchange rate.
+_PLACEMENT_MIN_DAILY_NGN = {"demand_gen": 8_000.0}
+
+
+def below_placement_minimum(placement: str, budget_ngn: float, days: int) -> Optional[str]:
+    """Why Google won't accept this budget for this placement, or None.
+    `budget_ngn` is the ad spend (URI's fee already out of it); the owner is
+    told in the figures they typed — their whole budget, fee included — and
+    only offered fixes that actually work."""
+    floor = _PLACEMENT_MIN_DAILY_NGN.get(placement)
+    if not floor:
+        return None
+    days = max(int(days or 1), 1)
+    daily = float(budget_ngn or 0) / days
+    if daily >= floor:
+        return None
+    from . import constants as C
+    from .adapters.google_visual import PLACEMENT_LABELS
+    label = PLACEMENT_LABELS[placement]
+    markup = C.AD_SPEND_MARKUP
+    stated = float(budget_ngn or 0) * markup
+    floor_stated = floor * markup
+    plural = lambda n: "" if n == 1 else "s"  # noqa: E731
+    head = (f"{label} needs at least ₦{floor_stated:,.0f} a day — Google won't run it for less. "
+            f"₦{stated:,.0f} over {days} day{plural(days)} is ₦{stated / days:,.0f} a day.")
+    fits = int(float(budget_ngn or 0) // floor)
+    if fits >= 1:
+        return (f"{head} Raise the budget to ₦{floor_stated * days:,.0f} for {days} day{plural(days)}, "
+                f"run it for {fits} day{plural(fits)} instead, or pick another Google placement.")
+    return (f"{head} The smallest {label} campaign is ₦{floor_stated:,.0f} for one day. Raise the budget, "
+            "or pick another Google placement — Display and Search have no minimum.")
+
+
 def budget_too_low_warning(budget_ngn: float, days: int) -> str:
     """The same point as budget_too_low, for when the owner goes ahead anyway:
     what to expect, not a refusal."""
     days = max(int(days or 1), 1)
     daily = float(budget_ngn or 0) / days
     clicks = estimate_clicks_per_day(daily, _DEFAULT_ESTIMATED_CPC_NGN)
-    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days
-    return (f"About ₦{daily:,.0f} a day — expect only ~{max(clicks, 0):.0f} click{'s' if round(clicks) != 1 else ''} "
+    m = _markup()
+    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days * m
+    return (f"About ₦{daily * m:,.0f} a day — expect only ~{max(clicks, 0):.0f} click{'s' if round(clicks) != 1 else ''} "
             f"a day, so treat this as a test. For real results on Search, about ₦{needed:,.0f} over "
             f"{days} day{'s' if days != 1 else ''}.")
 

@@ -555,3 +555,65 @@ class TestCarouselIsCheckedToo:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestFormalPlatformsStayInTheMainLanguage:
+    BC = {"languages": ["English", "Pidgin"], "same_tone_everywhere": False,
+          "platform_tones": {"linkedin": "formal and analytical, no slang", "instagram": "playful"}}
+
+    def test_a_formal_platform_drops_the_mixed_in_language(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.for_platform(self.BC, "linkedin")["languages"] == ["English"]
+        assert bb.languages_rule(bb.for_platform(self.BC, "linkedin")) is None
+        assert bb.missing_languages("A plain English post.", bb.for_platform(self.BC, "linkedin")) == []
+
+    def test_other_platforms_keep_the_mix(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.for_platform(self.BC, "instagram")["languages"] == ["English", "Pidgin"]
+        assert bb.for_platform({**self.BC, "same_tone_everywhere": True}, "linkedin")["languages"] == ["English", "Pidgin"]
+
+    def test_the_linkedin_prompt_has_no_pidgin_rule(self):
+        from app.agents.social_media_manager.services.content_generation_service import ContentGenerationService
+        prompt = ContentGenerationService.build_caption_prompt("Our launch", "linkedin", {"brand_name": "Acme", **self.BC})
+        assert "Pidgin" not in prompt
+        ig = ContentGenerationService.build_caption_prompt("Our launch", "instagram", {"brand_name": "Acme", **self.BC})
+        assert "Pidgin" in ig
+
+    def test_a_standing_pidgin_instruction_is_left_out_there_too(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        bc = {**self.BC, "playbook_instructions": [
+            {"id": "a", "text": "Mix in a little Pidgin for flavour.", "applies_to": ["all"], "platforms": []},
+            {"id": "b", "text": "Always mention the free trial.", "applies_to": ["all"], "platforms": []},
+            {"id": "c", "text": "Use Pidgin on LinkedIn too.", "applies_to": ["all"], "platforms": ["linkedin"]}]}
+        kept = [i["id"] for i in bb.for_platform(bc, "linkedin")["playbook_instructions"]]
+        assert kept == ["b", "c"]
+        assert [i["id"] for i in bb.for_platform(bc, "instagram")["playbook_instructions"]] == ["a", "b", "c"]
+
+
+class TestAPlatformsOwnCallToAction:
+    def ins(self, text, platforms):
+        return {"id": "i", "text": text, "applies_to": ["posts"], "platforms": platforms}
+
+    @pytest.mark.parametrize("text", [
+        "Always end Instagram posts with 'DM us to start'.",
+        "End Instagram posts with: DM us to start",
+        "End Instagram posts with “DM us to start”",
+    ])
+    def test_read_from_the_owners_instruction(self, text):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.platform_cta({"playbook_instructions": [self.ins(text, ["instagram"])]}, "instagram") == "DM us to start"
+
+    def test_replaces_the_general_one_on_that_platform_only(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        bc = {"cta_styles": ["Book a free demo"],
+              "playbook_instructions": [self.ins("Always end Instagram posts with 'DM us to start'.", ["instagram"])]}
+        ig = bb.for_platform(bc, "instagram")
+        assert bb.ctas(ig) == ["DM us to start"]
+        assert bb.ctas(bb.for_platform(bc, "linkedin")) == ["Book a free demo"]
+        # The ending step no longer adds the general one after the platform's own.
+        text = "Great tools for busy owners.\n\nDM us to start your free trial!"
+        assert bb.enforce(text, ig) == text
+
+    def test_an_instruction_without_a_platform_is_not_a_platform_cta(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.platform_cta({"playbook_instructions": [self.ins("End posts with 'Order now'", [])]}, "instagram") == ""

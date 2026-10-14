@@ -368,3 +368,16 @@ def test_no_configured_key_rejects_rather_than_letting_anything_through():
     from app.agents.jane_ads.payments import JaneAdsPayments
     with _with_secret(""):
         assert _run(JaneAdsPayments.verify_webhook_signature(b'{}', "ANYTHING")) is False
+
+
+def test_an_admin_credit_can_be_below_the_payment_minimum():
+    import asyncio as _asyncio
+    from app.agents.jane_ads.store import InMemoryWalletStore
+    from app.agents.jane_ads.wallet import MinimumTopUpError, WalletService
+    w = WalletService(InMemoryWalletStore())
+    with pytest.raises(MinimumTopUpError):
+        _asyncio.run(w.top_up("b1", 700))
+    _asyncio.run(w.top_up("b1", 700, enforce_minimum=False))
+    assert _asyncio.run(w.get_balance("b1")) == 700
+    with pytest.raises(MinimumTopUpError):
+        _asyncio.run(w.top_up("b1", 0, enforce_minimum=False))
