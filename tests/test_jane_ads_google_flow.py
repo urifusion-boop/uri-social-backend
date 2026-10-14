@@ -299,3 +299,37 @@ class TestPlacementMinimums:
         assert gf.below_placement_minimum("demand_gen", 70000, 7) is None
         assert gf.below_placement_minimum("display", 7000, 7) is None
         assert gf.below_placement_minimum("search", 7000, 7) is None
+
+
+class TestNeverSpendsPastWhatWasPaid:
+    def test_end_date_counts_today_as_day_one(self):
+        from datetime import date
+        from app.agents.jane_ads.adapters.google import campaign_end
+        assert campaign_end(5, date(2026, 10, 14)) == "2026-10-18 23:59:59"
+        assert campaign_end(1, date(2026, 10, 14)) == "2026-10-14 23:59:59"
+
+    def test_turning_on_sets_the_end_date_from_now(self):
+        db = db_with_campaign(days=5)
+        with Google({"results": [{}]}, {"results": [{}]}, {"results": [{}]}) as google:
+            run(adapter(db).set_delivery("777", True))
+        campaign_op = google.calls[0]["json"]["operations"][0]
+        assert campaign_op["updateMask"] == "status,end_date_time"
+        assert campaign_op["update"]["endDateTime"].endswith("23:59:59")
+
+    def test_pausing_leaves_the_end_date_alone(self):
+        db = db_with_campaign(days=5)
+        with Google({"results": [{}]}, {"results": [{}]}, {"results": [{}]}) as google:
+            run(adapter(db).set_delivery("777", False))
+        assert google.calls[0]["json"]["operations"][0]["updateMask"] == "status"
+
+    def test_the_sweep_stops_a_campaign_that_has_spent_what_was_paid(self):
+        db = db_with_campaign(charged_upfront_ngn=6000.0, budget_ngn=5400.0)
+        out, charged, dispatcher = TestHourlySpendSweep()._sweep(
+            db, {**TestHourlySpendSweep.SUMMARY, "spend_ngn": 5450.0})
+        dispatcher.set_delivery.assert_awaited_once_with("777", active=False)
+        assert charged == []
+
+    def test_still_within_budget_keeps_running(self):
+        db = db_with_campaign(charged_upfront_ngn=6000.0, budget_ngn=5400.0)
+        _, _, dispatcher = TestHourlySpendSweep()._sweep(db, {**TestHourlySpendSweep.SUMMARY, "spend_ngn": 3000.0})
+        dispatcher.set_delivery.assert_not_awaited()
