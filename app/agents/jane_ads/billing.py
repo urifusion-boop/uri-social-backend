@@ -109,7 +109,8 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
     convention both adapters follow — see their own docstrings)."""
     from .wallet import InsufficientFundsError
 
-    records = await db[collection].find({}, {"_id": 0}).to_list(length=500)
+    # detached_at: the brand let go of that (Google) ad account — URI can't reach it.
+    records = await db[collection].find({"detached_at": None}, {"_id": 0}).to_list(length=500)
 
     checked = paused_total = 0
     charged_total = 0.0

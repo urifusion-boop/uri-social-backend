@@ -22,6 +22,7 @@ treat Google like the other two platforms:
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import HTTPException
@@ -139,6 +140,9 @@ class GoogleCampaigns:
         record = await self._db[GOOGLE_CAMPAIGNS].find_one({"campaign_id": campaign_id})
         if not record or not record.get("customer_id"):
             raise GoogleAdsAPIError(f"no Google campaign record for campaign_id={campaign_id}")
+        if record.get("detached_at"):
+            # The brand let go of this Google Ads account; URI has no access to it any more.
+            raise GoogleAdsAPIError(NO_LONGER_MANAGED)
         customer_id = record["customer_id"]
         if customer_id not in self._currency:
             currency = record.get("currency_code") or ""
@@ -165,3 +169,57 @@ class GoogleCampaigns:
 
     async def delete_campaign(self, campaign_id: str) -> bool:
         return await (await self._adapter(campaign_id)).delete_campaign(campaign_id)
+
+
+# ── Letting go of an account that still has URI campaigns in it ──────────────
+
+NO_LONGER_MANAGED = ("URI no longer has access to this campaign's Google Ads account, so it can't change it. "
+                     "Manage it in Google Ads.")
+
+
+async def campaigns_in_account(db, brand_id: Optional[str], customer_id: str) -> list[dict]:
+    """URI campaigns of this brand that still exist in that Google Ads account,
+    each with its live delivery (Active / Paused...). Asked before the brand
+    lets go of the account: afterwards URI can't pause, track or bill them."""
+    if not (brand_id and customer_id):
+        return []
+    records = await db[GOOGLE_CAMPAIGNS].find(
+        {"brand_id": brand_id, "customer_id": customer_id, "platform": "google"}, {"_id": 0},
+    ).to_list(length=200)
+    dispatcher = GoogleCampaigns(db)
+    out = []
+    for r in records:
+        if r.get("detached_at"):
+            continue
+        try:
+            delivery = (await dispatcher.fetch_campaign_summary(r["campaign_id"]))["delivery"]
+        except Exception as e:      # can't read it: count it, don't drop it
+            print(f"[google_flow] could not read {r.get('campaign_id')}: {e}")
+            delivery = "Unknown"
+        if delivery == "Deleted":
+            continue
+        out.append({"campaign_id": r["campaign_id"], "name": r.get("display_name") or "Campaign",
+                    "delivery": delivery})
+    return out
+
+
+async def pause_campaigns(db, campaigns: list[dict]) -> int:
+    """Pause the ones still delivering (or unreadable). Raises GoogleAdsAPIError
+    if one can't be paused — the account is then NOT let go of, so nothing is
+    left running that URI can no longer reach."""
+    dispatcher = GoogleCampaigns(db)
+    paused = 0
+    for c in campaigns:
+        if c["delivery"] in ("Active", "Unknown"):
+            await dispatcher.set_delivery(c["campaign_id"], False)
+            paused += 1
+    return paused
+
+
+async def detach_campaigns(db, brand_id: Optional[str], customer_id: str) -> None:
+    """Mark them as no longer managed by URI: they stay in the list (and the
+    record keeps what was charged), but URI stops trying to reach them."""
+    await db[GOOGLE_CAMPAIGNS].update_many(
+        {"brand_id": brand_id, "customer_id": customer_id, "platform": "google"},
+        {"$set": {"detached_at": datetime.now(timezone.utc)}},
+    )
