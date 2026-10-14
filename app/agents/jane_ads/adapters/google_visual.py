@@ -212,8 +212,10 @@ def build_operations(placement: str, customer_id: str, *, name: str, daily_micro
         camp.update({"advertisingChannelType": "PERFORMANCE_MAX", "maximizeConversions": {},
                      "brandGuidelinesEnabled": False})
     ops.append({"campaignOperation": {"create": camp}})
-    ops.append({"campaignCriterionOperation": {"create": {
-        "campaign": campaign, "location": {"geoTargetConstant": geo_constant}}}})
+    if placement != "demand_gen":
+        # YouTube & Discover takes its location on the ad group instead (below).
+        ops.append({"campaignCriterionOperation": {"create": {
+            "campaign": campaign, "location": {"geoTargetConstant": geo_constant}}}})
 
     def image_asset(kind: str, data: str) -> str:
         res = tid("assets")
@@ -233,6 +235,9 @@ def build_operations(placement: str, customer_id: str, *, name: str, daily_micro
         if placement == "display":
             group["type"] = "DISPLAY_STANDARD"
         ops.append({"adGroupOperation": {"create": group}})
+        if placement == "demand_gen":
+            ops.append({"adGroupCriterionOperation": {"create": {
+                "adGroup": ad_group, "location": {"geoTargetConstant": geo_constant}}}})
         texts = lambda items: [{"text": t} for t in items]  # noqa: E731
         if placement == "display":
             ad = {"responsiveDisplayAd": {

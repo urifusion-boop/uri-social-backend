@@ -120,3 +120,9 @@ class TestOneAtomicRequest:
 
 def test_unknown_placement_means_search():
     assert gv.normalize_placement("tv") == "search" and gv.normalize_placement("PMAX") == "pmax"
+
+
+def test_youtube_and_discover_sets_its_location_on_the_ad_group():
+    kinds = _kinds(_ops("demand_gen"))
+    assert "campaignCriterionOperation" not in kinds and "adGroupCriterionOperation" in kinds
+    assert "campaignCriterionOperation" in _kinds(_ops("display"))
