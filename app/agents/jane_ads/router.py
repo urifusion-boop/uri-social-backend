@@ -60,6 +60,11 @@ META_DELETED_CAMPAIGN_SUBCODE = 1487566
 _AI_DIFFICULTIES = "We're experiencing some difficulties on our end — please try again in a little while."
 
 
+def _google_connection_message(state: str) -> str:
+    from .google_flow import connection_message
+    return connection_message(state)
+
+
 def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
     """Meta's ad-account-level rate limit ("too many calls to this ad-account")
     is shared across every caller of that account — heavy testing/usage can trip
@@ -1496,7 +1501,7 @@ async def jane_google_ads_link_existing(
             db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id,
         )
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
     except AccountNotLinkable as e:
         # Google refused for a reason the owner can fix (no such account, a
         # manager account, no admin user...) — say which, as a 400.
@@ -1663,7 +1668,7 @@ async def _release_google_ads(db, brand_ctx: dict, remove: bool,
     try:
         result = await release_account(db, user_id, brand_id, remove=remove)
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
     except AccountNotLinkable as e:
         raise HTTPException(status_code=409, detail=str(e))
     if live:
@@ -1697,7 +1702,7 @@ async def jane_google_ads_create_account(
             db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.account_name,
         )
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
     except MccNotEligibleToCreateAccounts as e:
         # Caught BEFORE the broader GoogleAdsConnectionError below — it's a
         # subclass, so ordering matters. A distinct code (not a generic 502)
@@ -2110,7 +2115,7 @@ async def google_test_launch(
     try:
         conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
     except GoogleAdsConnectionError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -2171,7 +2176,7 @@ async def _google_test_adapter(db, brand_ctx: dict, campaign_id: str):
     try:
         conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
     except GoogleAdsConnectionError as e:
         raise HTTPException(status_code=502, detail=str(e))
     record = await db[GOOGLE_CAMPAIGNS].find_one({"campaign_id": campaign_id, "customer_id": conn["customer_id"]})

@@ -197,7 +197,7 @@ def test_link_existing_account_raises_409_when_not_connected():
                 GoogleAdsLinkExistingBody(customer_id="555"), db=db, brand_ctx=BRAND_CTX,
             ))
     assert exc.value.status_code == 409
-    assert "none" in exc.value.detail
+    assert "isn't connected" in exc.value.detail
 
 
 def test_link_existing_account_raises_502_on_rest_failure():
