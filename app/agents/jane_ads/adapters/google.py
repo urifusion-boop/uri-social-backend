@@ -187,6 +187,11 @@ def _raise_for_error(data: dict, context: str) -> None:
                     ((inner.get("location") or {}).get("fieldPathElements") or []) if e.get("fieldName")]
             if path:
                 detail = f"{detail} (field: {'.'.join(path)})"
+            # Google says what the per-day minimum is: keep it, so the owner is told the number.
+            minimum = ((inner.get("details") or {}).get("budgetPerDayMinimumErrorDetails") or {})
+            if minimum.get("minimumBudgetAmountMicros"):
+                detail = (f"{detail} (minimum {float(minimum['minimumBudgetAmountMicros']) / 1_000_000:g} "
+                          f"{minimum.get('currencyCode', '')} a day)")
             code = inner.get("errorCode") or {}
             if isinstance(code, dict) and code:
                 detail = f"{detail} [{next(iter(code.values()))}]"

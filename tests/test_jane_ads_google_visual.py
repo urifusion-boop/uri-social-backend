@@ -95,7 +95,7 @@ class TestOneAtomicRequest:
     def test_display_ad_has_googles_required_pieces(self):
         ad = next(o["adGroupAdOperation"]["create"]["ad"] for o in _ops("display") if "adGroupAdOperation" in o)
         rda = ad["responsiveDisplayAd"]
-        assert rda["marketingImages"] and rda["squareMarketingImages"] and rda["longHeadline"]["text"]
+        assert rda["marketingImages"] and rda["squareMarketingImages"] and rda["squareLogoImages"] and rda["longHeadline"]["text"]
         assert rda["businessName"] == "Uri" and ad["finalUrls"] == ["https://urisocial.com"]
 
     def test_youtube_and_discover_ad_has_a_logo_and_all_image_shapes(self):

@@ -238,7 +238,8 @@ def build_operations(placement: str, customer_id: str, *, name: str, daily_micro
             ad = {"responsiveDisplayAd": {
                 "marketingImages": [{"asset": landscape}],
                 "squareMarketingImages": [{"asset": square}],
-                "logoImages": [{"asset": logo}],
+                # Display's logoImages slot is the 4:1 landscape logo; a square logo goes here.
+                "squareLogoImages": [{"asset": logo}],
                 "headlines": texts(copy["headlines"]),
                 "longHeadline": {"text": copy["long_headline"]},
                 "descriptions": texts(copy["descriptions"]),
