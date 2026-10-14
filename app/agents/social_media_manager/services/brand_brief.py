@@ -161,6 +161,25 @@ def emoji_mode(bc: Optional[Dict[str, Any]]) -> str:
     return "free"
 
 
+_FORMAL_TONE = ("formal", "no slang", "professional", "corporate", "analytical")
+
+
+def for_platform(bc: Optional[Dict[str, Any]], platform: str = "") -> Optional[Dict[str, Any]]:
+    """The brand as it should write on `platform`. A platform the owner set to
+    a formal / no-slang tone ("formal on LinkedIn, no slang") is written in the
+    brand's main language only: a mixed-in language like Pidgin there broke the
+    owner's own rule (seen on dev). Everything else is unchanged."""
+    if not bc or not platform:
+        return bc
+    langs = _list(bc.get("languages"))
+    if len(langs) < 2 or bc.get("same_tone_everywhere", True) is not False:
+        return bc
+    tone = str((bc.get("platform_tones") or {}).get(platform.lower()) or "").lower()
+    if tone and any(word in tone for word in _FORMAL_TONE):
+        return {**bc, "languages": [langs[0]]}
+    return bc
+
+
 def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
     langs = _list((bc or {}).get("languages"))
     if not langs or langs == ["English"]:
