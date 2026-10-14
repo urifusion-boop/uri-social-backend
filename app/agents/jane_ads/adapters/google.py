@@ -374,6 +374,11 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         description = kw_context.get("description", "")
         geo = kw_context.get("geo", "")
 
+        from .google_visual import VISUAL_PLACEMENTS, normalize_placement
+        placement = normalize_placement(kw_context.get("placement"))
+        if placement in VISUAL_PLACEMENTS:
+            return await self._launch_visual(plan, placement, daily_budget_ngn, dest_link, kw_context)
+
         keywords = await translate_keywords(category, description, geo)
         all_terms = (
             (keywords.get("head_terms") or [])
@@ -554,6 +559,73 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             platforms=[Platform.GOOGLE],
             launched=True,
         )
+
+    async def _launch_visual(self, plan: CampaignPlan, placement: str, daily_budget_ngn: float,
+                             dest_link: str, kw_context: dict) -> LaunchResult:
+        """Display, YouTube & Discover, or Everywhere: one atomic request (see
+        google_visual), so a failure leaves nothing behind in the account."""
+        from . import google_visual as gv
+
+        creative = plan.creative
+        if not creative or not creative.image_url or creative.is_video:
+            raise GoogleAdsAPIError(
+                f"{gv.PLACEMENT_LABELS[placement]} ads need a picture. Add or generate an image, then try again.")
+        image = await gv.fetch_bytes(creative.image_url)
+        if not image:
+            raise GoogleAdsAPIError("The ad's picture couldn't be loaded. Try again, or upload it again.")
+        business_name = kw_context.get("business_name") or kw_context.get("category") or "Our business"
+        try:
+            images = gv.marketing_images(image)
+        except Exception as e:
+            raise GoogleAdsAPIError(f"The ad's picture couldn't be prepared for Google: {e}")
+        logo_b64 = gv.logo_image(await gv.fetch_bytes(kw_context.get("logo_url", "")), business_name,
+                                 kw_context.get("brand_color") or "#C2185B")
+        copy = gv.ad_copy(creative.headline, creative.primary_text, business_name, rsa_assets,
+                          headline_limit=40 if placement == "demand_gen" else 30)
+        geo_constant = await self._resolve_geo(kw_context.get("geo", ""))
+        name = f"URI - {gv._fit(business_name, 40)} - {gv.PLACEMENT_LABELS[placement]} - {uuid.uuid4().hex[:4]}"
+        ops = gv.build_operations(
+            placement, self._customer_id, name=name,
+            daily_micros=budget_micros(daily_budget_ngn, self._currency_code),
+            geo_constant=geo_constant, final_url=dest_link, copy=copy, images=images, logo_b64=logo_b64,
+        )
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(
+                f"{self._api_base}/customers/{self._customer_id}/googleAds:mutate",
+                headers=self._headers(),
+                json={"mutateOperations": ops},
+            )
+        data = resp.json()
+        _raise_for_error(data, f"{gv.PLACEMENT_LABELS[placement]} campaign creation")
+        made = gv.created(data.get("mutateOperationResponses") or [])
+        campaign_resource_name = made.get("campaign", "")
+        campaign_id = campaign_resource_name.split("/")[-1]
+        ad_group = made.get("adGroup", "")
+        ad_id = made.get("adGroupAd", "").split("~")[-1] if made.get("adGroupAd") else ""
+
+        await self._db[COLLECTION].update_one(
+            {"campaign_id": campaign_id},
+            {"$set": {
+                "campaign_id": campaign_id,
+                "campaign_resource_name": campaign_resource_name,
+                "ad_group_id": ad_group,
+                "ad_id": ad_id,
+                "asset_group": made.get("assetGroup", ""),
+                "placement": placement,
+                "business_id": plan.business_id,
+                "customer_id": self._customer_id,
+                "login_customer_id": self._login_customer_id,
+                "currency_code": self._currency_code,
+                "budget_resource_name": made.get("campaignBudget", ""),
+                "geo_target": geo_constant,
+                "platform": "google",
+                "last_click_count": 0,
+                "created_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+        return LaunchResult(campaign_id=campaign_id, ad_ids={plan.business_id: ad_id},
+                            platforms=[Platform.GOOGLE], launched=True)
 
     async def _resolve_geo(self, geo: str) -> str:
         """Google's location id for the plan's place ("Lagos", "Ikeja, Lagos",
