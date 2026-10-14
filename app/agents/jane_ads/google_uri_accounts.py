@@ -198,7 +198,9 @@ async def create_account(db, name: str, created_by: str) -> dict:
     data = resp.json()
     if "error" in data and _is_ineligible_mcc_error(json.dumps(data.get("error", {}))):
         await set_mcc_creation_eligibility(db, False, "Google won't let URI's manager account create accounts yet.")
+        print(f"[google_uri_accounts] account creation refused: {data.get('error')}", flush=True)
         raise UriAccountError(
+            f"(Google said: {((data.get('error') or {}).get('details') or [{}])[0].get('errors', [{}])[0].get('message') or (data.get('error') or {}).get('message')}) "
             "Google won't let URI's manager account create new accounts automatically yet — it needs more "
             "ad-spend history. Create the account in Google Ads (Accounts → + → Create new account) and add it here.")
     _raise_for_error(data, "account creation")
