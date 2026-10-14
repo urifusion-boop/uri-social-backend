@@ -397,3 +397,58 @@ class TestPreviewLimit:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestSaferChanges:
+    def test_a_call_to_action_for_one_platform_stays_on_that_platform(self, env):
+        client, db, replies, _ = env
+        replies.append({"understood": True,
+                        "changes": [{"field": "cta_styles", "op": "set", "value": ["DM us to start"]}],
+                        "reply": "Done — Instagram posts end with 'DM us to start'."})
+        out = data(client.post("/social-media/brand-profile/instruct",
+                               json={"text": "Always end Instagram posts with 'DM us to start'"}))
+        p = stored(client, db)
+        assert p["cta_styles"] == ["DM us"]                       # every other platform untouched
+        ins = p["playbook_instructions"][0]
+        assert ins["platforms"] == ["instagram"] and "DM us to start" in ins["text"]
+        assert out["changes"] == [] and out["added"]
+
+    def test_a_general_call_to_action_still_changes_everywhere(self, env):
+        client, db, replies, _ = env
+        replies.append({"understood": True,
+                        "changes": [{"field": "cta_styles", "op": "set", "value": ["Order on WhatsApp"]}],
+                        "reply": "Done."})
+        client.post("/social-media/brand-profile/instruct", json={"text": "Always end posts with Order on WhatsApp"})
+        assert stored(client, db)["cta_styles"] == ["Order on WhatsApp"]
+
+    def test_one_message_never_wipes_the_playbook(self, env):
+        client, db, replies, _ = env
+        replies.append({"understood": True, "reply": "Done — cleared.",
+                        "changes": [{"field": "words_to_avoid", "op": "set", "value": []},
+                                    {"field": "cta_styles", "op": "set", "value": []},
+                                    {"field": "product_description", "op": "set", "value": ""},
+                                    {"field": "guardrails.avoid_topics", "op": "set", "value": ""},
+                                    {"field": "region", "op": "set", "value": ""}]})
+        out = data(client.post("/social-media/brand-profile/instruct",
+                               json={"text": "Clear all my preferences and start from scratch"}))
+        assert not out["understood"] and out["change_id"] is None and "haven't changed anything" in out["reply"]
+        p = stored(client, db)
+        assert p["words_to_avoid"] == ["cheap"] and p["cta_styles"] == ["DM us"] and p["region"] == "Nigeria"
+
+    def test_clearing_one_thing_still_works(self, env):
+        client, db, replies, _ = env
+        replies.append({"understood": True, "reply": "Done.",
+                        "changes": [{"field": "words_to_avoid", "op": "set", "value": []}]})
+        data(client.post("/social-media/brand-profile/instruct", json={"text": "Remove my words to avoid"}))
+        assert stored(client, db)["words_to_avoid"] == []
+
+
+def test_platforms_named_in_a_message():
+    assert pi.platforms_named("End Instagram posts with X") == ["instagram"]
+    assert pi.platforms_named("On LinkedIn and on X keep it formal") == ["linkedin", "twitter"]
+    assert pi.platforms_named("Always end posts with Order now") == []
+    assert pi.platforms_named("Use the next steps") == []          # "next" is not X
+
+
+def test_a_stray_letter_x_is_not_the_platform():
+    assert pi.platforms_named("Rate us 5x better, end with X marks the spot") == []
