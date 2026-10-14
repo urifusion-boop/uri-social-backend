@@ -1591,33 +1591,86 @@ async def jane_google_ads_signin_select(
 
 @router.post("/google/connection/change-account")
 async def jane_google_ads_change_account(
+    pause_campaigns: bool = False,
+    keep_running: bool = False,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
     """Let go of the chosen Google Ads account and go back to "choose your
     account". Withdraws a pending invitation / removes an accepted link on
-    Google's side too."""
-    return await _release_google_ads(db, brand_ctx, remove=False)
+    Google's side too. If URI campaigns are still in that account, answers 409
+    with the list unless pause_campaigns or keep_running says what to do."""
+    return await _release_google_ads(db, brand_ctx, remove=False,
+                                     pause_campaigns=pause_campaigns, keep_running=keep_running)
 
 
 @router.delete("/google/connection")
 async def jane_google_ads_disconnect(
+    pause_campaigns: bool = False,
+    keep_running: bool = False,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """Disconnect Google Ads for this brand altogether (also ends the link on Google's side)."""
-    return await _release_google_ads(db, brand_ctx, remove=True)
+    """Disconnect Google Ads for this brand altogether (also ends the link on
+    Google's side). Same campaign check as change-account."""
+    return await _release_google_ads(db, brand_ctx, remove=True,
+                                     pause_campaigns=pause_campaigns, keep_running=keep_running)
 
 
-async def _release_google_ads(db, brand_ctx: dict, remove: bool) -> dict:
-    from .google_ads_connection import AccountNotLinkable, AdsConnectionRequired, release_account
+def _campaigns_in_account_message(total: int, running: int) -> str:
+    many = total != 1
+    them = "them" if many else "it"
+    return (
+        f"{total} URI campaign{'s are' if many else ' is'} still in this Google Ads account"
+        f"{f' ({running} running)' if running else ''}. Once URI lets go of the account it can't pause, "
+        f"track or bill {them}. Pause {them} first, or keep {them} running and manage {them} in Google Ads yourself."
+    )
+
+
+async def _release_google_ads(db, brand_ctx: dict, remove: bool,
+                              pause_campaigns: bool = False, keep_running: bool = False) -> dict:
+    from . import google_flow
+    from .google_ads_connection import (
+        AccountNotLinkable, AdsConnectionRequired, get_any_google_ads_connection, release_account,
+    )
+
+    user_id, brand_id = brand_ctx.get("user_id"), brand_ctx.get("brand_id")
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
+    customer_id = (conn or {}).get("customer_id") or ""
+
+    # Once URI lets go of the account it can no longer pause, track or bill the
+    # campaigns it launched there. So say which are still there and let the
+    # owner choose: pause them first, or leave them running under their own control.
+    live: list = []
+    paused = 0
+    if customer_id and not (conn or {}).get("created_account_by_uri"):
+        live = await google_flow.campaigns_in_account(db, brand_id, customer_id)
+        if live and not (pause_campaigns or keep_running):
+            running = sum(1 for c in live if c["delivery"] in ("Active", "Unknown"))
+            raise HTTPException(status_code=409, detail={
+                "code": "google_campaigns_in_account",
+                "campaigns": live,
+                "running": running,
+                "message": _campaigns_in_account_message(len(live), running),
+            })
+        if live and pause_campaigns:
+            try:
+                paused = await google_flow.pause_campaigns(db, live)
+            except google_flow.GoogleAdsAPIError as e:
+                raise HTTPException(status_code=502, detail=(
+                    f"Couldn't pause every campaign, so nothing was changed: {e}"))
 
     try:
-        return await release_account(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), remove=remove)
+        result = await release_account(db, user_id, brand_id, remove=remove)
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
     except AccountNotLinkable as e:
         raise HTTPException(status_code=409, detail=str(e))
+    if live:
+        await google_flow.detach_campaigns(db, brand_id, customer_id)
+    return {**result, "campaigns_paused": paused,
+            "campaigns_left_running": 0 if pause_campaigns else
+            sum(1 for c in live if c["delivery"] in ("Active", "Unknown"))}
 
 
 class GoogleAdsCreateAccountBody(BaseModel):
@@ -4256,6 +4309,8 @@ async def meta_campaigns(
         collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
                       else "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns")
         adapter = google_adapter if is_google else tiktok_adapter if is_tiktok else meta_adapter
+        if is_google and r.get("detached_at"):
+            adapter = None      # URI let go of that Google Ads account; nothing to read
         created = r.get("created_at")
         row = {
             "campaign_id": r.get("campaign_id"),
@@ -4294,6 +4349,9 @@ async def meta_campaigns(
             ),
             "metrics": None,
         }
+        if is_google and r.get("detached_at"):
+            row["status"] = "not managed by uri"
+            row["detached"] = True
         if adapter and r.get("campaign_id"):
             try:
                 summary = await adapter.fetch_campaign_summary(r["campaign_id"])
@@ -5257,7 +5315,10 @@ async def set_meta_campaign_status(
 
     brand_id = brand_ctx.get("brand_id")
     from . import google_flow
-    if await google_flow.find_record(db, campaign_id, brand_id):
+    google_record = await google_flow.find_record(db, campaign_id, brand_id)
+    if google_record:
+        if google_record.get("detached_at"):
+            raise HTTPException(status_code=409, detail=google_flow.NO_LONGER_MANAGED)
         # A Google campaign, in this brand's own Google Ads account.
         try:
             return await google_flow.GoogleCampaigns(db).set_delivery(campaign_id, body.active)
@@ -5320,7 +5381,12 @@ async def delete_meta_campaign(
 
     brand_id = brand_ctx.get("brand_id")
     from . import google_flow
-    if await google_flow.find_record(db, campaign_id, brand_id):
+    google_record = await google_flow.find_record(db, campaign_id, brand_id)
+    if google_record and google_record.get("detached_at"):
+        # URI can't reach it any more — this only removes it from URI's list.
+        await db[google_flow.GOOGLE_CAMPAIGNS].delete_one({"campaign_id": campaign_id})
+        return {"deleted": True, "removed_from_list_only": True}
+    if google_record:
         try:
             await google_flow.GoogleCampaigns(db).delete_campaign(campaign_id)
         except google_flow.GoogleAdsAPIError as e:
