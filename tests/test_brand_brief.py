@@ -234,7 +234,7 @@ class TestInboxSoundsLikeTheBrand:
 
         text = _DRAFT_SYSTEM.format(channel="Instagram", public_note="", brand_style="7. Sound like this business.\n")
         assert "7. Sound like this business." in text
-        assert "Use ONLY facts from the numbered SOURCES" in text
+        assert "come ONLY from the numbered SOURCES" in text      # facts only from the sources
 
     def test_banned_word_in_draft_is_never_auto_sent(self):
         import inspect
