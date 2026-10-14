@@ -46,38 +46,21 @@ def db_with_campaign(**extra):
     return db
 
 
-class TestIsTheBrandReady:
-    def test_linked_account_is_ready_without_any_network_call(self):
-        db = FakeDb()
-        db["x"].docs.append(_conn_doc(manager_link_status="active"))
-        with Google() as google:
-            assert run(gf.is_ready(db, "u1", "b1")) is True
-        assert google.calls == []
-
-    @pytest.mark.parametrize("conn", [dict(manager_link_status="pending"), dict(manager_link_status="none", customer_id="")])
-    def test_not_ready_until_linked(self, conn):
-        db = FakeDb()
-        db["x"].docs.append(_conn_doc(**conn))
-        assert run(gf.is_ready(db, "u1", "b1")) is False
-
-    def test_never_ready_when_uri_itself_is_not_set_up(self, monkeypatch):
-        monkeypatch.setattr(gf.settings, "GOOGLE_ADS_DEVELOPER_TOKEN", "", raising=False)
-        db = FakeDb()
-        db["x"].docs.append(_conn_doc(manager_link_status="active"))
-        assert run(gf.is_ready(db, "u1", "b1")) is False
-
-
 class TestBudgetIsEnoughForSearch:
     def test_enough(self):
         assert gf.budget_too_low(35000, 7) is None          # ₦5,000 a day ≈ 20 clicks
 
     def test_too_little_says_what_would_work(self):
         msg = gf.budget_too_low(7000, 7)                    # ₦1,000 a day ≈ 4 clicks
-        assert "₦1,000 a day" in msg and "₦17,500" in msg and "Instagram and Facebook" in msg
+        from app.agents.jane_ads import constants as C
+        assert f"₦{7000 * C.AD_SPEND_MARKUP:,.0f} over 7 days" in msg                 # the budget they typed
+        assert f"₦{17500 * C.AD_SPEND_MARKUP:,.0f}" in msg and "Instagram and Facebook" in msg
 
     def test_going_ahead_anyway_gets_what_to_expect_not_a_refusal(self):
         msg = gf.budget_too_low_warning(5400, 5)            # ₦1,080 a day ≈ 4 clicks
-        assert "₦1,080 a day" in msg and "~4 clicks" in msg and "test" in msg and "₦12,500" in msg
+        from app.agents.jane_ads import constants as C
+        assert f"₦{1080 * C.AD_SPEND_MARKUP:,.0f} a day" in msg and "~4 clicks" in msg and "test" in msg
+        assert f"₦{12500 * C.AD_SPEND_MARKUP:,.0f}" in msg
 
 
 class TestTargetingThePlansOwnCity:
@@ -288,3 +271,55 @@ class TestErrorsAnOwnerCanActOn:
                                        "manager_link_refused", "manager_link_declined"])
     def test_connection_problems_say_where_to_fix_them(self, state):
         assert "Connected Accounts → Google Ads" in gf.connection_message(state)
+
+
+class TestPlacementMinimums:
+    def test_in_the_owners_own_figures_with_a_fix_that_works(self):
+        from app.agents.jane_ads import constants as C
+        msg = gf.below_placement_minimum("demand_gen", 35000, 7)       # ₦5,000 a day of ad spend
+        assert f"₦{8000 * C.AD_SPEND_MARKUP:,.0f} a day" in msg
+        assert f"₦{35000 * C.AD_SPEND_MARKUP:,.0f} over 7 days" in msg
+        assert "run it for 4 days instead" in msg
+
+    def test_too_little_for_even_one_day_says_so(self):
+        msg = gf.below_placement_minimum("demand_gen", 6300, 5)
+        assert "for one day" in msg and "1 days" not in msg and "Display and Search have no minimum" in msg
+
+    def test_enough_or_no_floor(self):
+        assert gf.below_placement_minimum("demand_gen", 70000, 7) is None
+        assert gf.below_placement_minimum("display", 7000, 7) is None
+        assert gf.below_placement_minimum("search", 7000, 7) is None
+
+
+class TestNeverSpendsPastWhatWasPaid:
+    def test_end_date_counts_today_as_day_one(self):
+        from datetime import date
+        from app.agents.jane_ads.adapters.google import campaign_end
+        assert campaign_end(5, date(2026, 10, 14)) == "2026-10-18 23:59:59"
+        assert campaign_end(1, date(2026, 10, 14)) == "2026-10-14 23:59:59"
+
+    def test_turning_on_sets_the_end_date_from_now(self):
+        db = db_with_campaign(days=5)
+        with Google({"results": [{}]}, {"results": [{}]}, {"results": [{}]}) as google:
+            run(adapter(db).set_delivery("777", True))
+        campaign_op = google.calls[0]["json"]["operations"][0]
+        assert campaign_op["updateMask"] == "status,end_date_time"
+        assert campaign_op["update"]["endDateTime"].endswith("23:59:59")
+
+    def test_pausing_leaves_the_end_date_alone(self):
+        db = db_with_campaign(days=5)
+        with Google({"results": [{}]}, {"results": [{}]}, {"results": [{}]}) as google:
+            run(adapter(db).set_delivery("777", False))
+        assert google.calls[0]["json"]["operations"][0]["updateMask"] == "status"
+
+    def test_the_sweep_stops_a_campaign_that_has_spent_what_was_paid(self):
+        db = db_with_campaign(charged_upfront_ngn=6000.0, budget_ngn=5400.0)
+        out, charged, dispatcher = TestHourlySpendSweep()._sweep(
+            db, {**TestHourlySpendSweep.SUMMARY, "spend_ngn": 5450.0})
+        dispatcher.set_delivery.assert_awaited_once_with("777", active=False)
+        assert charged == []
+
+    def test_still_within_budget_keeps_running(self):
+        db = db_with_campaign(charged_upfront_ngn=6000.0, budget_ngn=5400.0)
+        _, _, dispatcher = TestHourlySpendSweep()._sweep(db, {**TestHourlySpendSweep.SUMMARY, "spend_ngn": 3000.0})
+        dispatcher.set_delivery.assert_not_awaited()

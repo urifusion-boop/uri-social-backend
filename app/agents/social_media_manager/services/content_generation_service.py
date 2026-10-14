@@ -247,6 +247,7 @@ Write one caption. No alternatives, no meta-commentary.
           4. Brand instructions (the Playbook)
           5. The platform's own prompt, with the topic
         """
+        brand_context = brand_brief.for_platform(brand_context, platform)
         brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
         platform_prompt = ContentGenerationService.PLATFORM_PROMPTS[platform].format(seed_content=seed_content)
         voice_instructions = ""
@@ -808,6 +809,9 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         if platform not in ContentGenerationService.PLATFORM_PROMPTS:
             return UriResponse.error_response(f"Unsupported platform: {platform}")
 
+        # A formal / no-slang platform is written in the main language only — the
+        # prompt, the Playbook check and the rewrite all see the same rule.
+        brand_context = brand_brief.for_platform(brand_context, platform)
         try:
             # Get platform-specific prompt
             prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context)

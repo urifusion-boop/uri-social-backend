@@ -161,6 +161,58 @@ def emoji_mode(bc: Optional[Dict[str, Any]]) -> str:
     return "free"
 
 
+_FORMAL_TONE = ("formal", "no slang", "professional", "corporate", "analytical")
+
+
+# "End Instagram posts with 'DM us to start'" / "End Instagram posts with: DM us to start"
+_ENDING = re.compile(r"\bend\b[^:'\"\u2018\u201c]{0,60}?(?:with|using)\s*:?\s*['\"\u2018\u201c]?([^'\"\u2019\u201d\n]{2,80}?)['\"\u2019\u201d]?\s*\.?\s*$",
+                     re.IGNORECASE)
+
+
+def platform_cta(bc: Optional[Dict[str, Any]], platform: str) -> str:
+    """The call to action the owner set for this one platform ("Always end
+    Instagram posts with 'DM us to start'"), or ""."""
+    for item in (bc or {}).get("playbook_instructions") or []:
+        if not isinstance(item, dict) or platform.lower() not in [str(x).lower() for x in item.get("platforms") or []]:
+            continue
+        m = _ENDING.search(str(item.get("text") or "").strip())
+        if m and m.group(1).strip():
+            return m.group(1).strip().rstrip(".")
+    return ""
+
+
+def for_platform(bc: Optional[Dict[str, Any]], platform: str = "") -> Optional[Dict[str, Any]]:
+    """The brand as it should write on `platform`:
+      • a call to action the owner set for this platform replaces the general
+        one here, so the post ends with it alone (both were added, seen on dev)
+      • a platform set to a formal / no-slang tone is written in the brand's
+        main language only, without standing instructions about the other
+        languages (Pidgin on a "formal, no slang" LinkedIn, seen on dev).
+    Everything else is unchanged."""
+    if not bc or not platform:
+        return bc
+    out = dict(bc)
+    own_cta = platform_cta(bc, platform)
+    if own_cta:
+        out["cta_styles"] = [own_cta]
+    langs = _list(bc.get("languages"))
+    if len(langs) < 2 or bc.get("same_tone_everywhere", True) is not False:
+        return out
+    tone = str((bc.get("platform_tones") or {}).get(platform.lower()) or "").lower()
+    if not (tone and any(word in tone for word in _FORMAL_TONE)):
+        return out
+    # Standing instructions about the dropped languages ("mix in a little
+    # Pidgin") would contradict the tone the same way — unless the owner named
+    # this platform in them, which is then their explicit choice.
+    dropped = [lang.lower() for lang in langs[1:]]
+    out["languages"] = [langs[0]]
+    out["playbook_instructions"] = [
+        i for i in bc.get("playbook_instructions") or []
+        if not (isinstance(i, dict) and platform.lower() not in (i.get("platforms") or [])
+                and any(lang in str(i.get("text", "")).lower() for lang in dropped))]
+    return out
+
+
 def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
     langs = _list((bc or {}).get("languages"))
     if not langs or langs == ["English"]:
@@ -446,6 +498,43 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
         if cta[-1:] not in ".!?":
             cta += "."
         out = f"{out.rstrip()}\n\n{cta}"
+    elif append_cta and out.strip():
+        out = cta_last(out, bc)
+    return out
+
+
+def cta_last(text: str, bc: Optional[Dict[str, Any]]) -> str:
+    """The call-to-action line closes the piece. Writers often add one more
+    line after it ("DM us to start." then "Don't forget our free trial!") when
+    the owner asked to END with it; this moves the CTA's line to the end, above
+    any closing hashtags. Only a short line is moved: a CTA inside a long
+    paragraph stays where it is."""
+    wanted = [_norm(c) for c in ctas(bc) if _norm(c)]
+    if not wanted:
+        return text
+    lines = text.rstrip().split("\n")
+    tail: List[str] = []
+    while lines and (not lines[-1].strip() or lines[-1].strip().startswith("#")):
+        tail.insert(0, lines.pop())
+    body = [i for i, line in enumerate(lines) if line.strip()]
+    if not body:
+        return text
+    if any(c in _norm(lines[body[-1]]) for c in wanted):
+        return text
+    hit = next((i for i in reversed(body)
+                if any(c in _norm(lines[i]) for c in wanted) and len(lines[i].split()) <= 25), None)
+    if hit is None:
+        return text
+    cta_line = lines.pop(hit)
+    # Don't leave two blank lines where the CTA was.
+    if 0 < hit < len(lines) and not lines[hit].strip() and not lines[hit - 1].strip():
+        lines.pop(hit)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    out = "\n".join(lines + ["", cta_line])
+    tags = [t for t in tail if t.strip()]
+    if tags:
+        out += "\n\n" + "\n".join(tags)
     return out
 
 

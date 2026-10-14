@@ -187,10 +187,37 @@ def _raise_for_error(data: dict, context: str) -> None:
                     ((inner.get("location") or {}).get("fieldPathElements") or []) if e.get("fieldName")]
             if path:
                 detail = f"{detail} (field: {'.'.join(path)})"
+            # Google says what the per-day minimum is: keep it, so the owner is told the number.
+            minimum = ((inner.get("details") or {}).get("budgetPerDayMinimumErrorDetails") or {})
+            if minimum.get("minimumBudgetAmountMicros"):
+                detail = (f"{detail} (minimum {float(minimum['minimumBudgetAmountMicros']) / 1_000_000:g} "
+                          f"{minimum.get('currencyCode', '')} a day)")
             code = inner.get("errorCode") or {}
             if isinstance(code, dict) and code:
                 detail = f"{detail} [{next(iter(code.values()))}]"
         raise GoogleAdsAPIError(f"{context}: {detail}", code=err.get("status"))
+
+
+def campaign_name(business: str, placement_label: str, goal: str = "", today: Optional["date"] = None) -> str:
+    """A name a person can read in Google Ads: "Mama Kitchen · Search · Leads ·
+    14 Oct 2026 · 3f2a". Google needs campaign names unique in the account, so a
+    short tag ends it; the old names were codes (JaneAds-brnd_personal_1f38…-leads)."""
+    from datetime import date
+    day = today or date.today()
+    business = " ".join((business or "").split())[:40].strip() or "URI campaign"
+    parts = [business, placement_label]
+    if goal:
+        parts.append(goal.replace("_", " ").title())
+    parts += [f"{day.day} {day.strftime('%b %Y')}", uuid.uuid4().hex[:4]]
+    return " · ".join(parts)
+
+
+def campaign_end(days: int, today: Optional["date"] = None) -> str:
+    """Google's end_date_time for a campaign running `days` days from today
+    (today counts as day one), in the format Google takes."""
+    from datetime import date, timedelta
+    start = today or date.today()
+    return f"{(start + timedelta(days=max(days, 1) - 1)).isoformat()} 23:59:59"
 
 
 def estimate_clicks_per_day(daily_budget_ngn: float, estimated_cpc_ngn: float) -> float:
@@ -374,6 +401,11 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         description = kw_context.get("description", "")
         geo = kw_context.get("geo", "")
 
+        from .google_visual import VISUAL_PLACEMENTS, normalize_placement
+        placement = normalize_placement(kw_context.get("placement"))
+        if placement in VISUAL_PLACEMENTS:
+            return await self._launch_visual(plan, placement, daily_budget_ngn, dest_link, kw_context, days)
+
         keywords = await translate_keywords(category, description, geo)
         all_terms = (
             (keywords.get("head_terms") or [])
@@ -388,6 +420,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         if clicks_per_day < _MIN_USEFUL_CLICKS_PER_DAY and not kw_context.get("low_budget_ok"):
             raise LowClicksWarning(daily_budget_ngn, estimated_cpc_ngn, clicks_per_day)
 
+        readable_name = campaign_name(kw_context.get("business_name") or category, "Search", plan.goal.value)
         campaign_resource_name = ""
         budget_resource_name = ""
         ad_group_resource_name = ""
@@ -399,7 +432,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     f"{self._api_base}/customers/{self._customer_id}/campaignBudgets:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
-                        "name": f"JaneAds-{plan.business_id}-budget-{uuid.uuid4().hex[:8]}",
+                        "name": f"{readable_name} · budget",
                         "amountMicros": budget_micros(daily_budget_ngn, self._currency_code),
                         "deliveryMethod": "STANDARD",
                     }}]},
@@ -414,7 +447,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     f"{self._api_base}/customers/{self._customer_id}/campaigns:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
-                        "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
+                        "name": readable_name,
                         "status": "PAUSED",
                         "advertisingChannelType": "SEARCH",
                         "campaignBudget": budget_resource_name,
@@ -456,7 +489,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     f"{self._api_base}/customers/{self._customer_id}/adGroups:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
-                        "name": f"JaneAds-{plan.business_id}-adgroup",
+                        "name": f"{readable_name} · ad group",
                         "campaign": campaign_resource_name,
                         "status": "PAUSED",
                         "type": "SEARCH_STANDARD",
@@ -541,6 +574,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "currency_code": self._currency_code,
                 "budget_resource_name": budget_resource_name,
                 "geo_target": geo_constant,
+                "placement": "search",
+                "days": days,
                 "platform": "google",
                 "last_click_count": 0,
                 "created_at": datetime.now(timezone.utc),
@@ -554,6 +589,75 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             platforms=[Platform.GOOGLE],
             launched=True,
         )
+
+    async def _launch_visual(self, plan: CampaignPlan, placement: str, daily_budget_ngn: float,
+                             dest_link: str, kw_context: dict, days: int = 0) -> LaunchResult:
+        """Display, YouTube & Discover, or Everywhere: one atomic request (see
+        google_visual), so a failure leaves nothing behind in the account."""
+        from . import google_visual as gv
+
+        creative = plan.creative
+        if not creative or not creative.image_url or creative.is_video:
+            raise GoogleAdsAPIError(
+                f"{gv.PLACEMENT_LABELS[placement]} ads need a picture. Add or generate an image, then try again.")
+        image = await gv.fetch_bytes(creative.image_url)
+        if not image:
+            raise GoogleAdsAPIError("The ad's picture couldn't be loaded. Try again, or upload it again.")
+        business_name = kw_context.get("business_name") or kw_context.get("category") or "Our business"
+        try:
+            images = gv.marketing_images(image)
+        except Exception as e:
+            raise GoogleAdsAPIError(f"The ad's picture couldn't be prepared for Google: {e}")
+        logo_b64 = gv.logo_image(await gv.fetch_bytes(kw_context.get("logo_url", "")), business_name,
+                                 kw_context.get("brand_color") or "#C2185B")
+        copy = gv.ad_copy(creative.headline, creative.primary_text, business_name, rsa_assets,
+                          headline_limit=40 if placement == "demand_gen" else 30)
+        geo_constant = await self._resolve_geo(kw_context.get("geo", ""))
+        short = {"display": "Display", "demand_gen": "YouTube & Discover", "pmax": "Everywhere"}[placement]
+        name = campaign_name(business_name, short, plan.goal.value)
+        ops = gv.build_operations(
+            placement, self._customer_id, name=name,
+            daily_micros=budget_micros(daily_budget_ngn, self._currency_code),
+            geo_constant=geo_constant, final_url=dest_link, copy=copy, images=images, logo_b64=logo_b64,
+        )
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(
+                f"{self._api_base}/customers/{self._customer_id}/googleAds:mutate",
+                headers=self._headers(),
+                json={"mutateOperations": ops},
+            )
+        data = resp.json()
+        _raise_for_error(data, f"{gv.PLACEMENT_LABELS[placement]} campaign creation")
+        made = gv.created(data.get("mutateOperationResponses") or [])
+        campaign_resource_name = made.get("campaign", "")
+        campaign_id = campaign_resource_name.split("/")[-1]
+        ad_group = made.get("adGroup", "")
+        ad_id = made.get("adGroupAd", "").split("~")[-1] if made.get("adGroupAd") else ""
+
+        await self._db[COLLECTION].update_one(
+            {"campaign_id": campaign_id},
+            {"$set": {
+                "campaign_id": campaign_id,
+                "campaign_resource_name": campaign_resource_name,
+                "ad_group_id": ad_group,
+                "ad_id": ad_id,
+                "asset_group": made.get("assetGroup", ""),
+                "placement": placement,
+                "days": days,
+                "business_id": plan.business_id,
+                "customer_id": self._customer_id,
+                "login_customer_id": self._login_customer_id,
+                "currency_code": self._currency_code,
+                "budget_resource_name": made.get("campaignBudget", ""),
+                "geo_target": geo_constant,
+                "platform": "google",
+                "last_click_count": 0,
+                "created_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+        return LaunchResult(campaign_id=campaign_id, ad_ids={plan.business_id: ad_id},
+                            platforms=[Platform.GOOGLE], launched=True)
 
     async def _resolve_geo(self, geo: str) -> str:
         """Google's location id for the plan's place ("Lagos", "Ikeja, Lagos",
@@ -651,11 +755,16 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         updated: dict = {}
         async with httpx.AsyncClient(timeout=30) as client:
             for name, service, resource in targets:
+                update, mask = {"resourceName": resource, "status": status}, "status"
+                if name == "campaign" and active and record.get("days"):
+                    # The plan's days count from when it's switched on, not from
+                    # when it was created paused: Google stops it on the last day.
+                    update["endDateTime"] = campaign_end(int(record["days"]))
+                    mask = "status,end_date_time"
                 resp = await client.post(
                     f"{self._api_base}/customers/{self._customer_id}/{service}:mutate",
                     headers=self._headers(),
-                    json={"operations": [{"update": {"resourceName": resource, "status": status},
-                                          "updateMask": "status"}]},
+                    json={"operations": [{"update": update, "updateMask": mask}]},
                 )
                 data = resp.json()
                 _raise_for_error(data, f"{name} status update")
