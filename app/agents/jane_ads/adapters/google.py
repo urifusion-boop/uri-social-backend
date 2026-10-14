@@ -584,30 +584,52 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         dict shape MetaAdPlatformAdapter/TikTokAdsAdapter return, which billing.py
         and the campaign list read directly. Spend comes back in the account's
         currency and is converted to naira. A click stands in for a conversation
-        (Google has no "conversation started" signal), as poll_conversations says."""
+        (Google has no "conversation started" signal), as poll_conversations says.
+
+        Also carries Google's own verdict on whether it is serving
+        (primary_status + reasons) and whether the account can pay for ads, so
+        the list can say WHY a turned-on campaign isn't showing."""
         cid = "".join(ch for ch in str(campaign_id) if ch.isdigit())
+        # end_date_time, not end_date: Google removed end_date in API v23.
         rows = await self._gaql_search(
-            "SELECT campaign.status, campaign.end_date, customer.currency_code, metrics.cost_micros, "
+            "SELECT campaign.status, campaign.end_date_time, campaign.primary_status, "
+            "campaign.primary_status_reasons, customer.currency_code, metrics.cost_micros, "
             f"metrics.impressions, metrics.clicks FROM campaign WHERE campaign.id = {cid}"
         )
         if not rows:
             return {"delivery": "Deleted", "spend_ngn": 0.0, "impressions": 0, "reach": 0,
                     "conversations": 0, "cost_per_conversation_ngn": None, "ends_at": None}
         row = rows[0]
+        campaign = row.get("campaign", {})
         currency = row.get("customer", {}).get("currencyCode", "") or self._currency_code
         metrics = row.get("metrics", {})
         clicks = int(metrics.get("clicks", 0))
         spend_ngn = to_ngn(float(metrics.get("costMicros", 0)) / 1_000_000, currency)
         impressions = int(metrics.get("impressions", 0))
+        ends = (campaign.get("endDateTime") or "")[:10] or None
         return {
-            "delivery": _DELIVERY_LABELS.get(row.get("campaign", {}).get("status", ""), "Paused"),
+            "delivery": _DELIVERY_LABELS.get(campaign.get("status", ""), "Paused"),
             "spend_ngn": spend_ngn,
             "impressions": impressions,
             "reach": impressions,          # Search reports impressions, not unique reach
             "conversations": clicks,
             "cost_per_conversation_ngn": (spend_ngn / clicks) if clicks else None,
-            "ends_at": row.get("campaign", {}).get("endDate") or None,
+            "ends_at": None if not ends or ends.startswith("2037") else ends,
+            "primary_status": campaign.get("primaryStatus", ""),
+            "primary_status_reasons": list(campaign.get("primaryStatusReasons") or []),
+            "billing_ready": await self.billing_ready(),
         }
+
+    async def billing_ready(self) -> Optional[bool]:
+        """Has this Google Ads account got an approved way to pay for ads?
+        Without one, Google shows nothing however the campaign is set. None when
+        it can't be read (never blocks anything on a failed read)."""
+        try:
+            rows = await self._gaql_search("SELECT billing_setup.status FROM billing_setup")
+        except Exception as e:
+            print(f"[google] billing read failed for {self._customer_id}: {e}", flush=True)
+            return None
+        return any(r.get("billingSetup", {}).get("status") in ("APPROVED", "APPROVED_HELD") for r in rows)
 
     async def set_delivery(self, campaign_id: str, active: bool) -> dict:
         """Turn a campaign on or off from the campaign list. Like Meta and TikTok,

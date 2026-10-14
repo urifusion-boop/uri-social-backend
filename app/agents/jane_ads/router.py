@@ -4375,6 +4375,8 @@ async def meta_campaigns(
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
                     continue
                 row["status"] = summary["delivery"].lower()
+                if is_google:
+                    row["serving_note"] = google_flow.serving_note(summary)
                 # A wa.me link ad reports 0 conversations forever — Meta only fires
                 # the conversation metric for native Click-to-WhatsApp. Rendering that
                 # raw would tell a client their ad produced nothing when the truth is
@@ -4403,6 +4405,10 @@ async def meta_campaigns(
                 }
             except Exception as e:
                 print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
+                if is_google:
+                    # Don't fall back to "paused": that hid a campaign that was running.
+                    row["status"] = "status unavailable"
+                    row["serving_note"] = "Couldn't reach Google to check this campaign. Press Refresh in a minute."
         out.append(row)
 
     out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
