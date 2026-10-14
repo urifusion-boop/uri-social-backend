@@ -125,6 +125,53 @@ def budget_too_low(budget_ngn: float, days: int) -> Optional[str]:
             f"Instagram and Facebook instead.")
 
 
+# Google's reasons a campaign isn't (fully) serving, in words an owner can act on.
+_SERVING_REASONS = {
+    "HAS_ADS_DISAPPROVED": "Google rejected the ad. Open it in Google Ads to see which policy, then ask Jane for a new one.",
+    "HAS_ADS_LIMITED_BY_POLICY": "Google is limiting where the ad shows because of one of its ad policies.",
+    "MOST_ADS_UNDER_REVIEW": "Google is still reviewing the ad — usually within a day. It starts showing once approved.",
+    "AD_GROUP_ADS_PAUSED": "The ad itself is paused. Press play again to switch everything on.",
+    "AD_GROUPS_PAUSED": "The ad group is paused. Press play again to switch everything on.",
+    "KEYWORDS_PAUSED": "Its keywords are paused in Google Ads.",
+    "NO_KEYWORDS": "It has no keywords, so Google has nothing to show it for.",
+    "NO_AD_GROUP_ADS": "It has no ad.",
+    "BUDGET_CONSTRAINED": "The daily budget is small, so Google shows it less often than it could.",
+    "BIDDING_STRATEGY_LEARNING": "Google is still learning who to show it to — normal for the first days.",
+    "BIDDING_STRATEGY_LIMITED": "Google's bidding is limited — usually too little budget or data yet.",
+    "BIDDING_STRATEGY_CONSTRAINED": "Google's bidding is limited by the budget.",
+    "SEARCH_VOLUME_LIMITED": "Few people search for these keywords, so it shows rarely.",
+    "CAMPAIGN_ENDED": "Its end date has passed.",
+    "CAMPAIGN_PENDING": "Its start date hasn't arrived yet.",
+}
+
+_NO_BILLING = ("Your Google Ads account has no payment method, so Google won't show any ads. "
+               "Add one in Google Ads → Billing → Payment methods.")
+
+
+def serving_note(summary: dict) -> str:
+    """One plain sentence on why a Google campaign isn't showing (or "" when
+    nothing needs saying). Read from Google's own primary_status/reasons and
+    the account's billing, never guessed."""
+    if summary.get("delivery") != "Active":
+        if summary.get("billing_ready") is False:
+            return "Before you turn this on: " + _NO_BILLING[0].lower() + _NO_BILLING[1:]
+        return ""
+    if summary.get("billing_ready") is False:
+        return _NO_BILLING
+    status = summary.get("primary_status") or ""
+    if status in ("", "ELIGIBLE", "UNKNOWN", "UNSPECIFIED"):
+        return ""
+    reasons = [r for r in summary.get("primary_status_reasons") or [] if r != "CAMPAIGN_PAUSED"]
+    said = [_SERVING_REASONS[r] for r in reasons if r in _SERVING_REASONS]
+    if said:
+        return " ".join(said[:2])
+    if status == "NOT_ELIGIBLE":
+        return "Google says it isn't eligible to show yet. Open it in Google Ads to see why."
+    if reasons:
+        return "Google reports: " + ", ".join(r.replace("_", " ").lower() for r in reasons[:2]) + "."
+    return ""
+
+
 def budget_too_low_warning(budget_ngn: float, days: int) -> str:
     """The same point as budget_too_low, for when the owner goes ahead anyway:
     what to expect, not a refusal."""

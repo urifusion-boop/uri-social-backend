@@ -104,7 +104,7 @@ class TestTargetingThePlansOwnCity:
 
 class TestWhatTheCampaignListShows:
     def test_spend_in_naira_and_clicks_as_conversations(self):
-        row = {"campaign": {"status": "ENABLED", "endDate": "2026-10-30"}, "customer": {"currencyCode": "USD"},
+        row = {"campaign": {"status": "ENABLED", "endDateTime": "2026-10-30 23:59:59"}, "customer": {"currencyCode": "USD"},
                "metrics": {"costMicros": "2000000", "impressions": "400", "clicks": "8"}}
         with Google({"results": [row]}):
             out = run(adapter().fetch_campaign_summary("777"))
@@ -116,6 +116,42 @@ class TestWhatTheCampaignListShows:
         with Google({"results": [{"campaign": {"status": "PAUSED"}, "metrics": {}}]}):
             out = run(adapter().fetch_campaign_summary("777"))
         assert out["delivery"] == "Paused" and out["cost_per_conversation_ngn"] is None and out["spend_ngn"] == 0
+
+    def test_reads_the_end_date_field_google_still_has(self):
+        # Google removed campaign.end_date in API v23 — asking for it failed the
+        # whole read, and the list then showed a running campaign as paused.
+        with Google({"results": [{"campaign": {"status": "PAUSED"}, "metrics": {}}]}) as google:
+            run(adapter().fetch_campaign_summary("777"))
+        query = google.calls[0]["json"]["query"]
+        assert "campaign.end_date_time" in query and "campaign.end_date," not in query
+
+    def test_says_when_the_account_cant_pay_for_ads(self):
+        with Google({"results": [{"campaign": {"status": "ENABLED", "primaryStatus": "NOT_ELIGIBLE"}, "metrics": {}}]},
+                    {"results": [{"billingSetup": {"status": "CANCELLED"}}]}):
+            out = run(adapter().fetch_campaign_summary("777"))
+        assert out["billing_ready"] is False
+        assert "no payment method" in gf.serving_note(out)
+
+    def test_an_approved_payment_method_counts(self):
+        with Google({"results": [{"campaign": {"status": "ENABLED"}, "metrics": {}}]},
+                    {"results": [{"billingSetup": {"status": "APPROVED"}}]}):
+            assert run(adapter().fetch_campaign_summary("777"))["billing_ready"] is True
+
+    @pytest.mark.parametrize("summary, says", [
+        ({"delivery": "Active", "billing_ready": True, "primary_status": "PENDING",
+          "primary_status_reasons": ["MOST_ADS_UNDER_REVIEW"]}, "still reviewing"),
+        ({"delivery": "Active", "billing_ready": True, "primary_status": "NOT_ELIGIBLE",
+          "primary_status_reasons": ["HAS_ADS_DISAPPROVED"]}, "rejected the ad"),
+        ({"delivery": "Active", "billing_ready": True, "primary_status": "NOT_ELIGIBLE",
+          "primary_status_reasons": []}, "isn't eligible"),
+        ({"delivery": "Paused", "billing_ready": False}, "Before you turn this on"),
+    ])
+    def test_why_it_isnt_showing_in_plain_words(self, summary, says):
+        assert says in gf.serving_note(summary)
+
+    def test_nothing_to_say_when_it_is_serving_or_simply_paused(self):
+        assert gf.serving_note({"delivery": "Active", "billing_ready": True, "primary_status": "ELIGIBLE"}) == ""
+        assert gf.serving_note({"delivery": "Paused", "billing_ready": True}) == ""
 
     @pytest.mark.parametrize("rows", [[], [{"campaign": {"status": "REMOVED"}, "metrics": {}}]])
     def test_gone_from_google_reads_as_deleted(self, rows):
