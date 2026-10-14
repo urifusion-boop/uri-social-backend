@@ -57,16 +57,22 @@ def configured() -> bool:
 
 
 async def is_ready(db, user_id: Optional[str], brand_id: Optional[str]) -> bool:
-    """This brand has a linked Google Ads account, per our own record. No
-    network call — used while planning, where it's asked on every message.
-    The link is re-checked with Google itself at launch."""
+    """Can this brand run on Google now? Google ads run in URI's own Google Ads
+    accounts (URI pays Google; the brand pays only from its wallet), so this is
+    "does the brand have one, or is one free". No network call — asked on every
+    planning message."""
     if not configured():
         return False
+    from .google_uri_accounts import available
     try:
-        state, _ = await resolve_connection_state(db, user_id, brand_id)
-    except Exception:
+        return await available(db, brand_id)
+    except Exception as e:
+        print(f"[google_flow] readiness check failed: {e}", flush=True)
         return False
-    return state == ConnectionState.READY
+
+
+NOT_AVAILABLE = ("Google ads aren't available on URI just yet — we're setting them up. "
+                 "I can run this on Instagram & Facebook instead, or try Google again later.")
 
 
 _CONNECT_HERE = "Connected Accounts → Google Ads"
@@ -129,13 +135,16 @@ def raise_http(e: Exception) -> None:
 
 
 async def adapter_for_launch(db, brand_ctx: dict) -> tuple[GoogleAdsAdapter, dict]:
-    """The brand's own adapter, through the pre-flight gate: the link is checked
-    against Google right now and a WhatsApp number must be on file. Raises the
-    HTTP error the launch endpoints return (409 with the connection state)."""
+    """The adapter for this brand's URI Google Ads account (given to the brand the
+    first time it launches on Google). Raises the HTTP error the launch endpoints
+    return when no account is free or Google can't be reached."""
+    from .google_uri_accounts import NoUriAccountAvailable, launch_connection
+
     try:
-        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
-    except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=connection_message(e.state.value))
+        conn = await launch_connection(db, brand_ctx.get("brand_id"))
+    except NoUriAccountAvailable:
+        print(f"[google_flow] no free URI Google Ads account for brand {brand_ctx.get('brand_id')}", flush=True)
+        raise HTTPException(status_code=409, detail=NOT_AVAILABLE)
     except GoogleAdsConnectionError as e:
         raise HTTPException(status_code=502, detail=friendly_error(e))
     try:

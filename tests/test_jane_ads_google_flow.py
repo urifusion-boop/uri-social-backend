@@ -46,27 +46,6 @@ def db_with_campaign(**extra):
     return db
 
 
-class TestIsTheBrandReady:
-    def test_linked_account_is_ready_without_any_network_call(self):
-        db = FakeDb()
-        db["x"].docs.append(_conn_doc(manager_link_status="active"))
-        with Google() as google:
-            assert run(gf.is_ready(db, "u1", "b1")) is True
-        assert google.calls == []
-
-    @pytest.mark.parametrize("conn", [dict(manager_link_status="pending"), dict(manager_link_status="none", customer_id="")])
-    def test_not_ready_until_linked(self, conn):
-        db = FakeDb()
-        db["x"].docs.append(_conn_doc(**conn))
-        assert run(gf.is_ready(db, "u1", "b1")) is False
-
-    def test_never_ready_when_uri_itself_is_not_set_up(self, monkeypatch):
-        monkeypatch.setattr(gf.settings, "GOOGLE_ADS_DEVELOPER_TOKEN", "", raising=False)
-        db = FakeDb()
-        db["x"].docs.append(_conn_doc(manager_link_status="active"))
-        assert run(gf.is_ready(db, "u1", "b1")) is False
-
-
 class TestBudgetIsEnoughForSearch:
     def test_enough(self):
         assert gf.budget_too_low(35000, 7) is None          # ₦5,000 a day ≈ 20 clicks
