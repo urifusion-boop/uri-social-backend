@@ -141,4 +141,77 @@ class TestLaunchingThere:
         monkeypatch.setattr(gf.settings, "GOOGLE_ADS_DEVELOPER_TOKEN", "dev", raising=False)
         with pytest.raises(HTTPException) as e:
             run(gf.adapter_for_launch(Db(), {"brand_id": "b1"}))
-        assert e.value.status_code == 409 and "aren't available on URI just yet" in e.value.detail
+        assert e.value.status_code == 409 and "aren't available just yet" in e.value.detail
+
+
+class TestTheTwoWays:
+    """'uri': URI's account, nothing to connect, wallet pays all.
+    'own': the brand's account, Google bills them the spend, wallet pays the fee."""
+
+    def test_uri_is_the_default_and_the_choice_is_kept(self):
+        db = Db()
+        assert run(gf.get_mode(db, "b1")) == "uri"
+        run(gf.set_mode(db, "b1", "own"))
+        assert run(gf.get_mode(db, "b1")) == "own" and run(gf.get_mode(db, "b2")) == "uri"
+        with pytest.raises(ValueError):
+            run(gf.set_mode(db, "b1", "tv"))
+
+    def _configured(self, monkeypatch):
+        monkeypatch.setattr(gf.settings, "GOOGLE_ADS_DEVELOPER_TOKEN", "dev", raising=False)
+        monkeypatch.setattr(gf.settings, "GOOGLE_ADS_MCC_CUSTOMER_ID", "2215391819", raising=False)
+
+    def test_uri_way_is_ready_with_a_free_account_and_says_so_without(self, monkeypatch):
+        self._configured(monkeypatch)
+        db = Db()
+        ready, reason = run(gf.readiness(db, "u1", "b1"))
+        assert not ready and "connect your own Google Ads account" in reason
+        db.c.docs.append(account("1111111111"))
+        assert run(gf.readiness(db, "u1", "b1")) == (True, "")
+
+    def test_own_way_needs_a_linked_account_and_says_where(self, monkeypatch):
+        from app.agents.jane_ads.google_ads_connection import ConnectionState
+        self._configured(monkeypatch)
+        db = Db()
+        run(gf.set_mode(db, "b1", "own"))
+        with patch.object(gf, "resolve_connection_state",
+                          AsyncMock(return_value=(ConnectionState.MANAGER_LINK_PENDING, {}))):
+            ready, reason = run(gf.readiness(db, "u1", "b1"))
+        assert not ready and "hasn't approved URI" in reason and "Run by URI" in reason
+        with patch.object(gf, "resolve_connection_state", AsyncMock(return_value=(ConnectionState.READY, {}))):
+            assert run(gf.readiness(db, "u1", "b1")) == (True, "")
+
+    def test_own_way_launches_in_the_brands_account(self, monkeypatch):
+        self._configured(monkeypatch)
+        db = Db()
+        run(gf.set_mode(db, "b1", "own"))
+        own = {"customer_id": "4052658060", "login_customer_id": "2215391819", "access_token": "t",
+               "currency_code": "USD", "whatsapp_number": "234"}
+        with patch.object(gf, "resolve_customer_id_for_launch", AsyncMock(return_value=own)):
+            adapter, conn = run(gf.adapter_for_launch(db, {"brand_id": "b1", "user_id": "u1"}))
+        assert conn["customer_id"] == "4052658060" and conn["uri_managed"] is False
+
+    def test_own_way_not_linked_is_a_plain_message(self, monkeypatch):
+        from app.agents.jane_ads.google_ads_connection import AdsConnectionRequired, ConnectionState
+        self._configured(monkeypatch)
+        db = Db()
+        run(gf.set_mode(db, "b1", "own"))
+        with patch.object(gf, "resolve_customer_id_for_launch",
+                          AsyncMock(side_effect=AdsConnectionRequired(ConnectionState.NONE))), \
+                pytest.raises(HTTPException) as e:
+            run(gf.adapter_for_launch(db, {"brand_id": "b1", "user_id": "u1"}))
+        assert e.value.status_code == 409 and "isn't connected" in e.value.detail
+
+
+class TestWhatTheWalletPays:
+    def test_uri_way_pays_the_whole_budget_own_way_only_the_fee(self):
+        from app.agents.jane_ads import constants as C
+        from app.agents.jane_ads.router import _total_due_ngn
+        whole = _total_due_ngn(5400)
+        fee = _total_due_ngn(5400, fee_only=True)
+        assert whole == round(5400 * C.AD_SPEND_MARKUP, 2)
+        assert fee == round(whole - 5400, 2) and 0 < fee < whole
+
+    def test_the_own_way_shortfall_message_says_google_bills_the_spend(self):
+        from app.agents.jane_ads.router import _wallet_shortfall_message
+        msg = _wallet_shortfall_message(100, 5400, fee_only=True)
+        assert "URI's fee" in msg and "Google bills your Google Ads account" in msg
