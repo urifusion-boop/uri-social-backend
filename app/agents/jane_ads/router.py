@@ -1950,6 +1950,47 @@ async def admin_add_google_uri_account(
         raise HTTPException(status_code=502, detail=friendly_error(e))
 
 
+class AdminGoogleCreateBody(BaseModel):
+    name: str = "URI - Ads"
+
+
+@router.post("/admin/google/uri-accounts/create")
+async def admin_create_google_uri_account(
+    body: AdminGoogleCreateBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Create a blank URI Google Ads account under the manager account (NGN,
+    Lagos time) and add it to URI's accounts — paid automatically if Google
+    offers monthly invoicing, otherwise waiting for URI's card in Google Ads."""
+    _require_ads_admin(token)
+    from .google_flow import friendly_error
+    from .google_uri_accounts import UriAccountError, create_account
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    try:
+        return {"account": await create_account(db, body.name.strip() or "URI - Ads", actor)}
+    except UriAccountError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=friendly_error(e))
+
+
+@router.get("/admin/google/billing-options")
+async def admin_google_billing_options(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Whether software can pay for new URI accounts (monthly invoicing)."""
+    _require_ads_admin(token)
+    from .google_flow import friendly_error
+    from .google_uri_accounts import billing_options
+    try:
+        options = await billing_options(db)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=friendly_error(e))
+    return {"automatic_billing": bool(options), "payments_accounts": options}
+
+
 @router.get("/admin/billing-summary")
 async def admin_billing_summary(
     from_date: Optional[str] = None,
