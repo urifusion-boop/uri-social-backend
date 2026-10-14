@@ -103,8 +103,18 @@ def _mock_client(responses):
     return client
 
 
+@pytest.fixture(autouse=True)
+def _nigeria_wide(monkeypatch):
+    """These tests count the launch's HTTP calls in order; the location lookup is
+    covered on its own (tests/test_jane_ads_google_flow.py), so it's pinned here."""
+    async def nigeria(self, geo):
+        return "geoTargetConstants/2566"
+    monkeypatch.setattr(GoogleAdsAdapter, "_resolve_geo", nigeria)
+
+
 def _adapter(db=None) -> GoogleAdsAdapter:
-    return GoogleAdsAdapter(db or FakeDb(), customer_id="1234567890", login_customer_id="9999999999", access_token="tok")
+    return GoogleAdsAdapter(db or FakeDb(), customer_id="1234567890", login_customer_id="9999999999",
+                            access_token="tok", currency_code="NGN")
 
 
 _KEYWORD_SET = {
@@ -269,7 +279,8 @@ def test_launch_campaign_with_creative_uses_its_headline():
         _run(adapter.launch_campaign(plan, _auth()))
     ad_json = mock_client.post.call_args_list[5].kwargs["json"]["operations"][0]["create"]
     headlines = [h["text"] for h in ad_json["ad"]["responsiveSearchAd"]["headlines"]]
-    assert headlines == ["Fast Plumbing Fixes"]
+    # Jane's own headline leads; Google needs at least three, so the rest are filled in.
+    assert headlines[0] == "Fast Plumbing Fixes" and len(headlines) >= 3
 
 
 def test_launch_campaign_raises_low_clicks_warning_before_any_http_call():
@@ -286,6 +297,24 @@ def test_launch_campaign_raises_low_clicks_warning_before_any_http_call():
             _run(adapter.launch_campaign(plan, _auth(funded=700)))
     assert mock_client.post.call_count == 0
     assert exc_info.value.estimated_clicks_per_day < 10
+
+
+def test_a_small_budget_the_owner_chose_still_launches():
+    adapter = _adapter()
+    plan = _plan(
+        platforms=[PlatformPlan(
+            platform=Platform.GOOGLE, budget_ngn=5_400, days=5, variants=1,
+            test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=5_400, account_cap_ngn=5_400,
+        google_keyword_context={"category": "plumbing", "description": "Plumbing repairs", "geo": "Surulere",
+                                "low_budget_ok": True},
+    )
+    with _patched_keywords(), patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_HAPPY_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth(funded=5_400)))
+    assert mock_client.post.call_count > 0
 
 
 def test_launch_campaign_raises_on_google_error():
@@ -314,8 +343,8 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
             _run(adapter.launch_campaign(_plan(), _auth()))
 
     rollback_json = mock_client.post.call_args_list[3].kwargs["json"]["operations"][0]
-    assert rollback_json["update"]["status"] == "REMOVED"
-    assert rollback_json["update"]["resourceName"] == "customers/1234567890/campaigns/111"
+    # Google rejects status=REMOVED via update; the rollback uses a real remove operation.
+    assert rollback_json["remove"] == "customers/1234567890/campaigns/111"
 
 
 # ── fetch_per_ad_spend ──────────────────────────────────────────────────────────

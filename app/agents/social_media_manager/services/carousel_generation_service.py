@@ -135,15 +135,16 @@ class CarouselGenerationService:
 
         print(f"📊 Carousel analysis: type={content_analysis['type']}, optimal_slides={content_analysis['optimal_slides']}, using={num_slides}")
 
-        brand_block = ""
-        if brand_name:
-            brand_block += f"Brand name: {brand_name}\n"
-        if industry:
-            brand_block += f"Industry: {industry}\n"
-        if brand_voice:
-            brand_block += f"Brand voice: {brand_voice}\n"
-        if target_audience:
-            brand_block += f"Target audience: {target_audience}\n"
+        # Same full Brand Playbook instructions single posts get (voice, audience,
+        # customer psychology, guardrails, words to avoid, CTAs, languages...) —
+        # carousels used to get only name/industry/voice/audience.
+        from .content_generation_service import ContentGenerationService
+        brand_block = ContentGenerationService._build_brand_block(bc, platform=platform)
+        if not brand_block:
+            for label, value in (("Brand name", brand_name), ("Industry", industry),
+                                 ("Brand voice", brand_voice), ("Target audience", target_audience)):
+                if value:
+                    brand_block += f"{label}: {value}\n"
 
         # Build content-type-specific structure instructions
         if content_analysis["type"] == "list" and content_analysis["numbered"]:
@@ -164,6 +165,11 @@ STRICT STRUCTURE FOR {num_slides} SLIDES:
 
 This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrative."""
 
+        # The brand's own hashtag limit wins over the default 3-6.
+        from . import brand_brief
+        _limit = brand_brief.hashtag_limit(bc)
+        hashtag_rule = "3-6" if _limit is None or _limit >= 6 else (f"up to {_limit}" if _limit > 0 else "no")
+
         system_prompt = (
             "You are an expert social media copywriter specialising in carousel posts "
             f"for {platform}. Your job is to create engaging, scroll-stopping carousel content.\n\n"
@@ -172,7 +178,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             "- Each headline: ≤8 words, punchy and bold\n"
             "- Each body: ≤25 words, clear and scannable\n"
             "- Overall caption: engaging hook, suitable for the platform\n"
-            "- End the caption with 3-6 relevant, specific hashtags (not generic ones like #social "
+            f"- End the caption with {hashtag_rule} relevant, specific hashtags (not generic ones like #social "
             "or #post) — always include hashtags, this is not optional\n"
             "- The carousel must tell a complete, cohesive story from slide 1 to slide N\n"
             "- Each slide must build on the previous slide\n"
@@ -187,19 +193,55 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             f"Generate exactly {num_slides} slides following the structure above."
         ).strip()
 
-        try:
+        # Everything the writer was given — a statistic or source not in here was invented.
+        sources = f"{seed_content}\n{json.dumps(bc, default=str, ensure_ascii=False)}"
+
+        async def _write(correction: str = "") -> Dict[str, Any]:
             response = await _client.chat.completions.create(
                 model="gpt-4.1",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "user", "content": user_prompt + correction},
                 ],
                 temperature=0.75,
-                max_tokens=800,
+                # Scale with slide count: a fixed 800 can cut the JSON off mid-way
+                # on 8-10 slide carousels, which then fails json.loads.
+                max_tokens=max(800, 200 + 150 * num_slides),
                 response_format={"type": "json_object"},
             )
-            raw = response.choices[0].message.content or "{}"
-            data = json.loads(raw)
+            return json.loads(response.choices[0].message.content or "{}")
+
+        def _issues(d: Dict[str, Any]) -> List[Dict[str, str]]:
+            """Playbook rules broken anywhere in the carousel. Banned words and
+            invented facts count on every slide; language and the call-to-action
+            are judged on the caption, where they belong."""
+            caption_text = re.sub(r"#\w+", "", str(d.get("caption", "")))
+            slide_text = "\n".join(f"{x.get('headline', '')}. {x.get('body', '')}"
+                                   for x in (d.get("slides") or []) if isinstance(x, dict))
+            found = brand_brief.audit(caption_text, bc, sources=sources)
+            seen = {(i["code"], i["detail"]) for i in found}
+            for i in brand_brief.audit(slide_text, bc, sources=sources):
+                if i["code"] in ("banned_word", "unverified_number", "unverified_source") \
+                        and (i["code"], i["detail"]) not in seen:
+                    found.append(i)
+            return found
+
+        try:
+            data = await _write()
+            # One rewrite if the carousel breaks the brand's rules, as captions get.
+            issues = _issues(data)
+            if issues:
+                print(f"📊 Carousel breaks Playbook rules: {[i['code'] + ':' + i['detail'] for i in issues]} — rewriting")
+                try:
+                    retry = await _write(
+                        "\n\nCORRECTION: your last attempt broke this brand's rules. Write the carousel again "
+                        "with these fixes:\n" + "\n".join(f"- {i['fix']}" for i in issues)
+                    )
+                    retry_issues = _issues(retry)
+                    if retry.get("slides") and len(retry_issues) < len(issues):
+                        data, issues = retry, retry_issues
+                except Exception as retry_error:
+                    print(f"⚠️ Carousel rewrite failed, keeping the first version: {retry_error}")
 
             caption_raw = data.get("caption", "")
             slides_raw = data.get("slides", [])
@@ -211,14 +253,18 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             # all even when the model did include them in the caption string.
             from .content_generation_service import ContentGenerationService
             caption, hashtags = ContentGenerationService._extract_and_clean_hashtags(caption_raw, platform)
+            # Guaranteed without a model: no emojis if the brand said none, the
+            # brand's hashtag limit, and its call-to-action closing the caption.
+            caption = brand_brief.enforce(caption, bc)
+            hashtags = brand_brief.limit_hashtags(hashtags, bc)
 
             # Normalise slides and add slide_number
             slides: List[Dict[str, str]] = []
             for idx, s in enumerate(slides_raw[:num_slides]):
                 slides.append({
                     "slide_number": idx + 1,  # 1-indexed for display
-                    "headline": str(s.get("headline", "")).strip(),
-                    "body": str(s.get("body", "")).strip(),
+                    "headline": brand_brief.enforce(str(s.get("headline", "")).strip(), bc, append_cta=False),
+                    "body": brand_brief.enforce(str(s.get("body", "")).strip(), bc, append_cta=False),
                 })
 
             # Pad if GPT returned fewer slides than requested
@@ -233,7 +279,10 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 "caption": caption,
                 "hashtags": hashtags,
                 "slides": slides,
-                "content_analysis": content_analysis
+                "content_analysis": content_analysis,
+                # Playbook rules still broken after the rewrite (normally empty).
+                "playbook_issues": [f"{i['code']}: {i['detail']}" for i in issues
+                                    if i["code"] != "missing_cta"],
             }
 
         except Exception as e:

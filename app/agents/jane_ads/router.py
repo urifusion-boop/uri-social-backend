@@ -60,6 +60,11 @@ META_DELETED_CAMPAIGN_SUBCODE = 1487566
 _AI_DIFFICULTIES = "We're experiencing some difficulties on our end — please try again in a little while."
 
 
+def _google_connection_message(state: str) -> str:
+    from .google_flow import connection_message
+    return connection_message(state)
+
+
 def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
     """Meta's ad-account-level rate limit ("too many calls to this ad-account")
     is shared across every caller of that account — heavy testing/usage can trip
@@ -1260,6 +1265,7 @@ async def jane_google_ads_admin_connect_initiate():
 async def jane_google_ads_admin_connect_callback(
     code: Optional[str] = None,
     error: Optional[str] = None,
+    state: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Exchanges the code and stores it as THE single admin connection (upsert on a
@@ -1267,7 +1273,28 @@ async def jane_google_ads_admin_connect_callback(
     the app: this isn't part of any brand-facing flow, there's nowhere in the UI to
     land."""
     from app.core.config import settings
-    from .google_ads_connection import exchange_code_for_tokens, save_admin_connection, GoogleAdsConnectionError
+    from .google_ads_connection import (
+        exchange_code_for_tokens, save_admin_connection, GoogleAdsConnectionError,
+        finish_signin, identity_manages_mcc, safe_return_to, take_signin_state,
+    )
+
+    # A brand owner coming back from "Continue with Google" — same registered
+    # redirect URI as the admin connect, told apart by the one-time state we issued.
+    if state and state.startswith("b_"):
+        import urllib.parse as _up
+        state_doc = await take_signin_state(db, state)
+        if not state_doc:
+            return RedirectResponse(f"{safe_return_to('')}/workspace/?tab=connections&google=error"
+                                    f"&reason={_up.quote('That sign-in link expired. Please try again.')}")
+        back = f"{state_doc.get('return_to') or safe_return_to('')}/workspace/?tab=connections"
+        if error or not code:
+            reason = "You cancelled the Google sign-in." if error == "access_denied" else "Google sign-in didn't complete."
+            return RedirectResponse(f"{back}&google=error&reason={_up.quote(reason)}")
+        outcome = await finish_signin(db, state_doc, code)
+        url = f"{back}&google={outcome['outcome']}"
+        if outcome.get("detail"):
+            url += f"&reason={_up.quote(outcome['detail'])}"
+        return RedirectResponse(url)
 
     if error:
         return HTMLResponse(f"<p>Google Ads admin connect failed: {error}</p>", status_code=400)
@@ -1291,6 +1318,19 @@ async def jane_google_ads_admin_connect_callback(
             "already granted this app access before. Revoke access at "
             "myaccount.google.com/permissions and try again.</p>",
             status_code=502,
+        )
+
+    # This link needs no login, so check the identity before trusting it: only
+    # someone who really has URI's manager account may become the admin connection.
+    try:
+        allowed = await identity_manages_mcc(tokens["access_token"])
+    except GoogleAdsConnectionError:
+        allowed = False
+    if not allowed:
+        return HTMLResponse(
+            "<p>That Google account doesn't have access to URI's Google Ads manager account, "
+            "so it can't be used as the admin connection. Nothing was changed.</p>",
+            status_code=403,
         )
 
     await save_admin_connection(db, tokens)
@@ -1449,6 +1489,7 @@ async def jane_google_ads_link_existing(
     invitation. On the known 'already linked to another manager' friction, returns
     a specific, actionable message instead of a generic failure."""
     from .google_ads_connection import (
+        AccountNotLinkable,
         AdsConnectionRequired,
         GoogleAdsConnectionError,
         InvalidCustomerId,
@@ -1460,7 +1501,12 @@ async def jane_google_ads_link_existing(
             db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id,
         )
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except AccountNotLinkable as e:
+        # Google refused for a reason the owner can fix (no such account, a
+        # manager account, no admin user...) — say which, as a 400.
+        print(f"ℹ️  Google Ads account not linkable: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except InvalidCustomerId as e:
         # Caught before any Google API call was even made — a client input
         # problem, not a rejected REST call, so 400 (not the 502 below).
@@ -1473,13 +1519,163 @@ async def jane_google_ads_link_existing(
     if result.get("manager_link_status") == "refused":
         return {
             "manager_link_status": "refused",
-            "detail": (
+            # A specific reason from Google when there is one; otherwise the
+            # general guidance for an account another manager is holding.
+            "detail": result.get("reason") or (
                 "This Google Ads account is already linked to another manager. "
                 "Ask the client to remove that link in their account "
                 "(Admin → Access and security → Managers) before reconnecting."
             ),
         }
     return result
+
+
+class GoogleSigninStartBody(BaseModel):
+    return_to: str = ""     # the app's own origin, so the browser comes back to the same site
+
+
+@router.post("/google/connect/signin/start")
+async def jane_google_ads_signin_start(
+    body: GoogleSigninStartBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """ "Continue with Google": returns the Google sign-in URL. After signing in the
+    owner lands back on Connected Accounts with their account linked (one usable
+    account) or a list to choose from — no Customer ID to find."""
+    from .google_ads_connection import GoogleAdsConnectionError, start_signin
+
+    try:
+        url = await start_signin(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.return_to)
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"auth_url": url}
+
+
+@router.get("/google/connect/signin/accounts")
+async def jane_google_ads_signin_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The Google Ads accounts the owner's sign-in found, by name. Empty once the
+    sign-in is used up or older than its short lifetime."""
+    from .google_ads_connection import _fresh_signin, get_any_google_ads_connection, usable_accounts
+
+    conn = await get_any_google_ads_connection(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    signin = _fresh_signin(conn)
+    found = (signin or {}).get("accounts") or []
+    return {
+        "signed_in": bool(signin),
+        "accounts": [{k: a.get(k) for k in ("customer_id", "name", "currency_code")} for a in usable_accounts(found)],
+        "other_accounts": len(found) - len(usable_accounts(found)),
+    }
+
+
+class GoogleSigninSelectBody(BaseModel):
+    customer_id: str
+
+
+@router.post("/google/connect/signin/select")
+async def jane_google_ads_signin_select(
+    body: GoogleSigninSelectBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Link the account the owner picked: URI sends the request and accepts it on
+    their behalf, so it is usually linked by the time this returns."""
+    from .google_ads_connection import AccountNotLinkable, GoogleAdsConnectionError, link_selected_account
+
+    try:
+        return await link_selected_account(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id)
+    except AccountNotLinkable as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except GoogleAdsConnectionError as e:
+        print(f"⚠️  Google Ads REST failure: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/google/connection/change-account")
+async def jane_google_ads_change_account(
+    pause_campaigns: bool = False,
+    keep_running: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Let go of the chosen Google Ads account and go back to "choose your
+    account". Withdraws a pending invitation / removes an accepted link on
+    Google's side too. If URI campaigns are still in that account, answers 409
+    with the list unless pause_campaigns or keep_running says what to do."""
+    return await _release_google_ads(db, brand_ctx, remove=False,
+                                     pause_campaigns=pause_campaigns, keep_running=keep_running)
+
+
+@router.delete("/google/connection")
+async def jane_google_ads_disconnect(
+    pause_campaigns: bool = False,
+    keep_running: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Disconnect Google Ads for this brand altogether (also ends the link on
+    Google's side). Same campaign check as change-account."""
+    return await _release_google_ads(db, brand_ctx, remove=True,
+                                     pause_campaigns=pause_campaigns, keep_running=keep_running)
+
+
+def _campaigns_in_account_message(total: int, running: int) -> str:
+    many = total != 1
+    them = "them" if many else "it"
+    return (
+        f"{total} URI campaign{'s are' if many else ' is'} still in this Google Ads account"
+        f"{f' ({running} running)' if running else ''}. Once URI lets go of the account it can't pause, "
+        f"track or bill {them}. Pause {them} first, or keep {them} running and manage {them} in Google Ads yourself."
+    )
+
+
+async def _release_google_ads(db, brand_ctx: dict, remove: bool,
+                              pause_campaigns: bool = False, keep_running: bool = False) -> dict:
+    from . import google_flow
+    from .google_ads_connection import (
+        AccountNotLinkable, AdsConnectionRequired, get_any_google_ads_connection, release_account,
+    )
+
+    user_id, brand_id = brand_ctx.get("user_id"), brand_ctx.get("brand_id")
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
+    customer_id = (conn or {}).get("customer_id") or ""
+
+    # Once URI lets go of the account it can no longer pause, track or bill the
+    # campaigns it launched there. So say which are still there and let the
+    # owner choose: pause them first, or leave them running under their own control.
+    live: list = []
+    paused = 0
+    if customer_id and not (conn or {}).get("created_account_by_uri"):
+        live = await google_flow.campaigns_in_account(db, brand_id, customer_id)
+        if live and not (pause_campaigns or keep_running):
+            running = sum(1 for c in live if c["delivery"] in ("Active", "Unknown"))
+            raise HTTPException(status_code=409, detail={
+                "code": "google_campaigns_in_account",
+                "campaigns": live,
+                "running": running,
+                "message": _campaigns_in_account_message(len(live), running),
+            })
+        if live and pause_campaigns:
+            try:
+                paused = await google_flow.pause_campaigns(db, live)
+            except google_flow.GoogleAdsAPIError as e:
+                raise HTTPException(status_code=502, detail=(
+                    f"Couldn't pause every campaign, so nothing was changed: {e}"))
+
+    try:
+        result = await release_account(db, user_id, brand_id, remove=remove)
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except AccountNotLinkable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if live:
+        await google_flow.detach_campaigns(db, brand_id, customer_id)
+    return {**result, "campaigns_paused": paused,
+            "campaigns_left_running": 0 if pause_campaigns else
+            sum(1 for c in live if c["delivery"] in ("Active", "Unknown"))}
 
 
 class GoogleAdsCreateAccountBody(BaseModel):
@@ -1506,7 +1702,7 @@ async def jane_google_ads_create_account(
             db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.account_name,
         )
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
     except MccNotEligibleToCreateAccounts as e:
         # Caught BEFORE the broader GoogleAdsConnectionError below — it's a
         # subclass, so ordering matters. A distinct code (not a generic 502)
@@ -1527,6 +1723,7 @@ async def jane_google_ads_create_account(
 
 @router.get("/google/connection/status")
 async def jane_google_ads_connection_status(
+    refresh: bool = False,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -1534,11 +1731,16 @@ async def jane_google_ads_connection_status(
     state in the body — this is a pure status read, not a pre-flight gate inside a
     build flow, so there's never a reason to raise here (unlike
     resolve_customer_id_for_launch, which does)."""
-    from .google_ads_connection import get_admin_connection, resolve_connection_state
+    from .google_ads_connection import get_admin_connection, owner_approval_settling, refresh_connection
     from .whatsapp import get_brand_whatsapp
+    from app.core.config import settings as _settings
 
-    state, conn = await resolve_connection_state(
-        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"),
+    # While an invitation is pending (or on "Check again", refresh=true) this
+    # asks Google whether it was accepted — the owner accepts it in Google Ads,
+    # so our own record can't know. It used to only re-read our record, which
+    # left every linked account "waiting" forever.
+    state, conn, sync_error = await refresh_connection(
+        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), force=refresh,
     )
     wa_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
     # URI-wide, not per-brand (URI has exactly one MCC) — a previously
@@ -1555,7 +1757,25 @@ async def jane_google_ads_connection_status(
         "customer_id": (conn or {}).get("customer_id", ""),
         "whatsapp_number": wa_number,
         "can_create_account": can_create_account,
+        "currency_code": (conn or {}).get("currency_code", ""),
+        "manager_link_status": (conn or {}).get("manager_link_status", ""),
+        "detail": (conn or {}).get("manager_link_error", ""),
+        "created_by_uri": bool((conn or {}).get("created_account_by_uri")),
+        "manager_customer_id": settings_mcc_display(),
+        "sync_error": sync_error,
+        "signin_verified": bool(_settings.GOOGLE_ADS_OAUTH_VERIFIED),
+        # We approved the link with the owner's sign-in and Google is still catching up.
+        "finishing": owner_approval_settling(conn),
     }
+
+
+def settings_mcc_display() -> str:
+    """URI's manager account ID as Google shows it (123-456-7890), so the owner
+    can recognise the request waiting in their Google Ads."""
+    from app.core.config import settings
+
+    digits = "".join(ch for ch in str(settings.GOOGLE_ADS_MCC_CUSTOMER_ID or "") if ch.isdigit())
+    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if len(digits) == 10 else digits
 
 
 @router.get("/instrumentation/{business_id}")
@@ -1857,6 +2077,162 @@ async def tiktok_test_launch(
     }
 
 
+class GoogleTestLaunchBody(BaseModel):
+    business_name: str = "Test Business"
+    category: str = ""            # what the business is, e.g. "document automation software"
+    description: str = ""         # a sentence about what it sells — Jane derives the keywords from this
+    geo: str = "Lagos"            # where customers search from
+    budget_ngn: float = Field(35_000, gt=0)
+    days: int = Field(7, gt=0)
+    headline: str = ""            # optional; keywords fill the rest
+    primary_text: str = ""
+
+
+@router.post("/google/test-launch")
+async def google_test_launch(
+    body: GoogleTestLaunchBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Creates a REAL Google Search campaign in the active brand's OWN linked
+    Google Ads account, entirely PAUSED (campaign, ad group and ad) — zero
+    spend until a human enables it in Google Ads. Mirrors /meta/test-launch and
+    /tiktok/test-launch: the way to prove the live adapter against a real
+    account before the campaign flow relies on it.
+
+    Uses the same pre-flight gate a real launch will (linked account checked
+    against Google, WhatsApp number present) and never a shared account."""
+    import uuid
+    from .adapters.google import GoogleAdsAdapter, GoogleAdsAPIError, LowClicksWarning
+    from .google_ads_connection import (
+        AdsConnectionRequired, GoogleAdsConnectionError, resolve_customer_id_for_launch,
+    )
+    from .models import (
+        ABTestScope, AdCreative, CampaignPlan, CampaignObjective, Goal, PlatformPlan,
+        PurchaseBehaviour, SpendAuthorization,
+    )
+
+    try:
+        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    business_id = f"google_test_{uuid.uuid4().hex[:8]}"
+    creative = None
+    if body.headline.strip():
+        creative = AdCreative(image_url="", headline=body.headline.strip(),
+                              primary_text=body.primary_text.strip() or body.headline.strip())
+    plan = CampaignPlan(
+        business_id=business_id,
+        goal=Goal.MESSAGES,
+        behaviour=PurchaseBehaviour.SEARCH,
+        platforms=[PlatformPlan(
+            platform=Platform.GOOGLE, budget_ngn=body.budget_ngn, days=body.days,
+            variants=1, test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=body.budget_ngn,
+        account_cap_ngn=body.budget_ngn,
+        whatsapp_number=conn["whatsapp_number"],
+        creative=creative,
+        google_keyword_context={"category": body.category or body.business_name,
+                                "description": body.description, "geo": body.geo},
+        explanation=f"Real Google Ads test launch for {body.business_name}",
+    )
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn,
+                              account_cap_ngn=body.budget_ngn)
+    adapter = GoogleAdsAdapter(
+        db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
+        access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
+    )
+    try:
+        result = await adapter.launch_campaign(plan, auth)
+    except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "campaign_id": result.campaign_id,
+        "ad_ids": result.ad_ids,
+        "customer_id": conn["customer_id"],
+        "currency_code": conn.get("currency_code", ""),
+        "note": "Created PAUSED — zero spend. Review it in Google Ads and enable it yourself if you want it live.",
+        "ads_manager_url": f"https://ads.google.com/aw/campaigns?__c={conn['customer_id']}",
+    }
+
+
+async def _google_test_adapter(db, brand_ctx: dict, campaign_id: str):
+    """The adapter for a campaign THIS brand's test launch created — never
+    anything else in their Google Ads account."""
+    from .adapters.google import COLLECTION as GOOGLE_CAMPAIGNS, GoogleAdsAdapter
+    from .google_ads_connection import (
+        AdsConnectionRequired, GoogleAdsConnectionError, resolve_customer_id_for_launch,
+    )
+
+    try:
+        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    record = await db[GOOGLE_CAMPAIGNS].find_one({"campaign_id": campaign_id, "customer_id": conn["customer_id"]})
+    if not record or not str(record.get("business_id", "")).startswith("google_test_"):
+        raise HTTPException(status_code=404, detail="That isn't a test campaign created from here.")
+    return GoogleAdsAdapter(
+        db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
+        access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
+    ), record
+
+
+@router.get("/google/test-launch/{campaign_id}")
+async def google_test_launch_read(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Reads a test campaign back from Google — status, budget (account
+    currency and naira), ad, keywords, locations — and exercises the calls the
+    live flow depends on afterwards: spend, new clicks, and pausing the ad."""
+    from .adapters.google import GoogleAdsAPIError
+
+    adapter, record = await _google_test_adapter(db, brand_ctx, campaign_id)
+    try:
+        info = await adapter.describe_campaign(campaign_id)
+        spend = await adapter.fetch_per_ad_spend(campaign_id)
+        clicks = await adapter.poll_conversations(campaign_id)
+        paused = await adapter.pause_ad(campaign_id, str(record.get("ad_id") or ""))
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {
+        **info,
+        "checks": {
+            "spend_read_ngn": [round(x.spend_ngn, 2) for x in spend],
+            "new_clicks": len(clicks),
+            "pause_ad_call_ok": paused,
+        },
+    }
+
+
+@router.delete("/google/test-launch/{campaign_id}")
+async def google_test_launch_remove(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Removes a test campaign (and its budget) from the brand's Google Ads account."""
+    from .adapters.google import GoogleAdsAPIError
+
+    adapter, _ = await _google_test_adapter(db, brand_ctx, campaign_id)
+    try:
+        return await adapter.remove_campaign(campaign_id)
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 class MetaLaunchFromMessageBody(BaseModel):
     message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
     # The CLIENT's Meta campaign objective, picked at the start of the conversation.
@@ -1947,7 +2323,7 @@ class MetaLaunchFromMessageBody(BaseModel):
     # honoured only if TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN are configured
     # and the creative is video (TikTok's hard requirement); otherwise an
     # early_return explains why, same shape as every other early_return here.
-    preferred_platform: str = ""          # "" | "tiktok"
+    preferred_platform: str = ""          # "" | "tiktok" | "google"
 
 
 class _PlanBuildResult(BaseModel):
@@ -2058,7 +2434,15 @@ async def _build_campaign_plan(
     from .threads import thread_history
     from .policy import Severity, review_ad_creative
 
-    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+    from . import google_flow
+    from .creative import search_ad_creative
+
+    # Google runs in the brand's OWN linked Google Ads account, so a brand can be
+    # ready for Google with no Meta Page at all. Known up front (our own record, no
+    # network) because it changes what counts as "not connected" below.
+    google_ready = await google_flow.is_ready(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    meta_configured = bool(settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN)
+    if not meta_configured and not google_ready:
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
 
     # 0. Per-brand Meta ads connection — checked FIRST, before Jane says a word, so a
@@ -2069,16 +2453,26 @@ async def _build_campaign_plan(
     # campaign's goal, which Jane hasn't determined yet at this point — a followers/
     # engagement campaign never uses it at all. Re-checked strictly once the goal is
     # known, at step 1.6 below.
-    try:
-        ads_conn = await resolve_ads_page_for_launch(
-            db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
-        )
-    except AdsConnectionRequired as e:
-        return {"early_return": {
-            "stage": f"meta_connection_{e.state.value}",
-            "understood": {},
-            "page_name": e.page_name,
-        }}
+    ads_conn = None
+    if meta_configured:
+        try:
+            ads_conn = await resolve_ads_page_for_launch(
+                db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
+            )
+        except AdsConnectionRequired as e:
+            if not google_ready:
+                return {"early_return": {
+                    "stage": f"meta_connection_{e.state.value}",
+                    "understood": {},
+                    "page_name": e.page_name,
+                }}
+    # No Meta Page but a linked Google Ads account: this campaign can only be a
+    # Google one. There is no Page, and the WhatsApp number is the brand's own.
+    google_only = ads_conn is None
+    if google_only:
+        from .whatsapp import get_brand_whatsapp
+        ads_conn = {"page_id": "",
+                    "whatsapp_number": await get_brand_whatsapp(db, brand_ctx.get("brand_id")) or ""}
     page_id = ads_conn["page_id"]
 
     if body.creative_source in ("upload", "recomposite") and not body.reference_image_url:
@@ -2276,6 +2670,13 @@ async def _build_campaign_plan(
         and requested_destination not in ("", "ask")
         and destination_type == DestinationType.WHATSAPP
     )
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"] and google_only:
+        return {"early_return": {
+            "stage": "google_connection_no_whatsapp",
+            "understood": parsed.model_dump(),
+            "question": "Add the WhatsApp number your ads should send people to (Connected Accounts → "
+                        "Google Ads), then tell me again and I'll build it.",
+        }}
     if needs_whatsapp_number and not ads_conn["whatsapp_number"]:
         try:
             ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
@@ -2471,7 +2872,37 @@ async def _build_campaign_plan(
     jane_platforms = [p.platform.value for p in plan.platforms]
     tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
 
-    if body.preferred_platform == "tiktok":
+    # Google Search: when the client asks for it, when it's the only platform this
+    # brand has connected, or when Jane herself picked Search and the brand's
+    # Google Ads account is linked. A budget too small for Search is said plainly
+    # when Google was asked for (or is all there is); when it was only Jane's own
+    # pick, she quietly uses Instagram/Facebook instead, as she always did.
+    wants_google = body.preferred_platform == "google"
+    google_budget_warning = ""
+    jane_picked_google = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
+    use_google = False
+    if wants_google or google_only or (jane_picked_google and google_ready and body.preferred_platform != "tiktok"):
+        if not google_ready:
+            return {"early_return": {"stage": "google_not_connected", "understood": parsed.model_dump(),
+                    "question": "Google Ads isn't connected yet. Connect it under Connected Accounts → Google Ads "
+                                 "(it takes a minute), or drop the Google request and I'll use what's available."}}
+        google_plan = apply_platform_override(plan, [Platform.GOOGLE])
+        too_low = google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+        if too_low and (wants_google or google_only):
+            # Asked for Google by name: their call. A small budget still runs
+            # (a test, a trial) — Jane says what to expect in the plan instead
+            # of refusing and repeating herself.
+            google_budget_warning = google_flow.budget_too_low_warning(
+                google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+            google_plan.trace.append(f"google budget below useful level, kept at owner's request: {too_low}")
+            use_google = True
+        else:
+            use_google = not too_low
+
+    if use_google:
+        plan = google_plan
+        forced_to_meta = False
+    elif body.preferred_platform == "tiktok":
         # Explicit "give me TikTok" request (MetaLaunchFromMessageBody.
         # preferred_platform) — purely additive on top of Jane's own silent
         # pick below; does not touch the Meta routing/gating in the else
@@ -2665,7 +3096,8 @@ async def _build_campaign_plan(
     # Image-selection step (PRD §2): don't silently generate once budget is set — ask the
     # user how to source the image (upload their own / pick a past post / let Jane generate).
     # Only when the caller hasn't already chosen ("ask"); a concrete source skips through.
-    if body.creative_source == "ask":
+    # (Not for Google: a Search ad is text, so there is no image to choose.)
+    if body.creative_source == "ask" and not use_google:
         from .creative import list_recent_drafts
         drafts = await list_recent_drafts(user_id, db, brand_id, limit=6) if user_id else []
         return {"early_return": {
@@ -2702,7 +3134,18 @@ async def _build_campaign_plan(
     # brand photoshoot instead of native, phone-shot-feeling creative.
     creative_platform = plan.platforms[0].platform.value if plan.platforms else Platform.META.value
 
-    if body.creative_source == "upload":
+    if creative_platform == Platform.GOOGLE.value:
+        # A Search ad is text: Jane writes it in the brand's voice and nothing is
+        # generated, so no upload is needed and no content credit is spent.
+        creative = await search_ad_creative(
+            business_name, category, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+            behaviour=plan.behaviour.value, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
+        )
+    elif body.creative_source == "upload":
         creative = await creative_from_upload(
             business_name, category, body.reference_image_url, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
@@ -2774,7 +3217,7 @@ async def _build_campaign_plan(
             # ad-specific reason value and adding one is a shared-model change beyond
             # this feature's scope.
             await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
-    if not creative.image_url:
+    if (not creative.headline) if creative_platform == Platform.GOOGLE.value else (not creative.image_url):
         # Empty creative almost always means the image/copy model failed (often the
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
@@ -2855,6 +3298,12 @@ async def _build_campaign_plan(
         }}
 
     plan.page_id = page_id
+    if creative_platform == Platform.GOOGLE.value:
+        # What the keywords are derived from at launch, and where to target.
+        plan.google_keyword_context = {"category": category or business_name,
+                                       "description": req.description, "geo": parsed.city or req.geo or "",
+                                       # the owner went ahead with a budget below Search's useful level
+                                       "low_budget_ok": bool(google_budget_warning)}
     plan.whatsapp_number = wa_number
     plan.destination_type = destination_type.value
     plan.destination_link = destination_link
@@ -2959,6 +3408,8 @@ async def _build_campaign_plan(
         summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
                                          delivery_estimate=estimate, audience_text=audience_text)
         summary_dump = summary.model_dump(mode="json")
+        if google_budget_warning:
+            summary_dump["budget_allocation"]["reason"] = google_budget_warning
     except Exception as e:
         print(f"[oneshot] summary skipped: {e}", flush=True)
 
@@ -3074,15 +3525,28 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     wallet = WalletService(MongoWalletStore(db))
     auth = await wallet.authorization_for(business_id, total_funded_wallets_ngn=req.budget_ngn)
 
+    from . import google_flow
+    from .adapters.google import LowClicksWarning
+
     launch_platform = plan.platforms[0].platform if plan.platforms else Platform.META
     is_tiktok = launch_platform == Platform.TIKTOK
+    is_google = launch_platform == Platform.GOOGLE
+    google_conn: dict = {}
 
-    if is_tiktok:
+    if is_google:
+        # The brand's OWN Google Ads account, through the pre-flight gate (the link
+        # is re-checked with Google right now) — never a shared account.
+        adapter, google_conn = await google_flow.adapter_for_launch(db, brand_ctx)
+    elif is_tiktok:
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
     else:
         adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         launch = await adapter.launch_campaign(plan, auth)
+    except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except google_flow.GoogleAdsAPIError as e:
+        google_flow.raise_http(e)
     except TikTokAdsAPIError as e:
         _raise_http_for_tiktok_error(e)
     except MetaAPIError as e:
@@ -3090,7 +3554,8 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     except (ValueError, NotImplementedError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    campaign_collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
+    campaign_collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
+                           else "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns")
     # TikTok-only (see _video_thumbnail_url docstring): for a video ad,
     # plan.creative.image_url IS the raw .mp4 URL, which the campaign list's
     # plain <img> tag can't render — swap in a Cloudinary-derived poster frame
@@ -3139,6 +3604,10 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
         f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
     )
+    if is_google:
+        launch_note = ("Created paused — nothing is spent until you turn it on: Campaign Manager → "
+                       "press ▶ on this campaign.")
+        ads_manager_url = google_flow.ads_url(google_conn.get("customer_id", ""))
     return {
         "stage": "launched",
         "understood": built.understood,
@@ -3155,7 +3624,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             # Additive — status already implied this (DISABLE vs PAUSED) but a
             # named field is what the frontend actually needs for a platform
             # badge, not string-sniffing an unrelated status value.
-            "platform": "tiktok" if is_tiktok else "meta",
+            "platform": "google" if is_google else "tiktok" if is_tiktok else "meta",
         },
     }
 
@@ -3371,12 +3840,18 @@ async def meta_launch_plan(
     require_whatsapp = (
         plan.goal != Goal.FOLLOWERS and destination_type == DestinationType.WHATSAPP
     )
-    try:
-        ads_conn = await resolve_ads_page_for_launch(
-            db, brand_ctx.get("user_id"), brand_id, require_whatsapp=require_whatsapp,
-        )
-    except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
+    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
+        # Google runs in the brand's own Google Ads account — there is no Meta Page.
+        # Its own gate (linked account, re-checked with Google) runs in _do_launch.
+        from .whatsapp import get_brand_whatsapp
+        ads_conn = {"page_id": "", "whatsapp_number": await get_brand_whatsapp(db, brand_id) or ""}
+    else:
+        try:
+            ads_conn = await resolve_ads_page_for_launch(
+                db, brand_ctx.get("user_id"), brand_id, require_whatsapp=require_whatsapp,
+            )
+        except AdsConnectionRequired as e:
+            raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]
 
     # A WhatsApp campaign requires a WhatsApp NUMBER — enforced above by
@@ -3476,8 +3951,9 @@ async def meta_launch_plan(
         # charged_upfront_ngn — so stated_budget_from_record() fell through to the
         # ad_spend × LEGACY_AD_SPEND_MARKUP reconstruction and showed the wrong
         # BUDGET on the campaign card (e.g. ₦35,000 charged displayed as ₦38,500).
-        charged_collection = ("jane_ads_tiktok_campaigns" if result["launch"].get("platform") == "tiktok"
-                              else "jane_ads_meta_campaigns")
+        charged_collection = {"tiktok": "jane_ads_tiktok_campaigns",
+                              "google": "jane_ads_google_campaigns"}.get(
+                                  result["launch"].get("platform"), "jane_ads_meta_campaigns")
         await db[charged_collection].update_one(
             {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
         )
@@ -3545,6 +4021,8 @@ def _preferred_platform_for_challenge(plan: CampaignPlan) -> str:
     original launch request pinned."""
     if plan.platforms and plan.platforms[0].platform == Platform.TIKTOK:
         return "tiktok"
+    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
+        return "google"
     return ""
 
 
@@ -3831,14 +4309,28 @@ async def meta_campaigns(
     if with_metrics and settings.TIKTOK_ADS_ACCESS_TOKEN and settings.TIKTOK_ADS_ADVERTISER_ID:
         tiktok_adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
 
+    from . import google_flow
+    google_records = await (db[google_flow.GOOGLE_CAMPAIGNS]
+                     .find({"brand_id": brand_id}, {"_id": 0})
+                     .sort("created_at", -1).to_list(length=200))
+    # One dispatcher for all of them: each Google campaign lives in its brand's own account.
+    google_adapter = (google_flow.GoogleCampaigns(db)
+                      if with_metrics and google_records and google_flow.configured() else None)
+
     out = []
-    for is_tiktok, r in [(False, r) for r in meta_records] + [(True, r) for r in tiktok_records]:
-        collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
-        adapter = tiktok_adapter if is_tiktok else meta_adapter
+    for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
+                             + [("google", r) for r in google_records]):
+        is_tiktok = platform_name == "tiktok"
+        is_google = platform_name == "google"
+        collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
+                      else "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns")
+        adapter = google_adapter if is_google else tiktok_adapter if is_tiktok else meta_adapter
+        if is_google and r.get("detached_at"):
+            adapter = None      # URI let go of that Google Ads account; nothing to read
         created = r.get("created_at")
         row = {
             "campaign_id": r.get("campaign_id"),
-            "platform": "tiktok" if is_tiktok else "meta",
+            "platform": platform_name,
             "name": r.get("display_name") or "Campaign",
             "headline": r.get("headline", ""),
             "primary_text": r.get("primary_text", ""),
@@ -3865,6 +4357,7 @@ async def meta_campaigns(
             "status": "paused",   # everything is created PAUSED (Meta) / DISABLE (TikTok) for now
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
             "ads_manager_url": (
+                google_flow.ads_url(r.get("customer_id", "")) if is_google else
                 f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
                 if is_tiktok else
                 f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
@@ -3872,6 +4365,9 @@ async def meta_campaigns(
             ),
             "metrics": None,
         }
+        if is_google and r.get("detached_at"):
+            row["status"] = "not managed by uri"
+            row["detached"] = True
         if adapter and r.get("campaign_id"):
             try:
                 summary = await adapter.fetch_campaign_summary(r["campaign_id"])
@@ -3884,6 +4380,8 @@ async def meta_campaigns(
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
                     continue
                 row["status"] = summary["delivery"].lower()
+                if is_google:
+                    row["serving_note"] = google_flow.serving_note(summary)
                 # A wa.me link ad reports 0 conversations forever — Meta only fires
                 # the conversation metric for native Click-to-WhatsApp. Rendering that
                 # raw would tell a client their ad produced nothing when the truth is
@@ -3912,6 +4410,10 @@ async def meta_campaigns(
                 }
             except Exception as e:
                 print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
+                if is_google:
+                    # Don't fall back to "paused": that hid a campaign that was running.
+                    row["status"] = "status unavailable"
+                    row["serving_note"] = "Couldn't reach Google to check this campaign. Press Refresh in a minute."
         out.append(row)
 
     out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
@@ -4507,6 +5009,13 @@ async def _live_campaign(db, campaign_id: str, brand_id: str) -> tuple[dict, boo
     record = await db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": campaign_id})
     if record and record.get("brand_id") == brand_id:
         return record, True
+    from . import google_flow
+    if await google_flow.find_record(db, campaign_id, brand_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Changing the audience or the end date isn't available for Google Search campaigns yet. "
+                   "You can pause it, turn it back on, or delete it and launch a new one.",
+        )
     raise HTTPException(status_code=404, detail="Campaign not found")
 
 
@@ -4827,6 +5336,16 @@ async def set_meta_campaign_status(
     from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
     brand_id = brand_ctx.get("brand_id")
+    from . import google_flow
+    google_record = await google_flow.find_record(db, campaign_id, brand_id)
+    if google_record:
+        if google_record.get("detached_at"):
+            raise HTTPException(status_code=409, detail=google_flow.NO_LONGER_MANAGED)
+        # A Google campaign, in this brand's own Google Ads account.
+        try:
+            return await google_flow.GoogleCampaigns(db).set_delivery(campaign_id, body.active)
+        except google_flow.GoogleAdsAPIError as e:
+            google_flow.raise_http(e)
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
     is_tiktok = False
     if not record:
@@ -4883,6 +5402,19 @@ async def delete_meta_campaign(
     from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
     brand_id = brand_ctx.get("brand_id")
+    from . import google_flow
+    google_record = await google_flow.find_record(db, campaign_id, brand_id)
+    if google_record and google_record.get("detached_at"):
+        # URI can't reach it any more — this only removes it from URI's list.
+        await db[google_flow.GOOGLE_CAMPAIGNS].delete_one({"campaign_id": campaign_id})
+        return {"deleted": True, "removed_from_list_only": True}
+    if google_record:
+        try:
+            await google_flow.GoogleCampaigns(db).delete_campaign(campaign_id)
+        except google_flow.GoogleAdsAPIError as e:
+            google_flow.raise_http(e)
+        await db[google_flow.GOOGLE_CAMPAIGNS].delete_one({"campaign_id": campaign_id})
+        return {"deleted": True}
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
     is_tiktok = False
     if not record:

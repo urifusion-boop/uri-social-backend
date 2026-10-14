@@ -197,6 +197,9 @@ def _parse_blog_output(raw: str) -> Dict[str, str]:
     body = "\n".join(
         ln for ln in body_lines
         if not re.match(r"^(TITLE:|META:)", ln.strip(), re.IGNORECASE)
+        # Labels from our own prompts, which a rewrite sometimes echoes back
+        # (a blog on dev opened with "BLOG:").
+        and not re.match(r"^(BLOG|CURRENT BLOG TO EXPAND|BODY|CONTENT)\s*:\s*$", ln.strip(), re.IGNORECASE)
     ).strip()
 
     return {"title": title, "meta": meta, "body": body}
@@ -250,6 +253,13 @@ class BlogGenerationService:
             word_count=word_count,
             secondary_keywords=secondary_keywords,
         )
+        # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
+        # language), the offer and what's happening now. The blog's voice stays
+        # with its own Writing DNA, so the voice tier is left out.
+        from . import brand_brief
+        _brief = brand_brief.build(brand_ctx, sections=("rules", "offer", "pulse"), kind="blog")
+        if _brief:
+            prompt = f"{prompt}\n\n{_brief}"
 
         # max_tokens = word_count * 2 gives ample headroom (1 word ≈ 1.3 tokens).
         # Cap at 8000 to stay within gpt-4o's output limit.
@@ -282,12 +292,17 @@ class BlogGenerationService:
             expansion_prompt = (
                 f"The blog below is {actual_words} words. It needs to be at least {word_count} words. "
                 f"Rewrite it in full, keeping the same title, meta description, voice, structure, and Writing DNA. "
-                f"Expand body sections by adding: more specific examples with real numbers, deeper explanations, "
+                f"Expand body sections by adding: more specific examples, deeper explanations, "
                 f"short stories or case studies, and practical step-by-step guidance. "
                 f"Do not add a new conclusion — make existing sections richer. "
                 f"Output the complete rewritten blog starting with TITLE: and META: exactly as before.\n\n"
                 f"CURRENT BLOG TO EXPAND:\n{raw_output}"
             )
+            # This pass used to ask for "examples with real numbers" and carried
+            # none of the brand's rules, so the longer version invented statistics
+            # ("SMEs make up 96% of businesses", seen on dev) and could undo the Playbook.
+            if _brief:
+                expansion_prompt = f"{expansion_prompt}\n\n{_brief}"
 
             exp_request = AIService.build_ai_model(
                 messages=[{"role": "user", "content": expansion_prompt}],
@@ -305,6 +320,39 @@ class BlogGenerationService:
                     print(f"✅ Expansion complete: {expanded_words} words (was {actual_words})")
                 else:
                     print(f"⚠️ Expansion didn't help ({expanded_words} vs {actual_words}), using original")
+
+        # ── Check against the Playbook, rewrite once if a rule is broken ──────
+        # A blog closes however the writer chose, so the caption CTA isn't required here.
+        def _playbook_issues(text: str) -> List[Dict[str, str]]:
+            return [i for i in brand_brief.audit(text, brand_ctx, sources=prompt) if i["code"] != "missing_cta"]
+
+        playbook_issues = _playbook_issues(raw_output)
+        if playbook_issues:
+            print(f"📝 Blog breaks Playbook rules: {[i['code'] + ':' + i['detail'] for i in playbook_issues]} — rewriting")
+            fix_prompt = (
+                "This blog breaks the brand's rules. Fix exactly these problems and change nothing else — "
+                "same title, structure, voice and length:\n"
+                + "\n".join(f"- {i['fix']}" for i in playbook_issues)
+                + "\n\nDo not add any fact, number or statistic that is not already there."
+                + (f"\n\n{_brief}" if _brief else "")
+                + "\n\nOutput the complete blog starting with TITLE: and META: exactly as before."
+                + f"\n\nBLOG:\n{raw_output}"
+            )
+            fix_request = AIService.build_ai_model(
+                messages=[{"role": "user", "content": fix_prompt}],
+                model="gpt-4o",
+                temperature=0.4,
+            )
+            fix_request.max_tokens = min(word_count * 3, 8000)
+            fix_response = await AIService.chat_completion(fix_request)
+            if not (isinstance(fix_response, dict) and "error" in fix_response):
+                fixed = fix_response.choices[0].message.content.strip()
+                fixed_issues = _playbook_issues(fixed)
+                # Keep the rewrite only if it's really the whole blog and breaks fewer rules.
+                if len(fixed.split()) >= 0.8 * len(raw_output.split()) and len(fixed_issues) < len(playbook_issues):
+                    raw_output, playbook_issues = fixed, fixed_issues
+        # Guaranteed without a model: no emojis when the brand said none.
+        raw_output = brand_brief.enforce(raw_output, brand_ctx, append_cta=False)
 
         parsed = _parse_blog_output(raw_output)
 
@@ -333,6 +381,8 @@ class BlogGenerationService:
                 "location": location,
             },
             "has_writing_dna": bool(dna_prompt),
+            # Playbook rules still broken after the rewrite (normally empty).
+            "playbook_issues": [f"{i['code']}: {i['detail']}" for i in playbook_issues],
             "created_at": now,
             "updated_at": now,
         }

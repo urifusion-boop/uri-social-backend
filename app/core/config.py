@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # a JSON API error, which is what actually broke create-account/link-existing on
     # staging. Bump this periodically; check developers.google.com/google-ads/api/docs/sunset-dates.
     GOOGLE_ADS_API_VERSION: str = "v24"
+    # Has Google verified URI's OAuth app for the Google Ads scope? Until it has,
+    # "Continue with Google" shows Google's red "hasn't verified this app" screen
+    # to everyone, so the app leads with the Customer ID route and warns about the
+    # screen instead of sending people into it cold. Set to true once Google's
+    # verification is approved (Google Cloud → OAuth consent screen).
+    GOOGLE_ADS_OAUTH_VERIFIED: bool = False
 
     # TikTok Marketing API (Jane + Ads, Phase 1 — see app/agents/jane_ads/adapters/tiktok.py)
     # Unlike Meta/Google, Phase 1 does NOT run ads from the brand's own TikTok presence
@@ -261,6 +267,15 @@ class Settings(BaseSettings):
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_WHATSAPP_FROM: str = ""  # e.g. whatsapp:+14155238886
+    # Brand Playbook notifications (app/services/notification_channels.py)
+    TWILIO_WHATSAPP_NOTIFY_TEMPLATE_SID: str = ""  # approved template, {{1}}=title {{2}}=message
+    TWILIO_SMS_FROM: str = ""                      # SMS sender number, e.g. +15005550006
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_BOT_USERNAME: str = ""                # without @, for the "Connect Telegram" link
+    TELEGRAM_WEBHOOK_SECRET: str = ""              # checked on every Telegram webhook call
+    VAPID_PUBLIC_KEY: str = ""                     # Web Push
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = ""                        # e.g. mailto:support@urisocial.com
 
     # Email (SMTP) — Notification System PRD
     SMTP_HOST: str = ""

@@ -443,8 +443,8 @@ class ApprovalWorkflowService:
             from app.services.CreditService import credit_service
             from app.services.TrialService import trial_service
 
-            # Get original draft details
-            draft = await db["content_drafts"].find_one({"id": draft_id})
+            # Get original draft details — the caller's own draft only, like delete.
+            draft = await db["content_drafts"].find_one({"id": draft_id, "user_id": user_id})
             if not draft:
                 return UriResponse.error_response("Draft not found")
 
@@ -473,11 +473,24 @@ class ApprovalWorkflowService:
             if regeneration_feedback:
                 enhanced_seed += f"\n\nUser feedback: {regeneration_feedback}"
 
+            # "Regenerate" used to write with no brand at all: the new version
+            # ignored the whole Playbook (voice, banned words, language, CTA).
+            from .brand_profile_service import BrandProfileService
+            _brand_id = draft.get("brand_id") or request.get("brand_id")
+            _profile = await db["brand_profiles"].find_one(
+                {"brand_id": _brand_id} if _brand_id else {"user_id": user_id}
+            )
+            brand_context = None
+            if _profile:
+                _profile.pop("_id", None)
+                brand_context = BrandProfileService.to_brand_context(_profile)
+
             result = await ContentGenerationService._generate_platform_content(
                 platform=draft["platform"],
                 seed_content=enhanced_seed,
                 request_id=draft["request_id"],
-                user_id=user_id
+                user_id=user_id,
+                brand_context=brand_context,
             )
 
             if result.get('status'):
@@ -514,36 +527,33 @@ class ApprovalWorkflowService:
                     }
                 )
 
-                # Create new draft with regenerated content
-                new_draft_id = str(ObjectId())
-                new_draft = {
-                    "id": new_draft_id,
-                    "request_id": draft["request_id"],
-                    "platform": draft["platform"],
-                    "content": new_draft_data["content"],
-                    "original_content": new_draft_data["content"],
-                    "hashtags": new_draft_data.get("hashtags", []),
-                    "status": "regenerated",
-                    "regenerated_from": draft_id,
-                    "regeneration_feedback": regeneration_feedback,
-                    "retry_number": new_retry_count,  # Track which retry this is
-                    "credit_charged": new_retry_count >= 2,  # Was credit charged?
-                    "image_retry_count": 0,  # PRD 4.3: Initialize image retry count
-                    "ai_metadata": new_draft_data.get("ai_metadata"),
-                    "created_at": datetime.utcnow(),
-                    "updated_at": datetime.utcnow()
-                }
-
-                await db["content_drafts"].insert_one(new_draft)
-
-                # Mark original as replaced
+                # Rewrite the draft in place. This used to insert a second draft for
+                # the same request and platform, which the unique index on
+                # (request_id, platform) rejects — so every regenerate failed with a
+                # duplicate-key error (after the retry had already been counted), and
+                # the copy it tried to make had no owner and no image anyway.
+                new_draft_id = draft_id
+                now = datetime.utcnow()
                 await db["content_drafts"].update_one(
                     {"id": draft_id},
-                    {"$set": {
-                        "status": "replaced",
-                        "replaced_by": new_draft_id,
-                        "updated_at": datetime.utcnow()
-                    }}
+                    {
+                        "$set": {
+                            "content": new_draft_data["content"],
+                            "original_content": new_draft_data["content"],
+                            "hashtags": new_draft_data.get("hashtags", []),
+                            "regeneration_feedback": regeneration_feedback,
+                            "retry_number": new_retry_count,  # Track which retry this is
+                            "credit_charged": new_retry_count >= 2,  # Was credit charged?
+                            "ai_metadata": new_draft_data.get("ai_metadata"),
+                            "updated_at": now,
+                        },
+                        # The version it replaced stays recoverable.
+                        "$push": {"previous_versions": {
+                            "content": draft.get("content"),
+                            "hashtags": draft.get("hashtags", []),
+                            "replaced_at": now,
+                        }},
+                    },
                 )
 
                 return UriResponse.get_single_data_response("content_regeneration", {
@@ -973,6 +983,7 @@ class ApprovalWorkflowService:
                                 platform=draft.get("platform", ""),
                                 content_preview=(draft.get("content") or "")[:120],
                                 campaign_id=draft.get("campaign_id", ""),
+                                brand_id=draft.get("brand_id"),
                             )
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
@@ -1171,6 +1182,7 @@ class ApprovalWorkflowService:
                                 platform=platform,
                                 content_preview=(draft.get("content") or "")[:120],
                                 campaign_id=draft.get("campaign_id", ""),
+                                brand_id=draft.get("brand_id"),
                             )
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")

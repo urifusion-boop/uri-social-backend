@@ -291,6 +291,9 @@ async def generate_plan_variants(
         raise PlanVariantsUnavailableError(str(e)) from e
 
     raw_variants = data.get("variants") or []
+    # The prompt asks for "All of <city>" when the client wanted the whole city, and the
+    # model still came back with Ikeja, Victoria Island and Lekki. Enforced here.
+    whole_area = bool(getattr(parsed, "whole_area", False) and parsed.city)
     variants: list[PlanVariant] = []
     for i, v in enumerate(raw_variants[:5], start=1):
         if not isinstance(v, dict):
@@ -300,7 +303,8 @@ async def generate_plan_variants(
             recommended=bool(v.get("recommended")),
             who_its_for=str(v.get("who_its_for", "")).strip(),
             audience_segment=str(v.get("audience_segment", "")).strip(),
-            geo_pockets=[str(g).strip() for g in (v.get("geo_pockets") or []) if str(g).strip()],
+            geo_pockets=([f"All of {parsed.city}"] if whole_area else
+                         [str(g).strip() for g in (v.get("geo_pockets") or []) if str(g).strip()]),
             trigger=str(v.get("trigger", "")).strip(),
             why_this_could_work=str(v.get("why_this_could_work", "")).strip(),
             trade_off=str(v.get("trade_off", "")).strip(),

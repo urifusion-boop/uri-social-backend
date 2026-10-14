@@ -71,6 +71,19 @@ async def get_brand_context(user_id: str, db, brand_id: Optional[str] = None) ->
         bc = BrandProfileService.to_brand_context(profile)
         if not bc:
             return bc
+        # Where this brand's profile lives, so ad generation can save rotation
+        # state (e.g. which preferred ad format is next) back to it. A private
+        # key on purpose: brand_id/user_id on brand_context already mean
+        # "which business" to the ad caps and must not change.
+        profile_brand_id = (profile or {}).get("brand_id")
+        bc = {
+            **bc,
+            "_profile_scope": (
+                {"brand_id": profile_brand_id} if profile_brand_id
+                # Older personal profiles carry no brand_id at all.
+                else {"user_id": user_id, "brand_id": {"$exists": False}}
+            ),
+        }
         # Organic content always picks a style (the brand's own rotation, or a
         # sensible default) before generating — ads never did, silently falling
         # back to _generate_platform_image's generic "immersive" composition with
@@ -107,6 +120,22 @@ def _brand_prompt_bits(bc: dict) -> str:
     if bc.get("brand_colors"):
         bits.append(f"Brand colours: {', '.join(bc['brand_colors'][:3])}.")
     return " ".join(bits)
+
+
+def _brand_copy_bits(bc: dict) -> str:
+    """_brand_prompt_bits plus the shared Brand Brief, for prompts that WRITE
+    (ad copy, shoot scripts): hard rules (avoid topics, banned words, compliance,
+    language), what the business offers, and what's happening right now.
+
+    Never use this for an image prompt — rules and promotions are words, and
+    words in an image prompt get painted into the picture. Image prompts keep
+    _brand_prompt_bits. And no audience tier here either: who an ad targets is
+    delivery context and must never be written into ad copy (see the leakage
+    check in write_ad_copy)."""
+    from app.agents.social_media_manager.services import brand_brief
+    bits = _brand_prompt_bits(bc)
+    brief = brand_brief.build(bc, sections=("rules", "offer", "pulse"), kind="ads")
+    return bits + (("\n" + brief) if brief else "")
 
 
 def _brand_color_directive(bc: dict) -> str:
@@ -444,7 +473,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     if not settings.jane_ads_openai_key:
         return AdCopy()
     bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
+    brand_bits = _brand_copy_bits(bc)
     geo_target = city or bc.get("region", "")
     audience_segment = audience_segment or bc.get("target_audience", "")
     location_bit = _location_prompt_bit(geo_target, category)
@@ -466,7 +495,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
            f"{service_area}\n" if service_area else "")
         + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
-    ad_label = "TikTok" if platform == "tiktok" else "Meta/Instagram"
+    ad_label = "TikTok" if platform == "tiktok" else "Google Search" if platform == "google" else "Meta/Instagram"
     # TikTok's own feed is dominated by phone-shot, unstaged footage — an obviously
     # art-directed brand photoshoot reads as an ad and gets scrolled past. Meta's
     # image brief stays exactly as it was (still additive-only per platform).
@@ -528,6 +557,36 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
             # Never ship a known leak and never loop silently — strip and move on.
             copy.headline = _strip_leaked_terms(copy.headline, leaked)
             copy.primary_text = _strip_leaked_terms(copy.primary_text, leaked)
+    # Brand Playbook hard rules, checked on what was actually written: words the
+    # brand never uses (in any form) and statistics nobody gave the writer — an
+    # invented "70% of businesses..." in a paid ad is the advertiser's liability.
+    # One rewrite, same as captions get; if the model still breaks a rule the copy
+    # is kept (a human reviews every ad plan before launch) and the miss is logged.
+    from app.agents.social_media_manager.services import brand_brief
+
+    def _copy_issues(headline: str, primary: str) -> list:
+        return [i for i in brand_brief.audit(f"{headline}\n{primary}", bc, sources=prompt)
+                if i["code"] in ("banned_word", "unverified_number")]
+
+    issues = _copy_issues(copy.headline, copy.primary_text)
+    if issues:
+        d3 = await _call_ad_copy_model(
+            prompt + "\n\nCORRECTION: your last attempt broke this brand's rules. Rewrite headline "
+            "and primary_text with these fixes:\n" + "\n".join(f"- {i['fix']}" for i in issues)
+        )
+        if d3 is not None:
+            headline = str(d3.get("headline", "")).strip()
+            primary = str(d3.get("primary_text", "")).strip()
+            if (headline and primary and not _check_leakage(headline, primary, leak_terms)
+                    and len(_copy_issues(headline, primary)) < len(issues)):
+                copy.headline, copy.primary_text = headline, primary
+        still = _copy_issues(copy.headline, copy.primary_text)
+        if still:
+            print(f"[Creative] ad copy still breaks Playbook rules after retry: "
+                  f"{[i['code'] + ':' + i['detail'] for i in still]}", flush=True)
+    # "No emojis" can be guaranteed without a model.
+    copy.headline = brand_brief.enforce(copy.headline, bc, append_cta=False)
+    copy.primary_text = brand_brief.enforce(copy.primary_text, bc, append_cta=False)
     # image_prompt needs the SAME deterministic guarantee, not just the instruction
     # above. It becomes the content engine's seed_content, and that engine renders
     # text INTO the graphic (that's how organic posts look) — so a place name left
@@ -552,7 +611,7 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
     if not settings.jane_ads_openai_key:
         return ShootScript()
     bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
+    brand_bits = _brand_copy_bits(bc)
     prompt = (
         f"Write a short phone-filmable shoot script for a Meta/Instagram ad for "
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
@@ -759,7 +818,7 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
     if not settings.jane_ads_openai_key or not image_summary.strip():
         return AdCopy()
     bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
+    brand_bits = _brand_copy_bits(bc)
     geo_target = city or bc.get("region", "")
     audience_segment = audience_segment or bc.get("target_audience", "")
     # NOTE: `category` is deliberately NOT passed as the Zone A interest-category term
@@ -921,6 +980,29 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
         shows_service_area=bool(service_area) and service_area.lower() in combined.lower(),
         copy_length=len(combined),
     )
+
+
+async def search_ad_creative(
+    business_name: str, category: str, goal: str = "messages", description: str = "",
+    user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
+    behaviour: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
+    geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
+    destination_cta: str = "",
+) -> AdCreative:
+    """The creative for a Google SEARCH ad: Jane's headline and description,
+    voice-matched to the Brand Playbook like every other ad — and no image,
+    because a search ad is text. Nothing is generated, so it costs no content
+    credit. The adapter turns this into the 3+ headlines and 2+ descriptions
+    Google requires (adapters/google.rsa_assets)."""
+    brand_context = await get_brand_context(user_id, db, brand_id) if db is not None and user_id else {}
+    copy = await write_ad_copy(business_name, category, goal, description, brand_context,
+                               city, behaviour, service_area, audience_segment, who_its_for,
+                               geo_pockets=geo_pockets, destination_type=destination_type, platform="google")
+    ad = assemble_creative(copy, "", source=CreativeSource.GENERATE, is_video=False,
+                           service_area=service_area, destination_type=destination_type,
+                           destination_cta=destination_cta)
+    ad.video_recommendation = ""    # "a video would work better" means nothing for a text ad
+    return ad
 
 
 # ── The three entry points ────────────────────────────────────────────────────

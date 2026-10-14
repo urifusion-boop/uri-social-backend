@@ -25,7 +25,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
-from .geo import whole_area_request
+from .geo import place_named_in, whole_area_answer
 from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
@@ -374,7 +374,7 @@ async def consult(message: str, business_name: str = "", category: str = "",
     # Ikeja, Victoria Island and Surulere" over a plan card that correctly read "All of
     # Lagos". Live-caught in the UI. Telling the model up front is the only way the
     # sentence it writes agrees with the plan it produces.
-    whole_now = whole_area_request(_latest_user_reply(message))
+    whole_now = _whole_area_answered(message)
     if whole_now:
         known_bits.append(
             f"the client has asked to cover ALL of {whole_now} — that IS the geography, "
@@ -449,6 +449,23 @@ def _latest_user_reply(message: str) -> str:
     `_client_gave_affirmative`'s tail check, since a substantive answer ("10000, ikeja")
     can run longer than a bare "yes" while still being exactly one fresh reply."""
     return (message or "").strip().split(".")[-1].strip().lower()
+
+
+def _whole_area_answered(message: str) -> str:
+    """The whole area the client settled on in ANY reply so far, newest first.
+
+    Only the latest reply used to count, so "Lagos" settled the geography for exactly
+    one turn: the client answered the budget next, and the plan came back pitching
+    Ikeja, Victoria Island and Lekki. A newer reply naming a neighbourhood wins — that
+    client has narrowed it since.
+    """
+    for reply in reversed((message or "").split(".")):
+        whole = whole_area_answer(reply)
+        if whole:
+            return whole
+        if place_named_in(reply):
+            return ""
+    return ""
 
 
 def _client_gave_affirmative(message: str) -> bool:
@@ -681,7 +698,7 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     # own clarify, and everything past that guard only runs when there is no clarify
     # to begin with — so a check placed after it can never see the loop it exists to
     # break.
-    whole = whole_area_request(_latest_user_reply(message))
+    whole = _whole_area_answered(message)
     if whole and _is_about_geography(brief.clarify):
         print(f"[Consultant] client asked for all of {whole} — dropping the area "
               f"question and settling the geography", flush=True)
