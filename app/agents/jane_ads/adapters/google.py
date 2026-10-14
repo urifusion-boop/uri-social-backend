@@ -198,6 +198,20 @@ def _raise_for_error(data: dict, context: str) -> None:
         raise GoogleAdsAPIError(f"{context}: {detail}", code=err.get("status"))
 
 
+def campaign_name(business: str, placement_label: str, goal: str = "", today: Optional["date"] = None) -> str:
+    """A name a person can read in Google Ads: "Mama Kitchen · Search · Leads ·
+    14 Oct 2026 · 3f2a". Google needs campaign names unique in the account, so a
+    short tag ends it; the old names were codes (JaneAds-brnd_personal_1f38…-leads)."""
+    from datetime import date
+    day = today or date.today()
+    business = " ".join((business or "").split())[:40].strip() or "URI campaign"
+    parts = [business, placement_label]
+    if goal:
+        parts.append(goal.replace("_", " ").title())
+    parts += [f"{day.day} {day.strftime('%b %Y')}", uuid.uuid4().hex[:4]]
+    return " · ".join(parts)
+
+
 def campaign_end(days: int, today: Optional["date"] = None) -> str:
     """Google's end_date_time for a campaign running `days` days from today
     (today counts as day one), in the format Google takes."""
@@ -406,6 +420,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         if clicks_per_day < _MIN_USEFUL_CLICKS_PER_DAY and not kw_context.get("low_budget_ok"):
             raise LowClicksWarning(daily_budget_ngn, estimated_cpc_ngn, clicks_per_day)
 
+        readable_name = campaign_name(kw_context.get("business_name") or category, "Search", plan.goal.value)
         campaign_resource_name = ""
         budget_resource_name = ""
         ad_group_resource_name = ""
@@ -417,7 +432,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     f"{self._api_base}/customers/{self._customer_id}/campaignBudgets:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
-                        "name": f"JaneAds-{plan.business_id}-budget-{uuid.uuid4().hex[:8]}",
+                        "name": f"{readable_name} · budget",
                         "amountMicros": budget_micros(daily_budget_ngn, self._currency_code),
                         "deliveryMethod": "STANDARD",
                     }}]},
@@ -432,7 +447,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     f"{self._api_base}/customers/{self._customer_id}/campaigns:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
-                        "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
+                        "name": readable_name,
                         "status": "PAUSED",
                         "advertisingChannelType": "SEARCH",
                         "campaignBudget": budget_resource_name,
@@ -474,7 +489,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     f"{self._api_base}/customers/{self._customer_id}/adGroups:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
-                        "name": f"JaneAds-{plan.business_id}-adgroup",
+                        "name": f"{readable_name} · ad group",
                         "campaign": campaign_resource_name,
                         "status": "PAUSED",
                         "type": "SEARCH_STANDARD",
@@ -598,7 +613,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         copy = gv.ad_copy(creative.headline, creative.primary_text, business_name, rsa_assets,
                           headline_limit=40 if placement == "demand_gen" else 30)
         geo_constant = await self._resolve_geo(kw_context.get("geo", ""))
-        name = f"URI - {gv._fit(business_name, 40)} - {gv.PLACEMENT_LABELS[placement]} - {uuid.uuid4().hex[:4]}"
+        short = {"display": "Display", "demand_gen": "YouTube & Discover", "pmax": "Everywhere"}[placement]
+        name = campaign_name(business_name, short, plan.goal.value)
         ops = gv.build_operations(
             placement, self._customer_id, name=name,
             daily_micros=budget_micros(daily_budget_ngn, self._currency_code),
