@@ -198,6 +198,14 @@ def _raise_for_error(data: dict, context: str) -> None:
         raise GoogleAdsAPIError(f"{context}: {detail}", code=err.get("status"))
 
 
+def campaign_end(days: int, today: Optional["date"] = None) -> str:
+    """Google's end_date_time for a campaign running `days` days from today
+    (today counts as day one), in the format Google takes."""
+    from datetime import date, timedelta
+    start = today or date.today()
+    return f"{(start + timedelta(days=max(days, 1) - 1)).isoformat()} 23:59:59"
+
+
 def estimate_clicks_per_day(daily_budget_ngn: float, estimated_cpc_ngn: float) -> float:
     """Pure function (§3.4) — never blocks on an unknown/zero CPC, since guessing
     wrong in the blocking direction is worse than not checking at all."""
@@ -382,7 +390,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         from .google_visual import VISUAL_PLACEMENTS, normalize_placement
         placement = normalize_placement(kw_context.get("placement"))
         if placement in VISUAL_PLACEMENTS:
-            return await self._launch_visual(plan, placement, daily_budget_ngn, dest_link, kw_context)
+            return await self._launch_visual(plan, placement, daily_budget_ngn, dest_link, kw_context, days)
 
         keywords = await translate_keywords(category, description, geo)
         all_terms = (
@@ -551,6 +559,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "currency_code": self._currency_code,
                 "budget_resource_name": budget_resource_name,
                 "geo_target": geo_constant,
+                "placement": "search",
+                "days": days,
                 "platform": "google",
                 "last_click_count": 0,
                 "created_at": datetime.now(timezone.utc),
@@ -566,7 +576,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         )
 
     async def _launch_visual(self, plan: CampaignPlan, placement: str, daily_budget_ngn: float,
-                             dest_link: str, kw_context: dict) -> LaunchResult:
+                             dest_link: str, kw_context: dict, days: int = 0) -> LaunchResult:
         """Display, YouTube & Discover, or Everywhere: one atomic request (see
         google_visual), so a failure leaves nothing behind in the account."""
         from . import google_visual as gv
@@ -617,6 +627,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "ad_id": ad_id,
                 "asset_group": made.get("assetGroup", ""),
                 "placement": placement,
+                "days": days,
                 "business_id": plan.business_id,
                 "customer_id": self._customer_id,
                 "login_customer_id": self._login_customer_id,
@@ -728,11 +739,16 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         updated: dict = {}
         async with httpx.AsyncClient(timeout=30) as client:
             for name, service, resource in targets:
+                update, mask = {"resourceName": resource, "status": status}, "status"
+                if name == "campaign" and active and record.get("days"):
+                    # The plan's days count from when it's switched on, not from
+                    # when it was created paused: Google stops it on the last day.
+                    update["endDateTime"] = campaign_end(int(record["days"]))
+                    mask = "status,end_date_time"
                 resp = await client.post(
                     f"{self._api_base}/customers/{self._customer_id}/{service}:mutate",
                     headers=self._headers(),
-                    json={"operations": [{"update": {"resourceName": resource, "status": status},
-                                          "updateMask": "status"}]},
+                    json={"operations": [{"update": update, "updateMask": mask}]},
                 )
                 data = resp.json()
                 _raise_for_error(data, f"{name} status update")
