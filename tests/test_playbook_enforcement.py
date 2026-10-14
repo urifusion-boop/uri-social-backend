@@ -578,3 +578,13 @@ class TestFormalPlatformsStayInTheMainLanguage:
         assert "Pidgin" not in prompt
         ig = ContentGenerationService.build_caption_prompt("Our launch", "instagram", {"brand_name": "Acme", **self.BC})
         assert "Pidgin" in ig
+
+    def test_a_standing_pidgin_instruction_is_left_out_there_too(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        bc = {**self.BC, "playbook_instructions": [
+            {"id": "a", "text": "Mix in a little Pidgin for flavour.", "applies_to": ["all"], "platforms": []},
+            {"id": "b", "text": "Always mention the free trial.", "applies_to": ["all"], "platforms": []},
+            {"id": "c", "text": "Use Pidgin on LinkedIn too.", "applies_to": ["all"], "platforms": ["linkedin"]}]}
+        kept = [i["id"] for i in bb.for_platform(bc, "linkedin")["playbook_instructions"]]
+        assert kept == ["b", "c"]
+        assert [i["id"] for i in bb.for_platform(bc, "instagram")["playbook_instructions"]] == ["a", "b", "c"]
