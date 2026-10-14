@@ -1972,7 +1972,7 @@ async def admin_create_google_uri_account(
     except UriAccountError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=friendly_error(e))
+        raise HTTPException(status_code=502, detail=f"{friendly_error(e)} (Google said: {e})")
 
 
 @router.get("/admin/google/billing-options")
@@ -1987,7 +1987,8 @@ async def admin_google_billing_options(
     try:
         options = await billing_options(db)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=friendly_error(e))
+        # Admin-only: Google's exact words help more than a friendly summary here.
+        raise HTTPException(status_code=502, detail=f"{friendly_error(e)} (Google said: {e})")
     return {"automatic_billing": bool(options), "payments_accounts": options}
 
 

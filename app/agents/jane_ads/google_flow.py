@@ -161,9 +161,12 @@ def friendly_error(e: Exception) -> str:
     already wrote for people (currency, budget) pass through; Google's own
     technical text is kept only as a short reference at the end."""
     text = str(e)
-    upper = text.upper()
+    # Match Google's own error codes (the adapter puts them in [BRACKETS]) — never
+    # the free text, where "payments accounts lookup" read as a billing problem.
+    import re as _re
+    codes_found = " ".join(_re.findall(r"\[([A-Z_]+)\]", text))
     for codes, message in _ERROR_MESSAGES:
-        if any(code in upper for code in codes):
+        if codes_found and any(code in codes_found for code in codes):
             return message
     if ":" not in text or text.startswith(("This Google Ads account", "That daily budget")):
         return text
