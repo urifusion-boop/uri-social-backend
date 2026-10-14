@@ -110,7 +110,13 @@ async def add_account(db, customer_id: str, added_by: str) -> dict:
 
 
 async def list_accounts(db) -> list[dict]:
-    return await db[COLLECTION].find({}, {"_id": 0}).to_list(length=500)
+    """Every URI account, with the name of the business using it (for the admin screen)."""
+    accounts = await db[COLLECTION].find({}, {"_id": 0}).to_list(length=500)
+    for a in accounts:
+        if a.get("brand_id"):
+            profile = await db["brand_profiles"].find_one({"brand_id": a["brand_id"]}, {"brand_name": 1}) or {}
+            a["brand_name"] = profile.get("brand_name") or ""
+    return accounts
 
 
 async def brand_account(db, brand_id: Optional[str]) -> Optional[dict]:
