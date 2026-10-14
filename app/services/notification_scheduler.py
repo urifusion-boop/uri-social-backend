@@ -93,6 +93,43 @@ def _run_async(job_id: str, coro_func):
         print("⚠️ Main event loop not available — skipping scheduled job")
 
 
+def _brand_alert_job(job_id: str, fn_name: str):
+    """Brand Playbook alerts (app/services/brand_alert_jobs.py) — only brands
+    that switched the alert on in their Playbook are notified."""
+    async def _run():
+        from app.database import get_db
+        from app.services import brand_alert_jobs
+        result = await getattr(brand_alert_jobs, fn_name)(get_db())
+        print(f"🔔 {job_id}: {result}")
+    _run_async(job_id, _run)
+
+
+def _job_google_ads_link_reminders():
+    """A day after a Google Ads link request that's still waiting, remind the owner once."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.google_ads_connection import remind_pending_links
+        result = await remind_pending_links(get_db())
+        print(f"🔔 google_ads_link_reminders: {result}")
+    _run_async("google_ads_link_reminders", _run)
+
+
+def _job_weekly_reports():
+    _brand_alert_job("brand_weekly_reports", "run_weekly_reports")
+
+
+def _job_engagement_spikes():
+    _brand_alert_job("brand_engagement_spikes", "run_engagement_spikes")
+
+
+def _job_calendar_refill():
+    _brand_alert_job("brand_calendar_refill", "run_calendar_refill")
+
+
+def _job_trending_topics():
+    _brand_alert_job("brand_trending_topics", "run_trending_topics")
+
+
 def _job_daily_suggestions():
     from app.services.NotificationService import notification_service
     _run_async("daily_suggestions", notification_service.run_daily_suggestions)
@@ -313,6 +350,36 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Brand Playbook alerts — each only reaches brands that switched it on.
+    # Weekly report: Mondays 08:00 UTC (09:00 WAT).
+    _scheduler.add_job(
+        _job_weekly_reports,
+        CronTrigger(day_of_week="mon", hour=8, minute=0),
+        id="brand_weekly_reports",
+        **_JOB_DEFAULTS,
+    )
+    # Engagement spikes: every 6 hours, after analytics have had time to sync.
+    _scheduler.add_job(
+        _job_engagement_spikes,
+        CronTrigger(hour="*/6", minute=40),
+        id="brand_engagement_spikes",
+        **_JOB_DEFAULTS,
+    )
+    # Content calendar running out: daily 09:30 UTC.
+    _scheduler.add_job(
+        _job_calendar_refill,
+        CronTrigger(hour=9, minute=30),
+        id="brand_calendar_refill",
+        **_JOB_DEFAULTS,
+    )
+    # Trending topics (real Google Trends only): daily 11:00 UTC.
+    _scheduler.add_job(
+        _job_trending_topics,
+        CronTrigger(hour=11, minute=0),
+        id="brand_trending_topics",
+        **_JOB_DEFAULTS,
+    )
+
     # Publish scheduled content every 5 minutes — see the module docstring:
     # the GH Actions workflow that used to own this is currently disabled,
     # so this in-process job is what actually publishes scheduled posts.
@@ -353,8 +420,16 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Google Ads: one reminder when a link request is still waiting a day later.
+    _scheduler.add_job(
+        _job_google_ads_link_reminders,
+        CronTrigger(minute=20),
+        id="google_ads_link_reminders",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 12 jobs")
+    print("📅 Notification scheduler started with 13 jobs")
 
 
 def stop_notification_scheduler():

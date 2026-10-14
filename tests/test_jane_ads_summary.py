@@ -109,3 +109,27 @@ def test_estimates_fall_back_to_price_without_conversion_count():
 def test_estimates_note_always_present():
     s = build_campaign_summary(_plan(), _req())
     assert "estimate" in s.estimates.note.lower()
+
+
+def _search_plan(budget, days):
+    return _plan(behaviour=PurchaseBehaviour.SEARCH, per_business_cap_ngn=budget, account_cap_ngn=budget,
+                 platforms=[PlatformPlan(platform=Platform.GOOGLE, budget_ngn=budget, days=days, variants=1,
+                                         test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS)])
+
+
+def test_google_search_estimates_come_from_cost_per_click_not_the_feed_price():
+    s = build_campaign_summary(_search_plan(5_400, 5), _req(budget_ngn=5_400), price_per_result_ngn=400.0)
+    est = s.estimates
+    assert est.estimated_clicks == 22                       # ₦5,400 ÷ ~₦250 a click
+    assert est.estimated_leads == round(22 * ASSUMED_LEAD_RATE)
+    assert est.cost_per_result_ngn == round(5_400 / est.estimated_leads, 2)
+
+
+def test_google_search_small_budget_is_called_a_test_not_enough():
+    s = build_campaign_summary(_search_plan(5_400, 5), _req(budget_ngn=5_400))
+    assert "fine for a test" in s.duration.reason and "minimum daily budget" not in s.duration.reason
+
+
+def test_google_search_enough_budget_says_so():
+    s = build_campaign_summary(_search_plan(35_000, 7), _req(budget_ngn=35_000))
+    assert "enough for Google to learn" in s.duration.reason

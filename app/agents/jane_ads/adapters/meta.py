@@ -49,9 +49,10 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
 from .. import constants as C
+from .. import messaging_ad
 from .base import AdPlatformAdapter
 from .. import constants as C
-from ..destination import DestinationType, link_for_plan
+from ..destination import CTA_CHOICES, DestinationType, link_for_plan
 from ..geo import meta_targeting_from_geo_named
 from ..objectives import meta_objective, optimization_goal
 from ..models import (
@@ -129,6 +130,72 @@ def _raise_for_error(data: dict, context: str) -> None:
             code=err.get("code"),
             subcode=err.get("error_subcode"),
         )
+
+
+def _wants_multi_destination(destination_type, is_followers_goal: bool) -> bool:
+    """Whether this campaign gets the manual campaign's multi-inbox messaging format.
+
+    Any campaign whose tap opens a chat. A followers campaign opens nothing, and a
+    website or custom link is not a conversation.
+    """
+    return (not is_followers_goal
+            and destination_type in (DestinationType.WHATSAPP, DestinationType.INSTAGRAM_DM))
+
+
+# Words Meta uses when it refuses a messaging DESTINATION rather than the ad set.
+_ROUTING_WORDS = ("whatsapp", "instagram", "messenger", "destination", "messaging")
+
+
+def _is_routing_refusal(error: dict) -> bool:
+    text = " ".join(str(error.get(k) or "") for k in
+                    ("message", "error_user_title", "error_user_msg")).lower()
+    return any(w in text for w in _ROUTING_WORDS)
+
+
+# The manual campaign targets every city with a 25-mile radius around it. A city key
+# with no radius is Meta's administrative boundary, which for most Nigerian cities is
+# far tighter than where the people who live and shop there actually are — part of why
+# Jane's audiences priced 3-6x the manual one's per thousand impressions.
+_CITY_RADIUS = {"radius": 25, "distance_unit": "mile"}
+
+
+def _advantage_age(targeting: dict) -> dict:
+    """The client's age range, expressed the way Advantage+ audience accepts it.
+
+    With Advantage+ audience on, Meta rejects a hard maximum age below 65 ("You can add
+    a lower maximum age as a suggestion instead", subcode 1870189) and caps a hard
+    minimum at 25. The manual campaign on the account shows the shape it wants: hard
+    age_min/age_max as the outer fence, and the intended range in age_range, which
+    Meta treats as the suggestion it starts from. The client's choice is kept intact
+    there — it still drives delivery, it just is not a wall.
+    """
+    # An age_range already present IS the client's choice — a live ad set read back
+    # from Meta, or an age edit that set it explicitly (live_edit). Only the hard
+    # fences are derived from it; re-deriving the range from the fences would replace
+    # "23-55" with "23-65" every time an unrelated field was edited.
+    if targeting.get("age_range"):
+        lo, hi = (int(v) for v in targeting["age_range"])
+    else:
+        lo, hi = targeting.get("age_min"), targeting.get("age_max")
+        if lo is None and hi is None:
+            return targeting
+        lo, hi = int(lo or 18), int(hi or 65)
+    return {**targeting,
+            "age_min": min(lo, 25),
+            "age_max": 65,
+            "age_range": [lo, hi]}
+
+
+def _with_city_radius(targeting: dict) -> dict:
+    geo = (targeting or {}).get("geo_locations") or {}
+    cities = geo.get("cities")
+    if not cities:
+        return targeting
+    return {**targeting, "geo_locations": {
+        **geo,
+        "cities": [{**_CITY_RADIUS, **c} if isinstance(c, dict) and "radius" not in c else c
+                   for c in cities],
+    }}
 
 
 class MetaAdPlatformAdapter(AdPlatformAdapter):
@@ -300,6 +367,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             and plan.whatsapp_number
         )
         use_native_whatsapp = want_native_whatsapp
+        # Any campaign whose tap opens a chat gets the manual campaign's
+        # multi-destination format first (see the ad set create below).
+        use_multi_destination = _wants_multi_destination(destination.type, is_followers_goal)
 
         campaign_id = ""
         adset_id = ""
@@ -344,41 +414,35 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "daily_budget": daily_budget_minor,
                     "billing_event": "IMPRESSIONS",
                     "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                    # Geo (pins/country) plus Jane's resolved demographic/interest read
-                    # (age_min/age_max/genders/flexible_spec, {} when nothing resolved) —
-                    # disjoint keys, so merging never overwrites either side.
+                    # Targeting matched setting-for-setting to the one campaign on this
+                    # account that was set up by hand in Ads Manager — which delivered
+                    # cheaper conversations from better people than any Jane campaign.
+                    # The geography, age and interests are still the client's; what is
+                    # copied is how Ads Manager asks Meta to deliver against them.
                     #
-                    # advantage_audience is REQUIRED by Meta as of 2026-09-05 — without it
-                    # every ad set create fails with "Advantage audience flag required"
-                    # (code=100, subcode=1870227). Meta used to default it to 1 silently.
-                    # We send 0 deliberately: 1 lets Meta treat the detailed targeting as a
-                    # mere suggestion and deliver outside it, which would make the plan card
-                    # lie — it names the exact interests and areas being targeted, and this
-                    # whole feature exists so the client's own audience choice is honoured.
-                    # Flip to 1 only alongside changing what the card promises.
-                    "targeting": {
+                    # advantage_audience 1, with geo as an individual Advantage+
+                    # setting, exactly as the manual ad set has it. This used to be 0
+                    # deliberately, so the plan card's named interests and areas would
+                    # be the literal audience. Ads Manager's default of 1 lets Meta reach
+                    # beyond them where it predicts results, and that is the setup that
+                    # performed; the card now says so (plan_fields).
+                    #
+                    # Placements and language are left to Meta, as on the manual ad set.
+                    # They were briefly forced to Facebook+Instagram and English, which
+                    # moved Jane AWAY from the campaign that worked — it has neither.
+                    "targeting": _advantage_age(_with_city_radius({
                         **(await meta_targeting_from_geo_named(
                             plan.geo,
                             region=(plan.geo.city if plan.geo else ""),
                             access_token=self._access_token,
                         )),
-                        # Placements and language, which Jane never set and a human
-                        # buyer always does. Unset, Meta picks automatic placements
-                        # (Audience Network included — third-party apps and games,
-                        # where the cheapest conversations in the auction come from)
-                        # and serves in any language. Compared against manually-run
-                        # ad sets on the same account, these were the two differences
-                        # that explain conversations from people with no interest in
-                        # the offer.
-                        #
-                        # BEFORE plan.audience_targeting on purpose: the client's own
-                        # choice — a placement they picked, a locale they set — still
-                        # wins, because these are defaults, not policy.
-                        "publisher_platforms": list(C.DEFAULT_PUBLISHER_PLATFORMS),
-                        "locales": list(C.DEFAULT_LOCALES),
                         **plan.audience_targeting,
-                        "targeting_automation": {"advantage_audience": 0},
-                    },
+                        "brand_safety_content_filter_levels": ["FACEBOOK_RELAXED", "AN_RELAXED"],
+                        "user_age_unknown": False,
+                        "targeting_automation": {"advantage_audience": 1,
+                                                 "individual_setting": {"geo": 1}},
+                    })),
+                    "regional_regulated_categories": ["VOLUNTARY_VERIFICATION"],
                     "status": "PAUSED",
                     "start_time": start_time.isoformat(),
                     "end_time": end_time.isoformat(),
@@ -437,12 +501,47 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     else:
                         adset_payload["optimization_goal"] = "LINK_CLICKS"
 
-                adset_resp = await client.post(
-                    f"{self._graph_base}/act_{self._ad_account_id}/adsets",
-                    params={"access_token": self._access_token},
-                    json=adset_payload,
-                )
-                adset_data = adset_resp.json()
+                # The manual campaign's routing: ONE ad set whose destination covers
+                # Messenger, Instagram DMs and WhatsApp, with Meta opening whichever
+                # inbox each person actually uses. Tried first on any messaging
+                # campaign; if Meta refuses it for this Page (an inbox not connected,
+                # say) the WhatsApp-only path below runs exactly as before, so a Page
+                # that worked yesterday cannot stop working today.
+                adset_data = None
+                if use_multi_destination:
+                    multi_payload = {
+                        **{k: v for k, v in adset_payload.items()
+                           if k not in ("destination_type", "promoted_object")},
+                        **messaging_ad.adset_messaging_fields(plan.page_id),
+                        "optimization_goal": "CONVERSATIONS",
+                    }
+                    multi_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                        params={"access_token": self._access_token},
+                        json=multi_payload,
+                    )
+                    multi_data = multi_resp.json()
+                    multi_err = multi_data.get("error") or {}
+                    # Only a refusal about the ROUTING falls back — an inbox this Page
+                    # hasn't connected. Anything else (a bad bid, a budget floor) would
+                    # fail the WhatsApp-only create identically, so it surfaces as
+                    # itself, here, rather than costing a second create and arriving
+                    # under a misleading "multi-destination refused" log line. Same
+                    # rule the 1487246 fallback below already follows.
+                    if multi_err and _is_routing_refusal(multi_err):
+                        print(f"[MetaAds] multi-destination messaging refused for page "
+                              f"{plan.page_id} ({multi_err.get('message')}) — "
+                              f"using the WhatsApp-only ad set", flush=True)
+                        use_multi_destination = False
+                    else:
+                        adset_payload, adset_data = multi_payload, multi_data
+                if adset_data is None:
+                    adset_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                        params={"access_token": self._access_token},
+                        json=adset_payload,
+                    )
+                    adset_data = adset_resp.json()
 
                 # Meta is the only reliable oracle for "is this number linked to this
                 # Page", and it answers by rejecting the create with subcode 1487246.
@@ -575,13 +674,49 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             "call_to_action": cta,
                         },
                     }
+                creative_body = {
+                    "name": f"JaneAds-{plan.business_id}-creative",
+                    "object_story_spec": object_story_spec,
+                }
+                if use_multi_destination:
+                    # The manual ad's creative: the Messenger button on the story, one
+                    # call-to-action per inbox in the asset feed, the welcome message
+                    # with its ice-breaker, a headline, and Meta's standard creative
+                    # enhancements opted in. An API-created creative defaults every
+                    # enhancement to OPT_OUT, which is most of what made Jane's ad a
+                    # lesser version of the same ad.
+                    cta_type = CTA_CHOICES.get(destination.cta, ("", "CONTACT_US"))[1]
+                    ig = await self._instagram_ids(plan.page_id)
+                    story = {"page_id": plan.page_id}
+                    if ig.get("id"):
+                        story["instagram_user_id"] = ig["id"]
+                    common = {
+                        "message": message,
+                        "call_to_action": messaging_ad.primary_call_to_action(cta_type),
+                        "page_welcome_message": messaging_ad.welcome_message(),
+                    }
+                    if plan.creative.is_video:
+                        story["video_data"] = {
+                            "video_id": video_id, "image_url": video_thumbnail_url,
+                            "title": plan.creative.headline or "", **common,
+                        }
+                    else:
+                        story["link_data"] = {
+                            "link": "https://fb.com/messenger_doc/",
+                            "name": plan.creative.headline or "",
+                            "picture": plan.creative.image_url, **common,
+                        }
+                    creative_body = {
+                        "name": f"JaneAds-{plan.business_id}-creative",
+                        "object_story_spec": story,
+                        "asset_feed_spec": messaging_ad.asset_feed_spec(
+                            cta_type, ig.get("ig_id", "")),
+                        **messaging_ad.creative_extras(),
+                    }
                 creative_resp = await client.post(
                     f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
                     params={"access_token": self._access_token},
-                    json={
-                        "name": f"JaneAds-{plan.business_id}-creative",
-                        "object_story_spec": object_story_spec,
-                    },
+                    json=creative_body,
                 )
                 creative_data = creative_resp.json()
                 _raise_for_error(creative_data, "ad creative creation")
@@ -625,7 +760,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 # dashboard's headline metric ("X people messaged you") renders a
                 # confident zero on every fallback campaign, so it is recorded at the
                 # moment the distinction is actually known.
-                "conversations_measurable": bool(use_native_whatsapp),
+                # Multi-destination messaging reports started conversations the
+                # same way native Click-to-WhatsApp does.
+                "conversations_measurable": bool(use_native_whatsapp or use_multi_destination),
                 "created_at": datetime.now(timezone.utc),
             }},
             upsert=True,
@@ -637,6 +774,34 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             platforms=[Platform.META],
             launched=True,
         )
+
+    async def _instagram_ids(self, page_id: str) -> dict:
+        """The Page's Instagram business id and LEGACY id, or {} if unknowable.
+
+        The Instagram leg of a multi-destination ad deep-links by the legacy id, which
+        the shared ads token cannot read — Graph returns "missing permissions" for every
+        Instagram account it is asked about. The Page's own token can, and it is on the
+        brand's ads connection. Best-effort: without it the ad still runs on Messenger
+        and WhatsApp.
+        """
+        try:
+            conn = await self._db["social_connections"].find_one(
+                {"page_id": page_id, "platform": "facebook_ads"}) or {}
+            token = conn.get("page_access_token") or ""
+            if not token:
+                return {}
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{self._graph_base}/{page_id}",
+                    params={"fields": "instagram_business_account{id,ig_id}",
+                            "access_token": token},
+                )
+            account = (resp.json() or {}).get("instagram_business_account") or {}
+            return {"id": str(account.get("id") or ""),
+                    "ig_id": messaging_ad.instagram_legacy_id(resp.json())}
+        except Exception as e:
+            print(f"[MetaAds] instagram id lookup failed for page {page_id}: {e}", flush=True)
+            return {}
 
     async def _rollback_partial_launch(self, campaign_id: str, creative_id: str = "") -> None:
         """Undo a launch that failed midway, so Meta is never left holding a campaign
@@ -982,6 +1147,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         are both rejected, unlike the creative endpoint which ignores the Instagram
         identity entirely.
         """
+        # A live Advantage+ ad set takes age only as a suggestion (see _advantage_age).
+        if ((targeting.get("targeting_automation") or {}).get("advantage_audience") == 1):
+            targeting = _advantage_age(targeting)
         payload = {"targeting": json.dumps(targeting),
                    "access_token": self._access_token}
         if validate_only:

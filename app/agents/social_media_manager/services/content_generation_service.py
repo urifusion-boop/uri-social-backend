@@ -2,7 +2,16 @@
 
 import asyncio
 import json
+import re
 from typing import List, Dict, Optional, Any, Tuple
+from . import brand_brief
+
+# Platform formats (e.g. LinkedIn's "end with an engaging question") were winning
+# over the brand's own call to action — confirmed on dev. The CTA closes the post.
+_CTA_LAST_LINE = (
+    "The call-to-action is the FINAL line of the post. If the platform format also asks for a "
+    "closing question, put the question just before it — never instead of it."
+)
 from datetime import datetime
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -224,6 +233,50 @@ Write one caption. No alternatives, no meta-commentary.
     }
     
     @staticmethod
+    def _brand_banned_words(brand_context: Optional[Dict[str, Any]]) -> List[str]:
+        """Every word the brand has said never to use (see brand_brief.banned_words)."""
+        return brand_brief.banned_words(brand_context)
+
+    @staticmethod
+    def build_caption_prompt(seed_content: str, platform: str, brand_context: Optional[Dict[str, Any]]) -> str:
+        """The complete prompt a caption is written from. One place, so real
+        posts and "Preview Jane's voice" can never drift apart. Order:
+          1. Banned patterns (universal)
+          2. Formatting rules (universal + platform)
+          3. Voice profile (brand)
+          4. Brand instructions (the Playbook)
+          5. The platform's own prompt, with the topic
+        """
+        brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
+        platform_prompt = ContentGenerationService.PLATFORM_PROMPTS[platform].format(seed_content=seed_content)
+        voice_instructions = ""
+        if brand_context and brand_context.get("voice_profile"):
+            voice_profile = dict(brand_context["voice_profile"])
+            # The voice profile's defaults ("1-2 emojis", "1-3 hashtags") used to
+            # contradict a Playbook that said none, in the same prompt.
+            if brand_brief.emoji_mode(brand_context) == "no":
+                voice_profile["emoji_usage"] = "none"
+            if brand_brief.hashtag_limit(brand_context) == 0:
+                voice_profile["hashtag_style"] = "none"
+            voice_instructions = build_voice_profile_instructions(
+                voice_profile,
+                brand_context.get("voice_sample_analysis"),
+                platform,
+                language_rule=brand_brief.languages_rule(brand_context),
+            )
+        # Without this the model wrote "if you're still typing invoices by hand in 2023" (seen on dev).
+        today = f"Today's date is {datetime.utcnow():%d %B %Y}. Never refer to an earlier year as the current one."
+        parts = [
+            BANNED_PATTERNS_RULES,
+            get_platform_formatting_rules(platform),
+            voice_instructions,
+            brand_block,
+            today,
+            platform_prompt,
+        ]
+        return "\n".join(p for p in parts if p)
+
+    @staticmethod
     def _build_brand_block(brand_context: Optional[Dict[str, Any]], platform: str = "") -> str:
         """
         Build directive brand instructions from every onboarding field.
@@ -232,7 +285,17 @@ Write one caption. No alternatives, no meta-commentary.
         if not brand_context:
             return ""
 
-        parts = ["BRAND INSTRUCTIONS — you are writing on behalf of this specific brand. Apply every rule below:"]
+        # Hard rules, voice and audience come from the shared Brand Brief so
+        # every generator states them the same way, in the same priority order.
+        parts = [
+            "BRAND INSTRUCTIONS — you are writing on behalf of this specific brand. Apply every rule below.",
+            brand_brief.PRIORITY_ORDER,
+            brand_brief.TRUTH_RULE,
+        ]
+        rules = brand_brief.hard_rules(brand_context, captions=True, platform=platform)
+        if rules:
+            parts.append("HARD RULES (never break these):")
+            parts.extend(f"- {r}" for r in rules)
 
         # ── Core identity ─────────────────────────────────────────────────────
         if brand_context.get("brand_name"):
@@ -387,64 +450,32 @@ Write one caption. No alternatives, no meta-commentary.
                 f'Let this reasoning surface naturally, especially in CTAs.'
             )
 
-        if brand_context.get("audience_age_range"):
-            age_range = brand_context["audience_age_range"]
-            print(f"🎯 Audience age range detected: '{age_range}'")
+        # The rest of the Playbook's customer psychology (until now only the
+        # 30-day Calendar read these). Short, top-3 lists so a full profile
+        # doesn't drown the prompt.
+        psychology = [
+            ("What they want", "customer_desires"),
+            ("What they fear", "customer_fears"),
+            ("What frustrates them", "customer_frustrations"),
+            ("What they aspire to", "customer_aspirations"),
+            ("Why they hesitate", "customer_hesitations"),
+            ("Questions they often ask", "common_questions"),
+            ("What makes them buy", "buying_triggers"),
+        ]
+        psych_lines = []
+        for label, key in psychology:
+            vals = [str(v).strip() for v in (brand_context.get(key) or []) if str(v).strip()]
+            if vals:
+                psych_lines.append(f'{label}: {"; ".join(vals[:3])}')
+        if psych_lines:
+            parts.append(
+                '- More about the customer: ' + ' | '.join(psych_lines) + '. '
+                'Where it fits the post, speak to one of these directly — use the customer\'s own words '
+                'from the questions rather than generic marketing phrasing.'
+            )
 
-            # Build age-specific voice instructions for each demographic
-            if "Gen Z" in age_range or "18-24" in age_range:
-                print(f"✅ Applying Gen Z voice adaptation")
-                parts.insert(0,
-                    f'🚨 MANDATORY GEN Z VOICE (18-24) - OVERRIDES EVERYTHING:\n'
-                    f'You MUST sound like an actual 20-year-old texting, NOT a brand or marketer.\n'
-                    f'REQUIRED Gen Z elements in EVERY caption:\n'
-                    f'  ✓ Use slang: lowkey, highkey, no cap, fr (for real), ngl (not gonna lie), tbh (to be honest), iykyk (if you know you know)\n'
-                    f'  ✓ Short sentences (5-10 words max). Fragments are GOOD.\n'
-                    f'  ✓ Casual lowercase where natural ("fr this is it", "ngl i love this")\n'
-                    f'  ✓ Drop formality completely - sound like Instagram/TikTok comments\n'
-                    f'  ✓ NO corporate words: "navigate", "key", "special moments", "come to life" = BANNED\n'
-                    f'  ✓ NO polished marketing language - keep it raw and real\n\n'
-                    f'IGNORE any "professional", "polished", or "sophisticated" instructions below.\n'
-                    f'If the caption sounds like it could be from a 40-year-old marketing manager, you FAILED.'
-                )
-            elif "Millennials" in age_range or "25-40" in age_range:
-                print(f"✅ Applying Millennials voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Millennials (25-40) - CRITICAL\n'
-                    f'Write for millennials who value authenticity:\n'
-                    f'  • Conversational but polished\n'
-                    f'  • Reference millennial culture (nostalgia, work-life balance, experiences)\n'
-                    f'  • Balance casual and professional\n'
-                    f'  • Relatable without being too corporate or too trendy\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Gen X" in age_range or "41-56" in age_range:
-                print(f"✅ Applying Gen X voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Gen X (41-56) - CRITICAL\n'
-                    f'Write for Gen X who value authenticity and directness:\n'
-                    f'  • Straightforward, no-nonsense tone\n'
-                    f'  • Skip the hype - be genuine and practical\n'
-                    f'  • Professional but not stiff\n'
-                    f'  • Focus on value, quality, and results\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Boomers" in age_range or "57+" in age_range:
-                print(f"✅ Applying Boomers voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Boomers (57+) - CRITICAL\n'
-                    f'Write for baby boomers with respect and clarity:\n'
-                    f'  • Professional, respectful tone\n'
-                    f'  • Clear, well-structured sentences\n'
-                    f'  • Emphasize trust, reliability, expertise\n'
-                    f'  • Avoid slang and internet jargon\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Everyone" not in age_range:
-                # Fallback for custom age ranges
-                parts.append(
-                    f'- Target audience age: {age_range}. Adjust language and references to match this demographic.'
-                )
+        for line in brand_brief.audience_adaptation(brand_context):
+            parts.append(f"- {line}")
 
         if brand_context.get("primary_goal"):
             parts.append(
@@ -465,14 +496,6 @@ Write one caption. No alternatives, no meta-commentary.
                 f'- Market/region: {brand_context["region"]}. '
                 f'Use cultural references and examples that resonate specifically in this market.'
             )
-
-        if brand_context.get("languages"):
-            langs = brand_context["languages"]
-            if isinstance(langs, list) and langs and langs != ["English"]:
-                parts.append(
-                    f'- Write in: {", ".join(langs)}. '
-                    f'Default to English but naturally weave in local expressions where appropriate.'
-                )
 
         # ── Content strategy ─────────────────────────────────────────────────
         if brand_context.get("content_pillars"):
@@ -499,23 +522,11 @@ Write one caption. No alternatives, no meta-commentary.
                     f'Let the tone and energy of the post feel consistent with this visual palette.'
                 )
 
-        # ── Guardrails ───────────────────────────────────────────────────────
-        guardrails = brand_context.get("guardrails")
-        if guardrails and isinstance(guardrails, dict):
-            if guardrails.get("avoid_topics"):
-                parts.append(f'- NEVER mention or reference: {guardrails["avoid_topics"]}.')
-            if guardrails.get("banned_words"):
-                parts.append(f'- NEVER use these words or phrases: {guardrails["banned_words"]}.')
-            emoji_rule = guardrails.get("emoji_usage")
-            if emoji_rule == "no":
-                parts.append('- Use NO emojis under any circumstances.')
-            elif emoji_rule == "some":
-                parts.append('- Use emojis very sparingly — maximum 1-2 only if they add genuine meaning.')
-            max_hash = guardrails.get("max_hashtags")
-            if max_hash and max_hash not in ("No limit", ""):
-                parts.append(f'- Use a maximum of {max_hash} hashtags.')
-            if guardrails.get("compliance_notes"):
-                parts.append(f'- Compliance requirement: {guardrails["compliance_notes"]}.')
+        # ── Happening right now (Business Pulse) ─────────────────────────────
+        pulse = brand_brief.pulse(brand_context)
+        if pulse:
+            parts.append("- Happening right now at this business — use it where it genuinely fits this post, "
+                         "quote the real terms and never invent any: " + " ".join(pulse))
 
         # ── CTAs & links ─────────────────────────────────────────────────────
         # Priority order: override_cta > selected_cta (from image) > cta_styles (all CTAs)
@@ -526,12 +537,12 @@ Write one caption. No alternatives, no meta-commentary.
         if override_cta:
             # One-time override CTA (highest priority)
             parts.append(
-                f'- Call-to-action: End the post with this exact CTA: "{override_cta}"'
+                f'- Call-to-action: End the post with this exact CTA: "{override_cta}". {_CTA_LAST_LINE}'
             )
         elif selected_cta:
             # Use the SAME CTA that was used in the image (for consistency)
             parts.append(
-                f'- Call-to-action: End the post with this exact CTA: "{selected_cta}"'
+                f'- Call-to-action: End the post with this exact CTA: "{selected_cta}". {_CTA_LAST_LINE}'
             )
             print(f"✅ Caption will use same CTA as image: '{selected_cta}'")
         elif brand_context.get("cta_styles"):
@@ -540,7 +551,7 @@ Write one caption. No alternatives, no meta-commentary.
             if isinstance(ctas, list) and ctas:
                 parts.append(
                     f'- Preferred CTAs: {", ".join(ctas)}. '
-                    f'End the post with the most fitting one.'
+                    f'End the post with the most fitting one. {_CTA_LAST_LINE}'
                 )
 
         if brand_context.get("default_link"):
@@ -550,13 +561,8 @@ Write one caption. No alternatives, no meta-commentary.
             )
 
         # ── Competitive context ───────────────────────────────────────────────
-        if brand_context.get("competitor_handles"):
-            handles = brand_context["competitor_handles"]
-            if isinstance(handles, list) and handles:
-                parts.append(
-                    f'- Competitor accounts: {", ".join(handles[:5])}. '
-                    f'Be aware of this competitive landscape — differentiate the brand\'s voice and value clearly.'
-                )
+        if brand_brief.competitors_line(brand_context):
+            parts.append(f"- {brand_brief.competitors_line(brand_context)}")
 
         # ── Key dates / upcoming events ───────────────────────────────────────
         if brand_context.get("key_dates"):
@@ -565,7 +571,7 @@ Write one caption. No alternatives, no meta-commentary.
                 f'If any of these are relevant to the post topic, reference them naturally.'
             )
 
-        if len(parts) == 1:
+        if len(parts) == 3:
             # No brand instructions, but still check for voice profile
             brand_block = ""
         else:
@@ -804,37 +810,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
 
         try:
             # Get platform-specific prompt
-            prompt_template = ContentGenerationService.PLATFORM_PROMPTS[platform]
-            brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
-            platform_prompt = prompt_template.format(seed_content=seed_content)
-
-            # Build voice profile instructions if available
-            voice_instructions = ""
-            if brand_context and brand_context.get("voice_profile"):
-                voice_instructions = build_voice_profile_instructions(
-                    brand_context["voice_profile"],
-                    brand_context.get("voice_sample_analysis"),
-                    platform
-                )
-
-            # Get platform-specific formatting rules
-            platform_formatting = get_platform_formatting_rules(platform)
-
-            # Assemble the complete prompt with proper order:
-            # 1. Banned patterns rules (universal)
-            # 2. Formatting rules (universal + platform-specific)
-            # 3. Voice profile (brand-specific)
-            # 4. Brand context
-            # 5. Platform prompt
-            prompt_parts = [
-                BANNED_PATTERNS_RULES,
-                platform_formatting,
-                voice_instructions,
-                brand_block if brand_block else "",
-                platform_prompt
-            ]
-
-            prompt = "\n".join([p for p in prompt_parts if p])
+            prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context)
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
@@ -860,46 +836,76 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                 processed_content['content'], platform
             )
 
-            # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
-            # Extract custom banned words from voice profile
-            custom_banned_words = []
-            if brand_context and brand_context.get("voice_profile"):
-                custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
+            # ── Check against the universal rules and the Brand Playbook, rewrite
+            # if needed, then enforce what can be guaranteed (PRD Section 7) ────
+            custom_banned_words = ContentGenerationService._brand_banned_words(brand_context)
+            is_thread = platform in ("twitter", "x")
+            # Everything the writer was given — a statistic that isn't in here was invented.
+            sources = f"{seed_content}\n{json.dumps(brand_context or {}, default=str, ensure_ascii=False)}"
 
-            # Validate the caption
-            validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
+            def _check(text: str):
+                style = CaptionValidatorService.validate_caption(
+                    ContentGenerationService._for_validation(text, platform), custom_banned_words)
+                if is_thread:
+                    # A thread is laid out as tweets, not as one phone-screen caption.
+                    kept = [i for i in style["issues"] if i not in ("wall_of_text", "insufficient_line_breaks")]
+                    style = {**style, "issues": kept, "passed": not kept}
+                return style, brand_brief.audit(text, brand_context, sources=sources)
 
-            # If validation fails, attempt auto-fix (one retry)
-            if not validation_result["passed"]:
-                print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
-
-                # Generate fix prompt
-                fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
-
-                # Regenerate with fix instructions
+            validation_result, playbook_issues = _check(content)
+            brand_rules = brand_brief.hard_rules(brand_context, captions=True, platform=platform)
+            attempt = 0
+            # One rewrite for style, as before. A second only if a Playbook rule is still broken.
+            while attempt < 2 and (playbook_issues or (attempt == 0 and not validation_result["passed"])):
+                attempt += 1
+                print(f"[CAPTION] {platform} rewrite {attempt}: style={validation_result['issues'][:4]} "
+                      f"playbook={[i['code'] + ':' + i['detail'] for i in playbook_issues]}")
+                fix_prompt = CaptionValidatorService.generate_fix_prompt(
+                    content, validation_result, playbook_issues=playbook_issues,
+                    brand_rules=brand_rules, platform=platform,
+                )
                 fix_ai_request = AIService.build_ai_model(
                     messages=[{"role": "user", "content": fix_prompt}],
                     temperature=0.7,
                 )
-
                 fix_ai_response = await AIService.chat_completion(fix_ai_request)
-                if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
-                    fixed_content = fix_ai_response.choices[0].message.content.strip()
+                if isinstance(fix_ai_response, dict) and "error" in fix_ai_response:
+                    break
+                fixed_raw = fix_ai_response.choices[0].message.content.strip()
+                fixed_processed = ContentGenerationService._post_process_content(fixed_raw, platform)
+                fixed_content, fixed_hashtags = ContentGenerationService._extract_and_clean_hashtags(
+                    fixed_processed['content'], platform
+                )
+                if not fixed_content:
+                    break
+                new_validation, new_playbook = _check(fixed_content)
+                # Never trade a rewrite that breaks more of the brand's rules for the original.
+                if len(new_playbook) > len(playbook_issues):
+                    print(f"[CAPTION] ⚠ rewrite {attempt} for {platform} broke more Playbook rules — kept the previous version")
+                    continue
+                content, processed_content = fixed_content, fixed_processed
+                # The caption is rewritten without its hashtags, so a rewrite that
+                # returns none must not wipe the ones already written.
+                hashtags = fixed_hashtags or hashtags
+                validation_result, playbook_issues = new_validation, new_playbook
 
-                    # Re-extract hashtags from fixed content
-                    content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
-                        fixed_content, platform
-                    )
-
-                    # Validate again
-                    revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
-                    if revalidation["passed"]:
-                        print(f"[CAPTION] ✓ Fixed and validated for {platform}")
-                    else:
-                        print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
-                        # Proceed with content anyway, but flag it
-            else:
+            if validation_result["passed"] and not playbook_issues:
                 print(f"[CAPTION] ✓ Passed validation for {platform}")
+            else:
+                print(f"[CAPTION] ⚠ {platform} still has issues: style={validation_result['issues'][:3]} "
+                      f"playbook={[i['code'] for i in playbook_issues]}")
+
+            # Guaranteed, whatever the model did: no emojis if the brand said none,
+            # the hashtag limit, and the brand's call-to-action as the close.
+            content = brand_brief.enforce(content, brand_context, append_cta=not is_thread)
+            hashtags = brand_brief.limit_hashtags(hashtags, brand_context)
+            if is_thread and processed_content.get('tweets'):
+                processed_content['tweets'] = [
+                    brand_brief.enforce(t, brand_context, append_cta=False) for t in processed_content['tweets']
+                ]
+            remaining_issues = [
+                f"{i['code']}: {i['detail']}" for i in brand_brief.audit(content, brand_context, sources=sources)
+            ]
 
             # Generate a draft ID
             draft_id = str(ObjectId())
@@ -914,7 +920,9 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                 'seed_length': len(seed_content),
                 'output_length': len(content),
                 'hashtag_count': len(hashtags),
-                'nigerian_context': True  # Flag for Nigerian-optimized content
+                'nigerian_context': True,  # Flag for Nigerian-optimized content
+                'playbook_issues': remaining_issues,  # Playbook rules still broken after rewriting (normally empty)
+                'rewrites': attempt,
             }
             
             return UriResponse.get_single_data_response("platform_content", {
@@ -934,18 +942,30 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
             return UriResponse.error_response(f"Generation failed: {str(e)}")
     
     @staticmethod
+    def _for_validation(text: str, platform: str) -> str:
+        """The text the style validator should judge. A thread's "(1/4)" numbering
+        is structure, not a "slash construction" or a "parenthetical"."""
+        if platform in ("twitter", "x"):
+            return re.sub(r'\(\d+/\d+\)', '', text)
+        return text
+
+    @staticmethod
     def _post_process_content(raw_content: str, platform: str) -> Dict[str, Any]:
         """
         Post-process AI-generated content based on platform requirements
         """
         
         if platform in ("twitter", "x"):
+            # The model often wraps the thread in a ```json fence; without this the
+            # fence and brackets became "tweets" of their own (seen on dev).
+            raw_content = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', raw_content.strip()).strip()
             # Handle X/Twitter thread format
             try:
                 # Try to parse as JSON array first
                 if raw_content.strip().startswith('['):
                     tweets = json.loads(raw_content)
                     if isinstance(tweets, list):
+                        tweets = [str(t).strip() for t in tweets if str(t).strip()]
                         return {
                             'content': '\n\n'.join(tweets),
                             'tweets': tweets,
@@ -996,9 +1016,16 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         
         # Remove hashtags from content (we'll add them separately)
         cleaned_content = re.sub(r'#\w+', '', content)
-        
-        # Clean up extra whitespace
-        cleaned_content = ' '.join(cleaned_content.split())
+
+        # Tidy spaces inside each line but KEEP the line breaks. This used to be
+        # ' '.join(text.split()), which flattened every caption into one block:
+        # the paragraphs the prompts ask for never reached the draft, and the
+        # validator's "needs line breaks" check then failed on every caption.
+        lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in cleaned_content.replace('\r', '').split('\n')]
+        # A line holding only a dot is the old Instagram spacer trick, not content.
+        # Also ". . . . ." on one line (seen in a dev preview), with or without spaces.
+        lines = ['' if re.fullmatch(r'[.·•\-_~*\s]+', line or ' ') else line for line in lines]
+        cleaned_content = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines))
         
         # Platform-specific hashtag limits optimized for Nigerian audience
         limits = {
@@ -1023,7 +1050,8 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         user_id: str,
         feedback: Optional[str] = None,
         platform: Optional[str] = None,
-        original_seed: Optional[str] = None
+        original_seed: Optional[str] = None,
+        brand_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Regenerate content for a specific draft with optional feedback
@@ -1041,7 +1069,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         
         # Generate new content
         result = await ContentGenerationService._generate_platform_content(
-            platform, enhanced_seed, f"regen_{draft_id}", user_id
+            platform, enhanced_seed, f"regen_{draft_id}", user_id, brand_context=brand_context
         )
         
         if result.get('status'):

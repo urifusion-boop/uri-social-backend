@@ -1332,6 +1332,11 @@ async def _build_text_only(business_name: str, category: str, description: str, 
 # ── SEED-098: Work In Progress (generated scene — see module
 # docstring on why this doesn't yet accept a real work photo) ─────────────
 
+def _is_true(value) -> bool:
+    """A model's boolean, which may come back as true or as the string "true"."""
+    return value is True or str(value).strip().lower() in ("true", "yes", "1")
+
+
 async def _content_work_in_progress(business_name: str, category: str, description: str,
                                     brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
@@ -1344,10 +1349,23 @@ async def _content_work_in_progress(business_name: str, category: str, descripti
         "- statement: the short line, 6 words or fewer\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
-        "Return ONLY the JSON with exactly these 3 keys."
+        "- applies: true ONLY if THIS business itself does visible, hands-on physical work a camera "
+        "could photograph on site (trades, repairs, installation, construction, food preparation, "
+        "tailoring, cleaning, farming...). false for software, apps, online services, consulting, "
+        "finance, education, agencies and anything done at a screen or desk.\n"
+        "The examples above only show the STYLE. Never reuse them: the activity must be this "
+        "business's own real work. If applies is false, leave the other fields empty.\n"
+        "Return ONLY the JSON with exactly these 4 keys."
     )
     d = await _call_content_model(prompt)
     if not d:
+        return None
+    # This format shows a tradesperson mid-job. For a business with no such work
+    # the model used to copy an example from the prompt — a software company got
+    # an ad of plumbers fixing a burst pipe (seen on dev). Returning None makes
+    # select_and_render_vsg01_creative move on to the next format.
+    if not _is_true(d.get("applies")):
+        print(f"[VSG01] Work In Progress doesn't fit {business_name or 'this business'} (no hands-on work) — skipping", flush=True)
         return None
     trade_activity = str(d.get("trade_activity", "")).strip()
     statement = str(d.get("statement", "")).strip()
@@ -1964,6 +1982,27 @@ def _vsg01_candidate_params(
     return NO_PHOTO_FORMAT_IDS, False, False, None
 
 
+def pick_preferred_ad_format(preferred: list, rotation_index: int, eligible_ids: set) -> tuple:
+    """Next of the brand's preferred ad formats (Brand Playbook "Visual Styles —
+    Ads") that's eligible for this ad, taking turns from rotation_index.
+
+    Returns (format_id, next_rotation_index), or (None, None) when no preferred
+    format is eligible — ranking then proceeds exactly as without a preference.
+    """
+    preferred = [p for p in preferred if p]
+    if not preferred:
+        return None, None
+    try:
+        start = int(rotation_index or 0) % len(preferred)
+    except (TypeError, ValueError):
+        start = 0
+    for offset in range(len(preferred)):
+        position = (start + offset) % len(preferred)
+        if preferred[position] in eligible_ids:
+            return preferred[position], (position + 1) % len(preferred)
+    return None, None
+
+
 async def select_and_render_vsg01_creative(
     db, business_name: str, category: str, description: str,
     brand_context: Optional[dict] = None, *,
@@ -2024,10 +2063,19 @@ async def select_and_render_vsg01_creative(
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
     if effective_forced is None:
-        for preferred_id in (brand_context or {}).get("ad_format_selections") or []:
-            if preferred_id in ranked_ids:
-                effective_forced = preferred_id
-                break
+        effective_forced, next_rotation = pick_preferred_ad_format(
+            (brand_context or {}).get("ad_format_selections") or [],
+            (brand_context or {}).get("ad_format_rotation_index") or 0,
+            ranked_ids,
+        )
+        scope = (brand_context or {}).get("_profile_scope")
+        if effective_forced and next_rotation is not None and scope and db is not None:
+            # Take turns through the Playbook's preferred ad formats instead of
+            # always leading with the first one.
+            try:
+                await db["brand_profiles"].update_one(scope, {"$set": {"ad_format_rotation_index": next_rotation}})
+            except Exception as exc:
+                print(f"[VSG01] ad format rotation save failed: {exc}", flush=True)
     if effective_forced:
         ranked = (
             [s for s in ranked if s.strategy_id == effective_forced]

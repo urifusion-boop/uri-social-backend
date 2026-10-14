@@ -402,6 +402,22 @@ class VideoStoryboardService:
         # specifically. Broadening the guard makes every real failure a logged,
         # clean 400 instead of a request that just vanishes.
         try:
+            # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
+            # language), who it's for, what the business offers and what's on now —
+            # video scripts used to get only name, industry, region, voice and colours.
+            from . import brand_brief
+            _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), kind="video")
+            if _brief:
+                preamble_lines.append("")
+                # The brief is about WORDS. video_prompt goes to the video model and must stay
+                # plain-English and visual, or rules/promotions get rendered into the footage.
+                preamble_lines.append(
+                    "The BRAND BRIEF below governs the words people will read or hear — every "
+                    "text_overlay — and which ideas the video is built around. Each video_prompt "
+                    "stays a plain-English VISUAL description: never write rules, promotions, prices "
+                    "or brand copy into a video_prompt."
+                )
+                preamble_lines.append(_brief)
             contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
 
             for i, img_data in enumerate(brand_images):

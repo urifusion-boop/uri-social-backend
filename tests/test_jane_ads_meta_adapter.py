@@ -50,6 +50,18 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+@pytest.fixture
+def whatsapp_only(monkeypatch):
+    """Exercise the WhatsApp-only routing.
+
+    Launches try Meta's multi-inbox messaging format first (as the manual campaign on
+    the account is set up) and fall back to this path when Meta refuses it for a
+    Page. These tests cover that fallback path itself, so they start on it.
+    """
+    monkeypatch.setattr("app.agents.jane_ads.adapters.meta._wants_multi_destination",
+                        lambda *a, **k: False)
+
+
 class FakeCollection:
     def __init__(self):
         self.docs: dict = {}
@@ -247,20 +259,23 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     # the fallback for when it rejects with subcode 1487246, not the default.
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
     assert campaign_json["objective"] == "OUTCOME_ENGAGEMENT"
+    # The manual campaign's routing: one ad set covering Messenger, Instagram DMs and
+    # WhatsApp, Meta opening whichever inbox each person uses.
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert adset_json["optimization_goal"] == "CONVERSATIONS"
-    assert adset_json["destination_type"] == "WHATSAPP"
-    assert adset_json["promoted_object"] == {
-        "page_id": "pg123", "whatsapp_phone_number": "2348031234567",
-    }
-    creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    assert adset_json["destination_type"] == "MESSAGING_INSTAGRAM_DIRECT_MESSENGER_WHATSAPP"
+    assert adset_json["promoted_object"] == {"page_id": "pg123", "smart_pse_enabled": False}
+    creative_json = mock_client.post.call_args_list[2].kwargs["json"]
+    creative_spec = creative_json["object_story_spec"]
     assert creative_spec["page_id"] == "pg123"
-    # The ad set owns the routing on the native form, so the button carries no link —
-    # WHATSAPP_MESSAGE refuses a value.link ("Too many parameters in Call to Action",
-    # code=105, subcode=1815630), which is why only the fallback path can use a
-    # wa.me URL. See test_an_unlinked_page_falls_back_to_the_wa_me_link_ad.
-    assert creative_spec["link_data"]["call_to_action"] == {"type": "WHATSAPP_MESSAGE"}
-    assert "wa.me" not in creative_spec["link_data"]["link"]
+    # The button on the story routes to Messenger, as Ads Manager sets it; the asset
+    # feed carries one call-to-action per inbox.
+    assert creative_spec["link_data"]["call_to_action"]["value"]["app_destination"] == "MESSENGER"
+    assert "page_welcome_message" in creative_spec["link_data"]
+    assert creative_json["asset_feed_spec"]["optimization_type"] == "DOF_MESSAGING_DESTINATION"
+    assert creative_json["degrees_of_freedom_spec"]["creative_features_spec"][
+        "enhance_cta"] == {"enroll_status": "OPT_IN"}
+    assert creative_json["contextual_multi_ads"] == {"enroll_status": "OPT_IN"}
     ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json  # ad creation call still happens after creative
 
@@ -268,20 +283,23 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert record["ad_id"] == "ad_1"
     assert record["business_id"] == "b1"
     assert record["last_conversation_count"] == 0
+    assert record["conversations_measurable"] is True
 
 
 def test_adset_always_declares_the_advantage_audience_flag():
     # Meta made targeting_automation.advantage_audience mandatory 2026-09-05 — without
     # it EVERY ad set create fails with "Advantage audience flag required"
-    # (code=100, subcode=1870227). 0, not 1: 1 lets Meta deliver outside the detailed
-    # targeting, which would make the plan card's named interests/areas a lie.
+    # (code=100, subcode=1870227). 1, with geo as an individual Advantage+ setting —
+    # exactly as the manual campaign on the account has it, which out-performed every
+    # Jane campaign. The plan card says the interests steer rather than fence.
     responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
     with patch("httpx.AsyncClient") as MockClient:
         mock_client = _mock_client(responses)
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(_adapter().launch_campaign(_plan(), _auth()))
     targeting = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]
-    assert targeting["targeting_automation"] == {"advantage_audience": 0}
+    assert targeting["targeting_automation"] == {"advantage_audience": 1,
+                                                 "individual_setting": {"geo": 1}}
 
 
 def test_launch_campaign_with_no_geo_targets_all_of_nigeria():
@@ -315,7 +333,7 @@ def test_launch_campaign_targets_the_plans_actual_geo_pins(monkeypatch):
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["targeting"]["geo_locations"] == {"cities": [{"key": "1625140"}]}
+    assert adset_json["targeting"]["geo_locations"] == {"cities": [{"key": "1625140", "radius": 25, "distance_unit": "mile"}]}
 
 
 def test_launch_campaign_followers_goal_builds_engagement_not_whatsapp():
@@ -474,7 +492,7 @@ def test_launch_campaign_deletes_the_campaign_when_a_later_step_fails():
     assert "cmp_1" in mock_client.delete.await_args.args[0]
 
 
-def test_launch_campaign_stores_no_record_when_a_later_step_fails():
+def test_launch_campaign_stores_no_record_when_a_later_step_fails(whatsapp_only):
     db = FakeDb()
     adapter = _adapter(db)
     responses = [
@@ -490,7 +508,7 @@ def test_launch_campaign_stores_no_record_when_a_later_step_fails():
     assert _run(db["jane_ads_meta_campaigns"].find_one({"campaign_id": "cmp_1"})) is None
 
 
-def test_rollback_never_masks_the_original_error():
+def test_rollback_never_masks_the_original_error(whatsapp_only):
     # The user needs Meta's real reason ("WhatsApp number not linked"), not a
     # cleanup failure — so a failing rollback must stay silent about itself.
     adapter = _adapter()
@@ -549,7 +567,7 @@ def test_followers_goal_keeps_engagement_objective_and_page_link():
     assert link_data["call_to_action"]["type"] == "LIKE_PAGE"
 
 
-def test_video_creative_carries_the_wa_link_on_the_cta():
+def test_video_creative_carries_the_wa_link_on_the_cta(whatsapp_only):
     # video_data has no link field of its own, so the wa.me destination has to ride on
     # the call_to_action or the tap would go nowhere. Live-confirmed against the real
     # Meta API: WHATSAPP_MESSAGE rejects a "link" in its value ("Too many parameters
@@ -579,7 +597,7 @@ def test_video_creative_carries_the_wa_link_on_the_cta():
     assert video_data["call_to_action"]["value"]["link"].startswith("https://wa.me/2348031234567?text=")
 
 
-def test_wa_link_prefills_an_opening_message():
+def test_wa_link_prefills_an_opening_message(whatsapp_only):
     # Live-confirmed regression: a bare "https://wa.me/<number>" opens an EMPTY chat
     # with a number the person has never messaged — a real campaign got 186 link
     # clicks and zero WhatsApp messages. wa.me's own `text` param pre-fills the
@@ -613,7 +631,7 @@ def test_wa_link_prefills_an_opening_message():
 # Meta itself decides, by accepting or rejecting the real ad set.
 
 
-def test_linked_page_builds_a_native_click_to_whatsapp_ad():
+def test_linked_page_builds_a_native_click_to_whatsapp_ad(whatsapp_only):
     """Native is the only form that fires messaging_conversation_started — a wa.me link
     ad can never report a conversation, which is why those campaigns showed
     "WhatsApp conversations 0" while genuinely delivering clicks."""
@@ -640,7 +658,7 @@ def test_linked_page_builds_a_native_click_to_whatsapp_ad():
     assert "wa.me" not in spec["link_data"]["link"]
 
 
-def test_an_unlinked_page_falls_back_to_the_wa_me_link_ad():
+def test_an_unlinked_page_falls_back_to_the_wa_me_link_ad(whatsapp_only):
     """Unlinked Pages must keep launching. Meta refuses the native ad set with subcode
     1487246 and creates nothing, so retrying as a wa.me link ad is what stops a
     campaign failing to launch at all."""
@@ -672,7 +690,7 @@ def test_an_unlinked_page_falls_back_to_the_wa_me_link_ad():
     assert spec["link_data"]["call_to_action"]["type"] == "CONTACT_US"
 
 
-def test_only_the_not_linked_error_falls_back_every_other_one_surfaces():
+def test_only_the_not_linked_error_falls_back_every_other_one_surfaces(whatsapp_only):
     """The retry exists for exactly one Meta error. Treating any ad set failure as
     "must not be linked" would silently ship a lesser ad — and hide a real bug — so
     anything but subcode 1487246 has to fail the launch and roll the campaign back."""
@@ -741,7 +759,7 @@ def test_a_verified_pocket_is_sent_as_a_named_location(monkeypatch):
     geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
     # NO radius: Meta rejects a radius on a named key outright, because the named
     # location carries its own boundary (live-verified 2026-09-17).
-    assert geo_locations == {"cities": [{"key": "1625140"}]}
+    assert geo_locations == {"cities": [{"key": "1625140", "radius": 25, "distance_unit": "mile"}]}
     assert "custom_locations" not in geo_locations
 
 
@@ -767,7 +785,7 @@ def test_an_unresolvable_pocket_is_dropped_never_sent_as_coordinates(monkeypatch
         _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
 
     geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
-    assert geo_locations == {"cities": [{"key": "1234"}]}
+    assert geo_locations == {"cities": [{"key": "1234", "radius": 25, "distance_unit": "mile"}]}
     assert "custom_locations" not in geo_locations
 
 
@@ -793,7 +811,7 @@ def test_an_unnamed_pocket_never_drags_coordinates_in_beside_a_named_one(monkeyp
         _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
 
     geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
-    assert geo_locations == {"cities": [{"key": "1625140"}]}
+    assert geo_locations == {"cities": [{"key": "1625140", "radius": 25, "distance_unit": "mile"}]}
     assert "custom_locations" not in geo_locations
 
 
@@ -944,3 +962,62 @@ def test_widening_stops_at_the_country(monkeypatch):
     from app.agents.jane_ads.geo import widen_targeting
 
     assert _run(widen_targeting({"geo_locations": {"countries": ["NG"]}}, "Ikeja")) is None
+
+
+# ── Multi-inbox messaging, and falling back from it ──────────────────────────
+
+_MULTI_REFUSED = {"error": {"message": "Instagram account not connected to this Page",
+                            "code": 100, "error_subcode": 2490001}}
+
+
+def test_a_refused_multi_inbox_ad_falls_back_to_the_whatsapp_only_ad_set():
+    """A Page that hasn't connected an inbox can't run the multi-inbox format. That
+    must degrade to the WhatsApp-only ad set that already worked, not fail the launch."""
+    responses = [{"id": "cmp_1"}, _MULTI_REFUSED, {"id": "adset_1"},
+                 {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(_adapter().launch_campaign(_plan(), _auth()))
+    assert result.campaign_id == "cmp_1"
+    multi = mock_client.post.call_args_list[1].kwargs["json"]
+    fallback = mock_client.post.call_args_list[2].kwargs["json"]
+    assert multi["destination_type"] == "MESSAGING_INSTAGRAM_DIRECT_MESSENGER_WHATSAPP"
+    assert fallback["destination_type"] == "WHATSAPP"
+    creative = mock_client.post.call_args_list[3].kwargs["json"]
+    assert "asset_feed_spec" not in creative            # a WhatsApp-only ad, not half of one
+
+
+def test_a_non_routing_failure_on_the_multi_inbox_ad_surfaces_as_itself():
+    """A bad bid fails the WhatsApp-only create identically. Retrying would cost a call
+    and log a misleading reason — it surfaces, and the campaign is rolled back."""
+    responses = [{"id": "cmp_1"},
+                 {"error": {"message": "Invalid bid strategy", "code": 100,
+                            "error_subcode": 2490487}},
+                 {"success": True}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(MetaAPIError, match="ad set creation"):
+            _run(_adapter().launch_campaign(_plan(), _auth()))
+    assert mock_client.post.await_count == 2              # campaign + ONE ad set attempt
+    assert mock_client.delete.await_count == 1
+
+
+def test_the_multi_inbox_video_creative_carries_a_headline_and_welcome_message():
+    plan = _plan(creative=AdCreative(image_url="https://cdn/ad.mp4", is_video=True,
+                                     headline="Book your spot", primary_text="p"))
+    responses = [
+        {"id": "vid_1"}, {"status": {"video_status": "ready"}},
+        {"data": [{"uri": "https://thumb/1.jpg", "is_preferred": True}]},
+        {"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"},
+    ]
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.meta.asyncio.sleep", new=AsyncMock()):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(plan, _auth()))
+    video = mock_client.post.call_args_list[3].kwargs["json"]["object_story_spec"]["video_data"]
+    assert video["title"] == "Book your spot"
+    assert video["call_to_action"]["value"]["app_destination"] == "MESSENGER"
+    assert "ice_breakers" in video["page_welcome_message"]

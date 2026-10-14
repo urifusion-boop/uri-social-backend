@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import subprocess
 import traceback
 from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
@@ -215,7 +216,7 @@ class ContentGenerationRequest(BaseModel):
     # product cutout onto an AI-generated background instead of asking the AI to
     # redraw the product — see ImageContentService._generate_platform_image_composited.
     use_true_compositing: bool = False
-    num_slides: int = 3        # carousel only (2–5)
+    num_slides: int = 3        # carousel only (2–10; 10 is Instagram's carousel limit)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
     style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
@@ -353,6 +354,9 @@ class BrandProfileRequest(BaseModel):
     # Approval
     approval_workflow: Optional[str] = None
     approval_channels: Optional[List[str]] = None
+    # Slack incoming-webhook URL for Playbook notifications (Telegram's chat id
+    # is set only by the bot link flow, never from the client).
+    slack_webhook_url: Optional[str] = None
     notification_events: Optional[List[str]] = None
     notification_channel: Optional[str] = None
     # Team
@@ -548,7 +552,7 @@ async def generate_content(
             brand_context_dict = {**brand_context_dict, **overrides}
 
         post_type = request.post_type or "feed"
-        num_slides = max(2, min(5, request.num_slides or 3))
+        num_slides = max(2, min(10, request.num_slides or 3))
 
         # ── Reference images: normalise to a list, keep old single-image field working ──
         ref_images: List[str] = request.reference_images or (
@@ -597,7 +601,7 @@ async def generate_content(
             from ..services.carousel_generation_service import CarouselGenerationService
             # force_num_slides=True — this is the interactive "Create Post" flow
             # (ContentGeneratorForm.tsx), which always sends a real, deliberate
-            # value (2-5, defaulting to 3 if untouched — see num_slides above).
+            # value (2-10, defaulting to 3 if untouched — see num_slides above).
             # Without this flag, generate()'s own default value (also 3) is
             # indistinguishable from "user explicitly picked 3," so picking 3
             # silently fell through to content-based auto-detection instead —
@@ -704,6 +708,7 @@ async def generate_content(
                     content_preview=preview,
                     platforms=platforms_str,
                     campaign_id=request_id or "",
+                    brand_id=active_brand_id,
                 )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
@@ -807,6 +812,33 @@ async def regenerate_content(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+def _upload_slide_image_indices(
+    num_images: int, num_slides: Any = None, slide_image_map: Any = None
+) -> List[int]:
+    """Which uploaded image (by index) each carousel slide shows.
+
+    Mirrors Create Post: the user picks a slide count (2-10, Instagram's
+    limit) and optionally which image goes on each slide. Unset or invalid
+    entries fall back to cycling the uploads (image 1 -> slide 1, ...).
+    With no slide count given it's one slide per upload, as before.
+    """
+    if num_images <= 0:
+        return []
+    try:
+        count = max(2, min(10, int(num_slides))) if num_slides else num_images
+    except (TypeError, ValueError):
+        count = num_images
+    mapping = slide_image_map if isinstance(slide_image_map, list) else []
+    indices = []
+    for i in range(count):
+        chosen = mapping[i] if i < len(mapping) else None
+        if isinstance(chosen, int) and not isinstance(chosen, bool) and 0 <= chosen < num_images:
+            indices.append(chosen)
+        else:
+            indices.append(i % num_images)
+    return indices
+
+
 @router.post("/upload-user-content")
 async def upload_user_content(
     request: Dict[str, Any],
@@ -836,6 +868,11 @@ async def upload_user_content(
         context_text = request.get("context_text", "")
         platforms = request.get("platforms", [])
         post_type = request.get("post_type", "feed")
+        # Carousel only, same idea as Create Post: how many slides, and which
+        # uploaded image (by index) each slide shows. Both optional — without
+        # them it's one slide per upload, in upload order, as before.
+        requested_num_slides = request.get("num_slides")
+        slide_image_map = request.get("slide_image_map")
 
         # New options: logo and CTA overlays
         add_logo = request.get("add_logo", False)
@@ -1291,9 +1328,12 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                         # needs a per-slide video field added on the frontend too;
                         # out of scope here.
                         slides = []
-                        for i, url in enumerate(urls_for_platform):
+                        for i, img_idx in enumerate(
+                            _upload_slide_image_indices(len(urls_for_platform), requested_num_slides, slide_image_map)
+                        ):
+                            url = urls_for_platform[img_idx]
                             slide = {"headline": "", "body": "", "image_url": url, "image_failed": False}
-                            bg = backgrounds_for_platform[i] if backgrounds_for_platform else None
+                            bg = backgrounds_for_platform[img_idx] if backgrounds_for_platform else None
                             if bg:
                                 slide["background_image_url"] = bg["background_url"]
                                 slide["logo_placement"] = bg["logo_placement"]
@@ -1368,6 +1408,7 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                     content_preview=preview,
                     platforms=platforms_str,
                     campaign_id=request_id or "",
+                    brand_id=active_brand_id,
                 )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
@@ -3717,6 +3758,7 @@ class CalendarGenerateRequest(BaseModel):
 class CalendarCreateDraftRequest(BaseModel):
     platforms: List[str] = ["facebook", "instagram"]
     include_images: bool = False
+    num_slides: Optional[int] = None  # carousel days only: user's slide count (2-10)
 
 
 @router.get("/content-calendar/plan")
@@ -3861,12 +3903,19 @@ async def create_draft_from_calendar_day(
         # image/text post even though the calendar copy describes slides.
         if day.get("format") == "carousel":
             from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
+            # A user-chosen slide count (2-10) is forced; otherwise the
+            # service picks one from the copy, as before.
+            slide_kwargs = (
+                {"num_slides": max(2, min(10, int(request.num_slides))), "force_num_slides": True}
+                if request.num_slides else {}
+            )
             result = await CarouselGenerationService.generate_multi_platform(
                 user_id=user_id,
                 seed_content=seed_content,
                 platforms=request.platforms,
                 brand_context=brand_context,
                 db=db,
+                **slide_kwargs,
             )
         else:
             result = await ContentGenerationService.generate_multi_platform_content(
@@ -5726,6 +5775,298 @@ async def save_brand_profile(
                 for tm in payload["team_members"]
             ]
         return await BrandProfileService.save(user_id, payload, db, brand_id=ctx["brand_id"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/brand-profile/health")
+async def get_playbook_health(
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    How complete the active brand's Playbook is: a weighted score, the most
+    valuable things still missing (and which of Jane's jobs each improves),
+    and the "used in" map shown under each Playbook field.
+    """
+    from ..services import playbook_health
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        return UriResponse.get_single_data_response("playbook_health", playbook_health.assess(profile))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _playbook_profile_filter(profile: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """The exact brand_profiles document a profile came from (older personal
+    profiles carry no brand_id)."""
+    if profile.get("brand_id"):
+        return {"brand_id": profile["brand_id"]}
+    return {"user_id": user_id, "brand_id": {"$exists": False}}
+
+
+@router.get("/brand-profile/suggestions")
+async def get_playbook_suggestions(
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Playbook changes Jane suggests from what the user actually does: how they
+    keep editing her drafts, and when their posts perform best. Each one names
+    its evidence. Nothing changes until one is applied.
+    """
+    from ..services import playbook_learning
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        found = await playbook_learning.suggestions_for(db, ctx["user_id"], ctx["brand_id"], profile) if profile else []
+        public = [{k: s[k] for k in ("id", "title", "evidence", "change")} for s in found]
+        return UriResponse.get_single_data_response("playbook_suggestions", {"suggestions": public})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PlaybookSuggestionAction(BaseModel):
+    id: str
+
+
+@router.post("/brand-profile/suggestions/apply")
+async def apply_playbook_suggestion(
+    request: PlaybookSuggestionAction,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Apply one suggestion. The change is recomputed on the server from the
+    current evidence — the client only says which one — so a stale or made-up
+    id can't write anything."""
+    from ..services import playbook_learning
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=404, detail="Brand Playbook not found")
+    found = await playbook_learning.suggestions_for(db, ctx["user_id"], ctx["brand_id"], profile)
+    match = next((s for s in found if s["id"] == request.id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="That suggestion no longer applies.")
+    update = playbook_learning.build_update(match["apply"], profile)
+    update["updated_at"] = datetime.utcnow()
+    await db["brand_profiles"].update_one(_playbook_profile_filter(profile, ctx["user_id"]), {"$set": update})
+    fresh = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    return UriResponse.get_single_data_response("brand_profile", fresh.get("responseData") or {})
+
+
+@router.post("/brand-profile/suggestions/dismiss")
+async def dismiss_playbook_suggestion(
+    request: PlaybookSuggestionAction,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Hide a suggestion for a couple of months."""
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=404, detail="Brand Playbook not found")
+    if not re.fullmatch(r"[a-z0-9_'-]{1,120}", request.id):
+        raise HTTPException(status_code=400, detail="Invalid suggestion id")
+    dismissed = {**(profile.get("playbook_suggestions_dismissed") or {}), request.id: datetime.utcnow()}
+    await db["brand_profiles"].update_one(
+        _playbook_profile_filter(profile, ctx["user_id"]),
+        {"$set": {"playbook_suggestions_dismissed": dismissed}},
+    )
+    return UriResponse.get_single_data_response("playbook_suggestions", {"dismissed": request.id})
+
+
+class PlaybookInstructRequest(BaseModel):
+    text: str
+    source: Optional[str] = "playbook"   # where the owner said it: playbook | create | drafts
+
+
+class PlaybookUndoRequest(BaseModel):
+    change_id: str
+
+
+async def _active_profile(ctx: dict, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=404, detail="Set up your Brand Playbook first.")
+    return profile
+
+
+@router.post("/brand-profile/instruct")
+async def instruct_playbook(
+    request: PlaybookInstructRequest,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    "Tell Jane": the owner describes what they want in their own words; Jane
+    updates the matching Playbook fields and remembers the rest as standing
+    instructions that every writer follows from then on. Returns what changed
+    (with a change_id that can be undone) and the updated profile.
+    """
+    from ..services import playbook_instructions as pi
+    profile = await _active_profile(ctx, db)
+    source = request.source if request.source in ("playbook", "create", "drafts") else "playbook"
+    try:
+        result = await pi.instruct(db, ctx["user_id"], ctx["brand_id"], profile, request.text, source=source)
+    except pi.InstructError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    fresh = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    return UriResponse.get_single_data_response("playbook_instruct", {
+        **{k: result[k] for k in ("understood", "reply", "changes", "change_id")},
+        "added": [pi.public_instruction(i) for i in result["added"]],
+        "removed": [pi.public_instruction(i) for i in result["removed"]],
+        "profile": fresh.get("responseData") or {},
+    })
+
+
+@router.get("/brand-profile/instructions")
+async def list_playbook_instructions(
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """What Jane is remembering for this brand, and the recent changes made by telling her."""
+    from ..services import playbook_instructions as pi
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    items = [pi.public_instruction(i) for i in (profile.get("playbook_instructions") or []) if isinstance(i, dict)]
+    return UriResponse.get_single_data_response("playbook_instructions", {
+        "instructions": items,
+        "history": await pi.history(db, ctx["user_id"], ctx["brand_id"]),
+    })
+
+
+@router.delete("/brand-profile/instructions/{instruction_id}")
+async def delete_playbook_instruction(
+    instruction_id: str,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Stop following one remembered instruction."""
+    from ..services import playbook_instructions as pi
+    profile = await _active_profile(ctx, db)
+    try:
+        kept = await pi.remove_instruction(db, ctx["user_id"], profile, instruction_id)
+    except pi.InstructError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    return UriResponse.get_single_data_response("playbook_instructions", {
+        "instructions": [pi.public_instruction(i) for i in kept],
+    })
+
+
+@router.post("/brand-profile/instruct/undo")
+async def undo_playbook_instruct(
+    request: PlaybookUndoRequest,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Put back everything one "Tell Jane" update changed (fields edited again since are left alone)."""
+    from ..services import playbook_instructions as pi
+    profile = await _active_profile(ctx, db)
+    try:
+        result = await pi.undo(db, ctx["user_id"], ctx["brand_id"], profile, request.change_id)
+    except pi.InstructError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    fresh = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    return UriResponse.get_single_data_response("playbook_instruct_undo", {
+        **result, "profile": fresh.get("responseData") or {},
+    })
+
+
+PLAYBOOK_PREVIEWS_PER_DAY = 20          # previews actually written
+PLAYBOOK_PREVIEW_ATTEMPTS_PER_DAY = 60  # every request, as a guard against hammering the model
+
+
+class PlaybookPreviewRequest(BaseModel):
+    platform: Optional[str] = "instagram"
+
+
+@router.post("/brand-profile/preview-voice")
+async def preview_playbook_voice(
+    request: PlaybookPreviewRequest,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    "Preview Jane's voice": one sample caption written from the Playbook as
+    it is saved right now, through the same brand instructions real posts
+    get. Nothing is saved as a draft and no credits are used; capped per day.
+    """
+    from app.services.AIService import AIService
+    from ..services import brand_brief
+    from ..services.content_generation_service import ContentGenerationService
+
+    user_id = ctx["user_id"]
+    day_key = f"{user_id}:{datetime.utcnow().strftime('%Y-%m-%d')}"
+    # Only previews that were actually written count toward the daily limit
+    # ("written"). Every click used to count, including ones that failed or
+    # were refused, so the limit ran out without the user seeing 20 previews.
+    usage = await db["playbook_preview_usage"].find_one_and_update(
+        {"_id": day_key}, {"$inc": {"count": 1}, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True, return_document=True,
+    )
+    if (usage or {}).get("written", 0) >= PLAYBOOK_PREVIEWS_PER_DAY \
+            or (usage or {}).get("count", 1) > PLAYBOOK_PREVIEW_ATTEMPTS_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've used today's {PLAYBOOK_PREVIEWS_PER_DAY} voice previews — more tomorrow. "
+                   f"Your Playbook still applies to everything Jane writes.",
+        )
+
+    profile_result = await BrandProfileService.get(user_id, db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=400, detail="Fill in your Brand Playbook first.")
+    bc = BrandProfileService.to_brand_context(profile)
+    platform = (request.platform or "instagram").lower()
+    if platform not in ContentGenerationService.PLATFORM_PROMPTS:
+        platform = "instagram"
+    # The very function real posts are written by — same prompt, same banned-word
+    # check and one auto-fix — so the preview can't look better or worse than a
+    # real post. It writes nothing to the database.
+    result = await ContentGenerationService._generate_platform_content(
+        platform, "Introduce what this business offers and invite people to take the next step.",
+        request_id="playbook_preview", user_id=user_id, brand_context=bc,
+    )
+    if not result.get("status"):
+        raise HTTPException(status_code=503, detail="Jane is busy right now — try again in a minute.")
+    await db["playbook_preview_usage"].update_one({"_id": day_key}, {"$inc": {"written": 1}})
+    generated = result.get("responseData") or {}
+    hashtags = [str(h).lstrip("#") for h in (generated.get("hashtags") or [])]
+    caption = (generated.get("content") or "").strip()
+    if hashtags:
+        caption = f"{caption}\n\n{' '.join('#' + h for h in hashtags)}"
+    return UriResponse.get_single_data_response("playbook_preview", {
+        "caption": caption,
+        "platform": platform,
+        "banned_words_used": brand_brief.violations(caption, bc),
+        "playbook_issues": (generated.get("ai_metadata") or {}).get("playbook_issues") or [],
+    })
+
+
+@router.get("/brand-profile/next-posting-time")
+async def get_next_posting_time(
+    platform: str = "",
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    The brand's next preferred posting time for `platform`, from the Brand
+    Playbook's posting-time preferences in the brand's local timezone. The
+    schedule picker uses it as its default time.
+    """
+    from ..services import posting_preferences
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        when = posting_preferences.next_post_time(profile, platform)
+        return UriResponse.get_single_data_response("next_posting_time", {
+            "scheduled_datetime": when.isoformat() + "Z",
+            "timezone": str(posting_preferences.brand_timezone(profile)),
+            "mode": (profile or {}).get("posting_time_mode") or "ai",
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

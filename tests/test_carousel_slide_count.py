@@ -2,8 +2,9 @@
 Carousel slide-count regression tests.
 
 Confirmed live bug: the interactive "Create Post" carousel flow always sends
-an explicit num_slides (2-5, defaulting to 3 if the user never touches the
-selector — see ContentGeneratorForm.tsx, NUM_SLIDES_OPTIONS = [2,3,4,5]).
+an explicit num_slides (2-10 since customers asked for 8-slide carousels;
+originally 2-5. Defaults to 3 if the user never touches the selector — see
+ContentGeneratorForm.tsx, NUM_SLIDES_OPTIONS).
 generate() couldn't tell "user picked 3" apart from "caller passed no
 opinion" — both look identical since 3 is also the parameter's own default —
 so picking 3 silently fell through to content-based auto-detection instead,
@@ -80,6 +81,37 @@ class TestGenerateRespectsExplicitCount:
             else max(2, min(10, num_slides))
         )
         assert resolved == 2
+
+
+    def test_explicit_eight_with_force_stays_eight(self):
+        """Customer request: 8-slide carousels must not be cut back to 5."""
+        analysis = CarouselGenerationService.analyze_content_type(LIST_SEED)
+        num_slides, force = 8, True
+        resolved = (
+            max(2, min(10, num_slides)) if force
+            else analysis["optimal_slides"] if num_slides == 3
+            else max(2, min(10, num_slides))
+        )
+        assert resolved == 8
+
+
+class TestSlideLimits:
+    def test_create_post_endpoint_allows_up_to_ten_slides(self):
+        """The endpoint used to clamp to 5 (min(5, ...)), which is what stopped
+        customers getting 8 slides. 10 is Instagram's carousel limit."""
+        import inspect
+        from app.agents.social_media_manager.routers import complete_social_manager as mod
+
+        source = inspect.getsource(mod.generate_content)
+        assert "max(2, min(10, request.num_slides or 3))" in source
+        assert "min(5, request.num_slides" not in source
+
+    def test_generation_token_budget_scales_with_slide_count(self):
+        """A fixed 800-token budget can truncate the JSON for 8-10 slides."""
+        import inspect
+
+        source = inspect.getsource(CarouselGenerationService.generate)
+        assert "max_tokens=max(800, 200 + 150 * num_slides)" in source
 
 
 class TestGenerateContentCarouselCallSite:
