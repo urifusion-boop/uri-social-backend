@@ -2329,6 +2329,8 @@ class MetaLaunchFromMessageBody(BaseModel):
     # and the creative is video (TikTok's hard requirement); otherwise an
     # early_return explains why, same shape as every other early_return here.
     preferred_platform: str = ""          # "" | "tiktok" | "google"
+    # Where on Google: search | display | demand_gen (YouTube & Discover) | pmax (everywhere).
+    google_placement: str = ""
 
 
 class _PlanBuildResult(BaseModel):
@@ -2884,6 +2886,8 @@ async def _build_campaign_plan(
     # pick, she quietly uses Instagram/Facebook instead, as she always did.
     wants_google = body.preferred_platform == "google"
     google_budget_warning = ""
+    from .adapters.google_visual import PLACEMENT_LABELS, normalize_placement
+    google_placement = normalize_placement(body.google_placement)
     jane_picked_google = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
     use_google = False
     if wants_google or google_only or (jane_picked_google and google_ready and body.preferred_platform != "tiktok"):
@@ -2892,7 +2896,14 @@ async def _build_campaign_plan(
                     "question": "Google Ads isn't connected yet. Connect it under Connected Accounts → Google Ads "
                                  "(it takes a minute), or drop the Google request and I'll use what's available."}}
         google_plan = apply_platform_override(plan, [Platform.GOOGLE])
-        too_low = google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+        too_low = (google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+                   if google_placement == "search" else None)
+        below_minimum = google_flow.below_placement_minimum(
+            google_placement, google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+        if below_minimum:
+            # Google itself refuses these, so there is nothing to go ahead with.
+            return {"early_return": {"stage": "google_budget_too_low", "understood": parsed.model_dump(),
+                    "question": below_minimum}}
         if too_low and (wants_google or google_only):
             # Asked for Google by name: their call. A small budget still runs
             # (a test, a trial) — Jane says what to expect in the plan instead
@@ -3102,7 +3113,7 @@ async def _build_campaign_plan(
     # user how to source the image (upload their own / pick a past post / let Jane generate).
     # Only when the caller hasn't already chosen ("ask"); a concrete source skips through.
     # (Not for Google: a Search ad is text, so there is no image to choose.)
-    if body.creative_source == "ask" and not use_google:
+    if body.creative_source == "ask" and not (use_google and google_placement == "search"):
         from .creative import list_recent_drafts
         drafts = await list_recent_drafts(user_id, db, brand_id, limit=6) if user_id else []
         return {"early_return": {
@@ -3138,8 +3149,12 @@ async def _build_campaign_plan(
     # read like a Meta feed ad and its image brief still asked for a staged
     # brand photoshoot instead of native, phone-shot-feeling creative.
     creative_platform = plan.platforms[0].platform.value if plan.platforms else Platform.META.value
+    # Display / YouTube & Discover / Everywhere carry a picture, like a feed ad: the
+    # picture and copy are made the feed-ad way. Only Search is text-only.
+    google_visual = creative_platform == Platform.GOOGLE.value and google_placement != "search"
+    copy_platform = Platform.META.value if google_visual else creative_platform
 
-    if creative_platform == Platform.GOOGLE.value:
+    if creative_platform == Platform.GOOGLE.value and not google_visual:
         # A Search ad is text: Jane writes it in the brand's voice and nothing is
         # generated, so no upload is needed and no content credit is spent.
         creative = await search_ad_creative(
@@ -3159,7 +3174,7 @@ async def _build_campaign_plan(
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
             vsg01_format_id=body.vsg01_format_id, day30_photo_url=body.reference_image_url_2 or None,
-            platform=creative_platform,
+            platform=copy_platform,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -3169,7 +3184,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
-            vsg01_format_id=body.vsg01_format_id, platform=creative_platform,
+            vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
@@ -3178,7 +3193,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta, platform=creative_platform,
+            destination_cta=destination_cta, platform=copy_platform,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -3192,7 +3207,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta, platform=creative_platform,
+            destination_cta=destination_cta, platform=copy_platform,
         )
     else:
         # AI generation is the one creative path that costs a content credit — an
@@ -3214,7 +3229,7 @@ async def _build_campaign_plan(
             # Drives creative-stage retrieval; without it budget is 0, retrieval
             # bails early, and the ad ships with corpus_coverage="none".
             budget_ngn=float(parsed.budget_ngn or 0),
-            vsg01_format_id=body.vsg01_format_id, platform=creative_platform,
+            vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -3222,7 +3237,8 @@ async def _build_campaign_plan(
             # ad-specific reason value and adding one is a shared-model change beyond
             # this feature's scope.
             await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
-    if (not creative.headline) if creative_platform == Platform.GOOGLE.value else (not creative.image_url):
+    if (not creative.headline) if (creative_platform == Platform.GOOGLE.value and not google_visual) \
+            else (not creative.image_url):
         # Empty creative almost always means the image/copy model failed (often the
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
@@ -3305,8 +3321,13 @@ async def _build_campaign_plan(
     plan.page_id = page_id
     if creative_platform == Platform.GOOGLE.value:
         # What the keywords are derived from at launch, and where to target.
+        brand_look = await get_brand_context(user_id, db, brand_id) if google_visual else {}
         plan.google_keyword_context = {"category": category or business_name,
                                        "description": req.description, "geo": parsed.city or req.geo or "",
+                                       "placement": google_placement,
+                                       "business_name": business_name,
+                                       "logo_url": brand_look.get("logo_url") or "",
+                                       "brand_color": (brand_look.get("brand_colors") or [""])[0],
                                        # the owner went ahead with a budget below Search's useful level
                                        "low_budget_ok": bool(google_budget_warning)}
     plan.whatsapp_number = wa_number
@@ -4238,6 +4259,7 @@ async def meta_plan_ask(
             reuse_image_url=plan.creative.image_url if plan.creative else "",
             thread_id=doc.get("thread_id", ""),
             preferred_platform=_preferred_platform_for_challenge(plan),
+            google_placement=(plan.google_keyword_context or {}).get("placement", ""),
         )
         rebuilt = await _build_campaign_plan(synthetic_body, brand_ctx, db)
         if isinstance(rebuilt, dict):

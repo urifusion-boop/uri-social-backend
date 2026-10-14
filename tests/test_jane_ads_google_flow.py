@@ -288,3 +288,14 @@ class TestErrorsAnOwnerCanActOn:
                                        "manager_link_refused", "manager_link_declined"])
     def test_connection_problems_say_where_to_fix_them(self, state):
         assert "Connected Accounts → Google Ads" in gf.connection_message(state)
+
+
+class TestPlacementMinimums:
+    def test_youtube_and_discover_below_googles_floor_says_what_works(self):
+        msg = gf.below_placement_minimum("demand_gen", 35000, 7)       # ₦5,000 a day
+        assert "₦8,000 a day" in msg and "₦56,000" in msg and "4 days" in msg
+
+    def test_enough_or_no_floor(self):
+        assert gf.below_placement_minimum("demand_gen", 70000, 7) is None
+        assert gf.below_placement_minimum("display", 7000, 7) is None
+        assert gf.below_placement_minimum("search", 7000, 7) is None

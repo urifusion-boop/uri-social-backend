@@ -226,6 +226,27 @@ def serving_note(summary: dict) -> str:
     return ""
 
 
+# Google's own per-day floors (it refuses to create below them). YouTube &
+# Discover: US$5 a day, confirmed live — ₦8,000 covers it at our exchange rate.
+_PLACEMENT_MIN_DAILY_NGN = {"demand_gen": 8_000.0}
+
+
+def below_placement_minimum(placement: str, budget_ngn: float, days: int) -> Optional[str]:
+    """Why Google won't accept this budget for this placement, or None."""
+    floor = _PLACEMENT_MIN_DAILY_NGN.get(placement)
+    if not floor:
+        return None
+    days = max(int(days or 1), 1)
+    daily = float(budget_ngn or 0) / days
+    if daily >= floor:
+        return None
+    from .adapters.google_visual import PLACEMENT_LABELS
+    return (f"{PLACEMENT_LABELS[placement]} needs at least ₦{floor:,.0f} a day — Google won't run it for less. "
+            f"₦{budget_ngn:,.0f} over {days} day{'s' if days != 1 else ''} is ₦{daily:,.0f} a day. Raise the budget "
+            f"to ₦{floor * days:,.0f}, run it for {max(int(budget_ngn // floor), 1)} day"
+            f"{'s' if int(budget_ngn // floor) != 1 else ''}, or pick another Google placement.")
+
+
 def budget_too_low_warning(budget_ngn: float, days: int) -> str:
     """The same point as budget_too_low, for when the owner goes ahead anyway:
     what to expect, not a refusal."""
