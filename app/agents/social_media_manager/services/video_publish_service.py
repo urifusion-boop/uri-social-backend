@@ -215,16 +215,34 @@ class VideoPublishService:
         # TikTok pulls from Outstand's (already-verified) domain instead.
         outstand_media_url = await outstand.upload_media_from_url(video_url)
 
-        # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
-        # 2026-08-17, so TikTok now allows a privacy level other than SELF_ONLY.
-        # Before the audit, TikTok's API hard-rejects anything but SELF_ONLY for
-        # an unaudited app; that's what SELF_ONLY here was working around.
-        result = await outstand.publish_post(
-            outstand_account_ids=[outstand_account_id],
-            content=caption,
-            media_urls=[outstand_media_url],
-            platform_config={"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}},
-        )
+        # PUBLIC_TO_EVERYONE was believed correct per an earlier note claiming
+        # the app's Content Posting API audit passed 2026-08-17 — live-confirmed
+        # WRONG 2026-10-14 (same root cause as the identical fix in
+        # approval_workflow_service.py): a real post was rejected with TikTok's
+        # own "unaudited_client_can_only_post_to_private_accounts". Still tried
+        # first since it's correct once/if the app does pass audit; retry once
+        # with SELF_ONLY (TikTok's own suggested fix) on exactly that rejection
+        # so an unaudited app still gets a real, confirmable (if private) post
+        # instead of a hard failure.
+        tiktok_config = {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
+        try:
+            result = await outstand.publish_post(
+                outstand_account_ids=[outstand_account_id],
+                content=caption,
+                media_urls=[outstand_media_url],
+                platform_config={"tiktok": tiktok_config},
+            )
+        except Exception as publish_err:
+            err_str = str(publish_err)
+            if not ("privacy" in err_str.lower() or "unaudited" in err_str.lower() or "audit" in err_str.lower()):
+                raise
+            print(f"⚠️ TikTok video publish failed on privacyLevel/audit ({err_str}) — retrying as SELF_ONLY")
+            result = await outstand.publish_post(
+                outstand_account_ids=[outstand_account_id],
+                content=caption,
+                media_urls=[outstand_media_url],
+                platform_config={"tiktok": {**tiktok_config, "privacyLevel": "SELF_ONLY"}},
+            )
         post_obj = result.get("post") or result.get("data") or {}
         if isinstance(post_obj, list):
             post_obj = post_obj[0] if post_obj else {}
@@ -239,11 +257,20 @@ class VideoPublishService:
             post = post_data.get("post") or post_data.get("data") or {}
             if isinstance(post, list):
                 post = post[0] if post else {}
-            if post.get("status") == "failed":
-                raise ValueError(f"TikTok publish failed via Outstand: {post}")
             if post.get("publishedAt") and not post.get("isDraft"):
                 post_url = post.get("url") or post.get("permalink") or post_url
                 break
+            # The failure reason lives per-account, not on the post itself —
+            # live-confirmed via Outstand's own dashboard: socialAccounts[].status
+            # == "failed" with socialAccounts[].error holding the real detail.
+            # There is no top-level post.status to check (the previous version
+            # of this check looked for one and never matched).
+            failed_acct = next(
+                (a for a in (post.get("socialAccounts") or []) if a.get("status") == "failed"),
+                None,
+            )
+            if failed_acct:
+                raise ValueError(f"TikTok publish failed via Outstand: {failed_acct.get('error') or post}")
             await asyncio.sleep(_OUTSTAND_POLL_INTERVAL)
         else:
             raise TimeoutError("TikTok publish via Outstand timed out")

@@ -1907,9 +1907,15 @@ class ApprovalWorkflowService:
                         ]
                     media_urls = [await outstand.upload_media_from_url(u) for u in media_urls]
                     # DIRECT_POST so it goes live instead of sitting as an inbox draft.
-                    # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
-                    # 2026-08-17; before that, TikTok's API only accepted SELF_ONLY for
-                    # an unaudited app (see the identical fix in video_publish_service.py).
+                    # PUBLIC_TO_EVERYONE was believed correct per an earlier note claiming
+                    # the app's Content Posting API audit passed 2026-08-17 — live-confirmed
+                    # WRONG 2026-10-14: a real post was rejected with TikTok's own
+                    # "unaudited_client_can_only_post_to_private_accounts", meaning this
+                    # app has NOT passed that audit (or didn't at the time of that post).
+                    # Still tried as the first attempt since it's correct once/if the app
+                    # does pass audit — the except block below falls back to SELF_ONLY on
+                    # exactly this rejection, so a currently-unaudited app still gets a
+                    # real (if private) post instead of a hard failure.
                     tiktok_config = {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
                     # Music PRD (MUS-PRD-01) §2.2/§8, resolved: TikTok's Content Posting
                     # API has NO track-selection field for photo/carousel posts (verified
@@ -1934,37 +1940,35 @@ class ApprovalWorkflowService:
                         platform_config=platform_config,
                     )
                 except Exception as publish_err:
-                    # TikTok's privacyLevel "must come from the creator_info
-                    # privacy_level_options" for that specific account
-                    # (Outstand's own "Create a post" docs) — we hardcode
-                    # PUBLIC_TO_EVERYONE above with no way to check that in
-                    # advance (no per-account creator-info lookup exposed to
-                    # us for Outstand-connected accounts). Live-confirmed
-                    # 2026-10-14: a different TikTok account than the one
-                    # that's posted fine before rejected the request outright
-                    # with a 400. Retry once as MEDIA_UPLOAD instead of
-                    # failing hard — privacyLevel is ignored for that mode
-                    # (the creator picks visibility directly in the TikTok
-                    # app), sidestepping the mismatch entirely rather than
-                    # needing to know in advance which levels this account
-                    # allows. Worse UX (lands as a draft in the creator's
-                    # TikTok inbox, not live immediately) but far better than
-                    # a hard failure — and the existing publishedAt-polling
-                    # below already handles "never manually finished" honestly.
+                    # PUBLIC_TO_EVERYONE can fail two different ways, and we
+                    # can't know in advance which applies to a given account:
+                    # (a) privacyLevel "must come from the creator_info
+                    # privacy_level_options" for that account (Outstand's own
+                    # "Create a post" docs) — no per-account lookup exposed to
+                    # us for Outstand-connected accounts to check beforehand; or
+                    # (b) the TikTok app itself hasn't passed Content Posting
+                    # API audit, which TikTok reports as its own distinct error
+                    # — live-confirmed 2026-10-14: a real post rejected with
+                    # "unaudited_client_can_only_post_to_private_accounts",
+                    # TikTok's own suggested fix being privacyLevel SELF_ONLY.
+                    # Both land in the same place: retry once with SELF_ONLY,
+                    # keeping DIRECT_POST (not switching to MEDIA_UPLOAD) so the
+                    # post still actually goes live — privately — and the
+                    # existing publishedAt-polling below can still genuinely
+                    # confirm it, rather than MEDIA_UPLOAD's "parked in the
+                    # creator's TikTok inbox, publishedAt may never arrive."
                     err_str = str(publish_err)
                     is_tiktok_privacy_issue = (
                         platform == "tiktok"
                         and platform_config
                         and "tiktok" in platform_config
                         and platform_config["tiktok"].get("postMode") == "DIRECT_POST"
-                        and ("privacy" in err_str.lower())
+                        and ("privacy" in err_str.lower() or "unaudited" in err_str.lower() or "audit" in err_str.lower())
                     )
                     if not is_tiktok_privacy_issue:
                         raise
-                    print(f"⚠️ TikTok publish failed on privacyLevel ({err_str}) — retrying as MEDIA_UPLOAD")
-                    retry_config = {**platform_config["tiktok"]}
-                    retry_config.pop("privacyLevel", None)
-                    retry_config["postMode"] = "MEDIA_UPLOAD"
+                    print(f"⚠️ TikTok publish failed on privacyLevel/audit ({err_str}) — retrying as SELF_ONLY")
+                    retry_config = {**platform_config["tiktok"], "privacyLevel": "SELF_ONLY"}
                     result = await outstand.publish_post(
                         outstand_account_ids=[connection["outstand_account_id"]],
                         content=content,
