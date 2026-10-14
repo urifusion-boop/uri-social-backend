@@ -4392,6 +4392,10 @@ async def meta_campaigns(
             ),
             "metrics": None,
         }
+        if is_google:
+            row["placement"] = r.get("placement") or "search"
+            # the plan's picture, so a Display / YouTube ad's card shows it
+            row["image_url"] = row["image_url"] or r.get("image_url", "")
         if is_google and r.get("detached_at"):
             row["status"] = "not managed by uri"
             row["detached"] = True
