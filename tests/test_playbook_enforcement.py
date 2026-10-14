@@ -546,3 +546,26 @@ class TestCarouselIsCheckedToo:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestFormalPlatformsStayInTheMainLanguage:
+    BC = {"languages": ["English", "Pidgin"], "same_tone_everywhere": False,
+          "platform_tones": {"linkedin": "formal and analytical, no slang", "instagram": "playful"}}
+
+    def test_a_formal_platform_drops_the_mixed_in_language(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.for_platform(self.BC, "linkedin")["languages"] == ["English"]
+        assert bb.languages_rule(bb.for_platform(self.BC, "linkedin")) is None
+        assert bb.missing_languages("A plain English post.", bb.for_platform(self.BC, "linkedin")) == []
+
+    def test_other_platforms_keep_the_mix(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.for_platform(self.BC, "instagram")["languages"] == ["English", "Pidgin"]
+        assert bb.for_platform({**self.BC, "same_tone_everywhere": True}, "linkedin")["languages"] == ["English", "Pidgin"]
+
+    def test_the_linkedin_prompt_has_no_pidgin_rule(self):
+        from app.agents.social_media_manager.services.content_generation_service import ContentGenerationService
+        prompt = ContentGenerationService.build_caption_prompt("Our launch", "linkedin", {"brand_name": "Acme", **self.BC})
+        assert "Pidgin" not in prompt
+        ig = ContentGenerationService.build_caption_prompt("Our launch", "instagram", {"brand_name": "Acme", **self.BC})
+        assert "Pidgin" in ig
