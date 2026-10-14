@@ -1912,14 +1912,55 @@ class ApprovalWorkflowService:
                     platform_config = {"tiktok": tiktok_config}
 
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
-                result = await outstand.publish_post(
-                    outstand_account_ids=[connection["outstand_account_id"]],
-                    content=content,
-                    scheduled_at=scheduled_at,
-                    media_urls=media_urls,
-                    tweets=tweets,
-                    platform_config=platform_config,
-                )
+                try:
+                    result = await outstand.publish_post(
+                        outstand_account_ids=[connection["outstand_account_id"]],
+                        content=content,
+                        scheduled_at=scheduled_at,
+                        media_urls=media_urls,
+                        tweets=tweets,
+                        platform_config=platform_config,
+                    )
+                except Exception as publish_err:
+                    # TikTok's privacyLevel "must come from the creator_info
+                    # privacy_level_options" for that specific account
+                    # (Outstand's own "Create a post" docs) — we hardcode
+                    # PUBLIC_TO_EVERYONE above with no way to check that in
+                    # advance (no per-account creator-info lookup exposed to
+                    # us for Outstand-connected accounts). Live-confirmed
+                    # 2026-10-14: a different TikTok account than the one
+                    # that's posted fine before rejected the request outright
+                    # with a 400. Retry once as MEDIA_UPLOAD instead of
+                    # failing hard — privacyLevel is ignored for that mode
+                    # (the creator picks visibility directly in the TikTok
+                    # app), sidestepping the mismatch entirely rather than
+                    # needing to know in advance which levels this account
+                    # allows. Worse UX (lands as a draft in the creator's
+                    # TikTok inbox, not live immediately) but far better than
+                    # a hard failure — and the existing publishedAt-polling
+                    # below already handles "never manually finished" honestly.
+                    err_str = str(publish_err)
+                    is_tiktok_privacy_issue = (
+                        platform == "tiktok"
+                        and platform_config
+                        and "tiktok" in platform_config
+                        and platform_config["tiktok"].get("postMode") == "DIRECT_POST"
+                        and ("privacy" in err_str.lower())
+                    )
+                    if not is_tiktok_privacy_issue:
+                        raise
+                    print(f"⚠️ TikTok publish failed on privacyLevel ({err_str}) — retrying as MEDIA_UPLOAD")
+                    retry_config = {**platform_config["tiktok"]}
+                    retry_config.pop("privacyLevel", None)
+                    retry_config["postMode"] = "MEDIA_UPLOAD"
+                    result = await outstand.publish_post(
+                        outstand_account_ids=[connection["outstand_account_id"]],
+                        content=content,
+                        scheduled_at=scheduled_at,
+                        media_urls=media_urls,
+                        tweets=tweets,
+                        platform_config={"tiktok": retry_config},
+                    )
                 print(f"📬 Outstand publish response: {result}")
 
                 # Outstand returns {"data": {"id": "...", "status": "queued|processing|published|failed"}}

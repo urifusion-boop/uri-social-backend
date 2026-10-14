@@ -268,5 +268,19 @@ class OutstandService:
                 json=payload,
             )
             print(f"📡 Outstand response status: {resp.status_code} body: {resp.text[:2000]}")
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # resp.raise_for_status() raises httpx.HTTPStatusError whose
+                # str() is just "400 Bad Request for url ..." — the actual
+                # reason (in resp.text, already printed above) never reached
+                # the caller's error message, confirmed live 2026-10-14: a
+                # real 400 surfaced to the user as nothing more than "Client
+                # error '400 Bad Request'", useless for diagnosing why.
+                # Raising with the body included here means every caller's
+                # existing `except Exception as e: ...str(e)...` handling
+                # gets the real reason for free, no call-site changes needed.
+                raise httpx.HTTPStatusError(
+                    f"{resp.status_code} {resp.reason_phrase} for url {resp.url}: {resp.text[:1000]}",
+                    request=resp.request,
+                    response=resp,
+                )
             return resp.json()
