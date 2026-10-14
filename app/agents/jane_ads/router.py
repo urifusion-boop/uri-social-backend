@@ -1751,7 +1751,13 @@ async def jane_google_ads_connection_status(
     # fallback if it turns out not to be eligible after all.
     admin_conn = await get_admin_connection(db)
     can_create_account = (admin_conn or {}).get("mcc_can_create_accounts")
+    # URI pays Google: ads run in one of URI's own Google Ads accounts, so the
+    # brand has nothing to connect. These say whether that's ready for them.
+    from .google_uri_accounts import available as uri_available, brand_account as uri_brand_account
+    uri_account = await uri_brand_account(db, brand_ctx.get("brand_id"))
     return {
+        "uri_managed": await uri_available(db, brand_ctx.get("brand_id")),
+        "uri_account_assigned": bool(uri_account),
         "state": state.value,
         "account_name": (conn or {}).get("account_name", ""),
         "customer_id": (conn or {}).get("customer_id", ""),
@@ -1875,6 +1881,42 @@ async def admin_wallet_credit(
         "credited_by": actor,
         "note": body.note,
     }
+
+
+class AdminGoogleAccountBody(BaseModel):
+    customer_id: str                       # 123-456-7890, under URI's manager account
+
+
+@router.get("/admin/google/uri-accounts")
+async def admin_google_uri_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """URI's own Google Ads accounts and which brand each one serves."""
+    _require_ads_admin(token)
+    from .google_uri_accounts import list_accounts
+    accounts = await list_accounts(db)
+    return {"accounts": accounts, "free": sum(1 for a in accounts if not a.get("brand_id") and a.get("billing_ready"))}
+
+
+@router.post("/admin/google/uri-accounts")
+async def admin_add_google_uri_account(
+    body: AdminGoogleAccountBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Add one of URI's own Google Ads accounts (under URI's manager account,
+    paid by URI) so brands can run Google ads in it. Checked with Google first."""
+    _require_ads_admin(token)
+    from .google_uri_accounts import UriAccountError, add_account
+    from .google_flow import friendly_error
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    try:
+        return {"account": await add_account(db, body.customer_id, actor)}
+    except UriAccountError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=friendly_error(e))
 
 
 @router.get("/admin/billing-summary")
@@ -2893,8 +2935,7 @@ async def _build_campaign_plan(
     if wants_google or google_only or (jane_picked_google and google_ready and body.preferred_platform != "tiktok"):
         if not google_ready:
             return {"early_return": {"stage": "google_not_connected", "understood": parsed.model_dump(),
-                    "question": "Google Ads isn't connected yet. Connect it under Connected Accounts → Google Ads "
-                                 "(it takes a minute), or drop the Google request and I'll use what's available."}}
+                    "question": google_flow.NOT_AVAILABLE}}
         google_plan = apply_platform_override(plan, [Platform.GOOGLE])
         too_low = (google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
                    if google_placement == "search" else None)
