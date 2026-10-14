@@ -160,16 +160,23 @@ async def launch_connection(db, brand_id: str) -> dict:
 
 # ── Creating accounts and paying for them automatically ─────────────────────
 
-async def billing_options(db) -> list[dict]:
+async def billing_options(db, customer_id: str = "") -> list[dict]:
     """The payments accounts URI's manager account can attach to a new account
     by software. Google lists these only for monthly invoicing (consolidated
     billing); with card billing the list is empty and the card has to be added
     to each account by hand in Google Ads."""
     from .adapters.google import _raise_for_error
 
-    mcc = _digits(settings.GOOGLE_ADS_MCC_CUSTOMER_ID)
+    # Google answers this per ordinary (serving) account, never for the manager
+    # account itself. Any of URI's accounts will do; the list is the manager's.
+    if not customer_id:
+        first = await db[COLLECTION].find_one({}, {"_id": 0, "customer_id": 1})
+        customer_id = (first or {}).get("customer_id", "")
+    if not customer_id:
+        raise UriAccountError("Add one URI account first — Google answers this per account.")
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(f"{_api_base()}/customers/{mcc}/paymentsAccounts", headers=await _admin_headers(db))
+        resp = await client.get(f"{_api_base()}/customers/{_digits(customer_id)}/paymentsAccounts",
+                                headers=await _admin_headers(db))
     data = resp.json()
     _raise_for_error(data, "payments accounts lookup")
     return [
@@ -209,7 +216,7 @@ async def create_account(db, name: str, created_by: str) -> dict:
 
     billing_attached = False
     try:
-        options = [o for o in await billing_options(db) if o["currency_code"] in ("NGN", "")]
+        options = [o for o in await billing_options(db, customer_id) if o["currency_code"] in ("NGN", "")]
         if options:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
