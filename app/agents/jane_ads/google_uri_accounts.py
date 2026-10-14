@@ -156,3 +156,78 @@ async def launch_connection(db, brand_id: str) -> dict:
         "whatsapp_number": await get_brand_whatsapp(db, brand_id) or "",
         "uri_managed": True,
     }
+
+
+# ── Creating accounts and paying for them automatically ─────────────────────
+
+async def billing_options(db) -> list[dict]:
+    """The payments accounts URI's manager account can attach to a new account
+    by software. Google lists these only for monthly invoicing (consolidated
+    billing); with card billing the list is empty and the card has to be added
+    to each account by hand in Google Ads."""
+    from .adapters.google import _raise_for_error
+
+    mcc = _digits(settings.GOOGLE_ADS_MCC_CUSTOMER_ID)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{_api_base()}/customers/{mcc}/paymentsAccounts", headers=await _admin_headers(db))
+    data = resp.json()
+    _raise_for_error(data, "payments accounts lookup")
+    return [
+        {"resource_name": a.get("resourceName", ""), "name": a.get("name", ""),
+         "currency_code": a.get("currencyCode", ""), "payments_account_id": a.get("paymentsAccountId", "")}
+        for a in data.get("paymentsAccounts", [])
+    ]
+
+
+async def create_account(db, name: str, created_by: str) -> dict:
+    """Create a blank NGN Google Ads account under URI's manager account and
+    add it to URI's accounts. It can't show ads until it has a payment method:
+    attached here when Google offers one (monthly invoicing), otherwise it waits
+    for staff to add URI's card in Google Ads (billing_ready False until then)."""
+    from .adapters.google import _raise_for_error
+    from .google_ads_connection import _is_ineligible_mcc_error, set_mcc_creation_eligibility
+    import json
+
+    mcc = _digits(settings.GOOGLE_ADS_MCC_CUSTOMER_ID)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{_api_base()}/customers/{mcc}:createCustomerClient",
+            headers=await _admin_headers(db),
+            json={"customerClient": {"descriptiveName": name, "currencyCode": "NGN", "timeZone": "Africa/Lagos"}},
+        )
+    data = resp.json()
+    if "error" in data and _is_ineligible_mcc_error(json.dumps(data.get("error", {}))):
+        await set_mcc_creation_eligibility(db, False, "Google won't let URI's manager account create accounts yet.")
+        raise UriAccountError(
+            "Google won't let URI's manager account create new accounts automatically yet — it needs more "
+            "ad-spend history. Create the account in Google Ads (Accounts → + → Create new account) and add it here.")
+    _raise_for_error(data, "account creation")
+    await set_mcc_creation_eligibility(db, True)
+    customer_id = (data.get("resourceName") or "").split("/")[-1]
+
+    billing_attached = False
+    try:
+        options = [o for o in await billing_options(db) if o["currency_code"] in ("NGN", "")]
+        if options:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{_api_base()}/customers/{customer_id}/billingSetups:mutate",
+                    headers=await _admin_headers(db),
+                    json={"operation": {"create": {"paymentsAccount": options[0]["resource_name"],
+                                                   "startTimeType": "NOW"}}},
+                )
+            _raise_for_error(resp.json(), "billing setup")
+            billing_attached = True
+    except Exception as e:
+        print(f"[google_uri_accounts] couldn't attach billing to {customer_id}: {e}", flush=True)
+
+    now = datetime.now(timezone.utc)
+    await db[COLLECTION].update_one(
+        {"customer_id": customer_id},
+        {"$set": {"customer_id": customer_id, "name": name, "currency_code": "NGN",
+                  "billing_ready": billing_attached, "created_by_uri": True, "added_by": created_by,
+                  "checked_at": now},
+         "$setOnInsert": {"brand_id": None, "added_at": now}},
+        upsert=True,
+    )
+    return {"customer_id": customer_id, "name": name, "billing_ready": billing_attached}
