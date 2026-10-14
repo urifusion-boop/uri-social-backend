@@ -175,9 +175,16 @@ def for_platform(bc: Optional[Dict[str, Any]], platform: str = "") -> Optional[D
     if len(langs) < 2 or bc.get("same_tone_everywhere", True) is not False:
         return bc
     tone = str((bc.get("platform_tones") or {}).get(platform.lower()) or "").lower()
-    if tone and any(word in tone for word in _FORMAL_TONE):
-        return {**bc, "languages": [langs[0]]}
-    return bc
+    if not (tone and any(word in tone for word in _FORMAL_TONE)):
+        return bc
+    # The owner's standing instructions about the dropped languages ("mix in a
+    # little Pidgin") would contradict the platform's tone the same way — unless
+    # the owner named this platform in it, which is then their explicit choice.
+    dropped = [lang.lower() for lang in langs[1:]]
+    kept = [i for i in bc.get("playbook_instructions") or []
+            if not (isinstance(i, dict) and platform.lower() not in (i.get("platforms") or [])
+                    and any(lang in str(i.get("text", "")).lower() for lang in dropped))]
+    return {**bc, "languages": [langs[0]], "playbook_instructions": kept}
 
 
 def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
