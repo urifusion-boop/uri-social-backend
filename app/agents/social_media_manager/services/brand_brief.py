@@ -498,6 +498,43 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
         if cta[-1:] not in ".!?":
             cta += "."
         out = f"{out.rstrip()}\n\n{cta}"
+    elif append_cta and out.strip():
+        out = cta_last(out, bc)
+    return out
+
+
+def cta_last(text: str, bc: Optional[Dict[str, Any]]) -> str:
+    """The call-to-action line closes the piece. Writers often add one more
+    line after it ("DM us to start." then "Don't forget our free trial!") when
+    the owner asked to END with it; this moves the CTA's line to the end, above
+    any closing hashtags. Only a short line is moved: a CTA inside a long
+    paragraph stays where it is."""
+    wanted = [_norm(c) for c in ctas(bc) if _norm(c)]
+    if not wanted:
+        return text
+    lines = text.rstrip().split("\n")
+    tail: List[str] = []
+    while lines and (not lines[-1].strip() or lines[-1].strip().startswith("#")):
+        tail.insert(0, lines.pop())
+    body = [i for i, line in enumerate(lines) if line.strip()]
+    if not body:
+        return text
+    if any(c in _norm(lines[body[-1]]) for c in wanted):
+        return text
+    hit = next((i for i in reversed(body)
+                if any(c in _norm(lines[i]) for c in wanted) and len(lines[i].split()) <= 25), None)
+    if hit is None:
+        return text
+    cta_line = lines.pop(hit)
+    # Don't leave two blank lines where the CTA was.
+    if 0 < hit < len(lines) and not lines[hit].strip() and not lines[hit - 1].strip():
+        lines.pop(hit)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    out = "\n".join(lines + ["", cta_line])
+    tags = [t for t in tail if t.strip()]
+    if tags:
+        out += "\n\n" + "\n".join(tags)
     return out
 
 
