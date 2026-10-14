@@ -588,3 +588,32 @@ class TestFormalPlatformsStayInTheMainLanguage:
         kept = [i["id"] for i in bb.for_platform(bc, "linkedin")["playbook_instructions"]]
         assert kept == ["b", "c"]
         assert [i["id"] for i in bb.for_platform(bc, "instagram")["playbook_instructions"]] == ["a", "b", "c"]
+
+
+class TestAPlatformsOwnCallToAction:
+    def ins(self, text, platforms):
+        return {"id": "i", "text": text, "applies_to": ["posts"], "platforms": platforms}
+
+    @pytest.mark.parametrize("text", [
+        "Always end Instagram posts with 'DM us to start'.",
+        "End Instagram posts with: DM us to start",
+        "End Instagram posts with “DM us to start”",
+    ])
+    def test_read_from_the_owners_instruction(self, text):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.platform_cta({"playbook_instructions": [self.ins(text, ["instagram"])]}, "instagram") == "DM us to start"
+
+    def test_replaces_the_general_one_on_that_platform_only(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        bc = {"cta_styles": ["Book a free demo"],
+              "playbook_instructions": [self.ins("Always end Instagram posts with 'DM us to start'.", ["instagram"])]}
+        ig = bb.for_platform(bc, "instagram")
+        assert bb.ctas(ig) == ["DM us to start"]
+        assert bb.ctas(bb.for_platform(bc, "linkedin")) == ["Book a free demo"]
+        # The ending step no longer adds the general one after the platform's own.
+        text = "Great tools for busy owners.\n\nDM us to start your free trial!"
+        assert bb.enforce(text, ig) == text
+
+    def test_an_instruction_without_a_platform_is_not_a_platform_cta(self):
+        from app.agents.social_media_manager.services import brand_brief as bb
+        assert bb.platform_cta({"playbook_instructions": [self.ins("End posts with 'Order now'", [])]}, "instagram") == ""
