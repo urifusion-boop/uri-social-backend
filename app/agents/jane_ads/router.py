@@ -2086,6 +2086,9 @@ class GoogleTestLaunchBody(BaseModel):
     days: int = Field(7, gt=0)
     headline: str = ""            # optional; keywords fill the rest
     primary_text: str = ""
+    placement: str = "search"     # search | display | demand_gen | pmax
+    image_url: str = ""           # the picture, for the visual placements
+    logo_url: str = ""
 
 
 @router.post("/google/test-launch")
@@ -2121,8 +2124,8 @@ async def google_test_launch(
 
     business_id = f"google_test_{uuid.uuid4().hex[:8]}"
     creative = None
-    if body.headline.strip():
-        creative = AdCreative(image_url="", headline=body.headline.strip(),
+    if body.headline.strip() or body.image_url:
+        creative = AdCreative(image_url=body.image_url, headline=body.headline.strip(),
                               primary_text=body.primary_text.strip() or body.headline.strip())
     plan = CampaignPlan(
         business_id=business_id,
@@ -2137,7 +2140,9 @@ async def google_test_launch(
         whatsapp_number=conn["whatsapp_number"],
         creative=creative,
         google_keyword_context={"category": body.category or body.business_name,
-                                "description": body.description, "geo": body.geo},
+                                "description": body.description, "geo": body.geo,
+                                "placement": body.placement, "business_name": body.business_name,
+                                "logo_url": body.logo_url},
         explanation=f"Real Google Ads test launch for {body.business_name}",
     )
     auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn,
