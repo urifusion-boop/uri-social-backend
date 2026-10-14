@@ -191,7 +191,9 @@ not_a_preference = "vague" and ask one short, specific question with two or thre
 appear in "changes" (as the field named in handled_by) or in "remember". "Keep captions short" is a clause and \
 must produce voice_profile.caption_length "short" even if that might already be the case.
 8. Call to action: "always end with X", "our CTA is X", "use X as the call to action" → cta_styles op "set" \
-to [X] (posts rotate through the list, so anything else stays in the rotation); "also use X" → op "add".
+to [X] (posts rotate through the list, so anything else stays in the rotation); "also use X" → op "add". \
+cta_styles applies to EVERY platform: when the owner names one platform ("end Instagram posts with X"), do NOT \
+touch cta_styles — put it in "remember" with that platform in "platforms".
 9. reply: describe ONLY what is in changes, remember and forget — never claim something you did not change. \
 Talk to the owner ("Done — captions will be short, …"). Mention anything significant, e.g. that \
 Auto-tab posts will now publish without review.
@@ -322,6 +324,47 @@ def _display(key: str, value: Any) -> str:
 
 
 # ── Turning the model's proposal into a safe update ──────────────────────────
+
+_PLATFORM_WORDS = {
+    "instagram": ("instagram", " ig "), "facebook": ("facebook", " fb "), "linkedin": ("linkedin",),
+    # X only when clearly the platform ("on X", "X posts"), never a stray letter.
+    "twitter": ("twitter", " on x ", " for x ", " x posts ", " x post ", " to x "),
+    "tiktok": ("tiktok",), "pinterest": ("pinterest",), "youtube": ("youtube",),
+}
+
+
+def platforms_named(text: str) -> List[str]:
+    """Platforms the owner names in their message."""
+    t = f" {re.sub(r'[^a-z0-9]+', ' ', (text or '').lower())} "
+    return [p for p, words in _PLATFORM_WORDS.items() if any(w in t for w in words)]
+
+
+def scope_platform_ctas(proposal: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """cta_styles applies to every platform. A call to action the owner asked
+    for on named platforms only ("end Instagram posts with X") becomes a
+    standing instruction for those platforms instead of changing it everywhere."""
+    named = platforms_named(text)
+    if not named:
+        return proposal
+    changes, remember = [], list(proposal.get("remember") or [])
+    for ch in proposal.get("changes") or []:
+        if isinstance(ch, dict) and ch.get("field") == "cta_styles" and str(ch.get("op", "set")).lower() != "remove":
+            values = ch.get("value") if isinstance(ch.get("value"), list) else [ch.get("value")]
+            for v in values:
+                v = _clean_text(v, 200)
+                if v:
+                    remember.append({"text": f"End {', '.join(p.title() for p in named)} posts with: {v}",
+                                     "applies_to": ["posts"], "platforms": named})
+            continue
+        changes.append(ch)
+    return {**proposal, "changes": changes, "remember": remember}
+
+
+# More than this many fields emptied by one message is treated as a mistake:
+# a casual "clear everything" must never wipe a Playbook in one go.
+MAX_CLEARED_AT_ONCE = 3
+_EMPTY_SHOWN = ("—", "", "None", "none")
+
 
 def plan_update(proposal: Dict[str, Any], profile: Dict[str, Any], now: Optional[datetime] = None
                 ) -> Dict[str, Any]:
@@ -468,7 +511,16 @@ async def instruct(db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[st
             reply = _HOW_TO
         return {"understood": False, "reply": reply, "changes": [], "added": [], "removed": [], "change_id": None}
 
+    proposal = scope_platform_ctas(proposal, text)
     plan = plan_update(proposal, profile)
+    cleared = [c for c in plan["changes"] if c["after"] in _EMPTY_SHOWN and c["before"] not in _EMPTY_SHOWN]
+    if len(cleared) > MAX_CLEARED_AT_ONCE:
+        names = ", ".join(c["label"] for c in cleared[:5]) + (" and more" if len(cleared) > 5 else "")
+        print(f"[PlaybookInstruct] refused to clear {len(cleared)} fields at once: {[c['field'] for c in cleared]}")
+        return {"understood": False, "changes": [], "added": [], "removed": [], "change_id": None,
+                "reply": (f"That would clear {len(cleared)} parts of your Playbook ({names}), so I haven't changed "
+                          "anything. Tell me the specific parts to clear — for example \"remove our tagline\" — "
+                          "or edit them in the Playbook below.")}
     print(f"[PlaybookInstruct] clauses={json.dumps(proposal.get('clauses'), ensure_ascii=False)[:600]} "
           f"applied={[c['field'] for c in plan['changes']]} added={len(plan['added'])} removed={len(plan['removed'])}")
     if not plan["set"]:
