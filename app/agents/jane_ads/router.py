@@ -1594,6 +1594,32 @@ async def jane_google_ads_signin_select(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+class GoogleModeBody(BaseModel):
+    mode: str            # "uri" | "own"
+
+
+@router.post("/google/mode")
+async def jane_google_ads_mode(
+    body: GoogleModeBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Choose how this brand's Google ads run: in URI's account (nothing to
+    connect, the wallet pays everything) or in the brand's own Google Ads account
+    (Google bills them for the ad spend, the wallet pays URI's fee). Campaigns
+    already running stay where they are."""
+    from . import google_flow
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="Pick a brand first.")
+    try:
+        mode = await google_flow.set_mode(db, brand_id, body.mode)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Choose “Run by URI” or “My own Google Ads account”.")
+    ready, reason = await google_flow.readiness(db, brand_ctx.get("user_id"), brand_id)
+    return {"mode": mode, "ready": ready, "detail": reason}
+
+
 @router.post("/google/connection/change-account")
 async def jane_google_ads_change_account(
     pause_campaigns: bool = False,
@@ -1755,7 +1781,11 @@ async def jane_google_ads_connection_status(
     # brand has nothing to connect. These say whether that's ready for them.
     from .google_uri_accounts import available as uri_available, brand_account as uri_brand_account
     uri_account = await uri_brand_account(db, brand_ctx.get("brand_id"))
+    from . import google_flow
     return {
+        # How this brand's Google ads run: "uri" (URI's account, nothing to connect,
+        # wallet pays all) or "own" (their account, Google bills them, wallet pays the fee).
+        "mode": await google_flow.get_mode(db, brand_ctx.get("brand_id")),
         "uri_managed": await uri_available(db, brand_ctx.get("brand_id")),
         "uri_account_assigned": bool(uri_account),
         "state": state.value,
@@ -2489,7 +2519,8 @@ async def _build_campaign_plan(
     # Google runs in the brand's OWN linked Google Ads account, so a brand can be
     # ready for Google with no Meta Page at all. Known up front (our own record, no
     # network) because it changes what counts as "not connected" below.
-    google_ready = await google_flow.is_ready(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    google_ready, google_not_ready_reason = await google_flow.readiness(
+        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
     meta_configured = bool(settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN)
     if not meta_configured and not google_ready:
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
@@ -2935,7 +2966,7 @@ async def _build_campaign_plan(
     if wants_google or google_only or (jane_picked_google and google_ready and body.preferred_platform != "tiktok"):
         if not google_ready:
             return {"early_return": {"stage": "google_not_connected", "understood": parsed.model_dump(),
-                    "question": google_flow.NOT_AVAILABLE}}
+                    "question": google_not_ready_reason}}
         google_plan = apply_platform_override(plan, [Platform.GOOGLE])
         too_low = (google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
                    if google_placement == "search" else None)
@@ -3366,6 +3397,7 @@ async def _build_campaign_plan(
         plan.google_keyword_context = {"category": category or business_name,
                                        "description": req.description, "geo": parsed.city or req.geo or "",
                                        "placement": google_placement,
+                                       "billing": await google_flow.get_mode(db, brand_id),
                                        "business_name": business_name,
                                        "logo_url": brand_look.get("logo_url") or "",
                                        "brand_color": (brand_look.get("brand_colors") or [""])[0],
@@ -3490,7 +3522,7 @@ async def _build_campaign_plan(
     )
 
 
-def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False) -> float:
+def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False, fee_only: bool = False) -> float:
     """What the customer's wallet must cover for a campaign whose AD SPEND is
     `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
     taken out of it to arrive at that spend (constants.ad_spend_from_budget).
@@ -3506,13 +3538,24 @@ def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False) -> float:
     _PlanBuildResult.fee_bypassed — when true, `ad_spend_ngn` already IS the full
     stated budget (no fee was ever taken out of it), so the total due is exactly that,
     with no markup applied on top."""
+    if fee_only:
+        # Google in the brand's OWN account: Google bills their card for the ad
+        # spend, so the wallet pays URI's fee alone — never the spend twice.
+        return 0.0 if fee_bypassed else round(ad_spend_ngn * (C.AD_SPEND_MARKUP - 1), 2)
     if fee_bypassed:
         return round(ad_spend_ngn, 2)
     return round(ad_spend_ngn * C.AD_SPEND_MARKUP, 2)
 
 
+def _google_own_billing(plan) -> bool:
+    """A Google plan running in the brand's own Google Ads account (Google bills them)."""
+    return bool(plan.platforms and plan.platforms[0].platform == Platform.GOOGLE
+                and (plan.google_keyword_context or {}).get("billing") == "own")
+
+
 async def _wallet_status(
     db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float, fee_bypassed: bool = False,
+    fee_only: bool = False,
 ) -> tuple[float, bool]:
     """(balance, sufficient) — the real Mongo-backed balance vs. the total due. Takes
     AD SPEND, so the total due comes back out as the client's stated budget."""
@@ -3521,14 +3564,18 @@ async def _wallet_status(
 
     wallet = WalletService(MongoWalletStore(db))
     balance = await wallet.get_balance(business_id)
-    return balance, balance >= _total_due_ngn(budget_ngn, fee_bypassed)
+    return balance, balance >= _total_due_ngn(budget_ngn, fee_bypassed, fee_only)
 
 
-def _wallet_shortfall_message(balance: float, budget_ngn: float, fee_bypassed: bool = False) -> str:
+def _wallet_shortfall_message(balance: float, budget_ngn: float, fee_bypassed: bool = False,
+                              fee_only: bool = False) -> str:
     """`budget_ngn` is AD SPEND; the client is told the one number that matters to
     them — the total leaving their wallet, which is the budget they stated. The fee is
     deliberately not itemised: it is inside that figure, not added to it."""
-    due = _total_due_ngn(budget_ngn, fee_bypassed)
+    due = _total_due_ngn(budget_ngn, fee_bypassed, fee_only)
+    if fee_only:
+        return (f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more before launching. "
+                f"URI's fee for this campaign is ₦{due:,.0f}; Google bills your Google Ads account for the ad spend.")
     return (
         f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more "
         f"before launching. This campaign costs ₦{due:,.0f}."
@@ -3714,10 +3761,11 @@ async def meta_launch_from_message(
     # Wallet gate — the ad wallet must actually have the money before anything
     # reaches Meta. Blocks with the exact shortfall rather than silently launching
     # a campaign whose real Meta daily budget got clamped to less than requested.
-    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed)
+    own = _google_own_billing(built.plan)
+    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed, own)
     if not sufficient:
         raise HTTPException(status_code=400,
-                             detail=_wallet_shortfall_message(balance, built.req.budget_ngn, built.fee_bypassed))
+                             detail=_wallet_shortfall_message(balance, built.req.budget_ngn, built.fee_bypassed, own))
 
     return await _do_launch(built, body.message, body.business_name, brand_ctx, db)
 
@@ -3740,7 +3788,9 @@ async def meta_plan_from_message(
     if isinstance(built, dict):
         return built["early_return"]
 
-    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed)
+    own_billing = _google_own_billing(built.plan)
+    balance, sufficient = await _wallet_status(
+        db, built.business_id, built.req.budget_ngn, built.fee_bypassed, own_billing)
 
     plan_id = f"plan_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc)
@@ -3804,8 +3854,13 @@ async def meta_plan_from_message(
             # stated budget now, so itemising it invited the old "+ service fee" line
             # that asked them to fund more than the number they gave.
             "budget_ngn": built.req.budget_ngn,
-            "total_due_ngn": _total_due_ngn(built.req.budget_ngn, built.fee_bypassed),
+            "total_due_ngn": _total_due_ngn(built.req.budget_ngn, built.fee_bypassed, own_billing),
             "sufficient": sufficient,
+            # Google in the brand's own account: the wallet pays URI's fee only and
+            # Google bills their account for ad_spend_ngn. "" for everything else.
+            "google_billing": ("own" if own_billing else "uri") if built.plan.platforms
+            and built.plan.platforms[0].platform == Platform.GOOGLE else "",
+            "ad_spend_ngn": built.req.budget_ngn,
         },
     }
 
@@ -3979,10 +4034,18 @@ async def meta_launch_plan(
     # TEMP (2026-09-17, revert when real TikTok testing is done): carried over from
     # /meta/plan-from-message via the pending-plan doc.
     fee_bypassed = bool(doc.get("fee_bypassed", False))
-    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn, fee_bypassed)
+    from . import google_flow
+    own_billing = False
+    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
+        # Where it runs is the brand's choice at THIS moment — they may have switched
+        # between planning and launching — so the wallet is gated and charged on that.
+        own_billing = (await google_flow.get_mode(db, brand_ctx.get("brand_id"))) == "own"
+        plan.google_keyword_context = {**(plan.google_keyword_context or {}),
+                                       "billing": "own" if own_billing else "uri"}
+    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn, fee_bypassed, own_billing)
     if not sufficient:
         raise HTTPException(status_code=400,
-                             detail=_wallet_shortfall_message(balance, req.budget_ngn, fee_bypassed))
+                             detail=_wallet_shortfall_message(balance, req.budget_ngn, fee_bypassed, own_billing))
 
     built = _PlanBuildResult(
         business_id=doc["business_id"], req=req, plan=plan,
@@ -4002,7 +4065,7 @@ async def meta_launch_plan(
     # charge this campaign again as it spends (it skips any record carrying
     # charged_upfront_ngn; without that the client would pay twice for the same ads).
     campaign_id = result["launch"]["campaign_id"]
-    due = _total_due_ngn(req.budget_ngn, fee_bypassed)
+    due = _total_due_ngn(req.budget_ngn, fee_bypassed, own_billing)
     try:
         from .store import MongoWalletStore
         from .wallet import InsufficientFundsError, WalletService
@@ -4022,7 +4085,10 @@ async def meta_launch_plan(
                               "google": "jane_ads_google_campaigns"}.get(
                                   result["launch"].get("platform"), "jane_ads_meta_campaigns")
         await db[charged_collection].update_one(
-            {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
+            {"campaign_id": campaign_id},
+            {"$set": {"charged_upfront_ngn": due,
+                      # own account: the wallet paid the fee; Google bills them the spend
+                      **({"google_billing": "own"} if own_billing else {})}},
         )
         # The decision record (CI-SPEC-01 Part 1). Written here because this is the
         # moment every input still exists together — the understanding, the ranked
@@ -4410,7 +4476,8 @@ async def meta_campaigns(
             # at launch, so it wins when present; otherwise it's reconstructed from the
             # markup stamped on the record (legacy records carry none, hence the
             # LEGACY_AD_SPEND_MARKUP fallback billing.py already uses).
-            "budget_ngn": C.stated_budget_from_record(r),
+            "budget_ngn": (round(float(r.get("budget_ngn") or 0) * C.AD_SPEND_MARKUP, 2)
+                           if r.get("google_billing") == "own" else C.stated_budget_from_record(r)),
             # What Meta actually received, kept for anything that needs the real spend.
             "ad_spend_ngn": r.get("budget_ngn"),
             "goal": r.get("goal", ""),

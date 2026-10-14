@@ -56,23 +56,65 @@ def configured() -> bool:
     return bool(settings.GOOGLE_ADS_DEVELOPER_TOKEN and settings.GOOGLE_ADS_MCC_CUSTOMER_ID)
 
 
-async def is_ready(db, user_id: Optional[str], brand_id: Optional[str]) -> bool:
-    """Can this brand run on Google now? Google ads run in URI's own Google Ads
-    accounts (URI pays Google; the brand pays only from its wallet), so this is
-    "does the brand have one, or is one free". No network call — asked on every
-    planning message."""
+# How a brand's Google ads run — its own choice, in Connected Accounts:
+#   "uri" — in URI's own Google Ads account. Nothing to connect; the whole budget
+#           comes from the URI wallet and URI pays Google. The default.
+#   "own" — in the brand's own Google Ads account. Google bills the brand's card
+#           for the ad spend; the URI wallet pays only URI's fee.
+SETTINGS = "jane_ads_google_settings"
+MODES = ("uri", "own")
+
+
+async def get_mode(db, brand_id: Optional[str]) -> str:
+    if not brand_id:
+        return "uri"
+    doc = await db[SETTINGS].find_one({"brand_id": brand_id, "kind": "google_mode"})
+    return (doc or {}).get("mode") if (doc or {}).get("mode") in MODES else "uri"
+
+
+async def set_mode(db, brand_id: str, mode: str) -> str:
+    if mode not in MODES:
+        raise ValueError("mode must be 'uri' or 'own'")
+    from datetime import datetime, timezone
+    await db[SETTINGS].update_one(
+        {"brand_id": brand_id, "kind": "google_mode"},
+        {"$set": {"mode": mode, "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return mode
+
+
+NOT_AVAILABLE = ("Google ads run by URI aren't available just yet — we're setting them up. "
+                 "You can connect your own Google Ads account instead (Connected Accounts → Google Ads), "
+                 "or run this on Instagram & Facebook.")
+
+
+async def readiness(db, user_id: Optional[str], brand_id: Optional[str]) -> tuple[bool, str]:
+    """(ready, what to tell the owner if not) for the brand's chosen way of
+    running Google ads. No network call — asked on every planning message."""
     if not configured():
-        return False
+        return False, "Google ads aren't available on URI right now. Try Instagram & Facebook instead."
+    mode = await get_mode(db, brand_id)
+    if mode == "own":
+        try:
+            state, _ = await resolve_connection_state(db, user_id, brand_id)
+        except Exception as e:
+            print(f"[google_flow] connection check failed: {e}", flush=True)
+            return False, "Couldn't check your Google Ads account just now. Try again in a minute."
+        if state == ConnectionState.READY:
+            return True, ""
+        return False, (connection_message(state.value) + " Or switch to “Run by URI” there — "
+                       "nothing to connect.")
     from .google_uri_accounts import available
     try:
-        return await available(db, brand_id)
+        return (True, "") if await available(db, brand_id) else (False, NOT_AVAILABLE)
     except Exception as e:
         print(f"[google_flow] readiness check failed: {e}", flush=True)
-        return False
+        return False, "Couldn't check Google ads just now. Try again in a minute."
 
 
-NOT_AVAILABLE = ("Google ads aren't available on URI just yet — we're setting them up. "
-                 "I can run this on Instagram & Facebook instead, or try Google again later.")
+async def is_ready(db, user_id: Optional[str], brand_id: Optional[str]) -> bool:
+    return (await readiness(db, user_id, brand_id))[0]
 
 
 _CONNECT_HERE = "Connected Accounts → Google Ads"
@@ -135,16 +177,24 @@ def raise_http(e: Exception) -> None:
 
 
 async def adapter_for_launch(db, brand_ctx: dict) -> tuple[GoogleAdsAdapter, dict]:
-    """The adapter for this brand's URI Google Ads account (given to the brand the
-    first time it launches on Google). Raises the HTTP error the launch endpoints
-    return when no account is free or Google can't be reached."""
+    """The adapter for wherever this brand's Google ads run: URI's account (given
+    to the brand the first time) or the brand's own linked account, re-checked
+    with Google now. conn["uri_managed"] says which. Raises the HTTP error the
+    launch endpoints return, in words the owner can act on."""
     from .google_uri_accounts import NoUriAccountAvailable, launch_connection
 
+    brand_id = brand_ctx.get("brand_id")
     try:
-        conn = await launch_connection(db, brand_ctx.get("brand_id"))
+        if await get_mode(db, brand_id) == "own":
+            conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_id)
+            conn = {**conn, "uri_managed": False}
+        else:
+            conn = await launch_connection(db, brand_id)
     except NoUriAccountAvailable:
-        print(f"[google_flow] no free URI Google Ads account for brand {brand_ctx.get('brand_id')}", flush=True)
+        print(f"[google_flow] no free URI Google Ads account for brand {brand_id}", flush=True)
         raise HTTPException(status_code=409, detail=NOT_AVAILABLE)
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=connection_message(e.state.value))
     except GoogleAdsConnectionError as e:
         raise HTTPException(status_code=502, detail=friendly_error(e))
     try:
