@@ -222,6 +222,12 @@ def ads_url(customer_id: str) -> str:
     return f"https://ads.google.com/aw/campaigns?__c={customer_id}"
 
 
+def _markup() -> float:
+    """Ad spend → the budget the owner typed (URI's fee comes out of it)."""
+    from . import constants as C
+    return C.AD_SPEND_MARKUP
+
+
 def budget_too_low(budget_ngn: float, days: int) -> Optional[str]:
     """Why this budget can't work on Google Search, or None when it can. A
     search campaign needs enough clicks a day to learn what's working; below
@@ -231,9 +237,11 @@ def budget_too_low(budget_ngn: float, days: int) -> Optional[str]:
     daily = float(budget_ngn or 0) / days
     if estimate_clicks_per_day(daily, _DEFAULT_ESTIMATED_CPC_NGN) >= _MIN_USEFUL_CLICKS_PER_DAY:
         return None
-    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days
-    return (f"On Google Search, ₦{budget_ngn:,.0f} over {days} day{'s' if days != 1 else ''} is about "
-            f"₦{daily:,.0f} a day — too little to get the ~{_MIN_USEFUL_CLICKS_PER_DAY:.0f} clicks a day a search ad "
+    # Told in the owner's own figures (their budget, URI's fee included), not ad spend.
+    m = _markup()
+    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days * m
+    return (f"On Google Search, ₦{budget_ngn * m:,.0f} over {days} day{'s' if days != 1 else ''} is about "
+            f"₦{daily * m:,.0f} a day — too little to get the ~{_MIN_USEFUL_CLICKS_PER_DAY:.0f} clicks a day a search ad "
             f"needs to work. Raise the budget to about ₦{needed:,.0f}, run it for fewer days, or let me use "
             f"Instagram and Facebook instead.")
 
@@ -291,7 +299,10 @@ _PLACEMENT_MIN_DAILY_NGN = {"demand_gen": 8_000.0}
 
 
 def below_placement_minimum(placement: str, budget_ngn: float, days: int) -> Optional[str]:
-    """Why Google won't accept this budget for this placement, or None."""
+    """Why Google won't accept this budget for this placement, or None.
+    `budget_ngn` is the ad spend (URI's fee already out of it); the owner is
+    told in the figures they typed — their whole budget, fee included — and
+    only offered fixes that actually work."""
     floor = _PLACEMENT_MIN_DAILY_NGN.get(placement)
     if not floor:
         return None
@@ -299,11 +310,21 @@ def below_placement_minimum(placement: str, budget_ngn: float, days: int) -> Opt
     daily = float(budget_ngn or 0) / days
     if daily >= floor:
         return None
+    from . import constants as C
     from .adapters.google_visual import PLACEMENT_LABELS
-    return (f"{PLACEMENT_LABELS[placement]} needs at least ₦{floor:,.0f} a day — Google won't run it for less. "
-            f"₦{budget_ngn:,.0f} over {days} day{'s' if days != 1 else ''} is ₦{daily:,.0f} a day. Raise the budget "
-            f"to ₦{floor * days:,.0f}, run it for {max(int(budget_ngn // floor), 1)} day"
-            f"{'s' if int(budget_ngn // floor) != 1 else ''}, or pick another Google placement.")
+    label = PLACEMENT_LABELS[placement]
+    markup = C.AD_SPEND_MARKUP
+    stated = float(budget_ngn or 0) * markup
+    floor_stated = floor * markup
+    plural = lambda n: "" if n == 1 else "s"  # noqa: E731
+    head = (f"{label} needs at least ₦{floor_stated:,.0f} a day — Google won't run it for less. "
+            f"₦{stated:,.0f} over {days} day{plural(days)} is ₦{stated / days:,.0f} a day.")
+    fits = int(float(budget_ngn or 0) // floor)
+    if fits >= 1:
+        return (f"{head} Raise the budget to ₦{floor_stated * days:,.0f} for {days} day{plural(days)}, "
+                f"run it for {fits} day{plural(fits)} instead, or pick another Google placement.")
+    return (f"{head} The smallest {label} campaign is ₦{floor_stated:,.0f} for one day. Raise the budget, "
+            "or pick another Google placement — Display and Search have no minimum.")
 
 
 def budget_too_low_warning(budget_ngn: float, days: int) -> str:
@@ -312,8 +333,9 @@ def budget_too_low_warning(budget_ngn: float, days: int) -> str:
     days = max(int(days or 1), 1)
     daily = float(budget_ngn or 0) / days
     clicks = estimate_clicks_per_day(daily, _DEFAULT_ESTIMATED_CPC_NGN)
-    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days
-    return (f"About ₦{daily:,.0f} a day — expect only ~{max(clicks, 0):.0f} click{'s' if round(clicks) != 1 else ''} "
+    m = _markup()
+    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days * m
+    return (f"About ₦{daily * m:,.0f} a day — expect only ~{max(clicks, 0):.0f} click{'s' if round(clicks) != 1 else ''} "
             f"a day, so treat this as a test. For real results on Search, about ₦{needed:,.0f} over "
             f"{days} day{'s' if days != 1 else ''}.")
 
