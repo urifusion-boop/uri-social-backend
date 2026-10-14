@@ -57,11 +57,15 @@ class WalletService:
 
     # ── Top-up (Flow B funding) ────────────────────────────────────────────────
     async def top_up(
-        self, business_id: str, amount_ngn: float, reference: str = "", now: Optional[datetime] = None
+        self, business_id: str, amount_ngn: float, reference: str = "", now: Optional[datetime] = None,
+        enforce_minimum: bool = True,
     ) -> Transaction:
-        """Credit the wallet. Enforces the ₦5,000 minimum. `reference` is the
-        Squad/Paystack payment ref."""
-        if amount_ngn < C.MIN_TOPUP_NGN:
+        """Credit the wallet. Enforces the ₦5,000 minimum for payments; an admin
+        credit (a refund, say) passes enforce_minimum=False, since a refund is
+        whatever was charged. `reference` is the Squad/Paystack payment ref."""
+        if amount_ngn <= 0:
+            raise MinimumTopUpError("The amount must be more than ₦0.")
+        if enforce_minimum and amount_ngn < C.MIN_TOPUP_NGN:
             raise MinimumTopUpError(
                 f"Minimum top-up is ₦{C.MIN_TOPUP_NGN:,.0f}; got ₦{amount_ngn:,.0f}."
             )

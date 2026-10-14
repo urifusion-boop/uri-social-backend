@@ -1865,7 +1865,7 @@ async def admin_access(token: dict = Depends(JWTBearer())) -> dict:
 
 class AdminWalletCreditBody(BaseModel):
     brand_id: str                          # whose wallet to credit
-    amount_ngn: float = Field(gt=0)        # WalletService still enforces the ₦5,000 floor
+    amount_ngn: float = Field(gt=0)        # any amount — refunds are whatever was charged
     note: str = ""                         # why — recorded alongside the credit
 
 
@@ -1896,7 +1896,8 @@ async def admin_wallet_credit(
     reference = f"manual:{actor}:{_uuid.uuid4().hex[:12]}"
     wallet = WalletService(MongoWalletStore(db))
     try:
-        await wallet.top_up(body.brand_id, body.amount_ngn, reference=reference)
+        # Admin-only, so no payment minimum: refunds are whatever was charged.
+        await wallet.top_up(body.brand_id, body.amount_ngn, reference=reference, enforce_minimum=False)
     except MinimumTopUpError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -3602,6 +3603,12 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             # delivery widening does) left the card describing the older one.
             "geo": (plan.geo.model_dump(mode="json") if plan.geo else built.geo_dump),
             "trace": plan.trace,
+            # Google only: where it runs (placement), how it's paid (billing) and the
+            # business name the ad shows — what the plan card's preview and labels read.
+            "google_keyword_context": {
+                k: (plan.google_keyword_context or {}).get(k, "")
+                for k in ("placement", "billing", "business_name")
+            } if plan.google_keyword_context else None,
         },
         "creative": plan.creative.model_dump(mode="json"),
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
