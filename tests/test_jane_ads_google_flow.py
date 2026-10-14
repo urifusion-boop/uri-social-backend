@@ -75,6 +75,10 @@ class TestBudgetIsEnoughForSearch:
         msg = gf.budget_too_low(7000, 7)                    # ₦1,000 a day ≈ 4 clicks
         assert "₦1,000 a day" in msg and "₦17,500" in msg and "Instagram and Facebook" in msg
 
+    def test_going_ahead_anyway_gets_what_to_expect_not_a_refusal(self):
+        msg = gf.budget_too_low_warning(5400, 5)            # ₦1,080 a day ≈ 4 clicks
+        assert "₦1,080 a day" in msg and "~4 clicks" in msg and "test" in msg and "₦12,500" in msg
+
 
 class TestTargetingThePlansOwnCity:
     def test_a_city_google_knows(self):

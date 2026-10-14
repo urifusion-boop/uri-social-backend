@@ -299,6 +299,24 @@ def test_launch_campaign_raises_low_clicks_warning_before_any_http_call():
     assert exc_info.value.estimated_clicks_per_day < 10
 
 
+def test_a_small_budget_the_owner_chose_still_launches():
+    adapter = _adapter()
+    plan = _plan(
+        platforms=[PlatformPlan(
+            platform=Platform.GOOGLE, budget_ngn=5_400, days=5, variants=1,
+            test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=5_400, account_cap_ngn=5_400,
+        google_keyword_context={"category": "plumbing", "description": "Plumbing repairs", "geo": "Surulere",
+                                "low_budget_ok": True},
+    )
+    with _patched_keywords(), patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_HAPPY_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth(funded=5_400)))
+    assert mock_client.post.call_count > 0
+
+
 def test_launch_campaign_raises_on_google_error():
     adapter = _adapter()
     with _patched_keywords(), patch("httpx.AsyncClient") as MockClient:

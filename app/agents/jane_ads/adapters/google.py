@@ -385,7 +385,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             await cpc_estimator(all_terms) if cpc_estimator else _DEFAULT_ESTIMATED_CPC_NGN
         )
         clicks_per_day = estimate_clicks_per_day(daily_budget_ngn, estimated_cpc_ngn)
-        if clicks_per_day < _MIN_USEFUL_CLICKS_PER_DAY:
+        if clicks_per_day < _MIN_USEFUL_CLICKS_PER_DAY and not kw_context.get("low_budget_ok"):
             raise LowClicksWarning(daily_budget_ngn, estimated_cpc_ngn, clicks_per_day)
 
         campaign_resource_name = ""
