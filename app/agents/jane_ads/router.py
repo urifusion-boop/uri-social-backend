@@ -3600,7 +3600,8 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
     )
     if is_google:
-        launch_note = "Created paused — nothing is spent until you turn it on in My Campaigns."
+        launch_note = ("Created paused — nothing is spent until you turn it on: Campaign Manager → "
+                       "press ▶ on this campaign.")
         ads_manager_url = google_flow.ads_url(google_conn.get("customer_id", ""))
     return {
         "stage": "launched",
