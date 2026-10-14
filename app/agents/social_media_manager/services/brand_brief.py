@@ -164,27 +164,53 @@ def emoji_mode(bc: Optional[Dict[str, Any]]) -> str:
 _FORMAL_TONE = ("formal", "no slang", "professional", "corporate", "analytical")
 
 
+# "End Instagram posts with 'DM us to start'" / "End Instagram posts with: DM us to start"
+_ENDING = re.compile(r"\bend\b[^:'\"\u2018\u201c]{0,60}?(?:with|using)\s*:?\s*['\"\u2018\u201c]?([^'\"\u2019\u201d\n]{2,80}?)['\"\u2019\u201d]?\s*\.?\s*$",
+                     re.IGNORECASE)
+
+
+def platform_cta(bc: Optional[Dict[str, Any]], platform: str) -> str:
+    """The call to action the owner set for this one platform ("Always end
+    Instagram posts with 'DM us to start'"), or ""."""
+    for item in (bc or {}).get("playbook_instructions") or []:
+        if not isinstance(item, dict) or platform.lower() not in [str(x).lower() for x in item.get("platforms") or []]:
+            continue
+        m = _ENDING.search(str(item.get("text") or "").strip())
+        if m and m.group(1).strip():
+            return m.group(1).strip().rstrip(".")
+    return ""
+
+
 def for_platform(bc: Optional[Dict[str, Any]], platform: str = "") -> Optional[Dict[str, Any]]:
-    """The brand as it should write on `platform`. A platform the owner set to
-    a formal / no-slang tone ("formal on LinkedIn, no slang") is written in the
-    brand's main language only: a mixed-in language like Pidgin there broke the
-    owner's own rule (seen on dev). Everything else is unchanged."""
+    """The brand as it should write on `platform`:
+      • a call to action the owner set for this platform replaces the general
+        one here, so the post ends with it alone (both were added, seen on dev)
+      • a platform set to a formal / no-slang tone is written in the brand's
+        main language only, without standing instructions about the other
+        languages (Pidgin on a "formal, no slang" LinkedIn, seen on dev).
+    Everything else is unchanged."""
     if not bc or not platform:
         return bc
+    out = dict(bc)
+    own_cta = platform_cta(bc, platform)
+    if own_cta:
+        out["cta_styles"] = [own_cta]
     langs = _list(bc.get("languages"))
     if len(langs) < 2 or bc.get("same_tone_everywhere", True) is not False:
-        return bc
+        return out
     tone = str((bc.get("platform_tones") or {}).get(platform.lower()) or "").lower()
     if not (tone and any(word in tone for word in _FORMAL_TONE)):
-        return bc
-    # The owner's standing instructions about the dropped languages ("mix in a
-    # little Pidgin") would contradict the platform's tone the same way — unless
-    # the owner named this platform in it, which is then their explicit choice.
+        return out
+    # Standing instructions about the dropped languages ("mix in a little
+    # Pidgin") would contradict the tone the same way — unless the owner named
+    # this platform in them, which is then their explicit choice.
     dropped = [lang.lower() for lang in langs[1:]]
-    kept = [i for i in bc.get("playbook_instructions") or []
-            if not (isinstance(i, dict) and platform.lower() not in (i.get("platforms") or [])
-                    and any(lang in str(i.get("text", "")).lower() for lang in dropped))]
-    return {**bc, "languages": [langs[0]], "playbook_instructions": kept}
+    out["languages"] = [langs[0]]
+    out["playbook_instructions"] = [
+        i for i in bc.get("playbook_instructions") or []
+        if not (isinstance(i, dict) and platform.lower() not in (i.get("platforms") or [])
+                and any(lang in str(i.get("text", "")).lower() for lang in dropped))]
+    return out
 
 
 def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
