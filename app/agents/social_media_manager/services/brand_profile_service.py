@@ -6,6 +6,25 @@ from pymongo import ReturnDocument
 from app.domain.responses.uri_response import UriResponse
 
 
+def normalize_platform_tones(tones: Any) -> Dict[str, str]:
+    """Tones keyed by lowercase platform name. Onboarding saved "LinkedIn",
+    the editor and Tell Jane save "linkedin" — both ended up stored, so
+    LinkedIn had two competing tones and the capitalised one was invisible in
+    the editor. A lowercase key (set later, in the app) wins over a
+    capitalised one for the same platform; empty tones are dropped."""
+    if not isinstance(tones, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in tones.items():
+        k = str(key).strip().lower()
+        if k and k != key and value and k not in out:
+            out[k] = str(value)
+    for key, value in tones.items():
+        if str(key) == str(key).strip().lower() and value:
+            out[str(key).strip()] = str(value)
+    return out
+
+
 class BrandProfileService:
     COLLECTION = "brand_profiles"
 
@@ -491,11 +510,15 @@ class BrandProfileService:
                 for field in PLAYBOOK_FIELDS:
                     if not profile.get(field) and personal_profile.get(field):
                         profile[field] = personal_profile[field]
+                if isinstance(profile.get("platform_tones"), dict):
+                    profile["platform_tones"] = normalize_platform_tones(profile["platform_tones"])
                 return UriResponse.get_single_data_response("brand_profile", profile)
 
         if not profile:
             return UriResponse.get_single_data_response("brand_profile", None)
         profile.pop("_id", None)
+        if isinstance(profile.get("platform_tones"), dict):
+            profile["platform_tones"] = normalize_platform_tones(profile["platform_tones"])
         return UriResponse.get_single_data_response("brand_profile", profile)
 
     @staticmethod
@@ -556,7 +579,7 @@ class BrandProfileService:
             "brand_colors":         profile.get("brand_colors") or [],
             "brand_voice":          brand_voice,
             "voice_sample":         profile.get("voice_sample", ""),
-            "platform_tones":       profile.get("platform_tones") or {},
+            "platform_tones":       normalize_platform_tones(profile.get("platform_tones")),
             "same_tone_everywhere": profile.get("same_tone_everywhere", True),
             "target_audience":      target_audience,
             "ideal_customer_profile": profile.get("ideal_customer_profile", ""),
