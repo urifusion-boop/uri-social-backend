@@ -230,7 +230,7 @@ class TestInboxSoundsLikeTheBrand:
         assert "playful and warm" in section
         assert "NEVER mention or reference: politics." in section and "Use NO emojis" in section
         assert "Yoruba" not in section      # replies stay in the customer's own language
-        assert "never overrides rules 1-6" in section
+        assert "never overrides rules 1-9" in section
         assert banned == ["cheap"]
 
     def test_no_profile_no_style(self):
@@ -242,8 +242,10 @@ class TestInboxSoundsLikeTheBrand:
     def test_prompt_takes_the_style_section(self):
         from app.agents.inbox.agent import _DRAFT_SYSTEM
 
-        text = _DRAFT_SYSTEM.format(channel="Instagram", public_note="", brand_style="7. Sound like this business.\n")
-        assert "7. Sound like this business." in text
+        text = _DRAFT_SYSTEM.format(channel="Instagram", public_note="", situation_note="",
+                                    language_rule="English.", length_rule="Short.",
+                                    brand_style="10. Sound like this business.\n")
+        assert "10. Sound like this business." in text
         assert "come ONLY from the numbered SOURCES" in text      # facts only from the sources
 
     def test_banned_word_in_draft_is_never_auto_sent(self):
