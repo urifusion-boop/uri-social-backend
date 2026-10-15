@@ -922,18 +922,26 @@ class ApprovalWorkflowService:
                                         print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
                             except Exception as e:
                                 print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
-                                # 404 = post no longer exists in Outstand; mark published to stop retry loop.
+                                # 404 = Outstand no longer has the post, so it can't be
+                                # confirmed. It used to be marked "published" here, which
+                                # hid posts that never went out. Say so instead; retries
+                                # are capped (publish_retry_count) so a post that did go
+                                # out is never sent twice automatically.
                                 if "404" in str(e):
                                     await db["content_drafts"].update_one(
                                         {"id": draft["id"]},
                                         {"$set": {
-                                            "status": "published",
-                                            "published_date": datetime.utcnow(),
+                                            "status": "publish_failed",
+                                            "error_message": (
+                                                "The publishing service no longer has this post, so it can't be "
+                                                "confirmed. Check your page, and publish it again if it isn't there."
+                                            ),
+                                            "platform_post_id": None,
+                                            "publish_retry_count": 3,
                                             "updated_at": datetime.utcnow(),
-                                            "error_message": None,
                                         }},
                                     )
-                                    print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
+                                    print(f"🗑️ Outstand post gone (404), marked unconfirmed | draft_id={draft['id']}")
                         continue  # Never re-publish a draft that already has a post_id
 
                     # Atomically claim this draft before publishing to prevent concurrent cron
@@ -1051,7 +1059,15 @@ class ApprovalWorkflowService:
                         else {"user_id": draft_user_id, "outstand_account_id": connection.get("outstand_account_id")}
                     )
                     print(f"📊 Publish result for draft {draft.get('id')}: success={publish_result.get('success')} post_id={publish_result.get('post_id')} error={publish_result.get('error')}")
-                    if publish_result.get("success"):
+                    from app.agents.social_media_manager.services import publish_confirmation as _pc
+                    if publish_result.get("success") and _pc.needs_confirmation(publish_result):
+                        # Accepted, not yet live: "Publishing…" until the network answers.
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]}, {"$set": _pc.awaiting_fields(publish_result)},
+                        )
+                        await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
+                        print(f"⏳ Outstand accepted scheduled post | draft={draft.get('id')} → confirming")
+                    elif publish_result.get("success"):
                         _post_id = publish_result.get("post_id")
                         # Phase 1: persist post_id while draft is still "publishing".
                         # If phase 2 hangs and the stale cleanup later resets status back
@@ -1091,11 +1107,13 @@ class ApprovalWorkflowService:
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
                     else:
+                        _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "")
                         await db["content_drafts"].update_one(
                             {"id": draft["id"]},
                             {"$set": {
                                 "status": "publish_failed",
-                                "error_message": publish_result.get("error"),
+                                "error_message": _msg,
+                                "network_error": (publish_result.get("error") or "")[:1000] or None,
                                 "updated_at": datetime.utcnow(),
                             }},
                         )
@@ -1332,7 +1350,18 @@ class ApprovalWorkflowService:
                     else {"user_id": user_id, "outstand_account_id": connection.get("outstand_account_id")}
                 )
                 is_scheduled = scheduled_datetime is not None
-                if publish_result.get("success"):
+                from app.agents.social_media_manager.services import publish_confirmation as _pc
+                if publish_result.get("success") and not is_scheduled and _pc.needs_confirmation(publish_result):
+                    # Accepted by Outstand, not yet live on the network: show
+                    # "Publishing…" until it's confirmed either way.
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {**_pc.awaiting_fields(publish_result), "scheduled_date": None},
+                         "$unset": {"last_dispatch_warning": ""}},
+                    )
+                    await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
+                    publish_result["status"] = _pc.CONFIRMING
+                elif publish_result.get("success"):
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {
@@ -1383,15 +1412,18 @@ class ApprovalWorkflowService:
                         }},
                     )
                 else:
+                    _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "")
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
                             "status": "publish_failed",
-                            "error_message": publish_result.get("error"),
+                            "error_message": _msg,
+                            "network_error": (publish_result.get("error") or "")[:1000] or None,
                             "updated_at": datetime.utcnow(),
                         }},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
+                    publish_result["error"] = _msg
 
                 results[draft_id] = publish_result
 
@@ -1855,13 +1887,31 @@ class ApprovalWorkflowService:
         if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
             if db is not None:
                 _fb_user_id = connection.get("user_id")
-                # 1. Check DB for existing Outstand FB connection
-                _fb_outstand_conn = await db["social_connections"].find_one({
+                _fb_page_id = str(connection.get("page_id") or "")
+                _fb_brand_id = connection.get("brand_id") or (draft or {}).get("brand_id")
+
+                def _same_page(acc: dict) -> bool:
+                    uid = str(acc.get("network_unique_id") or acc.get("networkUniqueId") or "")
+                    return bool(_fb_page_id) and uid == _fb_page_id
+
+                # 1. This brand's own page among the user's Outstand Facebook
+                #    connections — never just the first one: a user with two
+                #    brands has two pages, and the post must go to this brand's.
+                _cands = await db["social_connections"].find({
                     "user_id": _fb_user_id,
                     "platform": "facebook",
                     "connected_via": "outstand",
                     "connection_status": "active",
-                })
+                    "outstand_account_id": {"$exists": True, "$ne": None},
+                }).to_list(length=20)
+                _fb_outstand_conn = (
+                    next((c for c in _cands if _same_page(c)), None)
+                    or next((c for c in _cands if _fb_brand_id and c.get("brand_id") == _fb_brand_id), None)
+                    # The only one, when nothing says it's a different page.
+                    or (_cands[0] if len(_cands) == 1 and not (
+                        _fb_page_id and (_cands[0].get("network_unique_id") or _cands[0].get("networkUniqueId"))
+                    ) else None)
+                )
                 # 2. If not in DB, do a live lookup against Outstand API
                 if not (_fb_outstand_conn and _fb_outstand_conn.get("outstand_account_id")):
                     try:
@@ -1869,8 +1919,12 @@ class ApprovalWorkflowService:
                         _os = _OS()
                         _live = await _os.list_accounts(tenant_id=str(_fb_user_id), network="facebook")
                         _accs = _live.get("data", [])
-                        if _accs:
-                            _acc = _accs[0]
+                        # Only the account for this exact page (or the only one, when
+                        # the page isn't known); otherwise the brand's own page token
+                        # below publishes it directly to the right page.
+                        _acc = next((a for a in _accs if _same_page(a)), None) or (
+                            _accs[0] if len(_accs) == 1 and not _fb_page_id else None)
+                        if _acc:
                             _fb_outstand_conn = {
                                 "user_id": _fb_user_id,
                                 "platform": "facebook",
@@ -1880,7 +1934,8 @@ class ApprovalWorkflowService:
                             }
                             print(f"📡 FB Outstand live-lookup found account: {_acc.get('id')}")
                         else:
-                            print(f"⚠️ FB Outstand live-lookup: no Facebook accounts in Outstand for user {_fb_user_id}")
+                            print(f"⚠️ FB Outstand live-lookup: no Outstand account for page {_fb_page_id or '?'} "
+                                  f"(user {_fb_user_id} has {len(_accs)})")
                     except Exception as _os_err:
                         print(f"⚠️ FB Outstand live-lookup failed: {_os_err}")
 
@@ -2155,6 +2210,9 @@ class ApprovalWorkflowService:
                             break
                     if published:
                         print(f"✅ TikTok post {post_id} confirmed published")
+                        return {"success": True, "post_id": post_id, "outstand_status": "published",
+                                "raw_response": result, "via": "outstand", "confirmed": True,
+                                "outstand_account_id": connection.get("outstand_account_id")}
                     else:
                         success = False
                         error_msg = (
@@ -2175,7 +2233,12 @@ class ApprovalWorkflowService:
                             "error": error_msg,
                         }
 
-                return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result}
+                # Accepted is not published: the network can still reject it a
+                # moment later (e.g. an expired Facebook login). The caller marks
+                # the draft "confirming" and publish_confirmation settles it.
+                return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result,
+                        "via": "outstand", "confirmed": str(post_status).lower() == "published",
+                        "outstand_account_id": connection.get("outstand_account_id")}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
                 from app.agents.social_media_manager.services.outstand_service import OutstandPublishError

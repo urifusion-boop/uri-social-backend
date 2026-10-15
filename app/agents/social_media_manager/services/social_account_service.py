@@ -348,9 +348,15 @@ class SocialAccountService:
                 if acc.get("outstand_account_id")
             }
             local_cursor = db["social_connections"].find(local_filter)
+            # Connections a post just failed on because the network ended URI's
+            # access (publish_confirmation): shown as needing a reconnect.
+            expired: Dict[str, Any] = {}
             async for doc in local_cursor:
                 platform = doc.get("platform", "unknown")
                 doc_outstand_id = doc.get("outstand_account_id") or doc.get("id")
+                if doc.get("needs_reconnect"):
+                    expired[doc_outstand_id or f"platform:{platform}"] = doc.get("reconnect_reason")
+                    expired.setdefault(f"platform:{platform}", doc.get("reconnect_reason"))
                 if doc_outstand_id and doc_outstand_id in outstand_ids_seen:
                     continue
                 if doc_outstand_id and doc_outstand_id in disconnected_ids:
@@ -368,6 +374,18 @@ class SocialAccountService:
                     "page_name": doc.get("account_name"),
                     "ig_user_id": doc.get("ig_user_id"),
                 })
+
+            for platform, accs in by_platform.items():
+                for acc in accs:
+                    key = acc.get("outstand_account_id") or acc.get("id")
+                    hit = key in expired if key else False
+                    # A flagged brand doc with no account id covers that network's card.
+                    if not hit and f"platform:{platform}" in expired and len(accs) == 1:
+                        hit, key = True, f"platform:{platform}"
+                    if hit:
+                        acc["is_active"] = False
+                        acc["needs_reconnect"] = True
+                        acc["reconnect_reason"] = expired.get(key)
 
             total = sum(len(v) for v in by_platform.values())
             return UriResponse.get_single_data_response("user_connections", {
