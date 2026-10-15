@@ -311,7 +311,9 @@ class BrandProfileRequest(BaseModel):
     derived_voice: Optional[str] = None
     voice_sample: Optional[str] = None
     platform_tones: Optional[Dict[str, str]] = None
-    same_tone_everywhere: Optional[bool] = True
+    # None, not True: a partial save (e.g. one Playbook field) must not switch
+    # per-platform tones off. Only a save that sends it changes it.
+    same_tone_everywhere: Optional[bool] = None
     # Content strategy
     content_pillars: Optional[List[str]] = None
     preferred_formats: Optional[List[str]] = None
@@ -5760,6 +5762,9 @@ async def save_brand_profile(
     try:
         print(f"🔍 PYDANTIC PARSED REQUEST: logo_position={repr(request.logo_position)}, logo_size={repr(request.logo_size)}, ideal_customer_profile={repr(request.ideal_customer_profile)}, primary_font={repr(request.primary_font)}, secondary_font={repr(request.secondary_font)}")
         payload = request.dict(exclude_none=True)
+        if isinstance(payload.get("platform_tones"), dict):
+            from ..services.brand_profile_service import normalize_platform_tones
+            payload["platform_tones"] = normalize_platform_tones(payload["platform_tones"])
         print(f"🔍 PAYLOAD AFTER exclude_none: logo_position={repr(payload.get('logo_position'))}, logo_size={repr(payload.get('logo_size'))}, ideal_customer_profile={repr(payload.get('ideal_customer_profile'))}, primary_font={repr(payload.get('primary_font'))}, secondary_font={repr(payload.get('secondary_font'))}")
         # Serialize nested Pydantic models to plain dicts
         if "guardrails" in payload and hasattr(payload["guardrails"], "dict"):
