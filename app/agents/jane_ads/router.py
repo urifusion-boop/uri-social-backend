@@ -1930,6 +1930,22 @@ async def admin_google_uri_accounts(
     return {"accounts": accounts, "free": sum(1 for a in accounts if not a.get("brand_id") and a.get("billing_ready"))}
 
 
+@router.get("/admin/google/manager-accounts")
+async def admin_google_manager_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Every account under URI's manager account, as Google sees it, and which
+    of them are already URI's accounts — to spot a new one and add it."""
+    _require_ads_admin(token)
+    from .google_flow import friendly_error
+    from .google_uri_accounts import manager_accounts
+    try:
+        return {"accounts": await manager_accounts(db)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"{friendly_error(e)} (Google said: {e})")
+
+
 @router.post("/admin/google/uri-accounts")
 async def admin_add_google_uri_account(
     body: AdminGoogleAccountBody,
