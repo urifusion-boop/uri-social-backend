@@ -402,9 +402,9 @@ def test_launch_falls_back_to_the_shared_page_when_the_brand_has_not_connected()
     assert result["page_name"] == "URI Social"
 
 
-def test_an_unusable_brand_connection_falls_back_instead_of_blocking_the_launch():
-    # A dead/expired token on the brand's Page must not stop them advertising — the
-    # shared Page still works, and blocking would be worse than a generic identity.
+def test_an_unusable_brand_connection_asks_to_reconnect_instead_of_using_uris_page():
+    # This used to fall back to the shared Page. Live, that published a client's ad as
+    # "URI" and sent its customers' DMs to URI's inbox, which is worse than a prompt.
     db = FakeDb([
         {"brand_id": "brnd_1", "whatsapp_number": "2348031234567"},
         _ads_doc(page_id="pg_brand"),
@@ -412,8 +412,9 @@ def test_an_unusable_brand_connection_falls_back_instead_of_blocking_the_launch(
     with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"), \
          patch("app.agents.jane_ads.ads_connection.verify_token_live",
                new=AsyncMock(return_value=(False, set()))):
-        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
-    assert result["page_id"] == "pg_shared"
+        with pytest.raises(AdsConnectionRequired) as exc_info:
+            _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert exc_info.value.state == ConnectionState.EXPIRED
 
 
 def test_brand_page_is_used_even_when_its_whatsapp_was_never_linked_in_meta():
@@ -508,3 +509,15 @@ def test_an_inconclusive_answer_is_none_so_it_can_never_block_a_launch():
 
     assert _run_(page_has_whatsapp_linked("", "tok")) is None
     assert _run_(page_has_whatsapp_linked("1", "")) is None
+
+
+def test_a_brand_whose_own_page_connection_expired_is_asked_to_reconnect_not_moved_to_uri():
+    """Live-reported: the urisocialinsight brand's Uri Social connection expired, the
+    ad launched on URI's shared Page, and the customer's DM landed in URI's inbox."""
+    db = FakeDb([_ads_doc(whatsapp_page_linked=True, whatsapp_number="2348031234567")])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(False, set()))), \
+         patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"):
+        with pytest.raises(AdsConnectionRequired) as exc_info:
+            _run(resolve_ads_page_for_launch(db, None, "brnd_1", require_whatsapp=False))
+    assert exc_info.value.state == ConnectionState.EXPIRED
