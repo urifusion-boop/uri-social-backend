@@ -93,6 +93,18 @@ def _run_async(job_id: str, coro_func):
         print("⚠️ Main event loop not available — skipping scheduled job")
 
 
+def _job_publish_confirmations():
+    """Posts Outstand accepted but hasn't confirmed live yet: ask what happened,
+    mark them published or failed (with the reason), and flag expired logins."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services import publish_confirmation
+        result = await publish_confirmation.run(get_db())
+        if result["published"] or result["failed"] or result["pending"]:
+            print(f"🔎 publish_confirmations: {result}")
+    _run_async("publish_confirmations", _run)
+
+
 def _job_daily_suggestions():
     from app.services.NotificationService import notification_service
     _run_async("daily_suggestions", notification_service.run_daily_suggestions)
@@ -300,8 +312,16 @@ def start_notification_scheduler():
     # POST /api/admin/social-media/reconcile-published-posts) and confirm its
     # behavior against real drafts before adding it here on a schedule.
 
+    # Confirm that accepted posts actually reached the network.
+    _scheduler.add_job(
+        _job_publish_confirmations,
+        CronTrigger(minute="*/2"),
+        id="publish_confirmations",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 9 jobs")
+    print("📅 Notification scheduler started with 10 jobs")
 
 
 def stop_notification_scheduler():
