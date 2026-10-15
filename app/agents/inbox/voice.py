@@ -661,7 +661,8 @@ async def _exclusive(db, workspace_id: str, keep_id: ObjectId, clean: dict) -> N
 
 async def create_profile(db, workspace_id: str, fields: dict, actor: str, method: str) -> dict:
     existing = await list_profiles(db, workspace_id)
-    clean = normalize_profile({**fields, "is_default": fields.get("is_default", not existing)})
+    # The first profile answers everything until there are others to choose from.
+    clean = normalize_profile({**fields, "is_default": bool(fields.get("is_default")) or not existing})
     doc = {"workspace_id": workspace_id, **clean, "status": "draft", "active_version": None,
            "has_unpublished_changes": True, "source_methods": [method],
            "created_at": now(), "updated_at": now(), "created_by": actor}
