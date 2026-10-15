@@ -114,6 +114,18 @@ def _job_google_ads_link_reminders():
     _run_async("google_ads_link_reminders", _run)
 
 
+def _job_publish_confirmations():
+    """Posts Outstand accepted but hasn't confirmed live yet: ask what happened,
+    mark them published or failed (with the reason), and flag expired logins."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services import publish_confirmation
+        result = await publish_confirmation.run(get_db())
+        if result["published"] or result["failed"] or result["pending"]:
+            print(f"🔎 publish_confirmations: {result}")
+    _run_async("publish_confirmations", _run)
+
+
 def _job_weekly_reports():
     _brand_alert_job("brand_weekly_reports", "run_weekly_reports")
 
@@ -428,8 +440,16 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Confirm that accepted posts actually reached the network.
+    _scheduler.add_job(
+        _job_publish_confirmations,
+        CronTrigger(minute="*/2"),
+        id="publish_confirmations",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 13 jobs")
+    print("📅 Notification scheduler started with 14 jobs")
 
 
 def stop_notification_scheduler():

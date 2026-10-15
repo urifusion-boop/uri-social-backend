@@ -44,12 +44,16 @@ CHANNELS = {
 }
 
 # In-app panel types the frontend already knows how to show.
-_PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_posted"}
+_PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_posted", "post_failed": "post_failed"}
 
-# The two alerts every brand has always received. They stay on until the brand
+# The alerts every brand has always received. They stay on until the brand
 # picks its own list of alerts — choosing only a channel (the normal state
 # after onboarding) must not silence them.
 _DEFAULT_EVENTS = {"post_ready", "post_published"}
+
+# Never optional: an owner must hear that a post didn't go out, whatever
+# alerts they picked.
+_ALWAYS_EVENTS = {"post_failed"}
 
 
 def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -83,12 +87,12 @@ def is_customised(prefs: Dict[str, Any]) -> bool:
 
 def channels_for(event: str, prefs: Dict[str, Any]) -> List[str]:
     """Which external channels an event goes to (in-app is always added)."""
-    if event not in prefs["enabled"]:
+    if event not in prefs["enabled"] and event not in _ALWAYS_EVENTS:
         return []
     out: List[str] = []
     if prefs["channel"]:
         out.append(prefs["channel"])
-    elif event in _DEFAULT_EVENTS:
+    elif event in _DEFAULT_EVENTS or event in _ALWAYS_EVENTS:
         out.append("email")  # no channel chosen: these two have always gone by email
     if event == "post_ready":
         out += prefs["approval_channels"]
@@ -180,7 +184,7 @@ async def notify(
     prefs = preferences(profile)
     if only_if_configured and event not in prefs["events"]:
         return {"skipped": "not enabled"}   # the newer alerts are opt-in: only if explicitly ticked
-    if event not in prefs["enabled"]:
+    if event not in prefs["enabled"] and event not in _ALWAYS_EVENTS:
         return {"skipped": "not enabled"}
     if dedupe_key and dedupe_hours and await _recently_sent(db, user_id, event, dedupe_key, dedupe_hours):
         return {"skipped": "already sent"}
