@@ -251,7 +251,9 @@ class BrandProfileRequest(BaseModel):
     derived_voice: Optional[str] = None
     voice_sample: Optional[str] = None
     platform_tones: Optional[Dict[str, str]] = None
-    same_tone_everywhere: Optional[bool] = True
+    # None, not True: a partial save (e.g. one Playbook field) must not switch
+    # per-platform tones off. Only a save that sends it changes it.
+    same_tone_everywhere: Optional[bool] = None
     # Content strategy
     content_pillars: Optional[List[str]] = None
     preferred_formats: Optional[List[str]] = None
@@ -5636,6 +5638,9 @@ async def save_brand_profile(
         # that was actually present in the request body, null or not, while
         # still excluding genuinely-omitted fields exactly as before.
         payload = request.dict(exclude_unset=True)
+        if isinstance(payload.get("platform_tones"), dict):
+            from ..services.brand_profile_service import normalize_platform_tones
+            payload["platform_tones"] = normalize_platform_tones(payload["platform_tones"])
         # Serialize nested Pydantic models to plain dicts
         if "guardrails" in payload and hasattr(payload["guardrails"], "dict"):
             payload["guardrails"] = payload["guardrails"].dict(exclude_none=True)
