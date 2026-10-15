@@ -268,7 +268,9 @@ app.include_router(
 
 # Include additional social platform routers
 from app.agents.inbox.router import router as inbox_router
+from app.agents.inbox.voice_router import router as inbox_voice_router
 app.include_router(inbox_router)
+app.include_router(inbox_voice_router)
 app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
