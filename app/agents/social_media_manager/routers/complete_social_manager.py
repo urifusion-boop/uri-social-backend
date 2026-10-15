@@ -3721,7 +3721,7 @@ async def get_scheduled_content(
         request_ids = [req["id"] for req in requests if req.get("id")]
 
         import os as _os
-        _scheduled_statuses = ["scheduled", "staging_scheduled", "publish_failed"]
+        _scheduled_statuses = ["scheduled", "staging_scheduled", "publish_failed", "confirming"]
         scheduled_drafts = await db["content_drafts"].find({
             "$or": [
                 {**scope, "status": {"$in": _scheduled_statuses}},
