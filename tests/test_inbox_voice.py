@@ -167,6 +167,13 @@ def test_channel_overrides_apply_per_channel():
 
 # ── Publishing ───────────────────────────────────────────────────────────────
 
+def test_the_first_profile_is_the_default():
+    db = Db()
+    first = _run(voice.create_profile(db, WS, voice.from_template("luxury_concierge"), "owner", "template"))
+    second = _run(voice.create_profile(db, WS, voice.from_template("minimalist_assistant"), "owner", "template"))
+    assert first["is_default"] is True and second["is_default"] is False
+
+
 def test_a_draft_never_reaches_customers():
     db = Db()
     _run(voice.create_profile(db, WS, voice.from_template("minimalist_assistant"), "owner", "template"))
