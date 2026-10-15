@@ -223,3 +223,16 @@ class TestTelegramLink:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_platform_tones_are_keyed_by_lowercase_platform():
+    from app.agents.social_media_manager.services.brand_profile_service import normalize_platform_tones
+    merged = normalize_platform_tones({"Instagram": "Casual", "LinkedIn": "Educational", "linkedin": "formal, no slang",
+                                       "TikTok": ""})
+    assert merged == {"instagram": "Casual", "linkedin": "formal, no slang"}
+
+
+def test_a_partial_save_does_not_reset_the_tone_switch():
+    from app.agents.social_media_manager.routers.complete_social_manager import BrandProfileRequest
+    assert "same_tone_everywhere" not in BrandProfileRequest(tagline="x").dict(exclude_none=True)
+    assert BrandProfileRequest(same_tone_everywhere=False).dict(exclude_none=True)["same_tone_everywhere"] is False
