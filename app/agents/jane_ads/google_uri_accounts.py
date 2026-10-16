@@ -246,3 +246,34 @@ async def create_account(db, name: str, created_by: str) -> dict:
         upsert=True,
     )
     return {"customer_id": customer_id, "name": name, "billing_ready": billing_attached}
+
+
+async def manager_accounts(db) -> list[dict]:
+    """Every ordinary Google Ads account under URI's manager account, as Google
+    sees it: name, currency, status, whether it can pay, and whether it is
+    already one of URI's accounts. So staff can spot a newly created account
+    and add it in one click."""
+    mcc = _digits(settings.GOOGLE_ADS_MCC_CUSTOMER_ID)
+    rows = await _search(db, mcc, (
+        "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, "
+        "customer_client.manager, customer_client.status, customer_client.level FROM customer_client "
+        "WHERE customer_client.level <= 1"))
+    known = {a["customer_id"]: a for a in await list_accounts(db)}
+    out = []
+    for r in rows:
+        c = r.get("customerClient", {})
+        cid = str(c.get("id") or "")
+        if not cid or cid == mcc or c.get("manager"):
+            continue
+        billing_ready = None
+        if c.get("status") in (None, "", "ENABLED"):
+            try:
+                billing = await _search(db, cid, "SELECT billing_setup.status FROM billing_setup")
+                billing_ready = any(b.get("billingSetup", {}).get("status") in ("APPROVED", "APPROVED_HELD")
+                                    for b in billing)
+            except Exception as e:
+                print(f"[google_uri_accounts] billing read failed for {cid}: {e}", flush=True)
+        out.append({"customer_id": cid, "name": c.get("descriptiveName") or "", "currency_code": c.get("currencyCode") or "",
+                    "status": c.get("status") or "", "billing_ready": billing_ready,
+                    "added": cid in known, "brand_id": (known.get(cid) or {}).get("brand_id")})
+    return out
