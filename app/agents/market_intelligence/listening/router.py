@@ -48,6 +48,9 @@ async def enable_listening(ctx: dict = Depends(require_mi_write_access),
                                    force=True)
     if not prof:
         return UriResponse.error_response("Your Brand Playbook doesn't say what you sell yet — add your products there first.")
+    if not prof.get("markets"):
+        return UriResponse.error_response("Uri couldn't work out which market you sell in yet — add your products and "
+                                          "industry to your Brand Playbook, then try again.")
     await db["mi_listening_profiles"].update_one({"brand_id": ctx["brand_id"]}, {"$set": {"status": "active"}})
     return UriResponse.get_single_data_response("profile", _public_profile(prof))
 
