@@ -1324,6 +1324,44 @@ class ApprovalWorkflowService:
             return url
 
     @staticmethod
+    async def _poll_tiktok_publish(outstand, post_id: str):
+        """Poll Outstand until a TikTok post is confirmed published or fails.
+
+        Returns (published: bool, failure_reason: str | None). Acceptance by
+        Outstand's POST /v1/posts (a 200 with a post id) is not the same as
+        actually publishing — TikTok's own rejection (e.g. the unaudited-app
+        privacy restriction) arrives asynchronously and only shows up here,
+        live-confirmed 2026-10-16: Outstand returned 200 success:true, and
+        TikTok's "unaudited_client_can_only_post_to_private_accounts" only
+        surfaced minutes later through this poll. Never as an exception
+        around the publish_post() call itself.
+        """
+        for _ in range(90):
+            await asyncio.sleep(8)
+            try:
+                check = await outstand.get_post(post_id)
+            except Exception as poll_err:
+                print(f"⚠️ TikTok publish-status poll failed for {post_id}: {poll_err}")
+                continue
+            check_post = check.get("post") or check.get("data") or {}
+            if isinstance(check_post, list):
+                check_post = check_post[0] if check_post else {}
+            if check_post.get("publishedAt") and not check_post.get("isDraft"):
+                return True, None
+            # The failure reason lives per-account, not on the post itself —
+            # live-confirmed via Outstand's own dashboard: socialAccounts[].status
+            # == "failed" with socialAccounts[].error holding the real detail.
+            failed_acct = next(
+                (a for a in (check_post.get("socialAccounts") or []) if a.get("status") == "failed"),
+                None,
+            )
+            if failed_acct:
+                failure_reason = failed_acct.get("error") or "unknown reason"
+                print(f"⚠️ TikTok post {post_id} failed: {failure_reason}")
+                return False, failure_reason
+        return False, None
+
+    @staticmethod
     async def _upload_base64_image_to_facebook(
         page_id: str,
         page_token: str,
@@ -1930,53 +1968,14 @@ class ApprovalWorkflowService:
                     platform_config = {"tiktok": tiktok_config}
 
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
-                try:
-                    result = await outstand.publish_post(
-                        outstand_account_ids=[connection["outstand_account_id"]],
-                        content=content,
-                        scheduled_at=scheduled_at,
-                        media_urls=media_urls,
-                        tweets=tweets,
-                        platform_config=platform_config,
-                    )
-                except Exception as publish_err:
-                    # PUBLIC_TO_EVERYONE can fail two different ways, and we
-                    # can't know in advance which applies to a given account:
-                    # (a) privacyLevel "must come from the creator_info
-                    # privacy_level_options" for that account (Outstand's own
-                    # "Create a post" docs) — no per-account lookup exposed to
-                    # us for Outstand-connected accounts to check beforehand; or
-                    # (b) the TikTok app itself hasn't passed Content Posting
-                    # API audit, which TikTok reports as its own distinct error
-                    # — live-confirmed 2026-10-14: a real post rejected with
-                    # "unaudited_client_can_only_post_to_private_accounts",
-                    # TikTok's own suggested fix being privacyLevel SELF_ONLY.
-                    # Both land in the same place: retry once with SELF_ONLY,
-                    # keeping DIRECT_POST (not switching to MEDIA_UPLOAD) so the
-                    # post still actually goes live — privately — and the
-                    # existing publishedAt-polling below can still genuinely
-                    # confirm it, rather than MEDIA_UPLOAD's "parked in the
-                    # creator's TikTok inbox, publishedAt may never arrive."
-                    err_str = str(publish_err)
-                    is_tiktok_privacy_issue = (
-                        platform == "tiktok"
-                        and platform_config
-                        and "tiktok" in platform_config
-                        and platform_config["tiktok"].get("postMode") == "DIRECT_POST"
-                        and ("privacy" in err_str.lower() or "unaudited" in err_str.lower() or "audit" in err_str.lower())
-                    )
-                    if not is_tiktok_privacy_issue:
-                        raise
-                    print(f"⚠️ TikTok publish failed on privacyLevel/audit ({err_str}) — retrying as SELF_ONLY")
-                    retry_config = {**platform_config["tiktok"], "privacyLevel": "SELF_ONLY"}
-                    result = await outstand.publish_post(
-                        outstand_account_ids=[connection["outstand_account_id"]],
-                        content=content,
-                        scheduled_at=scheduled_at,
-                        media_urls=media_urls,
-                        tweets=tweets,
-                        platform_config={"tiktok": retry_config},
-                    )
+                result = await outstand.publish_post(
+                    outstand_account_ids=[connection["outstand_account_id"]],
+                    content=content,
+                    scheduled_at=scheduled_at,
+                    media_urls=media_urls,
+                    tweets=tweets,
+                    platform_config=platform_config,
+                )
                 print(f"📬 Outstand publish response: {result}")
 
                 # Outstand returns {"data": {"id": "...", "status": "queued|processing|published|failed"}}
@@ -2016,35 +2015,43 @@ class ApprovalWorkflowService:
                 # = 12 min) so a draft is only marked "published" in our DB
                 # once TikTok has actually confirmed it, not just accepted it.
                 if success and platform == "tiktok" and post_id:
-                    published = False
-                    failure_reason = None
-                    for _ in range(90):
-                        await asyncio.sleep(8)
-                        try:
-                            check = await outstand.get_post(post_id)
-                        except Exception as poll_err:
-                            print(f"⚠️ TikTok publish-status poll failed for {post_id}: {poll_err}")
-                            continue
-                        check_post = check.get("post") or check.get("data") or {}
-                        if isinstance(check_post, list):
-                            check_post = check_post[0] if check_post else {}
-                        if check_post.get("publishedAt") and not check_post.get("isDraft"):
-                            published = True
-                            break
-                        # The failure reason lives per-account, not on the post
-                        # itself — live-confirmed 2026-10-10 via Outstand's own
-                        # dashboard: socialAccounts[].status == "failed" with
-                        # socialAccounts[].error holding the real detail (e.g.
-                        # "picture_size_check_failed", a TikTok-side rejection
-                        # of one of the images, not a stuck/pending state).
-                        failed_acct = next(
-                            (a for a in (check_post.get("socialAccounts") or []) if a.get("status") == "failed"),
-                            None,
+                    published, failure_reason = await ApprovalWorkflowService._poll_tiktok_publish(outstand, post_id)
+
+                    # TikTok's rejection of an unaudited app's PUBLIC_TO_EVERYONE
+                    # post arrives asynchronously (see _poll_tiktok_publish) —
+                    # Outstand already accepted post_id, which is now dead, so
+                    # the only way to recover is a brand-new post, not a retry
+                    # of this one. TikTok's own suggested fix is SELF_ONLY.
+                    is_tiktok_privacy_issue = (
+                        not published
+                        and failure_reason
+                        and platform_config
+                        and platform_config.get("tiktok", {}).get("postMode") == "DIRECT_POST"
+                        and platform_config.get("tiktok", {}).get("privacyLevel") != "SELF_ONLY"
+                        and ("privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower())
+                    )
+                    if is_tiktok_privacy_issue:
+                        print(f"⚠️ TikTok post {post_id} failed on privacyLevel/audit ({failure_reason}) — submitting a new post as SELF_ONLY")
+                        retry_config = {**platform_config["tiktok"], "privacyLevel": "SELF_ONLY"}
+                        retry_result = await outstand.publish_post(
+                            outstand_account_ids=[connection["outstand_account_id"]],
+                            content=content,
+                            scheduled_at=scheduled_at,
+                            media_urls=media_urls,
+                            tweets=tweets,
+                            platform_config={"tiktok": retry_config},
                         )
-                        if failed_acct:
-                            failure_reason = failed_acct.get("error") or "unknown reason"
-                            print(f"⚠️ TikTok post {post_id} failed: {failure_reason}")
-                            break
+                        print(f"📬 Outstand retry publish response: {retry_result}")
+                        retry_post_obj = retry_result.get("post") or retry_result.get("data") or {}
+                        if isinstance(retry_post_obj, list):
+                            retry_post_obj = retry_post_obj[0] if retry_post_obj else {}
+                        retry_post_id = retry_post_obj.get("id")
+                        if retry_post_id:
+                            post_id = retry_post_id
+                            post_status = retry_post_obj.get("status", "")
+                            result = retry_result
+                            published, failure_reason = await ApprovalWorkflowService._poll_tiktok_publish(outstand, post_id)
+
                     if published:
                         print(f"✅ TikTok post {post_id} confirmed published")
                     else:
