@@ -306,6 +306,13 @@ async def resolve_ads_page_for_launch(
             "page_name": ads.get("account_name", ""),
         }
 
+    # A brand that connected its own Page for ads must never be moved onto URI's
+    # shared Page because that connection broke. An expired token did exactly that:
+    # the ad published as "URI" and its DMs went to URI's inbox, not the client's.
+    # They reconnect instead; the shared Page is only for brands that never connected.
+    if (ads or {}).get("page_id"):
+        raise AdsConnectionRequired(state, ads.get("account_name", ""))
+
     if not settings.META_ADS_PAGE_ID:
         # No brand Page AND no shared Page configured — surface the brand's real state
         # (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE) so the caller can prompt precisely.

@@ -194,6 +194,10 @@ def _agent_view(conv: dict) -> dict:
         "needs_human": bool(conv.get("needs_human")),
         "handoff_reason": conv.get("handoff_reason") or "",
         "ai_suggestion": conv.get("ai_suggestion"),
+        "emotion": conv.get("emotion") or "",
+        "situation": conv.get("situation") or "",
+        "situation_label": conv.get("situation_label") or "",
+        "voice_name": conv.get("voice_name") or "",
     }
 
 
