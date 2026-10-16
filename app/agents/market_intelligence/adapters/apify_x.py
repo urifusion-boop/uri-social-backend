@@ -71,8 +71,20 @@ PRO_PROFILE = ApifyXProfile(
 
 
 def _quote(term: str) -> str:
+    """For exclusions: an exact phrase, so '-free trial' doesn't drop every
+    post containing "free"."""
     term = " ".join(term.split())
     return f'"{term}"' if " " in term else term
+
+
+def _keyword(term: str) -> str:
+    """A keyword matches posts containing all its words, in any order — an
+    exact quoted phrase finds almost nothing on X (people don't write a
+    marketer's phrase word for word). Already-quoted terms stay exact."""
+    term = " ".join(term.split())
+    if term.startswith('"') and term.endswith('"'):
+        return term
+    return f"({term})" if " " in term else term
 
 
 def build_search_terms(keywords: list[str], excluded: list[str], since: datetime, until: datetime,
@@ -89,7 +101,7 @@ def build_search_terms(keywords: list[str], excluded: list[str], since: datetime
         if not k or k.lower() in seen:
             continue
         seen.add(k.lower())
-        out.append(" ".join([_quote(k)] + tail))
+        out.append(" ".join([_keyword(k)] + tail))
     return out
 
 
