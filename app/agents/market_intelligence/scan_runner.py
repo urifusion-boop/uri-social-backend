@@ -18,6 +18,7 @@ from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .adapters.base import AdapterCapabilities, SourceAdapter
+from .adapters.apify_x import PRO_PROFILE, TEST_PROFILE, ApifyXAdapter
 from .adapters.mock import MockSourceAdapter
 from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
@@ -63,7 +64,14 @@ NOISE_FILTER_PROMPT_VERSION = "mi-noise-filter-v1"
 # One adapter instance per provider — new real adapters register here.
 ADAPTER_REGISTRY: dict[str, SourceAdapter] = {
     "mock": MockSourceAdapter(),
+    # X through Apify: the cheap actor for testing, Tweet Scraper V2 for scale.
+    "x": ApifyXAdapter(TEST_PROFILE),
+    "x_pro": ApifyXAdapter(PRO_PROFILE),
 }
+
+# Real collection pages through results; a bound keeps one bad cursor from
+# looping forever (200 items/page -> up to 10,000 items per source).
+MAX_PAGES_PER_SOURCE = 50
 
 CLUSTERED_TYPES = {
     EvidenceType.CUSTOMER_CONCERN,
@@ -343,12 +351,25 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     )
 
     business_context = await _fetch_business_context(db, topic.user_id, topic.brand_id)
+    # The topic's own scope, so labelling can tell a competitor's news from a
+    # random brand, and a post from the market area from one elsewhere.
+    business_context["competitors"] = list(topic.competitors or [])
+    business_context["market_area"] = topic.geographic_scope
+
+    # Competitors are searched too — otherwise "what competitors are doing"
+    # could only ever be found by accident.
+    search_keywords = list(dict.fromkeys(
+        [k for k in topic.keywords if k.strip()] + [c for c in (topic.competitors or []) if c.strip()]))
+    # Only a single, explicit language narrows the search; several (e.g. en +
+    # pcm) means "don't filter", since X's own language tags are unreliable.
+    search_language = topic.languages[0] if len(topic.languages or []) == 1 else None
 
     until = datetime.utcnow()
 
     all_new_evidence: list[Evidence] = []
     gaps: list[str] = []
     provider_run_ids: dict[str, str] = {}
+    actual_costs: dict[str, float] = {}
 
     for source in topic.sources:
         adapter = ADAPTER_REGISTRY.get(source.provider)
@@ -365,7 +386,11 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         since = until - timedelta(days=accessible_days)
 
         try:
-            provider_run_id = await adapter.start_collection(topic.keywords, topic.excluded_keywords, since, until)
+            if isinstance(adapter, ApifyXAdapter):
+                provider_run_id = await adapter.start_collection(
+                    search_keywords, topic.excluded_keywords, since, until, language=search_language)
+            else:
+                provider_run_id = await adapter.start_collection(search_keywords, topic.excluded_keywords, since, until)
         except Exception as e:
             gaps.append(f"source '{source.provider}' collection failed: {e}")
             continue
@@ -376,29 +401,50 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         provider_run_ids[source.provider] = provider_run_id
         await db["mi_scans"].update_one({"id": run_id}, {"$set": {f"provider_run_ids.{source.provider}": provider_run_id}})
 
-        try:
-            page = await adapter.fetch_page(provider_run_id)
-        except Exception as e:
-            gaps.append(f"source '{source.provider}' collection failed: {e}")
-            continue
+        # Every page, not just the first: a real run returns hundreds of
+        # posts. fetch_page waits for a still-running provider run itself.
+        cursor: Optional[str] = None
+        seen_here: set[str] = set()
+        for _page_no in range(MAX_PAGES_PER_SOURCE):
+            try:
+                page = await adapter.fetch_page(provider_run_id, cursor)
+            except Exception as e:
+                gaps.append(f"source '{source.provider}' collection failed: {e}")
+                break
 
-        candidate_ids = [raw.source_id for raw in page.evidence]
-        existing_ids = await _dedupe_against_existing(db, topic.id, candidate_ids)
+            fresh = [raw for raw in page.evidence if raw.source_id not in seen_here]
+            seen_here.update(raw.source_id for raw in fresh)
+            existing_ids = await _dedupe_against_existing(db, topic.id, [raw.source_id for raw in fresh])
 
-        for raw in page.evidence:
-            if raw.source_id in existing_ids:
-                continue
-            evidence = Evidence(
-                **raw.dict(),
-                id=str(uuid.uuid4()),
-                brand_id=topic.brand_id,
-                user_id=topic.user_id,
-                topic_id=topic.id,
-                collection_run_id=run_id,
-            )
-            all_new_evidence.append(evidence)
+            for raw in fresh:
+                if raw.source_id in existing_ids:
+                    continue
+                evidence = Evidence(
+                    **raw.dict(),
+                    id=str(uuid.uuid4()),
+                    brand_id=topic.brand_id,
+                    user_id=topic.user_id,
+                    topic_id=topic.id,
+                    collection_run_id=run_id,
+                )
+                all_new_evidence.append(evidence)
 
-        gaps.extend(page.gaps)
+            gaps.extend(page.gaps)
+            if not page.has_more or not page.next_cursor:
+                break
+            cursor = page.next_cursor
+        else:
+            gaps.append(f"source '{source.provider}': stopped after {MAX_PAGES_PER_SOURCE} pages")
+
+        # What the provider actually charged, when it reports it (Apify does).
+        actual = getattr(adapter, "actual_cost", None)
+        if actual is not None:
+            try:
+                cost = await actual(provider_run_id)
+                if cost is not None:
+                    actual_costs[source.provider] = cost
+            except Exception as e:
+                print(f"[MI][scan] could not read actual cost for {source.provider}: {e}")
 
     if all_new_evidence:
         await db["mi_evidence"].insert_many([e.dict() for e in all_new_evidence])
@@ -614,13 +660,18 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         await db["mi_developments"].insert_many([d.dict() for d in developments])
 
     # PRD §23: "reconcile actual charges and release unused reservation."
-    # This pilot's adapters only ever report an upfront estimate, not a
-    # metered actual cost, so the reserved amount IS the actual charge here —
-    # documented simplification, not a placeholder to silently forget about
-    # once a metered adapter exists.
+    # Metered sources (Apify) report what the run really cost; the rest are
+    # booked at their estimate.
     run_doc = await db["mi_scans"].find_one({"id": run_id})
     reserved_amount = (run_doc or {}).get("estimated_cost_usd", 0.0)
-    await reconcile_spend(db, topic.brand_id, reserved_amount, reserved_amount)
+    if actual_costs:
+        previews = {p.provider: p.estimated_cost_usd for p in await preview_topic_coverage(topic)}
+        actual_amount = sum(actual_costs.values()) + sum(
+            v for k, v in previews.items() if k not in actual_costs)
+    else:
+        actual_amount = reserved_amount
+    await reconcile_spend(db, topic.brand_id, reserved_amount, actual_amount)
+    await db["mi_scans"].update_one({"id": run_id}, {"$set": {"actual_cost_usd": round(actual_amount, 4)}})
 
     completed_at = datetime.utcnow()
     final_status = ScanStatus.PARTIAL if gaps else ScanStatus.COMPLETED
