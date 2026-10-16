@@ -382,7 +382,7 @@ class VideoGenerationService:
         while True:
             elapsed = time.monotonic() - started
             if elapsed > timeout_seconds:
-                if col:
+                if col is not None:
                     await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
                 raise TimeoutError(
                     f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
@@ -401,14 +401,14 @@ class VideoGenerationService:
                 last_state = state
 
             if state == "Completed":
-                if col:
+                if col is not None:
                     await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
                 error = getattr(status, "error", None)
                 if error:
                     raise RuntimeError(f"{model} failed: {error}")
                 return await handle.get()
 
-            if col:
+            if col is not None:
                 await col.update_one({"job_id": job_id}, {"$set": {
                     "current_scene_status": {
                         "scene_number": scene_num,
