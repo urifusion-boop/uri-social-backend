@@ -216,6 +216,9 @@ class Classification(BaseModel):
     evidence_span: str
     uncertain: bool = False
     reasoning: str
+    # Relevance gate (mi-classify-v2): False = only shared words with the
+    # topic; such a post is stored as noise and never feeds an insight.
+    on_topic: Optional[bool] = None
 
     # Concern-specific structured fields (PRD §10 "Concern structure") — populated
     # only when primary_type == CUSTOMER_CONCERN, else left None.
@@ -374,6 +377,13 @@ class Topic(BaseModel):
     competitors: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=lambda: ["en"])
     notification_sensitivity: NotificationSensitivity = NotificationSensitivity.NORMAL
+
+    # Search plan (query_planner.py): the variation groups searched, plus what
+    # the topic has learned across scans (term_learning.py).
+    search_plan: Optional[dict] = None
+    learned_terms: list[str] = Field(default_factory=list)
+    retired_terms: list[str] = Field(default_factory=list)
+    plan_updated_at: Optional[datetime] = None
 
 
 class Development(BaseModel):
