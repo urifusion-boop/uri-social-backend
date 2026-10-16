@@ -39,9 +39,11 @@ Rules:
 - Use ONLY the facts given. Never invent a product, place, competitor or claim.
 - question: one plain question the owner would ask, e.g. "What are people in Lagos saying when they look for
   affordable skincare, and what stops them buying?"
-- keywords: 4-8 short phrases a real customer would actually post on X/Instagram — include the brand name,
-  the product/category in everyday words, and buying-intent or complaint phrasing for this category
-  (e.g. "where can I buy", "recommend a"). Not marketing slogans. No hashtags.
+- keywords: 4-8 SHORT search terms (1-3 words each) that real people actually type in posts — the brand
+  name alone, the product/category in everyday words (e.g. "social media manager", "skincare"), and short
+  category terms people use when asking or complaining (e.g. "content creator", "instagram growth").
+  Each keyword is matched as "all these words", so longer phrases find almost nothing. Not marketing
+  phrases, not sentences, no hashtags, never the brand name glued to other words.
 - excluded_keywords: only for obvious clashes (a brand name that is also a common word). Otherwise empty."""
 
 
