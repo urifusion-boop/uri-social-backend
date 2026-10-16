@@ -84,7 +84,7 @@ async def listening_status(ctx: dict = Depends(get_active_brand_context),
             "key": key, "label": m.get("label"), "last_collected_at": m.get("last_collected_at"),
             "learned_terms": m.get("learned_terms") or [], "topics": topics, "active_signals": signals,
             "last_run": {k: (last or {}).get(k) for k in ("status", "started_at", "finished_at", "items_returned",
-                                                          "new_items", "covered_from", "note")} if last else None,
+                                                          "new_items", "covered_from", "note", "per_query")} if last else None,
         })
     return UriResponse.get_single_data_response("listening", {
         "profile": _public_profile(prof) if prof else None,
