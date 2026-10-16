@@ -2082,6 +2082,66 @@ class ApprovalWorkflowService:
                             result = retry_result
                             published, failure_reason = await ApprovalWorkflowService._poll_tiktok_publish(outstand, post_id)
 
+                    # Live-confirmed 2026-10-16: SELF_ONLY can fail with the exact
+                    # same "unaudited_client_can_only_post_to_private_accounts"
+                    # error — TikTok's generic message doesn't actually reflect
+                    # which privacyLevel was sent, meaning the real block is
+                    # DIRECT_POST itself (likely the app's Content Posting API
+                    # under re-review after an unrelated portal change), not the
+                    # privacy value. No privacyLevel fixes that, so fall back to
+                    # TikTok's third suggested option: MEDIA_UPLOAD, which drops
+                    # privacyLevel entirely and delivers to the creator's TikTok
+                    # inbox as a draft instead of posting directly.
+                    is_still_privacy_issue = (
+                        not published
+                        and failure_reason
+                        and platform_config
+                        and platform_config.get("tiktok", {}).get("postMode") == "DIRECT_POST"
+                        and ("privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower())
+                    )
+                    media_upload_delivered = False
+                    if is_still_privacy_issue:
+                        print(f"⚠️ TikTok post {post_id} still failed on privacyLevel/audit ({failure_reason}) — submitting a new post as MEDIA_UPLOAD")
+                        media_upload_config = {k: v for k, v in platform_config["tiktok"].items() if k not in ("postMode", "privacyLevel")}
+                        media_upload_config["postMode"] = "MEDIA_UPLOAD"
+                        media_result = await outstand.publish_post(
+                            outstand_account_ids=[connection["outstand_account_id"]],
+                            content=content,
+                            scheduled_at=scheduled_at,
+                            media_urls=media_urls,
+                            tweets=tweets,
+                            platform_config={"tiktok": media_upload_config},
+                        )
+                        print(f"📬 Outstand MEDIA_UPLOAD response: {media_result}")
+                        media_post_obj = media_result.get("post") or media_result.get("data") or {}
+                        if isinstance(media_post_obj, list):
+                            media_post_obj = media_post_obj[0] if media_post_obj else {}
+                        media_post_id = media_post_obj.get("id")
+                        if media_post_id:
+                            # MEDIA_UPLOAD never sets publishedAt until the creator
+                            # manually finishes it in the TikTok app — polling for
+                            # that would just burn the full 12-minute budget, so
+                            # treat acceptance itself as the outcome here.
+                            post_id = media_post_id
+                            post_status = media_post_obj.get("status", "")
+                            result = media_result
+                            media_upload_delivered = True
+
+                    if media_upload_delivered:
+                        error_msg = (
+                            "TikTok is currently blocking direct posting for this app (likely under review). "
+                            f"This was delivered to @{connection.get('account_name') or connection.get('outstand_account_id')}'s "
+                            "TikTok inbox as a draft instead — open the TikTok app to review and publish it manually."
+                        )
+                        print(f"📥 TikTok post {post_id} delivered to inbox (MEDIA_UPLOAD) — {error_msg} Not marking this draft as published.")
+                        return {
+                            "success": False,
+                            "post_id": post_id,
+                            "outstand_status": post_status,
+                            "raw_response": result,
+                            "error": error_msg,
+                        }
+
                     if published:
                         print(f"✅ TikTok post {post_id} confirmed published")
                         return {"success": True, "post_id": post_id, "outstand_status": "published",
