@@ -81,6 +81,27 @@ def fingerprint(facts: dict) -> str:
     return hashlib.sha256(json.dumps({k: facts.get(k) for k in keys}, sort_keys=True).encode()).hexdigest()[:16]
 
 
+DEFINE_PROMPT = """Define the market category this business sells in, from its own facts only.
+label: a short category name (e.g. 'Medical documentation software', 'Dental clinics').
+core_terms: 8-14 short terms (1-3 words) real customers use on social media for this kind of product or service,
+including the problem it solves. No brand names. excluded: other meanings to exclude (or empty)."""
+
+
+async def _define_category(facts_text: str) -> Optional[_NewCategory]:
+    try:
+        req = AIService.build_ai_model(model="gpt-4o-mini", temperature=0, messages=[
+            {"role": "system", "content": DEFINE_PROMPT},
+            {"role": "user", "content": f"Business facts:\n{facts_text}"}])
+        completion = await AIService.structured_chat_completion(req, response_model=_NewCategory)
+        if isinstance(completion, dict) and "error" in completion:
+            raise RuntimeError(completion["error"])
+        cat = completion.choices[0].message.parsed
+        return cat if cat and cat.core_terms else None
+    except Exception as e:
+        print(f"[MI][listen] category definition failed: {e}")
+        return None
+
+
 async def _map(db, facts: dict) -> tuple[list[str], Optional[str]]:
     cats = await ontology.categories(db)
     listing = "\n".join(f"- {c['id']}: {c['label']} ({', '.join((c.get('core_terms') or [])[:6])})" for c in cats)
@@ -99,9 +120,13 @@ async def _map(db, facts: dict) -> tuple[list[str], Optional[str]]:
         return [], country
     valid = {c["id"] for c in cats}
     ids = [c for c in parsed.category_ids if c in valid][:2]
-    if not ids and parsed.new_category and parsed.new_category.core_terms:
-        new = await ontology.add_auto_category(db, parsed.new_category.label, parsed.new_category.core_terms,
-                                               parsed.new_category.excluded)
+    new_cat = parsed.new_category if parsed.new_category and parsed.new_category.core_terms else None
+    if not ids and not new_cat:
+        # Nothing fit and nothing was defined: every business must land in a
+        # market, so ask once more for its own category, which is required here.
+        new_cat = await _define_category(facts_text)
+    if not ids and new_cat:
+        new = await ontology.add_auto_category(db, new_cat.label, new_cat.core_terms, new_cat.excluded)
         ids = [new["id"]]
     code = (parsed.country or "").upper()
     return ids, country or (code if len(code) == 2 or code == "GLOBAL" else None)

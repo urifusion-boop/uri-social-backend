@@ -280,6 +280,38 @@ def test_collection_stops_at_the_monthly_budget():
     assert res["status"] == "skipped_budget"
 
 
+def test_business_that_fits_no_category_gets_its_own(monkeypatch):
+    """Live-found: a business no seeded category fits must still land in a market."""
+    db = fresh_db()
+    calls = []
+
+    class _Msg:
+        def __init__(self, parsed):
+            self.parsed, self.refusal = parsed, None
+
+    class _Completion:
+        def __init__(self, parsed):
+            self.choices = [type("C", (), {"message": _Msg(parsed)})()]
+
+    async def fake(req, response_model=None):
+        calls.append(response_model.__name__)
+        if response_model is profile_mod._MapLLM:
+            return _Completion(profile_mod._MapLLM(category_ids=[], new_category=None, country="NG"))
+        return _Completion(profile_mod._NewCategory(label="Medical documentation software",
+                                                    core_terms=["medical records", "clinic software", "patient notes"],
+                                                    excluded=[]))
+    monkeypatch.setattr(profile_mod.AIService, "structured_chat_completion", fake)
+    prof = run(profile_mod.build(db, "u1", "b1", {"brand_name": "Docerity", "industry": "Healthcare technology",
+                                                  "product_description": "Clinical documentation for doctors",
+                                                  "customer_location": "Lagos"}))
+    assert calls == ["_MapLLM", "_NewCategory"]
+    assert prof["markets"] == ["medical_documentation_software:NG"] and prof["country"] == "NG"
+    cat = run(db["mi_ontology"].find_one({"id": "medical_documentation_software"}))
+    assert cat["status"] == "auto" and "clinic software" in cat["core_terms"]
+    market = run(db["mi_markets"].find_one({"key": "medical_documentation_software:NG"}))
+    assert market["subscribers"] == ["b1"]
+
+
 def test_country_from_location_text():
     assert profile_mod._country_from_text("Lekki, Lagos") == "NG"
     assert profile_mod._country_from_text("Accra and Kumasi") == "GH"
