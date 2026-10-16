@@ -94,6 +94,42 @@ async def listening_status(ctx: dict = Depends(get_active_brand_context),
     })
 
 
+@router.get("/pulse")
+async def market_pulse(days: int = 7, ctx: dict = Depends(get_active_brand_context),
+                       db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """What people in this business's markets are talking about right now:
+    top topics by distinct accounts (only covered hours count), with what
+    they want. Context, not alerts — signals and cards still need evidence."""
+    from collections import Counter, defaultdict
+    from .detect import covered_hours
+
+    days = max(1, min(days, 30))
+    prof = await db["mi_listening_profiles"].find_one({"brand_id": ctx["brand_id"]})
+    now = datetime.utcnow()
+    start = now - timedelta(days=days)
+    out = []
+    for key in (prof or {}).get("markets") or []:
+        cov = await covered_hours(db, key, start, now)
+        agg: dict = defaultdict(lambda: {"authors": set(), "posts": 0, "intents": Counter(), "needs": Counter()})
+        async for r in db["mi_listen_readings"].find({"market": key, "on_topic": True, "published_at": {"$gte": start}}):
+            if r["published_at"].replace(minute=0, second=0, microsecond=0) not in cov:
+                continue
+            for t in r.get("topics") or []:
+                a = agg[t]
+                a["authors"].add(r.get("author") or r["source_id"])
+                a["posts"] += 1
+                a["intents"][r["intent"]] += 1
+                if r.get("need"):
+                    a["needs"][r["need"].strip().lower()] += 1
+        top = sorted(agg.items(), key=lambda kv: (-len(kv[1]["authors"]), -kv[1]["posts"]))[:15]
+        m = await db["mi_markets"].find_one({"key": key}) or {}
+        out.append({"market": key, "label": m.get("label"), "covered_hours": len(cov), "window_days": days,
+                    "topics": [{"topic": t, "accounts": len(v["authors"]), "posts": v["posts"],
+                                "intents": dict(v["intents"]), "needs": [n for n, _ in v["needs"].most_common(2)]}
+                               for t, v in top]})
+    return UriResponse.get_single_data_response("pulse", out)
+
+
 @router.post("/run")
 async def run_now(background_tasks: BackgroundTasks, ctx: dict = Depends(require_mi_write_access),
                   db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
