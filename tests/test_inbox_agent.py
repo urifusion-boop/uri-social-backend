@@ -372,6 +372,14 @@ def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
     assert not [m for m in db[MESSAGES].docs if m["direction"] == "outbound"]
 
 
+@pytest.mark.parametrize("value,expected", [
+    ([], False), ([""], False), (["Do you deliver to Ghana?"], True), (True, True), (False, False),
+    ("true", True), (None, False),
+])
+def test_unanswered_means_a_named_gap(value, expected):
+    assert agent._unanswered(value) is expected
+
+
 @pytest.mark.parametrize("text", ["i'm interested", "Im interested", "I am very interested!",
                                   "how do I get started?", "count me in"])
 def test_saying_youre_interested_is_a_lead_not_engagement(text):
