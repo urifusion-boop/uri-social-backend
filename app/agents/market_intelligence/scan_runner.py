@@ -73,6 +73,8 @@ ADAPTER_REGISTRY: dict[str, SourceAdapter] = {
 # looping forever (200 items/page -> up to 10,000 items per source).
 MAX_PAGES_PER_SOURCE = 50
 
+INCREMENTAL_OVERLAP = timedelta(hours=2)
+
 CLUSTERED_TYPES = {
     EvidenceType.CUSTOMER_CONCERN,
     EvidenceType.UNMET_NEED,
@@ -366,6 +368,23 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
 
     until = datetime.utcnow()
 
+    # A repeat scan only needs what's new since the last good one (with a
+    # small overlap for late-indexed posts) — re-requesting the whole window
+    # just re-buys posts the dedup below throws away. PRD §18's bounded
+    # overlap window.
+    try:
+        previous = await db["mi_scans"].find_one(
+            {"topic_id": topic.id, "id": {"$ne": run_id},
+             "status": {"$in": [ScanStatus.COMPLETED.value, ScanStatus.PARTIAL.value]},
+             "started_at": {"$ne": None}},
+            sort=[("started_at", -1)],
+        )
+    except Exception as e:  # can't tell -> collect the full window, never fail the scan over it
+        print(f"[MI][scan] could not read the previous scan for {topic.id}: {e}")
+        previous = None
+    started = (previous or {}).get("started_at")
+    resume_from = (started - INCREMENTAL_OVERLAP) if isinstance(started, datetime) else None
+
     all_new_evidence: list[Evidence] = []
     gaps: list[str] = []
     provider_run_ids: dict[str, str] = {}
@@ -384,6 +403,8 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         if coverage_note:
             gaps.append(f"source '{source.provider}': {coverage_note}")
         since = until - timedelta(days=accessible_days)
+        if resume_from and resume_from > since:
+            since = resume_from
 
         try:
             if isinstance(adapter, ApifyXAdapter):
