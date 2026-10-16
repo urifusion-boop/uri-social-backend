@@ -176,7 +176,7 @@ class ApifyXAdapter(SourceAdapter):
             supports_date_filters=True,
             supports_keyword_search=True,
             accessible_languages=["en", "pcm", "yo", "ig", "ha", "fr"],
-            refresh_cadence_hours=1,
+            refresh_cadence_hours=24,  # paid per post: once a day is plenty for keep-updating
             notes=(f"{self.profile.label}. Public posts only; up to {ITEMS_PER_KEYWORD} tweets per keyword per scan. "
                    "X search reliably reaches about the last 30 days."),
         )
