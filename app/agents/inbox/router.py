@@ -20,7 +20,7 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
-    link_workspace_channels,
+    link_workspace_channels, release_channels,
 )
 from . import agent
 from .meta_transport import meta_transport
@@ -367,6 +367,21 @@ async def list_channels(
             "last_event_at": (last[0].get("received_at") if last else None),
         })
     return {"channels": out}
+
+
+@router.delete("/channels")
+async def unlink_channels(
+    platform: str = Query(""),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Stop this workspace's inbox receiving an account's messages, without touching
+    its publishing connection. A workspace that no longer uses a Page here must be
+    able to give up its claim, or the workspace that does use it gets nothing."""
+    if platform and platform not in ("instagram", "facebook"):
+        raise HTTPException(status_code=400, detail="Platform must be instagram or facebook.")
+    removed = await release_channels(db, brand_ctx.get("brand_id"), platform=platform)
+    return {"removed": removed}
 
 
 @router.get("/agent/settings")
