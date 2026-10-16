@@ -244,6 +244,22 @@ def _job_market_intelligence_outbox():
     _run_async("market_intelligence_outbox", _run)
 
 
+def _job_listening_cycle():
+    """Listening Intelligence: collect due markets, read new posts, detect
+    signals and write each business's recommendation cards. Hourly tick;
+    each market is only collected when its own cadence is due."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.cycle import run_cycle
+        except ImportError:
+            return
+        from app.database import get_db
+        result = await run_cycle(get_db())
+        print(f"👂 Listening cycle: markets={len(result.get('markets', []))} cards={result.get('cards')} "
+              f"alerts={result.get('alerts')} {result.get('note') or ''}")
+    _run_async("listening_cycle", _run)
+
+
 def _job_market_intelligence_digests():
     """Uri Market Intelligence daily digest delivery (PRD §14) — runs
     hourly and only actually sends for recipients whose configured digest
@@ -429,6 +445,14 @@ def start_notification_scheduler():
         _job_market_intelligence_digests,
         CronTrigger(minute=45),
         id="market_intelligence_digests",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence: hourly tick, per-market cadence decides real work.
+    _scheduler.add_job(
+        _job_listening_cycle,
+        CronTrigger(minute=35),
+        id="listening_cycle",
         **_JOB_DEFAULTS,
     )
 

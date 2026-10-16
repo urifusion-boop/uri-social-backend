@@ -230,6 +230,36 @@ async def get_budget(
     return UriResponse.get_single_data_response("budget", budget)
 
 
+@router.get("/topics/{topic_id}/search-plan")
+async def get_search_plan(
+    topic_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """What this topic actually searches for: the variation groups, what it
+    has learned and retired, and how each term has performed so far."""
+    from . import query_planner
+
+    topic_doc = await _get_owned_topic(topic_id, ctx["brand_id"], db)
+    topic_doc.pop("_id", None)
+    topic = Topic(**topic_doc)
+    planned = bool(topic.search_plan)
+    plan = query_planner.assemble(topic)
+    stats = {}
+    async for row in db["mi_term_stats"].find({"topic_id": topic_id}):
+        stats[row["term"]] = {"seen": row.get("seen", 0), "useful": row.get("useful", 0)}
+    return UriResponse.get_single_data_response("search_plan", {
+        "planned": planned,
+        "groups": [{**g, "terms": [{"term": t, **stats.get(t, {"seen": 0, "useful": 0})} for t in g["terms"]]}
+                   for g in plan["groups"]],
+        "learned_terms": topic.learned_terms,
+        "retired_terms": topic.retired_terms,
+        "excluded": plan["excluded"],
+        "queries": len(plan["expressions"]),
+        "updated_at": topic.plan_updated_at,
+    })
+
+
 @router.get("/topics/{topic_id}/coverage-preview")
 async def get_topic_coverage_preview(
     topic_id: str,
@@ -681,3 +711,9 @@ async def set_access_grant(
         upsert=True,
     )
     return UriResponse.get_single_data_response("access", grant.dict())
+
+
+# Listening Intelligence (market-level listening -> recommendation cards).
+from .listening.router import router as _listening_router  # noqa: E402
+
+router.include_router(_listening_router)

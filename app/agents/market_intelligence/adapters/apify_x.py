@@ -41,6 +41,8 @@ ITEMS_PER_KEYWORD = 100
 PAGE_SIZE = 200
 WAIT_FOR_RUN_SECONDS = 15 * 60
 POLL_SECONDS = 10
+RETRIES = 3
+RETRY_BACKOFF_SECONDS = 3
 
 _STATUS = {
     "READY": ScanStatus.QUEUED,
@@ -82,7 +84,9 @@ def _keyword(term: str) -> str:
     exact quoted phrase finds almost nothing on X (people don't write a
     marketer's phrase word for word). Already-quoted terms stay exact."""
     term = " ".join(term.split())
-    if term.startswith('"') and term.endswith('"'):
+    if term.startswith("(") and term.endswith(")"):
+        return term  # a planned OR-group, already well-formed
+    if term.startswith('"') and term.endswith('"') and term.count('"') == 2:
         return term
     return f"({term})" if " " in term else term
 
@@ -174,8 +178,26 @@ class ApifyXAdapter(SourceAdapter):
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.token}"}
 
-    def _cap(self, keywords: list[str]) -> tuple[int, int]:
-        per = max(ITEMS_PER_KEYWORD, self.profile.min_items)
+    async def _request(self, method: str, url: str, **kw) -> httpx.Response:
+        """One Apify call, retried on rate limits, server errors and dropped
+        connections (Apify's own guidance: back off and retry 429/5xx)."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(RETRIES):
+            try:
+                async with self._client_factory() as c:
+                    r = await c.request(method, url, headers=self._headers(), **kw)
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_exc = RuntimeError(f"Apify {r.status_code}: {r.text[:200]}")
+                else:
+                    return r
+            except httpx.TransportError as e:
+                last_exc = e
+            if attempt < RETRIES - 1:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+        raise RuntimeError(f"Apify didn't respond after {RETRIES} tries: {last_exc}")
+
+    def _cap(self, keywords: list[str], items_per_query: Optional[int] = None) -> tuple[int, int]:
+        per = max(items_per_query or ITEMS_PER_KEYWORD, self.profile.min_items)
         n = max(1, len([k for k in keywords if k.strip()]))
         return per, per * n
 
@@ -198,19 +220,19 @@ class ApifyXAdapter(SourceAdapter):
         return round(total * self.profile.usd_per_1000 / 1000 + 0.01, 4)  # + run-start fee
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
-                               since: datetime, until: datetime, language: Optional[str] = None) -> str:
+                               since: datetime, until: datetime, language: Optional[str] = None,
+                               items_per_query: Optional[int] = None) -> str:
         terms = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not terms:
             raise ValueError("no keywords to search for")
-        per, total = self._cap(terms)
+        per, total = self._cap(terms, items_per_query)
         if self.profile.key == "x_pro":
             body = {"searchTerms": terms, "maxItems": total, "sort": "Latest"}
         else:
             body = {"searchTerms": terms, "maxItems": per, "queryType": "Latest"}
         max_charge = round(total * self.profile.usd_per_1000 / 1000 * 1.5 + 0.05, 2)
         params = {"maxItems": total, "maxTotalChargeUsd": max_charge}
-        async with self._client_factory() as c:
-            r = await c.post(f"{API}/acts/{self.profile.actor}/runs", params=params, json=body, headers=self._headers())
+        r = await self._request("POST", f"{API}/acts/{self.profile.actor}/runs", params=params, json=body)
         if r.status_code >= 400:
             raise RuntimeError(f"Apify refused to start {self.profile.actor}: {r.status_code} {r.text[:300]}")
         data = r.json().get("data") or {}
@@ -222,8 +244,7 @@ class ApifyXAdapter(SourceAdapter):
         return run_id
 
     async def _run(self, run_id: str) -> dict:
-        async with self._client_factory() as c:
-            r = await c.get(f"{API}/actor-runs/{run_id}", headers=self._headers())
+        r = await self._request("GET", f"{API}/actor-runs/{run_id}")
         r.raise_for_status()
         data = r.json().get("data") or {}
         self._runs[run_id] = {"dataset": data.get("defaultDatasetId"), "status": data.get("status"),
@@ -261,9 +282,8 @@ class ApifyXAdapter(SourceAdapter):
         if not dataset:
             return CollectionPage(evidence=[], has_more=False, gaps=gaps + ["Apify run has no dataset"])
         offset = int(cursor or 0)
-        async with self._client_factory() as c:
-            r = await c.get(f"{API}/datasets/{dataset}/items", headers=self._headers(),
-                            params={"offset": offset, "limit": PAGE_SIZE, "clean": "true", "format": "json"})
+        r = await self._request("GET", f"{API}/datasets/{dataset}/items",
+                                params={"offset": offset, "limit": PAGE_SIZE, "clean": "true", "format": "json"})
         r.raise_for_status()
         items = r.json() if isinstance(r.json(), list) else []
         now = datetime.utcnow()
@@ -289,6 +309,8 @@ class ApifyXAdapter(SourceAdapter):
         return float(usage) if usage is not None else None
 
     async def cancel_if_supported(self, run_id: str) -> bool:
-        async with self._client_factory() as c:
-            r = await c.post(f"{API}/actor-runs/{run_id}/abort", headers=self._headers())
+        try:
+            r = await self._request("POST", f"{API}/actor-runs/{run_id}/abort")
+        except RuntimeError:
+            return False
         return r.status_code < 400
