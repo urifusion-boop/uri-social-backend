@@ -155,7 +155,8 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
 
 async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: datetime, cfg: dict) -> Optional[dict]:
     rows = [r async for r in db["mi_listen_readings"].find(
-        {"market": market["key"], "topics": topic, "on_topic": True, "published_at": {"$gte": a, "$lt": b}})]
+        {"market": market["key"], "topics": topic, "on_topic": True, "measured": True,
+         "published_at": {"$gte": a, "$lt": b}})]
     if not rows:
         return None
     authors = Counter(r.get("author") or r["source_id"] for r in rows)
@@ -187,7 +188,7 @@ async def _recurring_needs(db, market: dict, cfg: dict, now: datetime, cov: set)
     d = cfg["detect"]
     a = now - timedelta(days=d["recurring_window_days"])
     by_topic: dict[str, dict] = defaultdict(lambda: {"authors": set(), "days": set()})
-    async for r in db["mi_listen_readings"].find({"market": market["key"], "on_topic": True,
+    async for r in db["mi_listen_readings"].find({"market": market["key"], "on_topic": True, "measured": True,
                                                   "intent": {"$in": list(NEED_INTENTS)},
                                                   "published_at": {"$gte": a, "$lt": now}}):
         if hour_floor(r["published_at"]) not in cov:

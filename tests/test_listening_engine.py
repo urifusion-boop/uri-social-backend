@@ -49,6 +49,9 @@ def test_queries_are_compiled_from_data_with_intent_first():
     assert any('"who dey sell wig"' in q for q in qs)            # local-language core term
     assert any(q["kind"] == "learned" and '"latasha wig"' in q["q"] for q in plan["queries"])
     assert plan["excluded"] == ["big wig"] and plan["languages"] == ["en", "pcm"]
+    roles = {q["kind"].split(":")[0]: q["role"] for q in plan["queries"]}
+    assert roles == {"intent": "measure", "problem": "measure", "core": "sample", "learned": "sample"}
+    assert all(len(q["id"]) == 12 for q in plan["queries"])
     assert all(len(q) <= markets.MAX_QUERY_CHARS + 120 for q in qs)
 
 
@@ -100,7 +103,7 @@ async def _seed(db, per_day_authors: dict[int, int], topic="latasha wig", covere
             author = "@one" if same_author else f"@a{ago}_{i}"
             item = {"source_id": sid, "author_handle": author, "published_at": ts, "raw_metrics": {"likes": i},
                     "text": f"who sells {topic} in lagos {i}", "url": f"https://x.com/s/{sid}"}
-            reading = {"source_id": sid, "market": MARKET["key"], "on_topic": True, "intent": intent,
+            reading = {"source_id": sid, "market": MARKET["key"], "on_topic": True, "measured": True, "intent": intent,
                        "need": "find a trusted vendor", "sentiment": "neutral", "buying_intent": "high",
                        "topics": [topic], "confidence": 0.9, "published_at": ts, "author": author}
             await db["mi_listen_items"].insert_one(dict(item))
@@ -244,6 +247,30 @@ def test_capped_search_is_covered_from_its_oldest_post():
     assert capped["capped"] and capped["covered_from"] == NOW - timedelta(hours=49)
     assert not full["capped"] and full["covered_from"] == since
     assert failed["covered_from"] is None and failed["error"]
+
+
+def test_full_measuring_search_widens_and_coverage_ignores_broad_samples():
+    db = fresh_db()
+
+    async def go():
+        from app.agents.market_intelligence.listening import ontology
+        await ontology.ensure_seeded(db)
+        await db["mi_markets"].insert_one({**MARKET, "status": "active", "subscribers": ["b1"], "last_collected_at": None})
+        res = await collector.collect_market(db, dict(MARKET), CFG, _FakeAdapter(50), NOW)
+        m = await db["mi_markets"].find_one({"key": MARKET["key"]})
+        item = await db["mi_listen_items"].find_one({"source_id": "x:0"})
+        return res, m, item
+    res, m, item = run(go())
+    assert res["status"] == "completed" and res["new_items"] == 50
+    roles = {q["role"] for q in res["per_query"]}
+    assert roles == {"measure", "sample"}
+    # every measuring search filled its 50-post cap -> doubled for next time
+    measure_ids = [q for q in res["per_query"] if q["role"] == "measure"]
+    assert measure_ids and all(v == 100 for v in m["query_caps"].values())
+    assert len(m["query_caps"]) == len(measure_ids)
+    # covered from the oldest post the measuring searches reached, not shrunk by broad samples
+    assert res["covered_from"] == NOW - timedelta(hours=49)
+    assert item["measured"] == [MARKET["key"]]
 
 
 def test_collection_stops_at_the_monthly_budget():

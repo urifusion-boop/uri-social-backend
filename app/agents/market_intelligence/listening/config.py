@@ -15,7 +15,8 @@ DEFAULTS: dict[str, Any] = {
     # Collection
     "source": "x",                    # adapter key in scan_runner.ADAPTER_REGISTRY
     "cadence_hours": 12,               # how often a market is collected
-    "items_per_query": 50,             # per search per run (test actor minimum is 20)
+    "items_per_query": 50,             # starting cap per search per run (test actor minimum is 20)
+    "max_items_per_query": 150,        # a measuring search that keeps filling up is raised to at most this
     "max_queries_per_market": 6,
     "backfill_days": 7,                # first run of a new market
     "overlap_hours": 2,                # re-read this much before the last run (late-indexed posts)

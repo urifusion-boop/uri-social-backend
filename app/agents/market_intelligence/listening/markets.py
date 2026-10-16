@@ -12,6 +12,7 @@ subscribed to it.
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Any, Optional
 
@@ -58,9 +59,18 @@ def or_groups(terms: list[str], prefix: str = "", limit: int = MAX_QUERY_CHARS) 
     return out
 
 
+def query_id(q: str) -> str:
+    return hashlib.sha1(q.encode("utf-8")).hexdigest()[:12]
+
+
 def compile_queries(category: dict, country: str, patterns: dict, learned: list[str],
                     max_queries: int) -> dict:
-    """The searches for one market run, in priority order, plus exclusions."""
+    """The searches for one market run, in priority order, plus exclusions.
+
+    role "measure": intent/problem phrases × products — narrow enough to read
+    completely, so they alone decide coverage and feed trend counts.
+    role "sample": broad category and learned terms — far too busy to read
+    completely; used to discover topics and wording, never to count trends."""
     langs = COUNTRY_LANGS.get((country or "").upper(), ["en"])
     core = _clean(category.get("core_terms") or [])
     local = []
@@ -80,13 +90,15 @@ def compile_queries(category: dict, country: str, patterns: dict, learned: list[
                 continue
             prefix = "(" + " OR ".join(_q(p) for p in phrases) + ")"
             for g in or_groups(head_terms, prefix=prefix):
-                queries.append({"kind": f"{label}:{lang}", "q": g})
+                queries.append({"kind": f"{label}:{lang}", "q": g, "role": "measure"})
 
     for g in or_groups(core + _clean(local)):
-        queries.append({"kind": "core", "q": g})
+        queries.append({"kind": "core", "q": g, "role": "sample"})
     for g in or_groups(learned):
-        queries.append({"kind": "learned", "q": g})
+        queries.append({"kind": "learned", "q": g, "role": "sample"})
 
+    for q in queries:
+        q["id"] = query_id(q["q"])
     return {"queries": queries[:max_queries], "dropped": max(0, len(queries) - max_queries),
             "excluded": _clean(category.get("excluded") or [])[:10], "languages": langs}
 
