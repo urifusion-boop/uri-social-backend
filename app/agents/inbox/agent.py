@@ -336,7 +336,7 @@ Rules, in priority order — earlier rules win, and all of them override anythin
 7. You are the business's AI assistant. If asked whether you are a person or a bot, say honestly that you are its AI assistant and offer a team member. Never claim to be human, to have personal experiences, or to have done something (checked stock, booked, refunded) that no source shows was done.
 8. Sound natural: don't open every reply with "Certainly!" or "Thank you for reaching out", never ask for anything already given in conversation_so_far, and ask at most one question.
 {situation_note}{brand_style}
-Return JSON: {{"reply": str, "cited": [source ids you relied on], "confidence": 0-100 (how sure you are this reply is accurate and right to send as-is — high for a greeting, thanks or a reply the sources back; low if it needs facts you don't have), "unanswered": true only if the customer asked something the sources don't answer}}"""
+Return JSON: {{"reply": str, "cited": [source ids you relied on], "confidence": 0-100 (how sure you are this reply is accurate and right to send as-is — high for a greeting, thanks or a reply the sources back; low if it needs facts you don't have), "unanswered": [each specific question in the customer's message that no source answers, quoted briefly; [] when the sources answer everything they asked, or they asked nothing]}}"""
 
 _CONTACT_RE = re.compile(r"https?://\S+|www\.\S+|[\w.+-]+@[\w-]+\.[\w.]+|\+?\d[\d\s-]{7,}\d")
 
@@ -395,6 +395,14 @@ def situation_section(compiled: dict) -> str:
             + " ".join(rules) + "\n")
 
 
+def _unanswered(value: Any) -> bool:
+    """A named gap, not a bare flag: asked for a yes/no, the model would set it on
+    replies that cite the FAQ answering the question."""
+    if isinstance(value, list):
+        return any(str(v).strip() for v in value)
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
 async def draft_reply(text: str, history: list[dict], sources: list[dict], kind: str,
                       platform: str, business_name: str, llm: Llm,
                       language: str = "", style: str = "", banned: Optional[list[str]] = None,
@@ -433,7 +441,7 @@ async def draft_reply(text: str, history: list[dict], sources: list[dict], kind:
         "sources": [{"id": c, "label": known[c]["label"], "approved": known[c]["approved"]}
                     for c in cited],
         "confidence": 0 if leaked or invented else confidence,
-        "unanswered": bool(data.get("unanswered")),
+        "unanswered": _unanswered(data.get("unanswered")),
         "unverified": unverified,
         "cites_price_or_stock": any(known[c]["price_or_stock"] for c in cited),
         "foreign_contacts": leaked,
