@@ -80,6 +80,8 @@ _INTEREST_WORDS = (r"\b(i'?\s?a?m|am|we'?re|we are)\s+(very\s+|really\s+)?intere
 
 # Belt and braces under the model's own exclusion flags: these words alone send a
 # message to a human, so one confident misread can't automate a refund dispute.
+_SERIOUS = {"payment_dispute", "refund", "safety", "legal"}
+
 _EXCLUSION_WORDS = {
     "payment_dispute": r"chargeback|charged twice|double charged|debited twice|"
                        r"didn'?t receive my money|reverse (the|my) (payment|transfer)",
@@ -261,7 +263,7 @@ Return JSON with exactly these keys:
 - urgency: one of {list(URGENCIES)} (high = a complaint about money, safety, an order that hasn't arrived, or a threat)
 - sentiment: one of {list(SENTIMENTS)}
 - language: ISO code ("en", "pcm" for Nigerian Pidgin, "yo", "ig", "ha", or "other")
-- exclusions: list of any that apply, from {list(EXCLUSIONS)} ("stock_or_price" = asks about price, availability or stock)
+- exclusions: usually []. Add one only when the customer's own words show it: payment_dispute = says they were wrongly charged or a payment went wrong; refund = asks for their money back; safety = reports harm, injury, allergy or danger; legal = threatens legal action or the authorities; stock_or_price = asks about price, availability or stock. A question about how payment or pricing works is not a dispute or a refund.
 - confidence: 0-100, how sure you are of the intent
 - rationale: one short sentence quoting the words that decided it
 - emotion: one of {list(sit.EMOTIONS)}
@@ -297,7 +299,14 @@ def coerce_classification(data: dict, text: str) -> dict:
     except (TypeError, ValueError):
         confidence = 0
     flagged = [e for e in (data.get("exclusions") or []) if e in EXCLUSIONS]
-    exclusions = sorted(set(flagged) | set(keyword_exclusions(text)))
+    keywords = keyword_exclusions(text)
+    # The model sometimes returns the list it was given rather than a judgement:
+    # "how does paying for ads work?" came back as a legal threat, a refund, a
+    # payment dispute and a safety concern at once. Nothing real is all of those
+    # without one of their words appearing.
+    if len(set(flagged) & _SERIOUS) >= 3 and not keywords:
+        flagged = [e for e in flagged if e not in _SERIOUS]
+    exclusions = sorted(set(flagged) | set(keywords))
     intent = pick(data.get("intent"), INTENTS, "other")
     urgency = pick(data.get("urgency"), URGENCIES, "normal")
     if intent in ("engagement", "other") and re.search(_INTEREST_WORDS, (text or "").lower()):

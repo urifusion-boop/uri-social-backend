@@ -372,6 +372,17 @@ def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
     assert not [m for m in db[MESSAGES].docs if m["direction"] == "outbound"]
 
 
+def test_an_echoed_exclusion_list_is_not_a_judgement():
+    from app.agents.inbox.agent import coerce_classification
+    echoed = {"intent": "product_question", "confidence": 90,
+              "exclusions": ["payment_dispute", "refund", "safety", "legal"]}
+    assert coerce_classification(echoed, "how does paying for ads work?")["exclusions"] == []
+    real = coerce_classification(echoed, "I want a refund or I'll get a lawyer")
+    assert {"refund", "legal"} <= set(real["exclusions"])
+    one = coerce_classification({**echoed, "exclusions": ["payment_dispute"]}, "you charged me wrongly")
+    assert one["exclusions"] == ["payment_dispute"]
+
+
 @pytest.mark.parametrize("value,expected", [
     ([], False), ([""], False), (["Do you deliver to Ghana?"], True), (True, True), (False, False),
     ("true", True), (None, False),
