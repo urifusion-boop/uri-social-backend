@@ -145,6 +145,29 @@ async def suggest_topic_keywords(
     return UriResponse.get_single_data_response("suggestion", {"keywords": result.keywords, "excluded_keywords": result.excluded_keywords})
 
 
+@router.post("/topics/suggest-from-brand")
+async def suggest_topic_from_brand(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """A starter topic built from the brand's own Playbook (what it sells,
+    where its customers are, competitors, languages). Read-only — the owner
+    reviews and edits it in the New Topic form before anything is collected."""
+    from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+    from .brand_topic import suggest_brand_topic
+
+    res = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx.get("brand_id"))
+    profile = (res.get("responseData") or {}) if res.get("status") else {}
+    suggestion = await suggest_brand_topic(profile)
+    if suggestion is None:
+        return UriResponse.error_response(
+            "Your Brand Playbook doesn't say what you sell yet — add your brand and products there first.")
+    # Default to the cheapest real source that's set up on this server.
+    from app.core.config import settings
+    suggestion["sources"] = ["x"] if (settings.APIFY_API_TOKEN or "").strip() else ["mock"]
+    return UriResponse.get_single_data_response("suggestion", suggestion)
+
+
 @router.post("/topics")
 async def create_topic(
     body: TopicCreateRequest,
