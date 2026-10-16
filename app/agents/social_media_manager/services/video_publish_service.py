@@ -266,6 +266,36 @@ class VideoPublishService:
                     outstand, post_id, post_url
                 )
 
+        # Live-confirmed 2026-10-16: SELF_ONLY can fail with the exact same
+        # "unaudited_client_can_only_post_to_private_accounts" error — the real
+        # block is DIRECT_POST itself (likely under TikTok re-review), not the
+        # privacy value. Fall back to TikTok's third suggested option,
+        # MEDIA_UPLOAD, which drops privacyLevel and delivers to the creator's
+        # TikTok inbox as a draft instead of posting directly.
+        if not published and failure_reason and (
+            "privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower()
+        ):
+            print(f"⚠️ TikTok post {post_id} still failed on privacyLevel/audit ({failure_reason}) — submitting a new post as MEDIA_UPLOAD")
+            media_result = await outstand.publish_post(
+                outstand_account_ids=[outstand_account_id],
+                content=caption,
+                media_urls=[outstand_media_url],
+                platform_config={"tiktok": {"postMode": "MEDIA_UPLOAD"}},
+            )
+            media_post_obj = media_result.get("post") or media_result.get("data") or {}
+            if isinstance(media_post_obj, list):
+                media_post_obj = media_post_obj[0] if media_post_obj else {}
+            media_post_id = media_post_obj.get("id")
+            if media_post_id:
+                # MEDIA_UPLOAD never sets publishedAt until the creator manually
+                # finishes it in the TikTok app — not a real publish, so raise
+                # instead of returning a success tuple, with a clear explanation.
+                raise ValueError(
+                    "TikTok is currently blocking direct posting for this app (likely under review). "
+                    f"This was delivered to the connected TikTok account's inbox as a draft (post {media_post_id}) "
+                    "instead — open the TikTok app to review and publish it manually."
+                )
+
         if not published:
             if failure_reason:
                 raise ValueError(f"TikTok publish failed via Outstand: {failure_reason}")
