@@ -312,6 +312,21 @@ def test_business_that_fits_no_category_gets_its_own(monkeypatch):
     assert market["subscribers"] == ["b1"]
 
 
+def test_locks_are_per_trigger_and_per_market():
+    from app.agents.market_intelligence.listening import cycle
+    db = fresh_db()
+
+    async def go():
+        a = await cycle._lock(db, "brands:b1", "run1")
+        b = await cycle._lock(db, "brands:b2", "run2")       # another business: not blocked
+        c = await cycle._lock(db, "market:hair_wigs:NG", "run1")
+        d = await cycle._lock(db, "market:hair_wigs:NG", "run2")  # same market: blocked
+        await cycle._unlock(db, "market:hair_wigs:NG", "run1")
+        e = await cycle._lock(db, "market:hair_wigs:NG", "run2")  # free again
+        return a, b, c, d, e
+    assert run(go()) == (True, True, True, False, True)
+
+
 def test_country_from_location_text():
     assert profile_mod._country_from_text("Lekki, Lagos") == "NG"
     assert profile_mod._country_from_text("Accra and Kumasi") == "GH"
