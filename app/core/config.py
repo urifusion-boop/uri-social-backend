@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     # Google Gemini (Nano Banana 2 image generation)
     GOOGLE_GEMINI_API_KEY: Optional[str] = None
 
+    # Apify — Market Intelligence (social listening) collection actors
+    APIFY_API_TOKEN: Optional[str] = None
+
     # fal.ai image/video generation
     FAL_API_KEY: Optional[str] = None
 

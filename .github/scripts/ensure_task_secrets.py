@@ -29,6 +29,9 @@ REQUIRED = {
     # value put there by whoever manages this project's secrets — this entry
     # only makes sure that value reaches the container once it exists.
     "GOOGLE_GEMINI_API_KEY": f"{SSM_PREFIX}/GOOGLE_GEMINI_API_KEY",
+    # Market Intelligence (social listening) collection through Apify actors —
+    # the real source adapters (X first) read it; the mock adapter needs none.
+    "APIFY_API_TOKEN": f"{SSM_PREFIX}/APIFY_API_TOKEN",
 }
 
 
