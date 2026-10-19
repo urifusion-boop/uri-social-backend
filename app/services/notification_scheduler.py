@@ -378,7 +378,7 @@ def start_notification_scheduler():
     )
 
     _scheduler.start()
-    print("📅 Notification scheduler started with 10 jobs")
+    print("📅 Notification scheduler started with 14 jobs")
 
 
 def stop_notification_scheduler():
