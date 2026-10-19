@@ -208,6 +208,16 @@ class TestAdsUseTheBrief:
         assert "brand_brief.audit(" in inspect.getsource(creative.write_ad_copy)
 
 
+import importlib.util as _ilu
+
+# These features (Unified Inbox, video creative, voiceover) are not on every
+# branch; their tests run only where the feature exists.
+_HAS_INBOX = _ilu.find_spec("app.agents.inbox") is not None
+_HAS_VIDEO = all(_ilu.find_spec(m) is not None for m in (
+    "app.agents.social_media_manager.services.video_creative_service",
+    "app.agents.social_media_manager.services.voiceover_service"))
+
+@pytest.mark.skipif(not _HAS_INBOX, reason="Unified Inbox not on this branch")
 class TestInboxSoundsLikeTheBrand:
     PROFILE = {"brand_name": "Bukka", "derived_voice": "playful and warm",
                "guardrails": {"banned_words": "cheap", "emoji_usage": "no", "avoid_topics": "politics"},
@@ -260,6 +270,7 @@ class TestCalendarPlanUsesRulesPillarsAndDates:
         assert _brand_rules_block({}) == ""
 
 
+@pytest.mark.skipif(not _HAS_VIDEO, reason="video creative / voiceover not on this branch")
 class TestVideoAndBlogUseTheBrief:
     def test_wired_in(self):
         import inspect
