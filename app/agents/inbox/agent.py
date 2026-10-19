@@ -461,28 +461,38 @@ async def draft_reply(text: str, history: list[dict], sources: list[dict], kind:
 
 # ── The auto-reply decision ──────────────────────────────────────────────────
 
+def gate(settings: dict, conv: dict, auto_sent: int, human_replied: bool,
+         at: Optional[datetime] = None) -> str:
+    """Why the agent may not send anything at all in this conversation right now,
+    whatever the message says, or ''."""
+    if not settings["auto_reply_enabled"]:
+        return "Auto-replies are off"
+    kind = conv.get("kind") or Kind.DM.value
+    if not settings["auto_reply_channels"].get(kind):
+        return ("Auto-replies are off for public comments" if kind == Kind.COMMENT.value
+                else "Auto-replies are off for direct messages")
+    if conv.get("assignee_id"):
+        return "Assigned to a team member"
+    if human_replied:
+        return "A team member is handling this conversation"
+    if auto_sent >= MAX_AUTO_REPLIES_PER_HOUR:
+        return "Paused: 10 auto-replies in the last hour looks like another bot replying"
+    if not within_business_hours(settings["business_hours"], at):
+        return "Outside business hours"
+    try:
+        check_eligibility(conv, at)
+    except SendRefused as e:
+        return e.detail
+    return ""
+
+
 def decide_auto_reply(settings: dict, conv: dict, cls: dict, draft: dict,
                       auto_sent: int, human_replied: bool,
                       at: Optional[datetime] = None) -> tuple[bool, str]:
     """(send it, why not). Pure, so every guardrail is testable on its own."""
-    if not settings["auto_reply_enabled"]:
-        return False, "Auto-replies are off"
-    kind = conv.get("kind") or Kind.DM.value
-    if not settings["auto_reply_channels"].get(kind):
-        return False, ("Auto-replies are off for public comments" if kind == Kind.COMMENT.value
-                       else "Auto-replies are off for direct messages")
-    if conv.get("assignee_id"):
-        return False, "Assigned to a team member"
-    if human_replied:
-        return False, "A team member is handling this conversation"
-    if auto_sent >= MAX_AUTO_REPLIES_PER_HOUR:
-        return False, "Paused: 10 auto-replies in the last hour looks like another bot replying"
-    if not within_business_hours(settings["business_hours"], at):
-        return False, "Outside business hours"
-    try:
-        check_eligibility(conv, at)
-    except SendRefused as e:
-        return False, e.detail
+    blocked = gate(settings, conv, auto_sent, human_replied, at)
+    if blocked:
+        return False, blocked
     exclusions = list(cls["exclusions"])
     # A price the business itself approved in an FAQ isn't ambiguous. Every other
     # exclusion is absolute, and so is a price that only the Playbook states.
@@ -612,17 +622,14 @@ async def suggest(db, workspace_id: str, conversation_id: str, llm: Llm = openai
         } if draft["text"] else None,
     }})
     return {"suggestion_id": suggestion_id, "conv": conv, "history": history,
-            "target": target, "classification": cls, "draft": draft}
+            "target": target, "classification": cls, "draft": draft, "situation": situation}
 
 
 def _aware(at: Optional[datetime]) -> Optional[datetime]:
     return at.replace(tzinfo=timezone.utc) if at and at.tzinfo is None else at
 
 
-def verdict(settings: dict, conv: dict, history: list[dict], cls: dict, draft: dict,
-            at: Optional[datetime] = None) -> tuple[bool, str]:
-    """The auto-reply decision for this conversation as it stands."""
-    at = at or now()
+def _activity(history: list[dict], at: datetime) -> tuple[int, bool]:
     outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
     auto_sent = sum(1 for m in outbound if m["actor_id"] == AGENT_ACTOR
                     and (_aware(m.get("received_at")) or at) > at - timedelta(hours=1))
@@ -630,7 +637,47 @@ def verdict(settings: dict, conv: dict, history: list[dict], cls: dict, draft: d
     human_replied = any(
         m["actor_id"] != AGENT_ACTOR and not m.get("approved_draft") and (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF
         for m in outbound)
-    return decide_auto_reply(settings, conv, cls, draft, auto_sent, human_replied, at)
+    return auto_sent, human_replied
+
+
+def verdict(settings: dict, conv: dict, history: list[dict], cls: dict, draft: dict,
+            at: Optional[datetime] = None) -> tuple[bool, str]:
+    """The auto-reply decision for this conversation as it stands."""
+    at = at or now()
+    return decide_auto_reply(settings, conv, cls, draft, *_activity(history, at), at)
+
+
+# A message the agent can't answer still gets a reply: silence reads as being
+# ignored. The holding line states no facts, so it is safe whatever was asked.
+HOLDING_REPLIES = {
+    "human": "Sure, I've asked a member of our team to pick this up. They'll reply to you here shortly.",
+    "problem": "I'm sorry about this. I've passed it to our team and someone will reply to you here shortly.",
+    "question": "Good question! I'm checking with our team and someone will get back to you here shortly.",
+}
+
+
+def holding_reply(cls: dict, situation: str) -> str:
+    if cls.get("wants_human"):
+        return HOLDING_REPLIES["human"]
+    if situation in ("complaint", "delivery_issue", "refund", "safety", "abuse") \
+            or cls.get("intent") == "complaint":
+        return HOLDING_REPLIES["problem"]
+    return HOLDING_REPLIES["question"]
+
+
+def should_hold(settings: dict, conv: dict, history: list[dict],
+                at: Optional[datetime] = None) -> bool:
+    """A held reply gets a holding line when nothing but the message itself stopped
+    it, and only once until a person has replied: one "someone will get back to
+    you" is reassuring, three in a row is a bot stalling."""
+    at = at or now()
+    if gate(settings, conv, *_activity(history, at), at):
+        return False
+    held = _aware(conv.get("holding_sent_at"))
+    if not held:
+        return True
+    return any(m["direction"] == Direction.OUTBOUND.value and m["actor_id"] != AGENT_ACTOR
+               and (_aware(m.get("received_at")) or at) > held for m in history)
 
 
 async def explain(db, workspace_id: str, result: dict) -> str:
@@ -662,12 +709,6 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
 
     settings = await load_settings(db, workspace_id)
     send, reason = verdict(settings, conv, history, cls, draft)
-    if not send:
-        await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
-            "needs_human": True,
-            "handoff_reason": reason if settings["auto_reply_enabled"] else "",
-        }})
-        return {"status": "drafted", "reason": reason}
 
     from .meta_transport import meta_transport
     from .send import send_reply
@@ -675,6 +716,31 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
     account = await db[CHANNEL_ACCOUNTS].find_one(
         {"_id": ObjectId(conv["channel_account_id"])}
     ) if ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+
+    if not send:
+        await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
+            "needs_human": True,
+            "handoff_reason": reason if settings["auto_reply_enabled"] else "",
+        }})
+        held = False
+        if settings["auto_reply_enabled"] and should_hold(settings, conv, history):
+            line = holding_reply(cls, result.get("situation", ""))
+            try:
+                record = await send_reply(
+                    db, workspace_id, conversation_id, line,
+                    idempotency_key=f"hold:{result['target']['id']}",
+                    actor_id=AGENT_ACTOR, transport=transport or meta_transport,
+                    account=account or {})
+                held = record.get("delivery") == "accepted"
+            except SendRefused:
+                pass
+            if held:
+                await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
+                    "holding_sent_at": now()}})
+        if settings["auto_reply_enabled"]:
+            await notify_needs_reply(db, workspace_id, conv, result["target"]["text"], reason, held)
+        return {"status": "held" if held else "drafted", "reason": reason}
+
     try:
         record = await send_reply(
             db, workspace_id, conversation_id, draft["text"],
@@ -701,6 +767,36 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
     }})
     return {"status": "auto_sent" if accepted else "auto_failed",
             "delivery": record.get("delivery")}
+
+
+async def _owner_of(db, workspace_id: str) -> str:
+    if workspace_id.startswith("brnd_personal_"):
+        return workspace_id[len("brnd_personal_"):]
+    brand = await db["brand_accounts"].find_one({"brand_id": workspace_id}, {"owner_user_id": 1})
+    return (brand or {}).get("owner_user_id", "")
+
+
+async def notify_needs_reply(db, workspace_id: str, conv: dict, text: str, reason: str,
+                             held: bool) -> None:
+    """Tell the business a customer is waiting on a person. Once an hour per
+    conversation at most; a customer sending five messages is one alert."""
+    from app.services import brand_notifier
+
+    user_id = await _owner_of(db, workspace_id)
+    if not user_id:
+        return
+    who = conv.get("display_name") or "A customer"
+    told = " Jane told them someone will reply shortly." if held else ""
+    try:
+        await brand_notifier.notify(
+            db, user_id, workspace_id, "inbox_needs_reply",
+            title=f"{who} is waiting for a reply",
+            message=f'"{text[:200]}" — {reason}.{told}',
+            link="/workspace/?tab=messages",
+            metadata={"conversation_id": str(conv["_id"])},
+            dedupe_key=str(conv["_id"]), dedupe_hours=1)
+    except Exception as e:  # an alert failing must never cost the customer's message
+        print(f"[Inbox] needs-reply alert failed for {workspace_id}: {e}", flush=True)
 
 
 async def record_correction(db, workspace_id: str, conversation_id: str, intent: str,
