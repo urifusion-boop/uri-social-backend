@@ -115,19 +115,48 @@ def banned_words(bc: Optional[Dict[str, Any]]) -> List[str]:
     return out
 
 
+_FAMILY_SUFFIXES = sorted([
+    "ization", "isation", "ationary", "itionary", "ionary", "ations", "ation", "ionally", "ional",
+    "izing", "ising", "ized", "ised", "izes", "ises", "ize", "ise", "ary", "ions", "ion", "ively", "ive",
+    "ments", "ment", "ness", "ingly", "ing", "edly", "ed", "ers", "er", "est", "ly", "es", "s",
+], key=len, reverse=True)
+_MIN_STEM = 5
+
+
+def _banned_stem(word: str) -> str:
+    """The shared stem of a banned single word, for matching its whole word
+    family — or "" when the word is too short to do that safely (short words
+    keep exact-form matching, so "ok" never flags "book"). The stem must stay
+    at least 5 letters, so "art" or "cheap" never widen into unrelated words."""
+    if not re.fullmatch(r"[a-z]{6,}", word):
+        return ""
+    for suffix in _FAMILY_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= _MIN_STEM:
+            return word[: -len(suffix)]
+    if word.endswith(("e", "y")) and len(word) - 1 >= _MIN_STEM:
+        return word[:-1]
+    return word
+
+
 def banned_pattern(word: str) -> "re.Pattern":
     """Matches a banned word in its common forms, or a banned phrase exactly.
     Banning "streamline" also has to catch "streamlined" and "streamlining" —
     seen on dev, where the exact-word check let those through — but must not
     catch unrelated words that merely contain it ("ok" in "book")."""
     w = word.strip().lower()
+    stem = _banned_stem(w)
+    if stem:
+        # Related forms too: banning "revolutionary" also has to catch
+        # "revolutionize"/"revolutionized" (seen on prod in a 30-day plan) —
+        # the same word family, which the plain -s/-ed/-ing forms below missed.
+        return re.compile(r"(?<!\w)" + re.escape(stem) + r"\w*")
     if re.fullmatch(r"[a-z]{3,}", w):
         if w.endswith("e"):
             core = f"(?:{re.escape(w)}(?:s|d|r|rs)?|{re.escape(w[:-1])}(?:ing|ed|er|ers))"
         elif w.endswith("y"):
             core = f"(?:{re.escape(w)}|{re.escape(w[:-1])}(?:ies|ied|ier))"
         else:
-            core = f"{re.escape(w)}(?:s|es|ed|ing|er|ers)?"
+            core = f"{re.escape(w)}(?:s|es|ed|ing|er|ers|est|ly)?"
     else:
         core = re.escape(w)
     return re.compile(r"(?<!\w)" + core + r"(?!\w)")
