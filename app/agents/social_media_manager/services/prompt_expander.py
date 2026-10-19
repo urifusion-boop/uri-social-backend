@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
 
-PROMPT_VERSION = "content-prompt-expander-v3"
+PROMPT_VERSION = "content-prompt-expander-v4"
 MODEL = "gpt-4o"
 MAX_CHARS = 1800
 CONCEPT_MAX = 280
@@ -53,7 +53,8 @@ Return two parts:
 1. concept — ONE sentence that opens the brief: the occasion or subject, the core message, and the key visual
    scene (who/what is in the picture, setting, mood). Image generation reads mainly this sentence, so make the
    visual concrete. Do not start with "Jane", "Create", "Craft" or "Write".
-2. details — plain instructions (no headings, markdown or bullet symbols), covering only what helps:
+2. details — plain instructions that continue from the concept without repeating it (no headings, markdown or
+   bullet symbols), covering only what helps:
    - the angle/hook and the key message, who it speaks to (from the audience facts)
    - tone and voice (from the brand voice and the platform tone), words to avoid
    - visual direction: the chosen visual style(s), brand colours, setting and people appropriate to the brand's
