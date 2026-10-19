@@ -360,6 +360,28 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
     )
 
 
+def _brand_rules_block(brand: Dict[str, Any]) -> str:
+    """The Playbook's hard rules, content pillars and important dates for the
+    PLAN itself. Drafts made from an idea always applied these, but the ideas
+    were generated without them — a plan could be off-pillar, miss the brand's
+    own key dates, or pitch a topic the brand said never to touch."""
+    from app.agents.social_media_manager.services import brand_brief
+
+    parts: List[str] = []
+    rules = brand_brief.hard_rules(brand)
+    if rules:
+        parts.append("HARD RULES (never break these — an idea that needs to break one is not usable):\n"
+                     + "\n".join(f"- {r}" for r in rules))
+    pillars = [str(x) for x in (brand.get("content_pillars") or []) if x]
+    if pillars:
+        parts.append(f"CONTENT PILLARS: {', '.join(pillars)}. Every idea must sit under one of these, "
+                     f"and the plan should be spread across them rather than leaning on one.")
+    if brand.get("key_dates"):
+        parts.append(f"IMPORTANT DATES for this brand: {brand['key_dates']}. Plan a post for any that "
+                     f"fall inside this plan's period, on or just before the date.")
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
 def _visual_guide_block(brand: Dict[str, Any]) -> str:
     """Addendum §5: the client's selected Visual Guide is the design system
     — the model must stop inventing a new visual style per post. Confirmed
@@ -445,7 +467,7 @@ async def _generate_candidate_concepts(
         f"Business stage: {business_stage} — {_STAGE_GUIDANCE.get(business_stage, '')}"
         if business_stage else ""
     )
-    psychology_block = _customer_psychology_block(brand)
+    psychology_block = _customer_psychology_block(brand) + _brand_rules_block(brand)
 
     territories_block = "\n".join(
         f"- {key} ({t['label']}): {t['description']} Example subjects: {', '.join(t['subjects'][:8])}"
@@ -1211,6 +1233,13 @@ def _collect_item_text(idea: Dict[str, Any]) -> str:
     return " \n ".join(p for p in parts if p)
 
 
+def _all_banned_words(brand: Dict[str, Any]) -> List[str]:
+    """Words to avoid AND the guardrails' banned words — the Playbook has both,
+    and only the first list was being checked here."""
+    from app.agents.social_media_manager.services.brand_brief import banned_words
+    return banned_words(brand)
+
+
 def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[str]:
     """The brand's words_to_avoid was only ever a prompt instruction (soft
     guidance the model can and does ignore under pressure to hit other
@@ -1221,8 +1250,10 @@ def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[
     same validation-failure → regenerate loop everything else here uses."""
     if not words_to_avoid:
         return []
-    haystack = _collect_item_text(idea).lower()
-    return [str(w).strip() for w in words_to_avoid if str(w).strip() and str(w).strip().lower() in haystack]
+    # Same matcher every other writer uses: catches other forms of a word
+    # ("streamlining" for "streamline") without flagging "book" for "ok".
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    return [str(w).strip() for w in find_banned(_collect_item_text(idea), words_to_avoid)]
 
 
 def _validate_item_v2(
@@ -1289,7 +1320,7 @@ async def _generate_final_copy(
     price_range = brand.get("price_range", "")
     business_pulse = brand.get("business_pulse") or {}
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
-    psychology_block = _customer_psychology_block(brand)
+    psychology_block = _customer_psychology_block(brand) + _brand_rules_block(brand)
     visual_guide_block = _visual_guide_block(brand)
 
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
@@ -1478,7 +1509,7 @@ business's actual customers, not a generic reader?
                 _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-5 hard rule
             issues = _validate_item_v2(
                 idea, is_carousel=is_carousel, expected_slides=expected_slides,
-                words_to_avoid=brand.get("words_to_avoid"),
+                words_to_avoid=_all_banned_words(brand),
             )
             if issues:
                 failures[i] = issues
