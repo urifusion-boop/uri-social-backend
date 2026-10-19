@@ -420,6 +420,45 @@ class BrandProfileRequest(BaseModel):
 # CONTENT GENERATION ENDPOINTS
 # ==============================================================================
 
+class ExpandPromptRequest(BaseModel):
+    idea: str
+    platforms: List[str] = []
+    post_type: str = "feed"
+    num_slides: Optional[int] = None
+    include_images: bool = False  # ignored: every post gets a visual; the switch is set after the brief
+    style_override: Optional[List[str]] = None
+    override_cta: Optional[str] = None
+    reference_image_labels: Optional[List[str]] = None  # one entry per uploaded photo ("" if unlabelled)
+
+
+@router.post("/expand-prompt")
+async def expand_prompt(
+    request: ExpandPromptRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Turn a short content idea ("happy Mother's Day post") into a fuller
+    creative brief guided by the brand's Playbook and the chosen visual style.
+    Returned for the owner to review/edit — nothing is generated or charged."""
+    from app.agents.social_media_manager.services import prompt_expander
+
+    idea = (request.idea or "").strip()
+    if len(idea) < 3:
+        raise HTTPException(status_code=400, detail="Write a few words about the post first.")
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+    result = await prompt_expander.expand(
+        idea[:5000], brand_context, request.platforms, request.post_type, request.num_slides,
+        styles=request.style_override or None,
+        cta=(request.override_cta or "").strip() or None,
+        photos=[(l or "").strip()[:80] for l in (request.reference_image_labels or [])][:10] or None,
+    )
+    if not result:
+        raise HTTPException(status_code=502, detail="Jane couldn't expand that right now — try again in a moment.")
+    return UriResponse.get_single_data_response("expanded_prompt", result)
+
+
 @router.post("/generate-content")
 async def generate_content(
     request: ContentGenerationRequest,

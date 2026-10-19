@@ -38,6 +38,7 @@ from .clustering import cluster_evidence, match_existing_cluster
 from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
+from . import query_planner, term_learning
 from .notifications import queue_notification
 from app.services.PostHogService import track_event
 from .models import (
@@ -72,6 +73,8 @@ ADAPTER_REGISTRY: dict[str, SourceAdapter] = {
 # Real collection pages through results; a bound keeps one bad cursor from
 # looping forever (200 items/page -> up to 10,000 items per source).
 MAX_PAGES_PER_SOURCE = 50
+
+INCREMENTAL_OVERLAP = timedelta(hours=2)
 
 CLUSTERED_TYPES = {
     EvidenceType.CUSTOMER_CONCERN,
@@ -355,6 +358,22 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     # random brand, and a post from the market area from one elsewhere.
     business_context["competitors"] = list(topic.competitors or [])
     business_context["market_area"] = topic.geographic_scope
+    business_context["topic_question"] = topic.question
+
+    # Real (word-searching) sources get a search plan: many real-world
+    # variations OR-ed into a few queries, sharpened by what earlier scans
+    # learned. The sample-data source doesn't search, so it doesn't need one.
+    plan: Optional[dict] = None
+    if any(isinstance(ADAPTER_REGISTRY.get(s.provider), ApifyXAdapter) for s in topic.sources):
+        if not query_planner.plan_is_current(topic):
+            topic.search_plan = await query_planner.build_base_plan(topic, business_context)
+            await db["mi_topics"].update_one(
+                {"id": topic.id}, {"$set": {"search_plan": topic.search_plan, "plan_updated_at": datetime.utcnow()}})
+        plan = query_planner.assemble(topic)
+        await db["mi_scans"].update_one({"id": run_id}, {"$set": {"search_plan": {
+            "groups": plan["groups"], "queries": len(plan["expressions"]), "excluded": plan["excluded"],
+            "dropped_queries": plan["dropped_queries"],
+        }}})
 
     # Competitors are searched too — otherwise "what competitors are doing"
     # could only ever be found by accident.
@@ -365,6 +384,23 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     search_language = topic.languages[0] if len(topic.languages or []) == 1 else None
 
     until = datetime.utcnow()
+
+    # A repeat scan only needs what's new since the last good one (with a
+    # small overlap for late-indexed posts) — re-requesting the whole window
+    # just re-buys posts the dedup below throws away. PRD §18's bounded
+    # overlap window.
+    try:
+        previous = await db["mi_scans"].find_one(
+            {"topic_id": topic.id, "id": {"$ne": run_id},
+             "status": {"$in": [ScanStatus.COMPLETED.value, ScanStatus.PARTIAL.value]},
+             "started_at": {"$ne": None}},
+            sort=[("started_at", -1)],
+        )
+    except Exception as e:  # can't tell -> collect the full window, never fail the scan over it
+        print(f"[MI][scan] could not read the previous scan for {topic.id}: {e}")
+        previous = None
+    started = (previous or {}).get("started_at")
+    resume_from = (started - INCREMENTAL_OVERLAP) if isinstance(started, datetime) else None
 
     all_new_evidence: list[Evidence] = []
     gaps: list[str] = []
@@ -384,11 +420,15 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         if coverage_note:
             gaps.append(f"source '{source.provider}': {coverage_note}")
         since = until - timedelta(days=accessible_days)
+        if resume_from and resume_from > since:
+            since = resume_from
 
         try:
             if isinstance(adapter, ApifyXAdapter):
                 provider_run_id = await adapter.start_collection(
-                    search_keywords, topic.excluded_keywords, since, until, language=search_language)
+                    plan["expressions"] if plan else search_keywords,
+                    plan["excluded"] if plan else topic.excluded_keywords,
+                    since, until, language=search_language)
             else:
                 provider_run_id = await adapter.start_collection(search_keywords, topic.excluded_keywords, since, until)
         except Exception as e:
@@ -475,11 +515,14 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         # checked/populated around the unchanged classify_evidence() call so
         # an exact repost or syndicated copy already classified for this
         # brand skips a second LLM call entirely.
-        result = await get_cached_classification(db, evidence.text, topic.brand_id)
+        # Keyed per topic too: the relevance verdict depends on the question
+        # being researched, so another topic's verdict can't be reused.
+        cache_scope = f"{topic.brand_id}:{topic.id}"
+        result = await get_cached_classification(db, evidence.text, cache_scope)
         if result is None:
             result = await classify_evidence(evidence, business_context)
             if result is not None:
-                await store_classification_cache(db, evidence.text, topic.brand_id, result)
+                await store_classification_cache(db, evidence.text, cache_scope, result)
 
         if result is None:
             gaps.append(f"evidence {evidence.source_id} could not be classified — left for manual review")
@@ -491,6 +534,17 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         await db["mi_classifications"].insert_many([c.dict() for c in classifications.values()])
 
     # ── Cluster the types that cluster, score, compose insights ─────────────
+    # Learn which search terms work: retire junk terms, pick up the wording
+    # real customers used. Never allowed to fail the scan.
+    if plan:
+        try:
+            learning = await term_learning.update_after_scan(db, topic, plan, all_new_evidence, classifications)
+            off_topic = sum(1 for c in classifications.values() if getattr(c, "on_topic", None) is False)
+            await db["mi_scans"].update_one({"id": run_id}, {"$set": {
+                "learning": learning, "off_topic_filtered": off_topic}})
+        except Exception as e:
+            print(f"[MI][scan] term learning failed for {topic.id}: {e}")
+
     primary_types = {eid: c.primary_type for eid, c in classifications.items()}
     clusterable_evidence = [e for e in all_new_evidence if e.id in primary_types and primary_types[e.id] in CLUSTERED_TYPES]
 

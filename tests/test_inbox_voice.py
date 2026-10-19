@@ -358,7 +358,7 @@ def test_asking_for_a_person_is_never_auto_answered():
     conv_id, msg_id = _seed(db, "Can I speak to a real person please")
     sent = []
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id, _capture_llm({}), _sent_transport(sent)))
-    assert sent == [] and out["reason"] == "Customer asked to speak to a person"
+    assert sent == [agent.HOLDING_REPLIES["human"]] and out["reason"] == "Customer asked to speak to a person"
 
 
 def test_pidgin_replies_wait_for_review_when_the_brand_says_so():
@@ -369,7 +369,7 @@ def test_pidgin_replies_wait_for_review_when_the_brand_says_so():
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id,
                                      _capture_llm(seen, {"language": "pcm"}), _sent_transport(sent)))
     assert "Reply in light, easy-to-read Nigerian Pidgin" in seen["system"]
-    assert sent == [] and "Pidgin replies wait" in out["reason"]
+    assert sent == [agent.HOLDING_REPLIES["question"]] and "Pidgin replies wait" in out["reason"]
 
 
 def test_without_a_voice_the_agent_behaves_as_before():

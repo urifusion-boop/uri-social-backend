@@ -9,6 +9,13 @@ from app.domain.responses.uri_response import UriResponse
 from app.services.AIService import AIService
 
 
+
+# Image models given a "reserved logo zone" tend to draw that zone (a dotted
+# placeholder box). Every mention of the logo corner carries this sentence.
+NO_MARK_LOGO = (
+    "Do NOT mark that area in any way: no dotted or dashed lines, no outline, frame, box, border, placeholder, label or watermark — it must look like ordinary background that simply continues."
+)
+
 class ImageContentService:
     """
     AI-powered image generation service for social media content
@@ -886,16 +893,20 @@ class ImageContentService:
                     "bottom_right": "bottom-right corner"
                 }
                 pos_text = position_map.get(logo_position, logo_position)
-                logo_space_note = f"\n\n🚨 CRITICAL - LOGO OVERLAY ZONE ({pos_text}):\n" \
-                    f"A {logo_reserve_size} brand logo will be overlaid in the {pos_text}.\n" \
-                    f"MANDATORY REQUIREMENTS:\n" \
-                    f"  • This zone MUST be 100% clear of ALL text, headlines, diagrams, illustrations, and visual elements\n" \
-                    f"  • ONLY solid colors, gradients, or simple background patterns allowed in this zone\n" \
-                    f"  • NO text of any kind (not even small text or labels)\n" \
-                    f"  • NO shapes, icons, illustrations, or graphic elements\n" \
-                    f"  • NO white boxes, cards, panels, frames, or borders\n" \
-                    f"  • Place ALL content (headlines, diagrams, text, visuals) OUTSIDE this reserved zone\n" \
-                    f"If ANY element overlaps this zone, the design FAILS. This overrides all aesthetic preferences."
+                # Worded as "plain background that continues", never as a "zone"
+                # to "reserve": image models answer "reserve a logo zone" by
+                # DRAWING the zone (a dotted placeholder box the real logo then
+                # lands inside — reported on staging, Oct 2026).
+                logo_space_note = f"\n\n🚨 CRITICAL - KEEP THE {pos_text.upper()} PLAIN:\n" \
+                    f"The brand's real logo is added to the {pos_text} after the image is made " \
+                    f"(about {logo_reserve_size}). For that to look clean:\n" \
+                    f"  • Leave the {pos_text} as plain, continuous background — the same colour, gradient or " \
+                    f"surface as the area around it\n" \
+                    f"  • NO text of any kind there (not even small text or labels)\n" \
+                    f"  • NO shapes, icons, illustrations, people, products or graphic elements there\n" \
+                    f"  • {NO_MARK_LOGO}\n" \
+                    f"  • Place ALL content (headlines, diagrams, text, visuals) away from the {pos_text}\n" \
+                    f"This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
@@ -1141,9 +1152,9 @@ Follow these rules precisely for every image. No exceptions.
                     f"=== FINAL LAYOUT CHECK ===\n"
                     f"Before finalising, check the {pos_text} of the canvas "
                     f"({logo_reserve_size}). A brand logo will be placed there after "
-                    f"generation. That exact area must be empty background — no letters, "
-                    f"words, icons, or graphics touching it. If your layout puts anything "
-                    f"there, shift it elsewhere before rendering."
+                    f"generation. That area must be plain, continuous background — no letters, "
+                    f"words, icons, or graphics touching it. {NO_MARK_LOGO} If your layout puts "
+                    f"anything there, shift it elsewhere before rendering."
                 )
 
             # ASSEMBLE FINAL PROMPT (Order matters - rules at top!)
@@ -1217,9 +1228,9 @@ Follow these rules precisely for every image. No exceptions.
                 logo_corner_note = ""
                 if logo_position:
                     logo_corner_note = (
-                        f"\n- EXCEPTION: the {pos_text} corner is reserved for the brand logo "
-                        f"({logo_reserve_size}) — keep that corner completely empty; start the "
-                        f"headline text outside of it, not inside it"
+                        f"\n- EXCEPTION: the brand logo is added to the {pos_text} corner afterward "
+                        f"({logo_reserve_size}) — keep that corner plain, continuous background; start the "
+                        f"headline text outside of it, not inside it. {NO_MARK_LOGO}"
                     )
 
                 if composition_mode == "editorial":
@@ -1534,8 +1545,9 @@ OVERALL:
                 }
                 pos_text = position_map.get(logo_position, logo_position)
                 logo_space_note = (
-                    f"\nReserve the {pos_text} ({reserve_pct}% width x {reserve_pct}% height) completely clear of "
-                    f"text/graphics — a brand logo will be overlaid there afterward."
+                    f"\nKeep the {pos_text} (about {reserve_pct}% width x {reserve_pct}% height) as plain, "
+                    f"continuous background with no text or graphics — a brand logo will be overlaid there "
+                    f"afterward. {NO_MARK_LOGO}"
                 )
 
             # CTA — same round-robin rotation as _generate_platform_image.

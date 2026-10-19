@@ -38,9 +38,13 @@ class TestQuery:
             ["vitamin c serum", "Glowup", "glowup"], ["giveaway"],
             datetime(2026, 10, 9), datetime(2026, 10, 16), language="en")
         assert terms == [
-            '"vitamin c serum" since:2026-10-09 until:2026-10-16 -filter:retweets lang:en -giveaway',
+            '(vitamin c serum) since:2026-10-09 until:2026-10-16 -filter:retweets lang:en -giveaway',
             'Glowup since:2026-10-09 until:2026-10-16 -filter:retweets lang:en -giveaway',
         ]  # duplicate keyword (any case) searched once
+
+    def test_quoted_keyword_stays_exact_and_exclusion_phrase_is_exact(self):
+        terms = ax.build_search_terms(['"glow up"'], ["free trial"], datetime(2026, 10, 9), datetime(2026, 10, 16))
+        assert terms[0].startswith('"glow up" ') and terms[0].endswith('-"free trial"')
 
     def test_no_language_means_no_filter(self):
         terms = ax.build_search_terms(["skincare lagos"], [], datetime(2026, 10, 1), datetime(2026, 10, 8))
