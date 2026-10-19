@@ -425,8 +425,10 @@ class ExpandPromptRequest(BaseModel):
     platforms: List[str] = []
     post_type: str = "feed"
     num_slides: Optional[int] = None
-    include_images: bool = False
+    include_images: bool = False  # ignored: every post gets a visual; the switch is set after the brief
     style_override: Optional[List[str]] = None
+    override_cta: Optional[str] = None
+    reference_image_labels: Optional[List[str]] = None  # one entry per uploaded photo ("" if unlabelled)
 
 
 @router.post("/expand-prompt")
@@ -448,7 +450,9 @@ async def expand_prompt(
     brand_context = BrandProfileService.to_brand_context(profile_data)
     result = await prompt_expander.expand(
         idea[:5000], brand_context, request.platforms, request.post_type, request.num_slides,
-        request.include_images, request.style_override or None,
+        styles=request.style_override or None,
+        cta=(request.override_cta or "").strip() or None,
+        photos=[(l or "").strip()[:80] for l in (request.reference_image_labels or [])][:10] or None,
     )
     if not result:
         raise HTTPException(status_code=502, detail="Jane couldn't expand that right now — try again in a moment.")
