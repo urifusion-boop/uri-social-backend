@@ -2581,8 +2581,16 @@ async def _build_campaign_plan(
     google_ready, google_not_ready_reason = await google_flow.readiness(
         db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
     meta_configured = bool(settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN)
-    if not meta_configured and not google_ready:
-        raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
+    # TikTok's own ad account is entirely separate from any Meta Page (see
+    # adapters/tiktok.py) — a brand explicitly asking for TikTok must never be
+    # blocked on Meta config/connection at all. Live-confirmed 2026-10-19: this
+    # whole step used to only ever consult google_ready, so a client who picked
+    # TikTok but had no Facebook Page connected got "Connect your Facebook Page"
+    # before TikTok was ever considered.
+    tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
+    tiktok_preferred = body.preferred_platform == "tiktok"
+    if not meta_configured and not google_ready and not (tiktok_ready and tiktok_preferred):
+        raise HTTPException(status_code=400, detail="No ad platform is configured — need Meta, Google, or TikTok credentials")
 
     # 0. Per-brand Meta ads connection — checked FIRST, before Jane says a word, so a
     # client never designs a whole campaign only to hit a wall at the end (Per-Brand
@@ -2591,9 +2599,10 @@ async def _build_campaign_plan(
     # require_whatsapp=False here: whether WhatsApp is actually needed depends on the
     # campaign's goal, which Jane hasn't determined yet at this point — a followers/
     # engagement campaign never uses it at all. Re-checked strictly once the goal is
-    # known, at step 1.6 below.
+    # known, at step 1.6 below. Skipped entirely when TikTok was explicitly asked for
+    # and is ready — this check is Meta-only and has nothing to say about TikTok.
     ads_conn = None
-    if meta_configured:
+    if meta_configured and not (tiktok_preferred and tiktok_ready):
         try:
             ads_conn = await resolve_ads_page_for_launch(
                 db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
@@ -2605,10 +2614,12 @@ async def _build_campaign_plan(
                     "understood": {},
                     "page_name": e.page_name,
                 }}
-    # No Meta Page but a linked Google Ads account: this campaign can only be a
-    # Google one. There is no Page, and the WhatsApp number is the brand's own.
-    google_only = ads_conn is None
-    if google_only:
+    # No Meta Page, but another platform this campaign can actually run on: Google
+    # (linked Google Ads account) or TikTok (explicitly asked for, credentials
+    # configured). There is no Page, and the WhatsApp number is the brand's own.
+    google_only = ads_conn is None and not tiktok_preferred
+    tiktok_only = ads_conn is None and tiktok_preferred
+    if google_only or tiktok_only:
         from .whatsapp import get_brand_whatsapp
         ads_conn = {"page_id": "",
                     "whatsapp_number": await get_brand_whatsapp(db, brand_ctx.get("brand_id")) or ""}
@@ -2809,6 +2820,13 @@ async def _build_campaign_plan(
         and requested_destination not in ("", "ask")
         and destination_type == DestinationType.WHATSAPP
     )
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"] and tiktok_only:
+        return {"early_return": {
+            "stage": "tiktok_connection_no_whatsapp",
+            "understood": parsed.model_dump(),
+            "question": "Add the WhatsApp number your ads should send people to (Connected Accounts), "
+                        "then tell me again and I'll build it.",
+        }}
     if needs_whatsapp_number and not ads_conn["whatsapp_number"] and google_only:
         return {"early_return": {
             "stage": "google_connection_no_whatsapp",
@@ -2816,7 +2834,7 @@ async def _build_campaign_plan(
             "question": "Add the WhatsApp number your ads should send people to (Connected Accounts → "
                         "Google Ads), then tell me again and I'll build it.",
         }}
-    if needs_whatsapp_number and not ads_conn["whatsapp_number"]:
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"] and not tiktok_only:
         try:
             ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
         except AdsConnectionRequired as e:
@@ -3009,20 +3027,23 @@ async def _build_campaign_plan(
     # launch path yet. Jane's original recommendation is always surfaced in the
     # response for transparency, regardless of what actually launches.
     jane_platforms = [p.platform.value for p in plan.platforms]
-    tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
+    # tiktok_ready computed earlier (step 0), reused here — single source of truth.
 
     # Google Search: when the client asks for it, when it's the only platform this
     # brand has connected, or when Jane herself picked Search and the brand's
     # Google Ads account is linked. A budget too small for Search is said plainly
     # when Google was asked for (or is all there is); when it was only Jane's own
     # pick, she quietly uses Instagram/Facebook instead, as she always did.
+    # google_only excludes tiktok_preferred (see step 0) but guarded here too —
+    # a TikTok-preferred request must never fall into the Google branch just
+    # because there's no Meta Page.
     wants_google = body.preferred_platform == "google"
     google_budget_warning = ""
     from .adapters.google_visual import PLACEMENT_LABELS, normalize_placement
     google_placement = normalize_placement(body.google_placement)
     jane_picked_google = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
     use_google = False
-    if wants_google or google_only or (jane_picked_google and google_ready and body.preferred_platform != "tiktok"):
+    if wants_google or (google_only and not tiktok_preferred) or (jane_picked_google and google_ready and not tiktok_preferred):
         if not google_ready:
             return {"early_return": {"stage": "google_not_connected", "understood": parsed.model_dump(),
                     "question": google_not_ready_reason}}
@@ -3035,7 +3056,7 @@ async def _build_campaign_plan(
             # Google itself refuses these, so there is nothing to go ahead with.
             return {"early_return": {"stage": "google_budget_too_low", "understood": parsed.model_dump(),
                     "question": below_minimum}}
-        if too_low and (wants_google or google_only):
+        if too_low and (wants_google or (google_only and not tiktok_preferred)):
             # Asked for Google by name: their call. A small budget still runs
             # (a test, a trial) — Jane says what to expect in the plan instead
             # of refusing and repeating herself.
@@ -3409,7 +3430,7 @@ async def _build_campaign_plan(
     # runs before a plan is ever shown as ready, not just right before launch.
     # BLOCK severity aborts with the specific guidance; WARN-only violations are
     # logged but don't stop planning (re-checked again at commit in /plan/{id}/launch).
-    policy_result = review_ad_creative(creative.headline, creative.primary_text)
+    policy_result = review_ad_creative(creative.headline, creative.primary_text, platform=creative_platform)
     blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
     if blocking:
         raise HTTPException(
@@ -4091,7 +4112,10 @@ async def meta_launch_plan(
     # Policy re-check at commit — cheap and deterministic, and real time has passed
     # since the plan was built, so this is a genuine safety re-validation, not just
     # a formality.
-    policy_result = review_ad_creative(plan.creative.headline, plan.creative.primary_text)
+    launch_platform_value = plan.platforms[0].platform.value if plan.platforms else Platform.META.value
+    policy_result = review_ad_creative(
+        plan.creative.headline, plan.creative.primary_text, platform=launch_platform_value,
+    )
     blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
     if blocking:
         raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")

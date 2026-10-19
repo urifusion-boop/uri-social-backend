@@ -53,6 +53,7 @@ from app.core.config import settings
 from .base import AdPlatformAdapter
 from ..destination import link_for_plan
 from ..models import (
+    CampaignObjective,
     CampaignPlan,
     ConversationDelivered,
     LaunchResult,
@@ -82,10 +83,11 @@ _NIGERIA_LOCATION_ID = "2328926"
 # own audience_targeting (age_min/age_max/genders/pins) was computed by Jane but
 # silently discarded at the TikTok launch step. gender and age_groups map
 # directly onto plan.audience_targeting's existing Meta-shaped fields (same
-# dict the review panel already edits); interests have no TikTok equivalent
-# wired up yet — deferred, not silently dropped: see _get_carousel_music_id's
-# own "NOT yet verified live" precedent for how a genuinely-unconfirmed piece
-# gets flagged here rather than guessed at.
+# dict the review panel already edits); interests are resolved to TikTok's own
+# interest_category_ids via _resolve_tiktok_interests/_fetch_tiktok_interest_
+# categories further down this file (GET /tool/interest_category/) — this
+# comment previously said they had no TikTok equivalent wired up, which went
+# stale once that landed (corrected 2026-10-19).
 
 # GENDER_UNLIMITED/GENDER_MALE/GENDER_FEMALE — confirmed against TikTok's
 # Enumerations reference. Reuses plan_fields.py's own genders encoding
@@ -93,6 +95,36 @@ _NIGERIA_LOCATION_ID = "2328926"
 # the review panel and a plan TikTok launches from can never disagree about
 # what "men" means.
 _TIKTOK_GENDER = {(): "GENDER_UNLIMITED", (1,): "GENDER_MALE", (2,): "GENDER_FEMALE"}
+
+# ── Objective mapping (2026-10-19) ─────────────────────────────────────────────
+# campaign/create/ previously hardcoded objective_type to "TRAFFIC" regardless of
+# what the client picked in ObjectivePicker.tsx (plan.objective, Meta's own
+# objective words — confirmed live: the question was asked and echoed back on the
+# plan card, but had zero effect on a TikTok launch). Confirmed against TikTok's
+# own Marketing API campaign objectives: TRAFFIC, CONVERSIONS, APP_PROMOTION,
+# REACH, VIDEO_VIEWS, LEAD_GENERATION.
+#
+# SALES intentionally still maps to TRAFFIC, not CONVERSIONS: CONVERSIONS
+# requires a TikTok Pixel (pixel_id) wired into the ad group, and no
+# TIKTOK_PIXEL_* setting exists anywhere in this codebase yet (settings.py has
+# none) — using CONVERSIONS without one would fail the launch outright, which is
+# worse than the honest "not supported yet" fallback this keeps. Wiring a real
+# TikTok Pixel is separate, larger infrastructure work.
+# FOLLOWERS also maps to TRAFFIC: TikTok's Marketing API has no page-follow /
+# community-growth objective equivalent to Meta's PAGE_LIKES.
+_TIKTOK_OBJECTIVE = {
+    CampaignObjective.AWARENESS: "REACH",
+    CampaignObjective.TRAFFIC: "TRAFFIC",
+    CampaignObjective.ENGAGEMENT: "VIDEO_VIEWS",
+    CampaignObjective.LEADS: "LEAD_GENERATION",
+    CampaignObjective.SALES: "TRAFFIC",       # see note above — needs a Pixel first
+    CampaignObjective.FOLLOWERS: "TRAFFIC",   # see note above — no TikTok equivalent
+    CampaignObjective.CONVERSATIONS: "TRAFFIC",  # legacy pre-ObjectivePicker plans
+}
+
+
+def _tiktok_objective_type(objective: CampaignObjective) -> str:
+    return _TIKTOK_OBJECTIVE.get(objective, "TRAFFIC")
 
 # (enum, inclusive lower bound, inclusive upper bound) — confirmed against
 # TikTok's Enumerations reference. AGE_13_17 is deliberately never reachable
@@ -712,6 +744,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         # file_name), which all already append a random hex suffix for
                         # exactly this reason.
                         "campaign_name": f"JaneAds-{plan.business_id}-{plan.goal.value}-{uuid.uuid4().hex[:8]}",
+                        # _tiktok_objective_type(plan.objective) is ready above but NOT yet
+                        # wired in here — optimization_goal/billing_event below are still
+                        # hardcoded to CLICK/CPC (only valid for TRAFFIC). Switching
+                        # objective_type alone would make REACH/VIDEO_VIEWS/LEAD_GENERATION
+                        # launches fail outright once TikTok rejects the mismatched
+                        # optimization_goal — worse than today's "always Traffic" behavior.
+                        # Wire both together once the real optimization_goal/billing_event
+                        # values per objective are confirmed (pending 2026-10-19).
                         "objective_type": "TRAFFIC",
                         "budget_mode": "BUDGET_MODE_INFINITE",
                         "operation_status": "DISABLE",
