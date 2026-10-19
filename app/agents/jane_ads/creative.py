@@ -161,7 +161,9 @@ def _logo_reserve_directive(bc: dict) -> str:
     position = (bc.get("logo_position") or "bottom_right").replace("_", " ")
     return (
         f" Leave the {position} corner visually clear (no faces, text, or busy detail "
-        "there) — a brand logo will be composited onto that corner afterward."
+        "there) — a brand logo will be composited onto that corner afterward. Don't mark "
+        "that corner in any way (no dotted or dashed lines, outline, box, border or placeholder) — "
+        "it must look like ordinary background."
     )
 
 
