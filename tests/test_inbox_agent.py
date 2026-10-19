@@ -284,7 +284,7 @@ def test_a_refund_request_is_never_auto_replied():
                    {"reply": "Sorry! Refunds take 3 days.", "cited": [FAQ_ID], "confidence": 99})
     sent: list = []
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
-    assert out["status"] == "drafted" and not sent
+    assert out["status"] == "held" and sent == [agent.HOLDING_REPLIES["problem"]]
     assert "Refunds" in db[CONVERSATIONS].docs[0]["handoff_reason"]
 
 
@@ -296,7 +296,7 @@ def test_an_injected_instruction_cannot_send_unsourced_contact_details():
                              "cited": [FAQ_ID], "confidence": 99})
     sent: list = []
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
-    assert out["status"] == "drafted" and not sent
+    assert out["status"] == "held" and sent == [agent.HOLDING_REPLIES["question"]]
     assert db[CONVERSATIONS].docs[0]["ai_suggestion"]["confidence"] == 0
 
 
@@ -306,7 +306,7 @@ def test_citations_the_model_invents_are_dropped():
     llm = fake_llm(CLS_FAQ, {"reply": "We open at 7.", "cited": ["faq:made-up"], "confidence": 99})
     sent: list = []
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
-    assert out["status"] == "drafted" and not sent
+    assert out["status"] == "held" and sent == [agent.HOLDING_REPLIES["question"]]
     assert db[CONVERSATIONS].docs[0]["ai_suggestion"]["sources"] == []
     assert db[CONVERSATIONS].docs[0]["ai_suggestion"]["confidence"] == 0
 
@@ -360,6 +360,39 @@ def test_a_team_reply_blocks_auto_replies_for_a_day_not_forever():
     assert agent.verdict(s, _conv(), old, _cls(), _draft(), OPEN_HOURS) == (True, "")
 
 
+def test_a_held_message_gets_one_holding_line_until_a_person_replies():
+    db = Db()
+    conv_id, msg_id = _seed(db, faq=False)
+    llm = fake_llm(CLS_FAQ, {"reply": "We open at 7.", "cited": [], "confidence": 90,
+                             "unanswered": ["When do you open?"]})
+    sent: list = []
+    out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
+    assert out["status"] == "held" and sent == [agent.HOLDING_REPLIES["question"]]
+    assert db[CONVERSATIONS].docs[0]["needs_human"] is True
+
+    again = ObjectId()
+    db[MESSAGES].docs.append({"_id": again, "workspace_id": WS, "conversation_id": conv_id,
+                              "direction": "inbound", "text": "hello??", "provider_message_id": "mid_in_2",
+                              "received_at": now()})
+    out = _run(agent.process_inbound(db, WS, conv_id, str(again), llm, _sent_transport(sent)))
+    assert out["status"] == "drafted" and len(sent) == 1
+
+
+def test_holding_lines_fit_the_situation():
+    assert agent.holding_reply({"wants_human": True}, "general") == agent.HOLDING_REPLIES["human"]
+    assert agent.holding_reply({"intent": "complaint"}, "complaint") == agent.HOLDING_REPLIES["problem"]
+    assert agent.holding_reply({"intent": "booking"}, "buying_intent") == agent.HOLDING_REPLIES["question"]
+
+
+def test_no_holding_line_when_auto_replies_are_off():
+    db = Db()
+    conv_id, msg_id = _seed(db, faq=False, auto=False)
+    llm = fake_llm(CLS_FAQ, {"reply": "x", "cited": [], "confidence": 90, "unanswered": ["x"]})
+    sent: list = []
+    out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
+    assert out["status"] == "drafted" and not sent
+
+
 def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
     db = Db()
     conv_id, msg_id = _seed(db, faq=False)
@@ -370,6 +403,25 @@ def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
     assert reason == "No approved FAQ answers what they asked"
     assert db[CONVERSATIONS].docs[0]["handoff_reason"] == reason
     assert not [m for m in db[MESSAGES].docs if m["direction"] == "outbound"]
+
+
+def test_an_echoed_exclusion_list_is_not_a_judgement():
+    from app.agents.inbox.agent import coerce_classification
+    echoed = {"intent": "product_question", "confidence": 90,
+              "exclusions": ["payment_dispute", "refund", "safety", "legal"]}
+    assert coerce_classification(echoed, "how does paying for ads work?")["exclusions"] == []
+    real = coerce_classification(echoed, "I want a refund or I'll get a lawyer")
+    assert {"refund", "legal"} <= set(real["exclusions"])
+    one = coerce_classification({**echoed, "exclusions": ["payment_dispute"]}, "you charged me wrongly")
+    assert one["exclusions"] == ["payment_dispute"]
+
+
+@pytest.mark.parametrize("value,expected", [
+    ([], False), ([""], False), (["Do you deliver to Ghana?"], True), (True, True), (False, False),
+    ("true", True), (None, False),
+])
+def test_unanswered_means_a_named_gap(value, expected):
+    assert agent._unanswered(value) is expected
 
 
 @pytest.mark.parametrize("text", ["i'm interested", "Im interested", "I am very interested!",

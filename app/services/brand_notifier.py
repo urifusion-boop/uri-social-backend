@@ -29,6 +29,7 @@ EVENTS = {
     "Trending topic in your niche": "trending_topic",
     "Content calendar needs refill": "calendar_refill",
     "Engagement spike detected": "engagement_spike",
+    "Customer message needs a reply": "inbox_needs_reply",
 }
 EVENT_LABELS = {v: k for k, v in EVENTS.items()}
 
@@ -51,9 +52,9 @@ _PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_poste
 # after onboarding) must not silence them.
 _DEFAULT_EVENTS = {"post_ready", "post_published"}
 
-# Never optional: an owner must hear that a post didn't go out, whatever
-# alerts they picked.
-_ALWAYS_EVENTS = {"post_failed"}
+# Never optional: an owner must hear that a post didn't go out, or that a
+# customer is waiting on a person, whatever alerts they picked.
+_ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply"}
 
 
 def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
