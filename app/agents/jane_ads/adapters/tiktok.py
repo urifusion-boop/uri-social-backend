@@ -51,7 +51,7 @@ import httpx
 
 from app.core.config import settings
 from .base import AdPlatformAdapter
-from ..destination import link_for_plan
+from ..destination import CTA_CHOICES, link_for_plan
 from ..models import (
     CampaignObjective,
     CampaignPlan,
@@ -125,6 +125,55 @@ _TIKTOK_OBJECTIVE = {
 
 def _tiktok_objective_type(objective: CampaignObjective) -> str:
     return _TIKTOK_OBJECTIVE.get(objective, "TRAFFIC")
+
+
+# ── call_to_action mapping (2026-10-19) ────────────────────────────────────────
+# ad/create previously hardcoded call_to_action to "CONTACT_US" regardless of
+# which button the client actually picked (plan.destination_cta, a key into
+# destination.CTA_CHOICES) — link_for_plan(plan) was only ever read for its
+# .link, .cta was discarded entirely. TikTok's own call_to_action field is
+# documented as a free string in their SDK (no enforced enum found there,
+# unlike Meta's strict enum) — best-guess below assumes TikTok accepts the
+# same SCREAMING_SNAKE_CASE values Meta does for the ones that are genuinely
+# standard across ad platforms (confirmed as real TikTok CTA display options
+# via their own marketing docs: Learn More, Shop Now, Order Now, Book Now,
+# Sign Up, Contact Us). GET_OFFER has no confirmed TikTok equivalent, so it
+# stays CONTACT_US. NOT independently verified against a live TikTok account —
+# same discipline as _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE: tried first, and the
+# ad/create call below falls back to CONTACT_US on any rejection rather than
+# failing the whole launch over a button label.
+_TIKTOK_CTA = {
+    "LEARN_MORE": "LEARN_MORE",
+    "SHOP_NOW": "SHOP_NOW",
+    "ORDER_NOW": "ORDER_NOW",
+    "BOOK_NOW": "BOOK_NOW",
+    "SIGN_UP": "SIGN_UP",
+    "GET_OFFER": "CONTACT_US",  # no confirmed TikTok equivalent
+    "CONTACT_US": "CONTACT_US",
+}
+
+
+def _tiktok_cta(destination_cta_key: str) -> str:
+    meta_cta_value = CTA_CHOICES.get(destination_cta_key, ("", "CONTACT_US"))[1]
+    return _TIKTOK_CTA.get(meta_cta_value, "CONTACT_US")
+
+
+# optimization_goal/billing_event per objective_type — NOT independently verified
+# against TikTok's own docs (portal access was unavailable 2026-10-19; best-guess
+# from TikTok's own established SCREAMING_SNAKE_CASE enum convention, confirmed
+# elsewhere in this file, plus general ad-platform billing patterns: reach/
+# impression objectives bill CPM, click objectives bill CPC, view objectives bill
+# CPV). TRAFFIC's pair is the one actually confirmed live. Every other pair is
+# tried first but never trusted blindly — see the try/except around campaign+
+# adgroup creation below, which falls back to the confirmed TRAFFIC/CLICK/CPC
+# combination on ANY rejection from TikTok's API, so a wrong guess here degrades
+# to today's known-working behavior instead of breaking the launch outright.
+_TIKTOK_OPTIMIZATION_FOR_OBJECTIVE: dict[str, tuple[str, str]] = {
+    "REACH": ("REACH", "CPM"),
+    "TRAFFIC": ("CLICK", "CPC"),  # matches _OPTIMIZATION_GOAL/_BILLING_EVENT below — the confirmed pair
+    "VIDEO_VIEWS": ("VIDEO_VIEW", "CPV"),
+    "LEAD_GENERATION": ("LEAD_GENERATION", "CPM"),
+}
 
 # (enum, inclusive lower bound, inclusive upper bound) — confirmed against
 # TikTok's Enumerations reference. AGE_13_17 is deliberately never reachable
@@ -696,7 +745,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         tiktok_plans = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
         if not tiktok_plans:
             raise ValueError("TikTokAdsAdapter only handles Platform.TIKTOK plans")
-        dest_link = link_for_plan(plan).link
+        resolved_destination = link_for_plan(plan)
+        dest_link = resolved_destination.link
         if not dest_link:
             raise ValueError(
                 f"CampaignPlan has no usable destination link for destination_type="
@@ -731,35 +781,146 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # 1. Campaign — a container only; the real budget lives on the ad
                 # group (mirrors meta.py's own "budget lives on the ad set, not the
                 # campaign" decision, for the same per-business isolation reason).
-                campaign_resp = await client.post(
-                    f"{self._api_base}/campaign/create/",
-                    headers=self._headers(),
-                    json={
-                        "advertiser_id": self._advertiser_id,
-                        # Live-caught 2026-09-21: TikTok rejects campaign/create with
-                        # "Campaign name already exists" once a business launches a
-                        # second campaign with the same goal — this name had no
-                        # uniqueness suffix at all, unlike every other name/file_name
-                        # in this adapter (ad_name, adgroup_name, video/image
-                        # file_name), which all already append a random hex suffix for
-                        # exactly this reason.
-                        "campaign_name": f"JaneAds-{plan.business_id}-{plan.goal.value}-{uuid.uuid4().hex[:8]}",
-                        # _tiktok_objective_type(plan.objective) is ready above but NOT yet
-                        # wired in here — optimization_goal/billing_event below are still
-                        # hardcoded to CLICK/CPC (only valid for TRAFFIC). Switching
-                        # objective_type alone would make REACH/VIDEO_VIEWS/LEAD_GENERATION
-                        # launches fail outright once TikTok rejects the mismatched
-                        # optimization_goal — worse than today's "always Traffic" behavior.
-                        # Wire both together once the real optimization_goal/billing_event
-                        # values per objective are confirmed (pending 2026-10-19).
-                        "objective_type": "TRAFFIC",
-                        "budget_mode": "BUDGET_MODE_INFINITE",
-                        "operation_status": "DISABLE",
-                    },
+                #
+                # objective_type now reflects the client's actual ObjectivePicker pick
+                # (ready since 2026-10-19 but previously left unused because its
+                # optimization_goal/billing_event pairing wasn't confirmed). Since that
+                # pairing is still a best guess (see _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE's
+                # own note), this creates the campaign+ad group with the guessed
+                # combination first and, on ANY rejection from TikTok, falls back to the
+                # one combination that IS confirmed live (TRAFFIC/CLICK/CPC) rather than
+                # leaving the launch broken. A rejected first attempt just means this
+                # specific campaign optimizes on Traffic instead of the client's actual
+                # pick, the same as every launch before this fix — never a hard failure.
+                # Real audience targeting (2026-09-25) — see the module-level
+                # constants/helpers above for what's confirmed vs. still deferred.
+                # Resolved once, outside the retry closure below, since it never
+                # varies between a guessed attempt and the TRAFFIC fallback.
+                targeting = plan.audience_targeting or {}
+                location_names = [p.name for p in (plan.geo.pins if plan.geo else [])]
+                resolved_locations, unresolved_locations = await _resolve_tiktok_locations(
+                    location_names, self._advertiser_id, self._access_token)
+                if unresolved_locations:
+                    print(f"[TikTokAdsAdapter] locations not resolved, dropped: {unresolved_locations}", flush=True)
+                # Nigeria-wide is the honest fallback whenever nothing named
+                # resolved (no pins on the plan at all, or every lookup failed) —
+                # never an empty location_ids, which the launch would reject.
+                location_ids = [r["location_id"] for r in resolved_locations] or [_NIGERIA_LOCATION_ID]
+
+                # Interests, unlike locations, are genuinely optional on TikTok —
+                # omitting interest_category_ids entirely means "no interest
+                # restriction", the same broad-audience meaning an empty/missing
+                # flexible_spec has on Meta. So no Nigeria-wide-style fallback
+                # here: resolving to nothing just means the key is left out.
+                interest_names = _targeting_interest_names(targeting)
+                resolved_interests, unresolved_interests = await _resolve_tiktok_interests(
+                    interest_names, self._advertiser_id, self._access_token)
+                if unresolved_interests:
+                    print(f"[TikTokAdsAdapter] interests not resolved, dropped: {unresolved_interests}", flush=True)
+                interest_category_ids = [r["interest_category_id"] for r in resolved_interests]
+
+                async def _create_campaign_and_adgroup(
+                    objective_type: str, optimization_goal: str, billing_event: str,
+                ) -> tuple[str, str]:
+                    campaign_resp = await client.post(
+                        f"{self._api_base}/campaign/create/",
+                        headers=self._headers(),
+                        json={
+                            "advertiser_id": self._advertiser_id,
+                            # Live-caught 2026-09-21: TikTok rejects campaign/create with
+                            # "Campaign name already exists" once a business launches a
+                            # second campaign with the same goal — this name had no
+                            # uniqueness suffix at all, unlike every other name/file_name
+                            # in this adapter (ad_name, adgroup_name, video/image
+                            # file_name), which all already append a random hex suffix for
+                            # exactly this reason.
+                            "campaign_name": f"JaneAds-{plan.business_id}-{plan.goal.value}-{uuid.uuid4().hex[:8]}",
+                            "objective_type": objective_type,
+                            "budget_mode": "BUDGET_MODE_INFINITE",
+                            "operation_status": "DISABLE",
+                        },
+                    )
+                    campaign_data = campaign_resp.json()
+                    _raise_for_error(campaign_data, "campaign creation")
+                    new_campaign_id = str(campaign_data["data"]["campaign_id"])
+
+                    # Ad group — the real budget + targeting + schedule live here.
+                    # PAUSED via operation_status="DISABLE", same as every other create
+                    # call in this method.
+                    adgroup_resp = await client.post(
+                        f"{self._api_base}/adgroup/create/",
+                        headers=self._headers(),
+                        json={
+                            "advertiser_id": self._advertiser_id,
+                            "campaign_id": new_campaign_id,
+                            "adgroup_name": f"JaneAds-{plan.business_id}-adgroup",
+                            # Required by TikTok for every ad group — confirmed live
+                            # (2026-08-31): omitting it fails with "Invalid value for
+                            # promotion_type" rather than defaulting to anything. The
+                            # destination is an external URL (wa.me) regardless of
+                            # objective, so this is always "WEBSITE" — not TikTok's
+                            # native in-app messaging type, since we're not using their
+                            # Click-to-Message integration.
+                            "promotion_type": "WEBSITE",
+                            "placement_type": "PLACEMENT_TYPE_NORMAL",
+                            "placements": ["PLACEMENT_TIKTOK"],
+                            "location_ids": location_ids,
+                            "gender": _tiktok_gender_for(targeting),
+                            "age_groups": _tiktok_age_groups_for(targeting),
+                            **({"interest_category_ids": interest_category_ids} if interest_category_ids else {}),
+                            "budget_mode": "BUDGET_MODE_TOTAL",
+                            "budget": total_budget_ngn,
+                            "schedule_type": "SCHEDULE_START_END",
+                            "schedule_start_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                            "schedule_end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
+                            "optimization_goal": optimization_goal,
+                            "billing_event": billing_event,
+                            # Confirmed live (2026-08-31) for TRAFFIC/CLICK/CPC: omitting
+                            # bid_type fails with "Bid needs to be greater than $0.00" —
+                            # TikTok defaults to requiring an explicit bid_price unless
+                            # told otherwise. NO_BID lets TikTok pick the bid
+                            # automatically, matching Meta/Google's own automatic-bidding
+                            # choice elsewhere in Jane + Ads. NOT re-verified for the
+                            # other guessed optimization_goal values above — if NO_BID
+                            # turns out invalid for one of those, it surfaces as a
+                            # rejection here and this whole attempt falls back to the
+                            # confirmed TRAFFIC combination below, same as a bad
+                            # optimization_goal/billing_event guess would.
+                            "bid_type": "BID_TYPE_NO_BID",
+                            # Confirmed live (2026-08-31) for TRAFFIC: whatever pacing
+                            # TikTok defaults to reads as "accelerated," which it flatly
+                            # rejects paired with BID_TYPE_NO_BID ("Accelerated delivery
+                            # under No-Bid strategy is not supported"). SMOOTH (standard
+                            # pacing) is also just the right choice for an unattended,
+                            # no-manual-tuning campaign regardless of the error.
+                            "pacing": "PACING_MODE_SMOOTH",
+                            "operation_status": "DISABLE",
+                        },
+                    )
+                    adgroup_data = adgroup_resp.json()
+                    _raise_for_error(adgroup_data, "ad group creation")
+                    new_adgroup_id = str(adgroup_data["data"]["adgroup_id"])
+                    return new_campaign_id, new_adgroup_id
+
+                guessed_objective = _tiktok_objective_type(plan.objective)
+                guessed_optimization, guessed_billing = _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE.get(
+                    guessed_objective, (_OPTIMIZATION_GOAL, _BILLING_EVENT),
                 )
-                campaign_data = campaign_resp.json()
-                _raise_for_error(campaign_data, "campaign creation")
-                campaign_id = str(campaign_data["data"]["campaign_id"])
+                if guessed_objective == "TRAFFIC":
+                    campaign_id, adgroup_id = await _create_campaign_and_adgroup(
+                        "TRAFFIC", _OPTIMIZATION_GOAL, _BILLING_EVENT,
+                    )
+                else:
+                    try:
+                        campaign_id, adgroup_id = await _create_campaign_and_adgroup(
+                            guessed_objective, guessed_optimization, guessed_billing,
+                        )
+                    except TikTokAdsAPIError as guess_err:
+                        print(f"[TikTokAdsAdapter] {guessed_objective}/{guessed_optimization}/{guessed_billing} "
+                              f"rejected ({guess_err}) — falling back to confirmed TRAFFIC/CLICK/CPC", flush=True)
+                        campaign_id, adgroup_id = await _create_campaign_and_adgroup(
+                            "TRAFFIC", _OPTIMIZATION_GOAL, _BILLING_EVENT,
+                        )
 
                 video_id = ""
                 image_ids_for_ad: list[str] = []   # cover image (video path) or every
@@ -857,90 +1018,6 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         img_entry = img_data["data"][0] if isinstance(img_data["data"], list) else img_data["data"]
                         image_ids_for_ad.append(img_entry["image_id"])
 
-                # 3. Ad group — the real budget + targeting + schedule live here.
-                # PAUSED via operation_status="DISABLE", same as every other create
-                # call in this method.
-                #
-                # Real audience targeting (2026-09-25) — see the module-level
-                # constants/helpers above for what's confirmed vs. still deferred.
-                # Every campaign before this launched with location_ids hardcoded
-                # to all of Nigeria and no gender/age targeting at all, silently
-                # discarding whatever plan.audience_targeting/plan.geo Jane had
-                # actually computed for this plan.
-                targeting = plan.audience_targeting or {}
-                location_names = [p.name for p in (plan.geo.pins if plan.geo else [])]
-                resolved_locations, unresolved_locations = await _resolve_tiktok_locations(
-                    location_names, self._advertiser_id, self._access_token)
-                if unresolved_locations:
-                    print(f"[TikTokAdsAdapter] locations not resolved, dropped: {unresolved_locations}", flush=True)
-                # Nigeria-wide is the honest fallback whenever nothing named
-                # resolved (no pins on the plan at all, or every lookup failed) —
-                # never an empty location_ids, which the launch would reject.
-                location_ids = [r["location_id"] for r in resolved_locations] or [_NIGERIA_LOCATION_ID]
-
-                # Interests, unlike locations, are genuinely optional on TikTok —
-                # omitting interest_category_ids entirely means "no interest
-                # restriction", the same broad-audience meaning an empty/missing
-                # flexible_spec has on Meta. So no Nigeria-wide-style fallback
-                # here: resolving to nothing just means the key is left out.
-                interest_names = _targeting_interest_names(targeting)
-                resolved_interests, unresolved_interests = await _resolve_tiktok_interests(
-                    interest_names, self._advertiser_id, self._access_token)
-                if unresolved_interests:
-                    print(f"[TikTokAdsAdapter] interests not resolved, dropped: {unresolved_interests}", flush=True)
-                interest_category_ids = [r["interest_category_id"] for r in resolved_interests]
-
-                adgroup_resp = await client.post(
-                    f"{self._api_base}/adgroup/create/",
-                    headers=self._headers(),
-                    json={
-                        "advertiser_id": self._advertiser_id,
-                        "campaign_id": campaign_id,
-                        "adgroup_name": f"JaneAds-{plan.business_id}-adgroup",
-                        # Required by TikTok for every ad group — confirmed live
-                        # (2026-08-31): omitting it fails with "Invalid value for
-                        # promotion_type" rather than defaulting to anything. The
-                        # destination is an external URL (wa.me), matching the
-                        # campaign's own TRAFFIC objective_type above, so this is
-                        # "WEBSITE" — not TikTok's native in-app messaging type,
-                        # since we're not using their Click-to-Message integration.
-                        "promotion_type": "WEBSITE",
-                        "placement_type": "PLACEMENT_TYPE_NORMAL",
-                        "placements": ["PLACEMENT_TIKTOK"],
-                        "location_ids": location_ids,
-                        "gender": _tiktok_gender_for(targeting),
-                        "age_groups": _tiktok_age_groups_for(targeting),
-                        **({"interest_category_ids": interest_category_ids} if interest_category_ids else {}),
-                        "budget_mode": "BUDGET_MODE_TOTAL",
-                        "budget": total_budget_ngn,
-                        "schedule_type": "SCHEDULE_START_END",
-                        "schedule_start_time": now.strftime("%Y-%m-%d %H:%M:%S"),
-                        "schedule_end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
-                        "optimization_goal": _OPTIMIZATION_GOAL,
-                        "billing_event": _BILLING_EVENT,
-                        # Confirmed live (2026-08-31): omitting bid_type fails with
-                        # "Bid needs to be greater than $0.00" — TikTok defaults to
-                        # requiring an explicit bid_price rather than automatic
-                        # bidding unless told otherwise. NO_BID lets TikTok pick the
-                        # bid automatically to spend the budget efficiently, matching
-                        # Meta/Google's own automatic-bidding choice elsewhere in
-                        # Jane + Ads — no per-click bid management for the user.
-                        "bid_type": "BID_TYPE_NO_BID",
-                        # Confirmed live (2026-08-31): whatever pacing TikTok defaults
-                        # to here reads as "accelerated," which it flatly rejects
-                        # paired with BID_TYPE_NO_BID for this objective ("Accelerated
-                        # delivery under No-Bid strategy is not supported"). SMOOTH
-                        # (standard pacing, spend spread across the whole schedule)
-                        # is also just the right choice for an unattended, no-manual-
-                        # tuning campaign regardless of the error.
-                        "pacing": "PACING_MODE_SMOOTH",
-                        "operation_status": "DISABLE",
-                    },
-                )
-                adgroup_data = adgroup_resp.json()
-                _raise_for_error(adgroup_data, "ad group creation")
-                adgroup_id = str(adgroup_data["data"]["adgroup_id"])
-
                 # 4. The ad itself — video creative + copy + the brand's destination
                 # as the landing page, paused. Every creative must declare an identity
                 # (who it's posted "as") — the one linked-and-authorized TikTok
@@ -962,7 +1039,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # match.' without this.
                     "identity_authorized_bc_id": identity_bc_id,
                     "landing_page_url": dest_link,
-                    "call_to_action": "CONTACT_US",
+                    "call_to_action": _tiktok_cta(resolved_destination.cta),
                 }
                 if is_carousel:
                     # Confirmed live 2026-09-22: ad/create rejected the carousel with
@@ -982,18 +1059,34 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # auto-generated cover frame, re-uploaded as an image asset.
                     creative_fields["image_ids"] = image_ids_for_ad
 
-                ad_resp = await client.post(
-                    f"{self._api_base}/ad/create/",
-                    headers=self._headers(),
-                    json={
-                        "advertiser_id": self._advertiser_id,
-                        "adgroup_id": adgroup_id,
-                        "creatives": [creative_fields],
-                        "operation_status": "DISABLE",
-                    },
-                )
-                ad_data = ad_resp.json()
-                _raise_for_error(ad_data, "ad creation")
+                async def _create_ad(cta: str) -> dict:
+                    resp = await client.post(
+                        f"{self._api_base}/ad/create/",
+                        headers=self._headers(),
+                        json={
+                            "advertiser_id": self._advertiser_id,
+                            "adgroup_id": adgroup_id,
+                            "creatives": [{**creative_fields, "call_to_action": cta}],
+                            "operation_status": "DISABLE",
+                        },
+                    )
+                    data = resp.json()
+                    _raise_for_error(data, "ad creation")
+                    return data
+
+                # creative_fields["call_to_action"] already carries the guessed value
+                # from _tiktok_cta above — re-passed explicitly here so the fallback
+                # retry can swap in CONTACT_US without rebuilding the whole dict.
+                guessed_cta = creative_fields["call_to_action"]
+                if guessed_cta == "CONTACT_US":
+                    ad_data = await _create_ad("CONTACT_US")
+                else:
+                    try:
+                        ad_data = await _create_ad(guessed_cta)
+                    except TikTokAdsAPIError as cta_err:
+                        print(f"[TikTokAdsAdapter] call_to_action={guessed_cta} rejected ({cta_err}) "
+                              f"— falling back to CONTACT_US", flush=True)
+                        ad_data = await _create_ad("CONTACT_US")
                 ad_id = str(ad_data["data"]["ad_ids"][0]) if ad_data["data"].get("ad_ids") else str(ad_data["data"].get("ad_id", ""))
         except Exception:
             await self._rollback_partial_launch(campaign_id)
