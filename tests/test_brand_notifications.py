@@ -224,3 +224,14 @@ class TestNotifyEndToEnd:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_escalations_are_always_emailed_on_top_of_the_chosen_channel():
+    assert bn.channels_for("inbox_needs_reply", bn.preferences({})) == ["email"]
+    slack = bn.preferences({"notification_channel": "Slack"})
+    assert bn.channels_for("inbox_needs_reply", slack) == ["slack", "email"]
+    email = bn.preferences({"notification_channel": "Email"})
+    assert bn.channels_for("inbox_needs_reply", email) == ["email"]
+    weekly_only = bn.preferences({"notification_events": ["Weekly performance report"],
+                                  "notification_channel": "WhatsApp"})
+    assert bn.channels_for("inbox_needs_reply", weekly_only) == ["whatsapp", "email"]
