@@ -861,6 +861,103 @@ def _assign_dates(
     return out
 
 
+# ── Step 6b — The brand's own key dates are guaranteed a post ─────────────────
+# The plan prompt already asks for a post on each important date in the
+# period, but that was only a request: a real plan on prod (Oct 2026) had the
+# brand's "launch anniversary" on 5 November inside its period and gave that
+# day an unrelated idea. So after dates are assigned, any key date in the
+# period whose day isn't already about it has that day's concept turned into
+# the key-date post, before the final copy is written.
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def _parse_key_date(raw: str, years: List[int]) -> List[str]:
+    """ISO dates for a key date: an exact date ("2026-11-05") as given, or a
+    yearly one ("11-05", "5 November", "Nov 5") in each of `years`."""
+    raw = (raw or "").strip().lower()
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if m:
+        return [f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"]
+    month = day = None
+    m = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})", raw)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r"(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3})|([a-z]{3})[a-z]*\.?\s+(\d{1,2})", raw)
+        if m:
+            if m.group(1):
+                day, month = int(m.group(1)), _MONTHS.get(m.group(2))
+            else:
+                month, day = _MONTHS.get(m.group(3)), int(m.group(4))
+    if not month or not day:
+        return []
+    out = []
+    for y in years:
+        try:
+            out.append(datetime(y, month, day).strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    return out
+
+
+def _brand_key_dates(brand: Dict[str, Any], all_dates: List[str]) -> List[Dict[str, str]]:
+    """[{label, date}] for the brand's key dates that fall inside the plan.
+    Reads the raw list ({label, date}) or to_brand_context's
+    "Label (date), Label (date)" string."""
+    raw = brand.get("key_dates")
+    pairs: List[tuple] = []
+    if isinstance(raw, list):
+        for d in raw:
+            if isinstance(d, dict):
+                pairs.append((str(d.get("label") or d.get("name") or "").strip(), str(d.get("date") or "")))
+    elif isinstance(raw, str) and raw.strip():
+        for m in re.finditer(r"([^,(]+?)\s*\(([^)]+)\)", raw):
+            pairs.append((m.group(1).strip(), m.group(2).strip()))
+    if not all_dates:
+        return []
+    years = sorted({int(all_dates[0][:4]), int(all_dates[-1][:4])})
+    window = set(all_dates)
+    out, seen = [], set()
+    for label, date_raw in pairs:
+        if not label:
+            continue
+        for iso in _parse_key_date(date_raw, years):
+            if iso in window and (label, iso) not in seen:
+                seen.add((label, iso))
+                out.append({"label": label, "date": iso})
+    return out
+
+
+def _is_about(item: Dict[str, Any], label: str) -> bool:
+    words = [w for w in re.findall(r"[a-z0-9]+", label.lower()) if len(w) > 3]
+    text = " ".join(str(item.get(k) or "") for k in
+                    ("subject", "concept_name", "creative_concept_name", "title", "angle")).lower()
+    return bool(words) and sum(w in text for w in words) >= max(1, len(words) // 2)
+
+
+def _enforce_key_dates(dated: List[Dict[str, Any]], brand: Dict[str, Any], all_dates: List[str]) -> List[Dict[str, str]]:
+    """Make sure each key date in the plan's period has its post. Changes the
+    concepts in place; returns the key dates that had to be placed."""
+    placed = []
+    by_date = {it["date"]: it for it in dated}
+    for kd in _brand_key_dates(brand, all_dates):
+        item = by_date.get(kd["date"])
+        if not item or _is_about(item, kd["label"]):
+            continue
+        label = kd["label"]
+        item.update({
+            "subject": label,
+            "angle": f"Mark {label} — what it means for the brand and the people it serves",
+            "concept_name": label,
+            "holiday_tie_in": {"name": label, "date": kd["date"], "source": "brand_key_date"},
+            "key_date": kd,
+        })
+        placed.append(kd)
+    return placed
+
+
 # ── Step 7 — Assign format, dynamic 2-5 slide carousels (PRD §16-17) ───────
 
 def _pick_carousel_slide_count(concept: Dict[str, Any]) -> int:
@@ -1354,7 +1451,9 @@ async def _generate_final_copy(
   Concept: {c.get('concept_name') or c.get('creative_concept_name', '')}
   Objective: {c.get('objective')} | Audience segment: {c.get('audience_segment', '')}
   Format: {_fmt_line(c)}"""
-        + (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else "")
+        + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
+           f"make it the subject of the post, by name." if c.get("key_date")
+           else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
         for i, c in enumerate(concepts_chunk)
     )
 
@@ -1534,7 +1633,7 @@ business's actual customers, not a generic reader?
     _CONCEPT_FIELDS = {
         "territory", "subject", "angle", "creative_device", "format_hint", "format",
         "objective", "audience_segment", "concept_name", "day_index", "date",
-        "carousel_slide_count", "holiday_tie_in", "selection_score",
+        "carousel_slide_count", "holiday_tie_in", "selection_score", "key_date",
     }
     merged = []
     for i, idea in enumerate(items):
@@ -1810,6 +1909,9 @@ async def _build_plan_doc(
 
     # Step 6 — assign dates
     dated = _assign_dates(selected, all_dates, holidays_by_date)
+    key_dates_placed = _enforce_key_dates(dated, brand, all_dates)
+    if key_dates_placed:
+        print(f"[CalendarV2] key dates given their post: {key_dates_placed}")
 
     # Step 7 — assign format, dynamic 2-5 slide carousels, capped video/week
     formatted = _assign_formats(dated, brand, existing_assets_summary)
