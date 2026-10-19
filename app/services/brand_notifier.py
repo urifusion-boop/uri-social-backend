@@ -56,6 +56,9 @@ _DEFAULT_EVENTS = {"post_ready", "post_published"}
 # customer is waiting on a person, whatever alerts they picked.
 _ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply"}
 
+# Emailed whatever channel the brand chose, on top of that channel.
+_EMAIL_TOO = {"inbox_needs_reply"}
+
 
 def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The brand's notification choices, as keys."""
@@ -97,6 +100,10 @@ def channels_for(event: str, prefs: Dict[str, Any]) -> List[str]:
         out.append("email")  # no channel chosen: these two have always gone by email
     if event == "post_ready":
         out += prefs["approval_channels"]
+    # A customer waiting on a person always reaches the owner's inbox too: a
+    # Slack or push alert alone is easy to miss, and nobody sits on a dashboard.
+    if event in _EMAIL_TOO:
+        out.append("email")
     seen: List[str] = []
     for c in out:
         if c not in seen and c != "dashboard":
