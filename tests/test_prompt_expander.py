@@ -74,3 +74,17 @@ def test_ai_failure_returns_none(monkeypatch):
         raise RuntimeError("down")
     monkeypatch.setattr(pe.AIService, "structured_chat_completion", boom)
     assert run(pe.expand("independence day post", BC, ["facebook"])) is None
+
+
+def test_markdown_links_become_plain_text(monkeypatch):
+    async def fake(req, response_model=None):
+        return _Comp(pe._Expanded(expanded_prompt="End with a CTA to visit [www.urisocial.com](http://www.urisocial.com) today.",
+                                  used=[]))
+    monkeypatch.setattr(pe.AIService, "structured_chat_completion", fake)
+    out = run(pe.expand("tips post", BC, ["linkedin"]))
+    assert out["expanded_prompt"] == "End with a CTA to visit www.urisocial.com today."
+
+
+def test_greeting_and_vague_idea_rules_are_sent():
+    system = pe.build_messages("x", BC, [], "feed", None, False, [], datetime(2026, 10, 19))[0]["content"]
+    assert "brand is simply the warm sender" in system and "choose ONE specific, useful angle" in system

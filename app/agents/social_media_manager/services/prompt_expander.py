@@ -16,6 +16,7 @@ culturally accurate for Nigerian and other occasions, without guessing dates.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -23,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
 
-PROMPT_VERSION = "content-prompt-expander-v1"
+PROMPT_VERSION = "content-prompt-expander-v2"  # v2: greetings without a pitch, concrete angle for vague ideas
 MODEL = "gpt-4o"
 MAX_CHARS = 1800
 
@@ -49,6 +50,12 @@ Write the brief as direct instructions to Jane, in plain sentences (no headings,
 
 Hard rules:
 - Keep the owner's idea and intent central. If the idea is already detailed, refine it lightly — don't rewrite it.
+- Greeting / occasion posts (Mother's Day, Independence Day, Eid, Christmas, New Year…): the post celebrates the
+  occasion and the people; the brand is simply the warm sender. No sales pitch and no forced comparison between
+  the occasion and the product — at most a light, natural sign-off or a gentle link to what the brand does.
+- Vague ideas ("tips post", "engagement post", "something for Friday"): choose ONE specific, useful angle from the
+  customers' pain points, desires or common questions, and name it concretely (e.g. "3 ways to post consistently
+  when you have no time").
 - Use ONLY the brand facts given. Never invent products, prices, offers, discounts, events, statistics or results.
 - No medical, financial or guaranteed-result claims. Respect the guardrails.
 - Occasions: be culturally accurate (e.g. Nigerian Independence Day, Mothers' Day, Sallah, Christmas) and
@@ -131,7 +138,9 @@ async def expand(idea: str, bc: dict, platforms: list[str], post_type: str = "fe
         return None
     if not parsed or not parsed.expanded_prompt.strip():
         return None
-    text = " ".join(parsed.expanded_prompt.replace("**", "").split())
+    text = parsed.expanded_prompt.replace("**", "")
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://)?[^)]+\)", r"\1", text)  # markdown links -> plain text
+    text = " ".join(text.split())
     if len(text) > MAX_CHARS:
         cut = text[:MAX_CHARS]
         text = cut[: cut.rfind(".") + 1] or cut
