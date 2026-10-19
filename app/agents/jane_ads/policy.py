@@ -9,6 +9,16 @@ client's ad — so this errs conservative: any BLOCK-severity match fails the wh
 creative. Deterministic, keyword/pattern-based, no live Meta call — fully testable
 today, and meant to run on `creative.py`'s output before it's ever handed to an ad
 platform (mock or real).
+
+The category rules below (prohibited phrases, exaggerated claims, personal-attribute
+targeting, spammy formatting) were written against Meta's own ad policy specifically.
+They're run against TikTok-bound creative too (`platform="tiktok"`, see
+review_ad_creative) since the broad categories are plausibly similar across
+platforms, but that hasn't been independently verified against TikTok's own written
+ad policy, which is known to differ from Meta's in places — a real TikTok-specific
+policy pass is still open work, not done by this fix. What IS fixed: a TikTok
+rejection now names "TikTok" in its guidance text instead of incorrectly blaming
+"Meta" for a platform the user never chose.
 """
 from __future__ import annotations
 
@@ -59,15 +69,25 @@ _PERSONAL_ATTRIBUTE_PATTERNS: list[str] = [
     r"\bpeople with (your|these) (disability|condition)\b",
 ]
 
+def _platform_label(platform: str) -> str:
+    return "TikTok" if platform == "tiktok" else "Meta"
+
+
+# {platform} is filled in by review_ad_creative from its own platform argument —
+# these category rules were written and scoped to Meta's own ad policy (module
+# docstring), and haven't been independently checked against TikTok's written
+# policy, which differs in places. Interpolating the platform name at least stops
+# a TikTok-bound rejection from blaming the wrong platform by name; it does not
+# mean every rule below has been verified correct for TikTok specifically.
 _GUIDANCE = {
-    "adult_content": "Adult content is never allowed in Meta ads.",
-    "illegal_drugs": "Illegal drug sales/promotion are never allowed in Meta ads.",
-    "weapons": "Weapon sales are restricted/prohibited on Meta ads.",
-    "tobacco_vaping": "Tobacco/vaping products are restricted on Meta ads.",
-    "unlicensed_gambling": "Gambling ads require Meta's specific licensing approval.",
-    "counterfeit_goods": "Counterfeit/replica goods are never allowed in Meta ads.",
-    "exaggerated_claims": "Meta bans unrealistic outcome/guarantee claims — rewrite without the guarantee.",
-    "personal_attributes": "Meta bans directly asserting a viewer's personal attributes — speak to the need, not the person.",
+    "adult_content": "Adult content is never allowed in {platform} ads.",
+    "illegal_drugs": "Illegal drug sales/promotion are never allowed in {platform} ads.",
+    "weapons": "Weapon sales are restricted/prohibited on {platform} ads.",
+    "tobacco_vaping": "Tobacco/vaping products are restricted on {platform} ads.",
+    "unlicensed_gambling": "Gambling ads require {platform}'s specific licensing approval.",
+    "counterfeit_goods": "Counterfeit/replica goods are never allowed in {platform} ads.",
+    "exaggerated_claims": "{platform} bans unrealistic outcome/guarantee claims — rewrite without the guarantee.",
+    "personal_attributes": "{platform} bans directly asserting a viewer's personal attributes — speak to the need, not the person.",
 }
 
 
@@ -99,33 +119,41 @@ def _has_excessive_punctuation(text: str) -> bool:
     return bool(re.search(r"[!?]{3,}", text))
 
 
-def review_ad_creative(headline: str, primary_text: str = "", image_prompt: str = "") -> PolicyReviewResult:
+def review_ad_creative(
+    headline: str, primary_text: str = "", image_prompt: str = "", platform: str = "meta",
+) -> PolicyReviewResult:
     """Run before any creative reaches an ad platform (mock or real). Combines the ad
     copy and the image brief into one scan — a prohibited image concept is just as
-    dangerous to the pooled account as prohibited ad copy."""
+    dangerous to the pooled account as prohibited ad copy.
+
+    `platform` ("meta" | "tiktok") only changes which platform name the guidance
+    text blames — see the _GUIDANCE dict's own note on what that does and doesn't
+    mean for TikTok specifically."""
     combined = " ".join(t for t in (headline, primary_text, image_prompt) if t)
     violations: list[PolicyViolation] = []
+    platform_label = _platform_label(platform)
+    review_label = f"{platform_label}'s review"
 
     for category, phrases in _PROHIBITED_PHRASES.items():
         hit = _find_phrase(combined, phrases)
         if hit:
             violations.append(PolicyViolation(
                 category=category, severity=Severity.BLOCK, matched_text=hit,
-                guidance=_GUIDANCE[category],
+                guidance=_GUIDANCE[category].format(platform=platform_label),
             ))
 
     hit = _find_phrase(combined, _EXAGGERATED_CLAIM_PHRASES)
     if hit:
         violations.append(PolicyViolation(
             category="exaggerated_claims", severity=Severity.BLOCK, matched_text=hit,
-            guidance=_GUIDANCE["exaggerated_claims"],
+            guidance=_GUIDANCE["exaggerated_claims"].format(platform=platform_label),
         ))
 
     hit = _find_pattern(combined, _PERSONAL_ATTRIBUTE_PATTERNS)
     if hit:
         violations.append(PolicyViolation(
             category="personal_attributes", severity=Severity.BLOCK, matched_text=hit,
-            guidance=_GUIDANCE["personal_attributes"],
+            guidance=_GUIDANCE["personal_attributes"].format(platform=platform_label),
         ))
 
     for field_name, text in (("headline", headline), ("primary_text", primary_text)):
@@ -134,12 +162,12 @@ def review_ad_creative(headline: str, primary_text: str = "", image_prompt: str 
         if _has_excessive_caps(text):
             violations.append(PolicyViolation(
                 category="excessive_caps", severity=Severity.WARN, matched_text=text,
-                guidance=f"{field_name} is mostly uppercase — reads as spammy/low-quality to Meta's review.",
+                guidance=f"{field_name} is mostly uppercase — reads as spammy/low-quality to {review_label}.",
             ))
         if _has_excessive_punctuation(text):
             violations.append(PolicyViolation(
                 category="excessive_punctuation", severity=Severity.WARN, matched_text=text,
-                guidance=f"{field_name} has repeated !/? — reads as spammy/low-quality to Meta's review.",
+                guidance=f"{field_name} has repeated !/? — reads as spammy/low-quality to {review_label}.",
             ))
 
     approved = not any(v.severity == Severity.BLOCK for v in violations)

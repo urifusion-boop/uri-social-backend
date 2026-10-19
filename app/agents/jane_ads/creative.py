@@ -719,7 +719,8 @@ def _as_ad_content(image_prompt: str, brand_context: Optional[dict] = None) -> s
 
 
 async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
-                            seed: str = "", reference_image: Optional[str] = None) -> Optional[str]:
+                            seed: str = "", reference_image: Optional[str] = None,
+                            platform: str = "meta") -> Optional[str]:
     """Generate the ad image using the SAME content engine normal posts use
     (ImageContentService._generate_platform_image) — richer, on-brand visuals than a bare
     gpt-image-1 call, which is what the ad flow wanted (Jane's own images weren't good
@@ -734,14 +735,21 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
     product photo URL, the engine's existing background-removal → forensic product
     analysis → preservation pipeline keeps the product exact and regenerates only the
     scene around it. This is the SAME parameter/pipeline the organic content engine
-    already uses for its own recompositing; not new image-generation work, just reuse."""
+    already uses for its own recompositing; not new image-generation work, just reuse.
+
+    `platform` ("meta" | "tiktok", matching write_ad_copy's own values) — the content
+    engine has its own "tiktok" preset (ImageContentService); was unconditionally
+    labeled "instagram" regardless of the ad's actual destination until this fix
+    (confirmed live 2026-10-19), which only mattered cosmetically since image_type
+    "story" already forces the right 9:16 shape either way, but a TikTok ad's image
+    deserves the TikTok preset, not an Instagram one, on principle."""
     if not (content or "").strip():
         return None
     bc = brand_context or {}
     try:
         from app.agents.social_media_manager.services.image_content_service import ImageContentService
         result = await ImageContentService._generate_platform_image(
-            platform="instagram",
+            platform="tiktok" if platform == "tiktok" else "instagram",
             content=content,
             seed_content=seed or content,
             brand_context=bc,
@@ -1064,7 +1072,13 @@ async def generate_ad_creative(
     # removed; flipping the flag restores the format library in front.
     vsg01_result = None
     image_url = None
-    if db is not None and settings.JANE_ADS_VSG01_ENABLED:
+    # VSG-01's format library is Meta-shaped (1080x1080 square — see
+    # vsg01_orchestrator.py's own _CANVAS_SIZE comment) with zero TikTok
+    # awareness anywhere in that module. Never attempt it for a TikTok-bound
+    # campaign, regardless of the flag, until it has real vertical/TikTok
+    # format support — confirmed live 2026-10-19: nothing here previously
+    # checked platform at all.
+    if db is not None and settings.JANE_ADS_VSG01_ENABLED and platform != "tiktok":
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
@@ -1089,7 +1103,7 @@ async def generate_ad_creative(
         # from the brand's real ad destination, not the brand playbook's generic one.
         image_brand_context = {**(brand_context or {}),
                                "override_cta": image_cta(coerce_type(destination_type))}
-        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
+        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt, platform=platform)
         # Caption LAST, matched to the actual generated image (vision) so it references the
         # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
         # original copy if the vision pass fails. Skipped for a VSG-01 render above — that
@@ -1164,7 +1178,11 @@ async def creative_from_upload(
     # the raw upload exactly as this function already did.
     vsg01_result = None
     final_image_url = image_url
-    if db is not None and not is_video and asset_attestation:
+    # VSG-01's format library is Meta-shaped with zero TikTok awareness — see
+    # generate_ad_creative's matching guard above. This path wasn't even behind
+    # settings.JANE_ADS_VSG01_ENABLED, so it was live for any attested upload
+    # regardless of platform until this check — confirmed live 2026-10-19.
+    if db is not None and not is_video and asset_attestation and platform != "tiktok":
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
@@ -1260,11 +1278,14 @@ async def creative_from_recomposite(
     content_for_image = f"{business_name or category} — {description or category}"
     image_url = await generate_ad_image(
         content_for_image, brand_context, seed=description, reference_image=reference_image_url,
+        platform=platform,
     )
     final_image = image_url or reference_image_url
 
     vsg01_result = None
-    if db is not None and asset_attestation:
+    # VSG-01's format library is Meta-shaped with zero TikTok awareness — see
+    # generate_ad_creative's matching guard above.
+    if db is not None and asset_attestation and platform != "tiktok":
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
