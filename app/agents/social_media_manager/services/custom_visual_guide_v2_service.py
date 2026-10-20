@@ -926,9 +926,16 @@ Do NOT style it as a button or banner."""
             # Step 5: Overlay logo on generated image
             logo_url = brand_context.get("logo_url")
             logo_position = brand_context.get("logo_position", "bottom_right")
+            # Was never read here at all (only logo_position was) — every V2
+            # guide image silently used _overlay_logo's "small" default
+            # regardless of the brand's actual Logo Size setting, unlike the
+            # standard generation path, which always reads this.
+            logo_size = brand_context.get("logo_size", "small")
+            background_image_url = None
+            logo_placement = None
 
             if logo_url:
-                print(f"[V2] Overlaying logo at position: {logo_position}")
+                print(f"[V2] Overlaying logo at position: {logo_position}, size: {logo_size}")
 
                 # Handle data URLs (base64) vs regular URLs
                 import base64
@@ -949,25 +956,49 @@ Do NOT style it as a button or banner."""
                         base64_image = base64.b64encode(img_response.content).decode('utf-8')
                         print(f"[V2] Downloaded image from URL and converted to base64")
 
-                # Overlay logo using ImageContentService (expects base64 string)
-                logo_result_b64 = ImageContentService._overlay_logo(
+                # Overlay logo using ImageContentService (expects base64 string).
+                # return_geometry=True — same contract the standard generation
+                # path already relies on — so Move Logo works consistently
+                # regardless of which generation path produced the image,
+                # instead of only ever working for standard (non-custom-guide)
+                # posts. Previously this call didn't capture geometry or the
+                # pre-overlay background at all, so a V2 guide image could
+                # never be repositioned even though the exact same compositing
+                # function the standard path uses was already being called
+                # right here.
+                logo_result_b64, geometry = ImageContentService._overlay_logo(
                     b64=base64_image,
                     logo_url=logo_url,
                     position=logo_position,
+                    logo_size=logo_size,
+                    return_geometry=True,
                 )
 
-                # Upload final image with logo to Cloudinary
+                # Upload final image with logo, and the pre-overlay background
+                # (needed to later re-paste the logo elsewhere without
+                # re-running generation), to Cloudinary.
                 import cloudinary.uploader
 
-                # Decode base64 back to bytes for upload
                 final_image_bytes = base64.b64decode(logo_result_b64)
-
                 upload_result = cloudinary.uploader.upload(
                     final_image_bytes,
                     folder="uri-social/generated-images",
                     resource_type="image",
                 )
                 final_image_url = upload_result['secure_url']
+
+                if geometry:
+                    # A raw base64 data URL, not a pre-uploaded Cloudinary URL —
+                    # matching exactly what the standard generation path already
+                    # returns for this same field. The caller (complete_social_
+                    # manager.py's _generate_image_bg) already knows how to
+                    # upload a data: URL background to Cloudinary itself; it
+                    # only skips doing so when the value doesn't start with
+                    # "data:", so returning an already-hosted URL here instead
+                    # would silently get dropped there rather than saved.
+                    background_image_url = f"data:image/webp;base64,{base64_image}"
+                    logo_placement = {**geometry, "position": logo_position, "logo_size": logo_size}
+
                 print(f"[V2] ✅ Logo overlaid and uploaded: {final_image_url[:80]}...")
             else:
                 final_image_url = generated_image_url
@@ -986,7 +1017,13 @@ Do NOT style it as a button or banner."""
                 "success": True,
                 "status": True,  # For UriResponse compatibility
                 "image_url": final_image_url,
-                "responseData": {"image_url": final_image_url},  # For UriResponse compatibility
+                "background_image_url": background_image_url,
+                "logo_placement": logo_placement,
+                "responseData": {
+                    "image_url": final_image_url,
+                    "background_image_url": background_image_url,
+                    "logo_placement": logo_placement,
+                },  # For UriResponse compatibility
                 "image_prompt": final_prompt,
                 "style_profile_used": style_profile.get("overall_aesthetic"),
                 "medium_used": medium,
