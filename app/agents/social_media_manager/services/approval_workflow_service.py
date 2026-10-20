@@ -32,46 +32,79 @@ _FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
         "Facebook's steps. Once confirmed, this and future posts to this Page will go "
         "out normally again — no need to reconnect anything here."
     ),
+    (
+        # Live-reported: "MEEQAT TRAVELS AND TOURS LTD"'s Facebook post failed
+        # with Facebook's own "400 - The user must be an administrator, editor,
+        # or moderator of the page in order to impersonate it." The connected
+        # Facebook user lost their admin/editor/moderator role on the Page
+        # itself (removed, role changed, Page ownership changed) — the token
+        # can still be technically valid, so this is NOT the same thing as a
+        # dead session, and telling the owner to just "reconnect Facebook"
+        # alone is misleading: reconnecting with the same now-demoted account
+        # hits this identical error again. The real fix is restoring that
+        # person's role on the Page, or connecting a different account that
+        # already has one.
+        re.compile(r"administrator,?\s*editor,?\s*or moderator of the page", re.IGNORECASE),
+        "Facebook says the connected account is no longer an admin, editor or moderator of "
+        "this Page, so it can't post there. Ask whoever manages the Page to restore that "
+        "access, or go to Connected Accounts and reconnect Facebook using an account that "
+        "already has it."
+    ),
 ]
 
-# Signatures that mean the connection's OWN token/session is dead — distinct from
-# the "confirm your identity" case above, which resolves without reconnecting.
-# Live-reported: the "Vchain" Facebook Page's access token was invalidated
-# (Facebook: "Error validating access token: The session has been invalidated
-# because..."); every subsequent publish to that Page failed the same way, but
-# nothing marked the connection disconnected or told the user to reconnect — it
-# just kept silently failing post after post. Matched against the raw Outstand/
-# Facebook error text, not the OutstandPublishError "no social accounts found"
-# signature (that one means Outstand itself no longer has the connection; this
-# one means Facebook rejected the token Outstand is still holding).
+# Signatures that mean the connection can no longer publish and needs the
+# owner's attention to fix — distinct from the "confirm your identity" case
+# above, which resolves on its own without reconnecting. Two different real
+# causes have been seen live and are both matched here, because the owner
+# needs the same reconnect prompt either way even though the underlying
+# Facebook-side reason differs (see the friendly-message table above for the
+# specific wording for each):
+#   - a dead access token/session ("Vchain" Facebook Page: "Error validating
+#     access token: The session has been invalidated because...")
+#   - the connected account losing Page admin/editor/moderator rights
+#     ("MEEQAT TRAVELS AND TOURS LTD": "...must be an administrator, editor,
+#     or moderator of the page in order to impersonate it.")
+# In both live cases, nothing marked the connection disconnected or told the
+# user to do anything — it just kept silently failing post after post.
+# Matched against the raw Outstand/Facebook error text, not the
+# OutstandPublishError "no social accounts found" signature (that one means
+# Outstand itself no longer has the connection; this means Facebook rejected
+# the token, or the token's permissions, that Outstand is still holding).
 _TOKEN_INVALIDATION_PATTERNS = [
     re.compile(r"error validating access token", re.IGNORECASE),
     re.compile(r"session has been invalidated", re.IGNORECASE),
     re.compile(r"session is invalid", re.IGNORECASE),
+    re.compile(r"administrator,?\s*editor,?\s*or moderator of the page", re.IGNORECASE),
 ]
 
 
 def _friendlier_facebook_error(raw: Optional[str]) -> str:
     """Prepend a plain-language explanation for a recognized Facebook error
     signature, keeping the raw detail alongside it (support/debugging).
-    Unrecognized errors pass through unchanged."""
+    Checks the specific-cause table first so a signature with its own precise
+    explanation (e.g. lost Page admin rights) never gets the generic "session
+    expired" message instead — that was wrong for that case and told the
+    owner to do something that wouldn't actually fix it. Unrecognized errors
+    pass through unchanged."""
     raw = raw or "unknown error"
+    for pattern, friendly in _FRIENDLY_FACEBOOK_ERROR_PATTERNS:
+        if pattern.search(raw):
+            return f"{friendly} (Facebook's detail: {raw})"
     if _is_token_invalidation_error(raw):
         return (
             "Your Facebook connection has expired or was revoked — this Page needs to be "
             "reconnected before it can publish again. Go to Connected Accounts and reconnect "
             f"Facebook. (Facebook's detail: {raw})"
         )
-    for pattern, friendly in _FRIENDLY_FACEBOOK_ERROR_PATTERNS:
-        if pattern.search(raw):
-            return f"{friendly} (Facebook's detail: {raw})"
     return raw
 
 
 def _is_token_invalidation_error(raw: Optional[str]) -> bool:
-    """True when an error message signature means the connection's token/session
-    itself is dead (needs reconnecting), as opposed to a one-off content/policy
-    rejection. Used to decide whether to mark a connection disconnected."""
+    """True when an error message signature means the connection can no longer
+    publish and needs the owner's attention (reconnecting, or fixing Page
+    access on Facebook's side), as opposed to a one-off content/policy
+    rejection. Used to decide whether to mark a connection disconnected and
+    notify the owner."""
     raw = raw or ""
     return any(pattern.search(raw) for pattern in _TOKEN_INVALIDATION_PATTERNS)
 
