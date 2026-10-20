@@ -73,6 +73,16 @@ class _Coll:
     async def update_many(self, q, upd, **k):
         return await self._update(q, upd, True)
 
+    async def find_one_and_update(self, q, upd, return_document=None, **k):
+        d = next((d for d in self.docs if _match(d, q)), None)
+        if d is None:
+            return None
+        before = dict(d)
+        d.update(upd.get("$set", {}))
+        for f, n in upd.get("$inc", {}).items():
+            d[f] = d.get(f, 0) + n
+        return dict(d) if return_document else before
+
 
 class _DB(dict):
     def __missing__(self, name):
@@ -183,6 +193,34 @@ class TestConfirm:
         assert conns["c2"]["connection_status"] == "active"         # the other brand's page is untouched
         assert ("disconnected", "facebook") in _quiet_notifications
         assert (False, saved["error_message"]) in _quiet_notifications
+
+    def test_unrecognized_error_does_not_flag_reconnect_on_one_failure(self, _quiet_notifications):
+        # A single occurrence of an error we've never catalogued must not
+        # trigger "reconnect your account" — it could just be this one post.
+        db, draft = _setup()
+        answer = {"post": {"publishedAt": None, "socialAccounts": [
+            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
+        ]}}
+        assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "failed"
+        assert db["social_connections"].docs[0]["connection_status"] == "active"
+        assert ("disconnected", "facebook") not in _quiet_notifications
+
+    def test_unrecognized_error_flags_reconnect_once_it_keeps_happening(self, _quiet_notifications):
+        # The same uncatalogued error, repeated on the same connection, is a
+        # real pattern — this must escalate even though no one has written a
+        # pattern for this exact error text yet, instead of staying silent
+        # forever just because nobody's catalogued it.
+        db, draft = _setup()
+        answer = {"post": {"publishedAt": None, "socialAccounts": [
+            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
+        ]}}
+        from app.agents.social_media_manager.services.approval_workflow_service import UNKNOWN_FAILURE_ESCALATION_THRESHOLD
+        for i in range(UNKNOWN_FAILURE_ESCALATION_THRESHOLD):
+            draft["status"] = pc.CONFIRMING  # each call re-confirms as if resubmitted/re-polled
+            result = _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
+        assert result == "failed"
+        assert db["social_connections"].docs[0]["connection_status"] == "disconnected"
+        assert ("disconnected", "facebook") in _quiet_notifications
 
     def test_live_marks_published(self, _quiet_notifications):
         db, draft = _setup()
