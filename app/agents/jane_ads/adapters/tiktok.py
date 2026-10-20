@@ -166,12 +166,13 @@ def _tiktok_cta(destination_cta_key: str) -> str:
 # in the reference distinguishing when to use which — LEADS is used here as
 # the more specifically-worded of the two ("people most likely to convert or
 # share contact information"), but this one specifically could still be wrong.
-# billing_event values are NOT cross-referenced against optimization_goal in
-# what's been checked so far (the docs page literally titled "Corresponding
-# billing event for an optimization goal" hasn't been reached) — CPM/CPC/CPV
-# below follow the Billing Event enum's own confirmed values, paired by the
-# general ad-platform convention (impression/reach goals bill CPM, click goals
-# bill CPC, view goals bill CPV), not a confirmed TikTok-specific pairing.
+# billing_event per advertising objective confirmed 2026-10-20 against TikTok's
+# own "Available bidding methods" help-center page (Bidding methods compared
+# table): Reach -> CPM, Video views -> CPV, Traffic -> CPC, Lead generation ->
+# oCPM (billing_event enum value OCPM — this table is phrased per objective,
+# not per optimization_goal directly, but objective and optimization_goal are
+# 1:1 here so it resolves the pairing). Corrects an earlier guess of CPM for
+# Lead Generation, which this table shows is actually oCPM.
 # TRAFFIC's full combination (CLICK/CPC/NO_BID/SMOOTH) is the one actually
 # confirmed live end-to-end. Every other combination is tried first but never
 # trusted blindly — see the try/except around campaign+adgroup creation below,
@@ -182,7 +183,7 @@ _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE: dict[str, tuple[str, str]] = {
     "REACH": ("REACH", "CPM"),
     "TRAFFIC": ("CLICK", "CPC"),  # matches _OPTIMIZATION_GOAL/_BILLING_EVENT below — the confirmed pair
     "VIDEO_VIEWS": ("ENGAGED_VIEW", "CPV"),
-    "LEAD_GENERATION": ("LEADS", "CPM"),
+    "LEAD_GENERATION": ("LEADS", "OCPM"),
 }
 
 # (enum, inclusive lower bound, inclusive upper bound) — confirmed against
