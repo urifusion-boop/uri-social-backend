@@ -4,6 +4,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
+from pymongo import ReturnDocument
 import asyncio
 import base64
 import re
@@ -79,13 +80,17 @@ _TOKEN_INVALIDATION_PATTERNS = [
 
 
 def _friendlier_facebook_error(raw: Optional[str]) -> str:
-    """Prepend a plain-language explanation for a recognized Facebook error
-    signature, keeping the raw detail alongside it (support/debugging).
-    Checks the specific-cause table first so a signature with its own precise
-    explanation (e.g. lost Page admin rights) never gets the generic "session
-    expired" message instead — that was wrong for that case and told the
-    owner to do something that wouldn't actually fix it. Unrecognized errors
-    pass through unchanged."""
+    """Plain-language explanation for a Facebook/Outstand error, keeping the
+    raw detail alongside it (support/debugging). Checks the specific-cause
+    table first so a signature with its own precise explanation (e.g. lost
+    Page admin rights) never gets the generic "session expired" message
+    instead — that was wrong for that case and told the owner to do
+    something that wouldn't actually fix it. An error we haven't catalogued
+    at all still gets a plain-language lead-in, not raw passthrough — a
+    one-off failure on this post is told immediately, in words a non-
+    technical owner can read, even on the first occurrence; see
+    _should_flag_connection for the separate, more cautious decision about
+    whether the whole connection needs reconnecting."""
     raw = raw or "unknown error"
     for pattern, friendly in _FRIENDLY_FACEBOOK_ERROR_PATTERNS:
         if pattern.search(raw):
@@ -96,7 +101,7 @@ def _friendlier_facebook_error(raw: Optional[str]) -> str:
             "reconnected before it can publish again. Go to Connected Accounts and reconnect "
             f"Facebook. (Facebook's detail: {raw})"
         )
-    return raw
+    return f"This post couldn't be published to Facebook. Facebook's detail: {raw}"
 
 
 def _is_token_invalidation_error(raw: Optional[str]) -> bool:
@@ -147,6 +152,85 @@ async def _mark_connection_disconnected_and_notify(
         await notification_service.notify_connection_disconnected(user_id=user_id, platform=platform)
     except Exception as notify_err:
         print(f"⚠️ connection_disconnected notification failed: {notify_err}")
+
+
+# How many consecutive publish failures on one connection, none of them a
+# signature we recognize, before treating it as needing the owner's
+# attention anyway. Catalogued signatures (_TOKEN_INVALIDATION_PATTERNS)
+# escalate on the first occurrence — this is the backstop for everything
+# else. Without it, any Facebook/Outstand error text we haven't specifically
+# seen and added a pattern for gets no fallback action at all, ever: the
+# draft shows publish_failed with the raw error, and the connection sits
+# connection_status="active" and silent no matter how many times in a row it
+# keeps failing — an indefinite game of catching up to error text one string
+# at a time instead of a system that degrades gracefully to something
+# reasonable for the errors nobody's catalogued yet.
+UNKNOWN_FAILURE_ESCALATION_THRESHOLD = 3
+
+
+def _connection_match(user_id: Optional[str], platform: str, connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    match: Dict[str, Any] = {"user_id": user_id, "platform": (connection or {}).get("platform", platform)}
+    if connection and connection.get("outstand_account_id"):
+        match["outstand_account_id"] = connection["outstand_account_id"]
+    return match
+
+
+async def _should_flag_connection(
+    db: AsyncIOMotorDatabase,
+    user_id: Optional[str],
+    platform: str,
+    connection: Optional[Dict[str, Any]],
+    raw_error: Optional[str],
+) -> tuple[bool, str]:
+    """Whether a publish failure means this connection needs the owner's
+    attention right now, and why. A recognized signature (dead session, lost
+    Page role, ...) escalates immediately — see _is_token_invalidation_error.
+    An error we have never catalogued does NOT just get ignored forever: it
+    increments a per-connection counter, and after
+    UNKNOWN_FAILURE_ESCALATION_THRESHOLD consecutive failures of any kind
+    (known or not), it escalates too, with the raw error attached since
+    there's no friendly translation for it yet. A single one-off failure
+    (a bad image, a transient Outstand hiccup) does not escalate on its own
+    — only a real, repeated pattern does, the same bar a human reading the
+    logs would use before concluding "this connection is actually broken."
+    """
+    if _is_token_invalidation_error(raw_error):
+        return True, "token invalidated (recognized error signature)"
+    if not db or not user_id:
+        return False, ""
+    try:
+        updated = await db["social_connections"].find_one_and_update(
+            _connection_match(user_id, platform, connection),
+            {"$inc": {"consecutive_publish_failures": 1}, "$set": {"last_publish_error": raw_error or "", "updated_at": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
+    except Exception as e:
+        print(f"⚠️ _should_flag_connection: counter update failed: {e}")
+        return False, ""
+    count = (updated or {}).get("consecutive_publish_failures", 0)
+    if count >= UNKNOWN_FAILURE_ESCALATION_THRESHOLD:
+        return True, f"{count} consecutive unrecognized publish failures (latest: {(raw_error or '')[:200]})"
+    return False, ""
+
+
+async def _record_publish_success(
+    db: AsyncIOMotorDatabase,
+    user_id: Optional[str],
+    platform: str,
+    connection: Optional[Dict[str, Any]],
+) -> None:
+    """Resets the unrecognized-failure counter on an actual successful
+    publish, so a connection that struggled once and then recovered doesn't
+    carry a stale count toward a future, unrelated run of failures."""
+    if not db or not user_id:
+        return
+    try:
+        await db["social_connections"].update_one(
+            _connection_match(user_id, platform, connection),
+            {"$set": {"consecutive_publish_failures": 0}},
+        )
+    except Exception as e:
+        print(f"⚠️ _record_publish_success: counter reset failed: {e}")
 
 
 class ApprovalWorkflowService:
@@ -920,6 +1004,9 @@ class ApprovalWorkflowService:
                                     )
                                     published_count += 1
                                     print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
+                                    await _record_publish_success(
+                                        db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
+                                    )
                                 else:
                                     # Live-reported bug: a post whose underlying platform
                                     # publish attempt actually FAILED on Outstand's side
@@ -956,10 +1043,15 @@ class ApprovalWorkflowService:
                                             }},
                                         )
                                         print(f"❌ Outstand-scheduled post failed at the platform | draft_id={draft['id']} post_id={existing_post_id} error={error_detail}")
-                                        if any(_is_token_invalidation_error(acc.get("error")) for acc in failed_accounts):
+                                        _worst_raw = next((a.get("error") for a in failed_accounts if a.get("error")), None)
+                                        _flag, _reason = await _should_flag_connection(
+                                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                                            connection=None, raw_error=_worst_raw,
+                                        )
+                                        if _flag:
                                             await _mark_connection_disconnected_and_notify(
                                                 db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
-                                                connection=None, reason="token invalidated (detected via scheduled-post poll)",
+                                                connection=None, reason=f"{_reason} (detected via scheduled-post poll)",
                                             )
                                     else:
                                         # Live-reported bug: Outstand can simply never answer
@@ -1302,10 +1394,15 @@ class ApprovalWorkflowService:
                         )
                         corrected += 1
                         print(f"❌ Published draft actually failed at the platform | draft_id={draft['id']} post_id={post_id} error={error_detail}")
-                        if any(_is_token_invalidation_error(acc.get("error")) for acc in failed_accounts):
+                        _worst_raw = next((a.get("error") for a in failed_accounts if a.get("error")), None)
+                        _flag, _reason = await _should_flag_connection(
+                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                            connection=None, raw_error=_worst_raw,
+                        )
+                        if _flag:
                             await _mark_connection_disconnected_and_notify(
                                 db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
-                                connection=None, reason="token invalidated (detected via published-post reconciliation)",
+                                connection=None, reason=f"{_reason} (detected via published-post reconciliation)",
                             )
                     elif post.get("publishedAt"):
                         await db["content_drafts"].update_one(
@@ -1313,6 +1410,9 @@ class ApprovalWorkflowService:
                             {"$set": {"outstand_post_status": "published", "updated_at": current_time}},
                         )
                         print(f"✅ Published draft confirmed live | draft_id={draft['id']} post_id={post_id}")
+                        await _record_publish_success(
+                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
+                        )
                     # Neither failed nor confirmed published yet — leave as-is,
                     # it'll be re-checked next tick.
                 except Exception as e:
@@ -2285,6 +2385,10 @@ class ApprovalWorkflowService:
                             break
                     if published:
                         print(f"✅ TikTok post {post_id} confirmed published")
+                        if db is not None:
+                            await _record_publish_success(
+                                db=db, user_id=connection.get("user_id"), platform=platform, connection=connection,
+                            )
                         return {"success": True, "post_id": post_id, "outstand_status": "published",
                                 "raw_response": result, "via": "outstand", "confirmed": True,
                                 "outstand_account_id": connection.get("outstand_account_id")}
@@ -2332,20 +2436,33 @@ class ApprovalWorkflowService:
                 # just fails silently again — up to 16 times for one user
                 # before the first signature was caught.
                 _msg = e.message if isinstance(e, OutstandPublishError) else str(e)
-                if (
-                    db is not None
-                    and ("no social accounts found" in _msg.lower() or _is_token_invalidation_error(_msg))
-                ):
-                    user_id = connection.get("user_id")
+                user_id = connection.get("user_id")
+                if db is not None and "no social accounts found" in _msg.lower():
+                    # Outstand's own signature for "this connection no longer
+                    # exists on our side at all" — always escalates immediately,
+                    # not subject to the unrecognized-error threshold below,
+                    # since there's nothing ambiguous about it.
                     await _mark_connection_disconnected_and_notify(
                         db=db, user_id=user_id, platform=platform, connection=connection,
-                        reason="Outstand no longer recognizes it" if "no social accounts found" in _msg.lower() else "token invalidated",
+                        reason="Outstand no longer recognizes it",
                     )
                     return {
                         "success": False,
                         "error": f"Your {platform} connection is no longer valid. Please reconnect your account.",
                     }
-                return {"success": False, "error": f"Outstand publish failed: {str(e)}"}
+                if db is not None:
+                    _flag, _reason = await _should_flag_connection(
+                        db=db, user_id=user_id, platform=platform, connection=connection, raw_error=_msg,
+                    )
+                    if _flag:
+                        await _mark_connection_disconnected_and_notify(
+                            db=db, user_id=user_id, platform=platform, connection=connection, reason=_reason,
+                        )
+                        return {
+                            "success": False,
+                            "error": f"Your {platform} connection is no longer valid. Please reconnect your account.",
+                        }
+                return {"success": False, "error": _friendlier_facebook_error(_msg)}
 
         # ── Legacy direct Facebook connection ─────────────────────────────────
         if platform == "facebook":

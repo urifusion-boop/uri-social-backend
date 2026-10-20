@@ -37,8 +37,13 @@ def network_name(platform: str) -> str:
 
 
 def explain(platform: str, raw: str) -> Dict[str, Any]:
-    """The network's error in words an owner can act on, and whether the
-    account needs reconnecting."""
+    """The network's error in words an owner can act on, whether the account
+    needs reconnecting right now, and which category it falls in — category
+    distinguishes a genuinely known signature ("known") from a one-off
+    content issue that should never trigger reconnect escalation
+    ("content") from an error that's simply never been catalogued ("unknown"),
+    so the caller can apply the repeated-failure threshold only to the last
+    of those, not to every unrecognized string."""
     name = network_name(platform)
     text = " ".join(str(raw or "").split())
     low = text.lower()
@@ -46,15 +51,19 @@ def explain(platform: str, raw: str) -> Dict[str, Any]:
     # helper), so only the signatures prod already trusts count.
     from app.agents.social_media_manager.services.approval_workflow_service import _is_token_invalidation_error
     if _is_token_invalidation_error(text):
-        return {"reconnect": True, "message": (
+        return {"reconnect": True, "category": "known", "message": (
             f"Your {name} connection has expired — {name} ended URI's access (this happens after a password "
             f"change or a security check). Reconnect {name} in Connected Accounts, then publish this post again."
         )}
     if any(m in low for m in ("image", "photo", "media", "picture")) and "error publishing" in low:
-        return {"reconnect": False, "message": f"{name} couldn't use the image for this post. Try another image, "
-                                               f"then publish again. ({name} said: {text[:220]})"}
-    return {"reconnect": False, "message": f"This post couldn't be published to {name}: {text[:260]}"
-            if text else f"This post couldn't be published to {name}. Try publishing it again."}
+        return {"reconnect": False, "category": "content", "message": (
+            f"{name} couldn't use the image for this post. Try another image, "
+            f"then publish again. ({name} said: {text[:220]})"
+        )}
+    return {"reconnect": False, "category": "unknown", "message": (
+        f"This post couldn't be published to {name}: {text[:260]}"
+        if text else f"This post couldn't be published to {name}. Try publishing it again."
+    )}
 
 
 def read_outcome(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,7 +88,7 @@ def read_outcome(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"state": "pending", "error": ""}
 
 
-async def _flag_reconnect(db, draft: Dict[str, Any], message: str) -> None:
+async def _flag_reconnect(db, draft: Dict[str, Any], message: str, reason: str = "token invalidated") -> None:
     # Prod's existing path for a dead login: mark the connection disconnected
     # (Connected Accounts then asks to reconnect) and email the owner, deduped.
     from app.agents.social_media_manager.services.approval_workflow_service import (
@@ -90,7 +99,7 @@ async def _flag_reconnect(db, draft: Dict[str, Any], message: str) -> None:
     await _mark_connection_disconnected_and_notify(
         db=db, user_id=draft.get("user_id"), platform=platform,
         connection={"platform": platform, "outstand_account_id": account_id} if account_id else None,
-        reason="token invalidated (detected via publish confirmation)",
+        reason=f"{reason} (detected via publish confirmation)",
     )
 
 
@@ -145,6 +154,10 @@ async def confirm(db, draft: Dict[str, Any], outstand=None, now: Optional[dateti
             "$unset": {"publish_slow": ""},
         })
         await _clear_reconnect(db, draft)
+        from app.agents.social_media_manager.services.approval_workflow_service import _record_publish_success
+        await _record_publish_success(
+            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
+        )
         await _notify(db, draft, published=True)
         return "published"
 
@@ -152,17 +165,35 @@ async def confirm(db, draft: Dict[str, Any], outstand=None, now: Optional[dateti
         if outcome.get("missing"):
             message = (f"The publishing service no longer has this post, so it can't be confirmed on "
                        f"{network_name(draft.get('platform', ''))}. Check your page, and publish it again if it isn't there.")
-            reconnect = False
+            reconnect, reason = False, ""
         else:
             info = explain(draft.get("platform", ""), outcome["error"])
             message, reconnect = info["message"], info["reconnect"]
+            reason = "token invalidated (recognized error signature)"
+            # A known signature always escalates. A genuinely uncatalogued
+            # error ("unknown") does not just get silently dropped either —
+            # it increments the same per-connection counter every other
+            # failure path uses, and escalates once a real pattern shows up
+            # on this connection specifically, not on the first occurrence
+            # (which could just be this one post). A recognized content
+            # issue ("content" — e.g. a bad image) never escalates at all,
+            # since that's never a sign the connection itself is broken.
+            if not reconnect and info.get("category") == "unknown":
+                from app.agents.social_media_manager.services.approval_workflow_service import _should_flag_connection
+                _platform = draft.get("platform", "unknown")
+                _account_id = draft.get("outstand_account_id")
+                reconnect, reason = await _should_flag_connection(
+                    db=db, user_id=draft.get("user_id"), platform=_platform,
+                    connection={"platform": _platform, "outstand_account_id": _account_id} if _account_id else None,
+                    raw_error=outcome["error"],
+                )
         await db["content_drafts"].update_one({"id": draft["id"], "status": CONFIRMING}, {
             "$set": {"status": "publish_failed", "error_message": message, "updated_at": now,
                      "network_error": outcome["error"][:1000] if outcome["error"] else None},
             "$unset": {"publish_slow": ""},
         })
         if reconnect:
-            await _flag_reconnect(db, draft, message)
+            await _flag_reconnect(db, draft, message, reason=reason or "token invalidated")
         await _notify(db, draft, published=False, message=message)
         return "failed"
 
