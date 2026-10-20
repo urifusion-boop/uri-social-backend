@@ -30,7 +30,7 @@ chunk — see _generate_final_copy's docstring for why two stages share one
 network round-trip) -> ad evaluation -> validate (deterministic + semantic
 + anti-boring) -> auto-regenerate flagged items.
 
-Reused from v1 (content_calendar_service.py) — only the genuinely
+Reused from v1 (now in calendar_rules.py; v1 itself was deleted) — only the genuinely
 content-type-agnostic pure helpers: _STAGE_GUIDANCE,
 _business_pulse_freshness_str, _validate_day. Deliberately NOT reused:
 _pick_mix_from_performance, DEFAULT_MIX_VARIANTS, INDUSTRY_MIX, POST_FORMATS,
@@ -47,7 +47,7 @@ import re
 import secrets
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -56,8 +56,8 @@ from app.services.AIService import AIService
 from app.agents.social_media_manager.services.holiday_calendar_service import HolidayCalendarService
 from app.agents.social_media_manager.services.cultural_moment_service import CulturalMomentService
 
-# Pure, stateless helpers reused directly from v1 — see module docstring.
-from app.agents.social_media_manager.services.content_calendar_service import (
+# Pure, stateless helpers shared with the caption writer (calendar_rules.py).
+from app.agents.social_media_manager.services.calendar_rules import (
     _STAGE_GUIDANCE,
     _business_pulse_freshness_str,
     _validate_day,
@@ -69,6 +69,7 @@ from ..creative_framework import (
     STRUCTURAL_DEVICE_SLIDE_HINT,
     ANTI_BORING_PHRASES,
     ANTI_BORING_OPENER_STEMS,
+    GENERIC_AI_WORDS,
 )
 
 # Matches a risky verb, any conjugation ("Unlock", "Unlocking", "Discover",
@@ -99,6 +100,7 @@ CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item
                               # evidence larger single structured-JSON calls degrade
 
 MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
+MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN = 3   # the brand picked Reels/video in its Playbook
                                   # (video/product_video/ai_video) per 7-day calendar week
 _VIDEO_FORMATS = {"video", "product_video", "ai_video"}
 
@@ -379,7 +381,13 @@ def _brand_rules_block(brand: Dict[str, Any]) -> str:
     if brand.get("key_dates"):
         parts.append(f"IMPORTANT DATES for this brand: {brand['key_dates']}. Plan a post for any that "
                      f"fall inside this plan's period, on or just before the date.")
-    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+    allowed = _allowed_formats(brand)
+    if allowed:
+        parts.append("FORMATS this brand posts in: " + ", ".join(sorted(allowed))
+                     + ". Plan only ideas that work in these formats.")
+    parts.append('NEVER use these generic AI words, in any form ("transforms", "discovering" count too): '
+                 + ", ".join(GENERIC_AI_WORDS) + ". Say the specific thing instead.")
+    return "\n\n" + "\n\n".join(parts)
 
 
 def _visual_guide_block(brand: Dict[str, Any]) -> str:
@@ -996,6 +1004,33 @@ def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_asse
     return result
 
 
+# The Playbook's "Content formats" labels -> the calendar formats they allow.
+# Labels with no calendar format (Poll, Live session) allow nothing extra.
+_PLAYBOOK_FORMATS: Dict[str, Tuple[str, ...]] = {
+    "reels / short video": ("video", "product_video", "ai_video"),
+    "story": ("video", "product_video", "ai_video"),
+    "carousel posts": ("carousel",),
+    "static image": ("image",),
+    "infographic": ("image",),
+    "long-form article": ("text",),
+    "thread / x post": ("text",),
+}
+# When a format has to change, the replacement is the least-used allowed one,
+# ties broken in this order.
+_FORMAT_FALLBACK_ORDER = ("image", "carousel", "video", "text", "product_video", "ai_video")
+
+
+def _allowed_formats(brand: Dict[str, Any]) -> Optional[set]:
+    """The calendar formats the brand chose in its Playbook, or None when it
+    chose none we can plan for (the plan then picks freely, as before).
+    Before this, V2 never read preferred_formats at all (v1 did), so a brand
+    that picked "Carousel posts" + "Static image" still got a video every week."""
+    allowed: set = set()
+    for label in brand.get("preferred_formats") or []:
+        allowed.update(_PLAYBOOK_FORMATS.get(str(label).strip().lower(), ()))
+    return allowed or None
+
+
 def _assign_formats(
     dated: List[Dict[str, Any]], brand: Dict[str, Any], existing_assets_summary: str,
 ) -> List[Dict[str, Any]]:
@@ -1006,17 +1041,35 @@ def _assign_formats(
     downgrading to "image" once a week's video quota is already spent.
     Assumes `dated` is already in day_index order (it is — _assign_dates
     walks the plan sequentially)."""
+    allowed = _allowed_formats(brand)
+    video_cap = MAX_VIDEO_FORMATS_PER_WEEK
+    if allowed and allowed & _VIDEO_FORMATS:
+        video_cap = MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN
     video_count_by_week: Dict[int, int] = {}
+    used: Dict[str, int] = {}
     result = []
     for c in dated:
         assigned = _assign_format(c, brand, existing_assets_summary)
         week = c.get("day_index", 0) // 7
-        if assigned.get("format") in _VIDEO_FORMATS:
-            if video_count_by_week.get(week, 0) >= MAX_VIDEO_FORMATS_PER_WEEK:
-                assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
-                assigned["format"] = "image"
+        fmt = assigned.get("format")
+        video_full = video_count_by_week.get(week, 0) >= video_cap
+        if (allowed and fmt not in allowed) or (fmt in _VIDEO_FORMATS and video_full):
+            if not allowed:
+                options = ["image"]
             else:
-                video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+                options = [f for f in _FORMAT_FALLBACK_ORDER
+                           if f in allowed and not (f in _VIDEO_FORMATS and video_full)]
+                if not options:   # only video allowed and this week's quota is spent
+                    options = [f for f in _FORMAT_FALLBACK_ORDER if f in allowed]
+            new_fmt = min(options, key=lambda f: (used.get(f, 0), _FORMAT_FALLBACK_ORDER.index(f)))
+            assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
+            assigned["format"] = new_fmt
+            if new_fmt == "carousel":
+                assigned["carousel_slide_count"] = _pick_carousel_slide_count(c)
+            fmt = new_fmt
+        if fmt in _VIDEO_FORMATS:
+            video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+        used[fmt] = used.get(fmt, 0) + 1
         result.append(assigned)
     return result
 
@@ -1353,6 +1406,31 @@ def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[
     return [str(w).strip() for w in find_banned(_collect_item_text(idea), words_to_avoid)]
 
 
+def _reader_text(idea: Dict[str, Any]) -> str:
+    """What the audience actually reads: title, hook, description, CTA, the
+    post's headline/caption and slides, the video's script. Internal notes
+    (reasoning, designer notes) aren't held to the generic-word ban."""
+    parts = [str(idea.get(k) or "") for k in ("title", "hook", "description", "cta")]
+    exact_copy = idea.get("exact_copy") or {}
+    if isinstance(exact_copy, dict):
+        parts += [str(exact_copy.get("headline") or ""), str(exact_copy.get("caption") or "")]
+    carousel = idea.get("carousel") or {}
+    if isinstance(carousel, dict):
+        for slide in (carousel.get("slides") or []):
+            if isinstance(slide, dict):
+                parts += [str(slide.get("headline") or ""), str(slide.get("body") or "")]
+    video_idea = idea.get("video_idea") or {}
+    if isinstance(video_idea, dict):
+        parts += [str(video_idea.get("hook") or ""), str(video_idea.get("cta") or "")]
+        parts += [str(x) for x in (video_idea.get("talking_points") or [])]
+    return " \n ".join(p for p in parts if p)
+
+
+def _generic_words_used(idea: Dict[str, Any]) -> List[str]:
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    return [str(w) for w in find_banned(_reader_text(idea), GENERIC_AI_WORDS)]
+
+
 def _validate_item_v2(
     idea: Dict[str, Any],
     is_carousel: bool,
@@ -1381,6 +1459,11 @@ def _validate_item_v2(
     if banned_hits:
         issues.append(
             f"uses word(s)/phrase(s) the brand asked to avoid: {', '.join(banned_hits)} — rewrite without them"
+        )
+    generic_hits = _generic_words_used(idea)
+    if generic_hits:
+        issues.append(
+            f"uses generic AI word(s): {', '.join(generic_hits)} — rewrite those lines in plain, specific words"
         )
     return issues
 
@@ -1972,8 +2055,12 @@ async def _build_plan_doc(
     if len(llm_flagged) > max(6, len(all_items) // 4):
         print(f"[CalendarV2] LLM diversity check flagged {len(llm_flagged)}/{len(all_items)} — implausible, discarding", flush=True)
         llm_flagged = []
-    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged))
-    print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration", flush=True)
+    # Items that still use a generic AI word after the per-chunk retry get the
+    # regeneration pass too, rather than shipping with only a warning.
+    generic_flagged = [it.get("day_index") for it in all_items if _generic_words_used(it)]
+    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged) | set(generic_flagged))
+    print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration "
+          f"({len(generic_flagged)} for generic words)", flush=True)
 
     # Step 12 — regenerate flagged items only, one bounded pass
     regenerated_day_indices: set = set()
