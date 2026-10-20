@@ -1165,6 +1165,140 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
         return AdCopyV2()
 
 
+# ── Generic AI words: last pass ────────────────────────────────────────────
+# Banning them in the prompt and rewriting failed items wasn't enough: on
+# staging (Oct 2026) the model still wrote "discover" 21 times and "journey"
+# 12 across a plan. So after everything else, every sentence that still uses
+# one is sent back on its own to be reworded, and anything that survives
+# that gets a plain-word swap in code. Covers what readers see and what the
+# draft writer is fed (caption_direction, key_points).
+
+_SCRUB_FIELDS = ("title", "hook", "description", "cta", "caption_direction")
+
+# Fallback swaps: (pattern, replacement). Case of the first letter is kept.
+_PLAIN_WORDS: List[Tuple[str, str]] = [
+    (r"\bdeep dive\b", "close look"), (r"\bdive into\b", "look at"),
+    (r"\bnext level\b", "further"), (r"\bin today's\b", "in the current"),
+    (r"\bnavigate the\b", "handle the"),
+    (r"\bgame-?changing\b", "big"), (r"\bgame-?changers?\b", "big change"),
+    (r"\btransformations?\b", "change"), (r"\btransformative\b", "big"),
+    (r"\btransformed\b", "changed"), (r"\btransforming\b", "changing"),
+    (r"\btransforms\b", "changes"), (r"\btransform\b", "change"),
+    (r"\bdiscovery\b", "finding"), (r"\bdiscoveries\b", "findings"),
+    (r"\bdiscovered\b", "found"), (r"\bdiscovering\b", "finding"),
+    (r"\bdiscovers\b", "finds"), (r"\bdiscover\b", "find"),
+    (r"\bjourneys\b", "paths"), (r"\bjourney\b", "path"),
+    (r"\bunlocked\b", "opened"), (r"\bunlocking\b", "opening"),
+    (r"\bunlocks\b", "opens"), (r"\bunlock\b", "open"),
+    (r"\bseamlessly\b", "smoothly"), (r"\bseamless\b", "smooth"),
+    (r"\beffortlessly\b", "easily"), (r"\beffortless\b", "easy"),
+    (r"\belevated\b", "raised"), (r"\belevating\b", "raising"),
+    (r"\belevates\b", "raises"), (r"\belevate\b", "raise"),
+    (r"\bempowered\b", "helped"), (r"\bempowering\b", "helping"),
+    (r"\bempowerment\b", "support"), (r"\bempowers\b", "helps"), (r"\bempower\b", "help"),
+    (r"\bunleashed\b", "released"), (r"\bunleashing\b", "releasing"),
+    (r"\bunleashes\b", "releases"), (r"\bunleash\b", "release"),
+    (r"\bsupercharged\b", "sped up"), (r"\bsupercharging\b", "speeding up"),
+    (r"\bsupercharges\b", "speeds up"), (r"\bsupercharge\b", "speed up"),
+    (r"\bharnessed\b", "used"), (r"\bharnessing\b", "using"),
+    (r"\bharnesses\b", "uses"), (r"\bharness\b", "use"),
+    (r"\bdelved\b", "dug"), (r"\bdelving\b", "digging"), (r"\bdelves\b", "digs"), (r"\bdelve\b", "dig"),
+    (r"\bskyrocketed\b", "grew fast"), (r"\bskyrocketing\b", "growing fast"),
+    (r"\bskyrockets\b", "grows fast"), (r"\bskyrocket\b", "grow fast"),
+    (r"\brevolutioni[sz]ed\b", "changed"), (r"\brevolutioni[sz]ing\b", "changing"),
+    (r"\brevolutioni[sz]es\b", "changes"), (r"\brevolutioni[sz]e\b", "change"),
+    (r"\brevolutionary\b", "new"), (r"\brevolutions?\b", "shift"),
+]
+
+
+def _plain_words(text: str) -> str:
+    def keep_case(m, word):
+        return word[:1].upper() + word[1:] if m.group(0)[:1].isupper() else word
+    for pat, word in _PLAIN_WORDS:
+        text = re.sub(pat, lambda m, w=word: keep_case(m, w), text, flags=re.I)
+    return text
+
+
+def _scrub_slots(item: Dict[str, Any]):
+    """(getter, setter) for each copy field of an item that the scrub covers."""
+    slots = []
+    for k in _SCRUB_FIELDS:
+        if isinstance(item.get(k), str):
+            slots.append((lambda d=item, k=k: d[k], lambda v, d=item, k=k: d.__setitem__(k, v)))
+    for container, keys in ((item.get("exact_copy"), ("headline", "caption")),
+                            (item.get("video_idea"), ("hook", "cta"))):
+        if isinstance(container, dict):
+            for k in keys:
+                if isinstance(container.get(k), str):
+                    slots.append((lambda d=container, k=k: d[k], lambda v, d=container, k=k: d.__setitem__(k, v)))
+    for lst in (item.get("key_points"), (item.get("video_idea") or {}).get("talking_points")
+                if isinstance(item.get("video_idea"), dict) else None):
+        if isinstance(lst, list):
+            for i, v in enumerate(lst):
+                if isinstance(v, str):
+                    slots.append((lambda l=lst, i=i: l[i], lambda v, l=lst, i=i: l.__setitem__(i, v)))
+    for slide in ((item.get("carousel") or {}).get("slides") or []) if isinstance(item.get("carousel"), dict) else []:
+        if isinstance(slide, dict):
+            for k in ("headline", "body"):
+                if isinstance(slide.get(k), str):
+                    slots.append((lambda d=slide, k=k: d[k], lambda v, d=slide, k=k: d.__setitem__(k, v)))
+    return slots
+
+
+async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
+    """Rewords every text in the plan that still uses a generic AI word.
+    Returns how many texts were changed. Never raises."""
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+
+    todo = []
+    for item in items:
+        for get, put in _scrub_slots(item):
+            if find_banned(get(), GENERIC_AI_WORDS):
+                todo.append((get, put))
+    if not todo:
+        return 0
+
+    async def reword(batch):
+        texts = {str(i): get() for i, (get, _) in enumerate(batch)}
+        prompt = (
+            "Reword each text below so it uses none of these words in any form "
+            f"(\"transforms\", \"discovering\" count too): {', '.join(GENERIC_AI_WORDS)}.\n"
+            "Say the specific, plain thing instead. Keep the meaning, length, tone, language, "
+            "line breaks, emojis and hashtags. Change nothing else.\n\n"
+            "Return ONLY valid JSON mapping each id to its reworded text.\n\n"
+            + json.dumps(texts, ensure_ascii=False)
+        )
+        try:
+            ai_request = AIService.build_ai_model(
+                messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
+            )
+            response = await AIService.chat_completion(ai_request)
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            out = _loads_lenient(raw)
+            return out if isinstance(out, dict) else {}
+        except Exception as exc:
+            print(f"[CalendarV2] generic-word reword failed: {exc}", flush=True)
+            return {}
+
+    batches = [todo[i:i + 30] for i in range(0, len(todo), 30)]
+    results = await asyncio.gather(*[reword(b) for b in batches])
+    changed = 0
+    for batch, out in zip(batches, results):
+        for i, (get, put) in enumerate(batch):
+            new = out.get(str(i))
+            text = new if isinstance(new, str) and new.strip() else get()
+            if find_banned(text, GENERIC_AI_WORDS):
+                text = _plain_words(text)
+            if text != get():
+                put(text)
+                changed += 1
+    return changed
+
+
 # ── Creative diversity + anti-boring validation (PRD §14, §29-30) ──────────
 
 def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
@@ -2078,6 +2212,10 @@ async def _build_plan_doc(
         rule_issues = _rule_based_diversity_issues(all_items)
         still_flagged = set(flagged_day_indices) - regenerated_day_indices
         flagged_day_indices = sorted(set(rule_issues.keys()) | still_flagged)
+
+    scrubbed = await _scrub_generic_words(all_items)
+    if scrubbed:
+        print(f"[CalendarV2] reworded {scrubbed} text(s) that still used generic AI words", flush=True)
 
     flagged_set = set(flagged_day_indices)
     anti_boring_notes = _anti_boring_check(all_items, brand_name=brand.get("brand_name", ""))
