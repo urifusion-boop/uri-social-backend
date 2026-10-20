@@ -126,6 +126,19 @@ def _job_publish_confirmations():
     _run_async("publish_confirmations", _run)
 
 
+def _job_connection_health_check():
+    """Asks Outstand directly whether each connected account's session is
+    still alive, instead of only finding out reactively when a publish
+    attempt fails (see connection_health_check.py's module docstring for
+    the live-confirmed gap this closes)."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services import connection_health_check
+        result = await connection_health_check.check_all_connections(get_db())
+        print(f"🔌 connection_health_check: {result}")
+    _run_async("connection_health_check", _run)
+
+
 def _job_weekly_reports():
     _brand_alert_job("brand_weekly_reports", "run_weekly_reports")
 
@@ -472,8 +485,17 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Proactively check every Outstand-managed connection's session health —
+    # the push side of what get_user_connections already does on pull.
+    _scheduler.add_job(
+        _job_connection_health_check,
+        CronTrigger(hour="*/6", minute=50),
+        id="connection_health_check",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 14 jobs")
+    print("📅 Notification scheduler started with 15 jobs")
 
 
 def stop_notification_scheduler():
