@@ -21,8 +21,9 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
+from app.services.PostHogService import track_event
 
-PROMPT_VERSION = "mi-listen-recommend-v2"  # v2: no generalisations in "why"
+PROMPT_VERSION = "mi-listen-recommend-v3"  # v3: validate-retry-fallback instead of strip
 SOURCE_LABEL = {"x": "X (Twitter)", "x_pro": "X (Twitter)"}
 
 
@@ -85,12 +86,85 @@ def observation(sig: dict) -> str:
 _NUM = re.compile(r"\d+(?:[.,]\d+)?\s*%|\b\d{2,}(?:[.,]\d+)?\b")
 
 
-def strip_statistics(text: str) -> str:
-    """Remove sentences carrying statistics the AI made up (percentages or
-    multi-digit counts). Creative small numbers ("3 ways") are fine."""
-    sentences = re.split(r"(?<=[.!?])\s+", (text or "").strip())
-    kept = [s for s in sentences if not _NUM.search(s)]
-    return " ".join(kept).strip()
+def _allowed_numbers(sig: dict, profile: dict) -> set[str]:
+    """Every number actually grounded in this signal's own evidence or this
+    business's own facts — the only numbers a card is allowed to state.
+    Single digits ("3 ways") are creative language, not claims, and are
+    never checked (see _NUM, which only matches percentages or 2+ digits)."""
+    cur, base = sig.get("current") or {}, sig.get("baseline") or {}
+    nums = {str(v) for v in (cur.get("authors"), base.get("median_per_day"), base.get("days"),
+                              cur.get("days_present"), cur.get("window_days")) if v is not None}
+    for v in (profile.get("facts") or {}).values():
+        if v:
+            nums.update(re.findall(r"\d+(?:[.,]\d+)?", str(v)))
+    return nums
+
+
+def _validate_card_numbers(why: str, action: dict, allowed: set[str]) -> Optional[str]:
+    """None if every statistic-looking number across why/action is grounded
+    in `allowed`; otherwise an error string describing the mismatch, for the
+    one-retry-then-fallback flow (mirrors insight_composer._validate_numbers)."""
+    if not (why or "").strip():
+        return "why is empty"
+    texts = [why, action.get("title", ""), action.get("hook", ""), action.get("cta", ""),
+             action.get("caption", ""), *(action.get("outline") or [])]
+    unknown = {m.group(0) for t in texts for m in _NUM.finditer(t or "")
+               if m.group(0).rstrip("%").strip() not in allowed}
+    if unknown:
+        return f"uses numbers not grounded in this signal's evidence or business facts: {sorted(unknown)}"
+    return None
+
+
+def _fallback_why(sig: dict) -> str:
+    """Deterministic, zero-fabrication-risk text used when validation fails
+    twice — same policy as insight_composer._fallback_insight_text."""
+    return "This is about what you sell, so it's a timely chance to show up where your customers are already talking."
+
+
+def _fallback_action(sig: dict) -> dict:
+    name = sig.get("topic_name") or sig.get("topic")
+    return {
+        "type": "post", "title": f"Post about {name}",
+        "platforms": ["instagram"], "format": "Single image post",
+        "hook": f"Let's talk about {name}.",
+        "outline": [f"Share your take on {name}", "Show how your product or service fits",
+                    "Invite a reply or DM"],
+        "cta": "Message us to learn more.",
+        "caption": f"We've been seeing “{name}” come up with our customers — here's where we stand.",
+    }
+
+
+async def _judge_one_retry(profile: dict, sig: dict, error: str, model: str) -> Optional["_Judged"]:
+    """Re-ask for just this one signal after a validation failure, with the
+    error named explicitly — mirrors insight_composer._call_llm's
+    error_context retry, adapted to the batched _Judgement schema."""
+    f = profile["facts"]
+    facts = "\n".join(f"{k}: {v}" for k, v in f.items() if v)
+    samples = " | ".join((x.get("text") or "")[:160].replace("\n", " ") for x in (sig.get("samples") or [])[:3])
+    line = (f"[0] topic: {sig.get('topic_name')} · type: {sig['type']} · market: {sig.get('market_label')} · "
+            f"customer needs: {', '.join(sig.get('needs') or []) or '—'} · intents: {sig.get('intent_mix')}\n"
+            f"    sample posts: {samples}")
+    req = AIService.build_ai_model(model=model, temperature=0.2, messages=[
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": f"BUSINESS FACTS\n{facts}\n\nSIGNALS\n{line}"},
+        {"role": "user", "content": (
+            f"Your previous attempt for this signal failed validation: {error}\n"
+            "Rewrite 'why' and 'action' for index 0 using ONLY plain language — no percentages, "
+            "no counts, no statistics of any kind. Small creative numbers like '3 ways' are fine; "
+            "specific counts or percentages are not, because nothing beyond the signal and business "
+            "facts above is a real number you have access to."
+        )},
+    ])
+    try:
+        completion = await AIService.structured_chat_completion(req, response_model=_Judgement)
+        if isinstance(completion, dict) and "error" in completion:
+            print(f"[MI][listen] retry judge failed: {completion['error']}")
+            return None
+        parsed: Optional[_Judgement] = completion.choices[0].message.parsed
+    except Exception as e:
+        print(f"[MI][listen] retry judge raised: {e}")
+        return None
+    return parsed.items[0] if parsed and parsed.items else None
 
 
 def score(sig: dict, relevance: float, brand_fit: float, weights: dict) -> dict:
@@ -151,10 +225,26 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
         s = score(sig, j.relevance, j.brand_fit, sc["weights"])
         if sig.get("confidence", 0) < sc["min_confidence"] or j.relevance < sc["min_relevance"] or s["total"] < sc["min_score"]:
             continue
-        why = strip_statistics(j.why) or "This is about what you sell, so it's a timely chance to show up where your customers are already talking."
-        action = j.action.dict()
-        for k in ("title", "hook", "cta", "caption"):
-            action[k] = re.sub(r"\d+(?:[.,]\d+)?\s*%", "", action.get(k) or "").strip()
+        allowed = _allowed_numbers(sig, profile)
+        why, action = j.why, j.action.dict()
+        err = _validate_card_numbers(why, action, allowed)
+        if err:
+            track_event(brand, "card_validation_retry", {
+                "brand_id": brand, "signal_id": sig.get("id"), "topic": sig.get("topic"), "reason": err[:200],
+            })
+            retry = await _judge_one_retry(profile, sig, err, sc["model"])
+            if retry and retry.action:
+                cand_why, cand_action = retry.why, retry.action.dict()
+                err = _validate_card_numbers(cand_why, cand_action, allowed)
+            else:
+                err = err or "retry produced no action"
+            if err:
+                track_event(brand, "card_validation_fallback", {
+                    "brand_id": brand, "signal_id": sig.get("id"), "topic": sig.get("topic"), "reason": err[:200],
+                })
+                why, action = _fallback_why(sig), _fallback_action(sig)
+            else:
+                why, action = cand_why, cand_action
         cards.append({
             "id": str(uuid.uuid4()), "brand_id": brand, "user_id": profile["user_id"],
             "signal_id": sig.get("id"), "market": sig["market"], "market_label": sig.get("market_label"),

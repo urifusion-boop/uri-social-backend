@@ -170,10 +170,19 @@ def test_observation_numbers_come_from_the_signal():
     assert "12 different accounts" in text and "usual 1.0 a day" in text and "9 days" in text
 
 
-def test_made_up_statistics_are_removed():
-    out = personalize.strip_statistics("Demand is up 45% this week. It fits your lace wigs. 2,000 people want it.")
-    assert out == "It fits your lace wigs."
-    assert personalize.strip_statistics("Film 3 ways to style it.") == "Film 3 ways to style it."
+def test_allowed_numbers_come_from_signal_and_profile():
+    sig = {"current": {"authors": 12, "days_present": 5, "window_days": 10}, "baseline": {"median_per_day": 1.0, "days": 9}}
+    prof = {"facts": {"price_band": "from 15000 naira"}}
+    allowed = personalize._allowed_numbers(sig, prof)
+    assert {"12", "5", "10", "1.0", "9", "15000"} <= allowed
+
+
+def test_validator_rejects_a_fabricated_number_but_allows_creative_small_ones():
+    allowed = {"12", "9"}
+    action = {"title": "Film 3 ways to style it", "hook": "", "cta": "", "caption": "", "outline": []}
+    assert personalize._validate_card_numbers("Demand is up 300% this week.", action, allowed) is not None
+    assert personalize._validate_card_numbers("It fits your lace wigs.", action, allowed) is None
+    assert personalize._validate_card_numbers("", action, allowed) is not None  # empty why also rejected
 
 
 def test_score_uses_configured_weights():
@@ -183,20 +192,24 @@ def test_score_uses_configured_weights():
 
 
 class _J:
-    def __init__(self, idx, rel, fit, why="Fits your catalogue. Up 300% today!"):
+    def __init__(self, idx, rel, fit, why="Fits your catalogue and your customers are already asking."):
         self.idx, self.relevance, self.brand_fit, self.why = idx, rel, fit, why
-        self.action = personalize._Action(type="video", title="Film 3 ways to style the Latasha wig — 50% off",
+        self.action = personalize._Action(type="video", title="Film 3 ways to style the Latasha wig",
                                           platforms=["instagram", "tiktok"], format="Reel 30s", hook="Hook",
                                           outline=["a", "b", "c"], cta="DM to order", caption="Caption")
 
 
-def test_cards_are_gated_scored_and_stored(monkeypatch):
-    db = fresh_db()
+def _seed_and_detect(db):
     run(_seed(db, {0: 12, 1: 11, **{d: 1 for d in range(2, 11)}}))
     run(_seed(db, {0: 12, 1: 11, **{d: 1 for d in range(2, 11)}}, topic="bob wig"))
     _detect(db)
     for s in run(db["mi_listen_signals"].find({}).to_list(None)):
         run(db["mi_listen_signals"].update_one({"_id": s["_id"]}, {"$set": {"computed_at": NOW}}))
+
+
+def test_cards_are_gated_scored_and_stored(monkeypatch):
+    db = fresh_db()
+    _seed_and_detect(db)
 
     async def fake_judge(profile, sigs, model):
         return {i: _J(i, 90 if s["topic"] == "latasha wig" else 20, 80) for i, s in enumerate(sigs)}
@@ -205,13 +218,50 @@ def test_cards_are_gated_scored_and_stored(monkeypatch):
     cards = run(personalize.cards_for(db, prof, CFG, NOW))
     assert [c["topic"] for c in cards] == ["latasha wig"]           # irrelevant topic gated out
     c = cards[0]
-    assert "300%" not in c["why"] and c["why"] == "Fits your catalogue."
-    assert "%" not in c["action"]["title"]
+    assert c["why"] == "Fits your catalogue and your customers are already asking."
+    assert c["action"]["title"] == "Film 3 ways to style the Latasha wig"
     assert c["scores"]["total"] >= CFG["score"]["min_score"] and c["evidence"]["scope_note"]
     # a live card is not repeated; a dismissed topic stays quiet
     assert run(personalize.cards_for(db, prof, CFG, NOW)) == []
     run(db["mi_listen_cards"].update_one({"id": c["id"]}, {"$set": {"status": "dismissed", "updated_at": NOW}}))
     assert run(personalize.cards_for(db, prof, CFG, NOW)) == []
+
+
+def test_fabricated_number_triggers_retry_and_uses_clean_retry_content(monkeypatch):
+    db = fresh_db()
+    _seed_and_detect(db)
+
+    async def fake_judge(profile, sigs, model):
+        return {i: _J(i, 90 if s["topic"] == "latasha wig" else 20, 80, why="Demand is up 300% this week.")
+                for i, s in enumerate(sigs)}
+    clean = _J(0, 90, 80, why="Your customers are already talking about this.")
+
+    async def fake_retry(profile, sig, error, model):
+        assert "300" in error
+        return clean
+    monkeypatch.setattr(personalize, "_judge", fake_judge)
+    monkeypatch.setattr(personalize, "_judge_one_retry", fake_retry)
+    prof = {"brand_id": "b1", "user_id": "u1", "markets": [MARKET["key"]], "facts": {}}
+    cards = run(personalize.cards_for(db, prof, CFG, NOW))
+    assert cards[0]["why"] == "Your customers are already talking about this."
+
+
+def test_fabricated_number_falls_back_when_retry_also_fails(monkeypatch):
+    db = fresh_db()
+    _seed_and_detect(db)
+
+    async def fake_judge(profile, sigs, model):
+        return {i: _J(i, 90 if s["topic"] == "latasha wig" else 20, 80, why="Demand is up 300% this week.")
+                for i, s in enumerate(sigs)}
+
+    async def fake_retry(profile, sig, error, model):
+        return None  # simulates AI call failing on retry too
+    monkeypatch.setattr(personalize, "_judge", fake_judge)
+    monkeypatch.setattr(personalize, "_judge_one_retry", fake_retry)
+    prof = {"brand_id": "b1", "user_id": "u1", "markets": [MARKET["key"]], "facts": {}}
+    cards = run(personalize.cards_for(db, prof, CFG, NOW))
+    assert cards[0]["why"] == personalize._fallback_why(cards[0])
+    assert cards[0]["action"] == personalize._fallback_action({"topic_name": "latasha wig", "topic": "latasha wig"})
 
 
 # ── collection ──────────────────────────────────────────────────────────────
