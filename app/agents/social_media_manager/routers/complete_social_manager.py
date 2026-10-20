@@ -6193,6 +6193,11 @@ async def _generate_image_bg(
                 "brand_name": brand_context.get("brand_name", ""),
                 "logo_url": brand_context.get("logo_url", ""),
                 "logo_position": brand_context.get("logo_position", "bottom_right"),
+                # Was missing here — every V2 guide image used _overlay_logo's
+                # "small" default regardless of the brand's actual Logo Size
+                # setting, unlike the standard generation path below, which
+                # always reads this from the full brand_context.
+                "logo_size": brand_context.get("logo_size", "small"),
                 "logo_description": brand_context.get("logo_description", "brand logo"),
                 "brand_colors": brand_context.get("brand_colors") or [],
                 "font_style": brand_context.get("font_style") or brand_context.get("primary_font", ""),
@@ -6245,7 +6250,16 @@ async def _generate_image_bg(
             # generated successfully" immediately followed by "BG image gen failed... None").
             image_result = {
                 "status": _v2_result.get("success", False),
-                "responseData": {"image_url": _v2_result.get("image_url")},
+                "responseData": {
+                    "image_url": _v2_result.get("image_url"),
+                    # Were dropped here even though generate_image_with_v2_guide
+                    # now returns them — a V2-guide image could never have its
+                    # logo moved, regardless of platform or brand, because this
+                    # normalization step discarded the data before it ever
+                    # reached the code below that saves it to the draft.
+                    "background_image_url": _v2_result.get("background_image_url"),
+                    "logo_placement": _v2_result.get("logo_placement"),
+                },
                 "responseMessage": None if _v2_result.get("success") else "V2 guide image generation failed",
             }
         else:
