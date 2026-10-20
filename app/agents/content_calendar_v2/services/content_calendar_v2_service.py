@@ -30,7 +30,7 @@ chunk — see _generate_final_copy's docstring for why two stages share one
 network round-trip) -> ad evaluation -> validate (deterministic + semantic
 + anti-boring) -> auto-regenerate flagged items.
 
-Reused from v1 (content_calendar_service.py) — only the genuinely
+Reused from v1 (now in calendar_rules.py; v1 itself was deleted) — only the genuinely
 content-type-agnostic pure helpers: _STAGE_GUIDANCE,
 _business_pulse_freshness_str, _validate_day. Deliberately NOT reused:
 _pick_mix_from_performance, DEFAULT_MIX_VARIANTS, INDUSTRY_MIX, POST_FORMATS,
@@ -47,7 +47,7 @@ import re
 import secrets
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -56,8 +56,8 @@ from app.services.AIService import AIService
 from app.agents.social_media_manager.services.holiday_calendar_service import HolidayCalendarService
 from app.agents.social_media_manager.services.cultural_moment_service import CulturalMomentService
 
-# Pure, stateless helpers reused directly from v1 — see module docstring.
-from app.agents.social_media_manager.services.content_calendar_service import (
+# Pure, stateless helpers shared with the caption writer (calendar_rules.py).
+from app.agents.social_media_manager.services.calendar_rules import (
     _STAGE_GUIDANCE,
     _business_pulse_freshness_str,
     _validate_day,
@@ -69,6 +69,7 @@ from ..creative_framework import (
     STRUCTURAL_DEVICE_SLIDE_HINT,
     ANTI_BORING_PHRASES,
     ANTI_BORING_OPENER_STEMS,
+    GENERIC_AI_WORDS,
 )
 
 # Matches a risky verb, any conjugation ("Unlock", "Unlocking", "Discover",
@@ -99,6 +100,7 @@ CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item
                               # evidence larger single structured-JSON calls degrade
 
 MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
+MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN = 3   # the brand picked Reels/video in its Playbook
                                   # (video/product_video/ai_video) per 7-day calendar week
 _VIDEO_FORMATS = {"video", "product_video", "ai_video"}
 
@@ -379,7 +381,13 @@ def _brand_rules_block(brand: Dict[str, Any]) -> str:
     if brand.get("key_dates"):
         parts.append(f"IMPORTANT DATES for this brand: {brand['key_dates']}. Plan a post for any that "
                      f"fall inside this plan's period, on or just before the date.")
-    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+    allowed = _allowed_formats(brand)
+    if allowed:
+        parts.append("FORMATS this brand posts in: " + ", ".join(sorted(allowed))
+                     + ". Plan only ideas that work in these formats.")
+    parts.append('NEVER use these generic AI words, in any form ("transforms", "discovering" count too): '
+                 + ", ".join(GENERIC_AI_WORDS) + ". Say the specific thing instead.")
+    return "\n\n" + "\n\n".join(parts)
 
 
 def _visual_guide_block(brand: Dict[str, Any]) -> str:
@@ -861,6 +869,103 @@ def _assign_dates(
     return out
 
 
+# ── Step 6b — The brand's own key dates are guaranteed a post ─────────────────
+# The plan prompt already asks for a post on each important date in the
+# period, but that was only a request: a real plan on prod (Oct 2026) had the
+# brand's "launch anniversary" on 5 November inside its period and gave that
+# day an unrelated idea. So after dates are assigned, any key date in the
+# period whose day isn't already about it has that day's concept turned into
+# the key-date post, before the final copy is written.
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def _parse_key_date(raw: str, years: List[int]) -> List[str]:
+    """ISO dates for a key date: an exact date ("2026-11-05") as given, or a
+    yearly one ("11-05", "5 November", "Nov 5") in each of `years`."""
+    raw = (raw or "").strip().lower()
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if m:
+        return [f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"]
+    month = day = None
+    m = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})", raw)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r"(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3})|([a-z]{3})[a-z]*\.?\s+(\d{1,2})", raw)
+        if m:
+            if m.group(1):
+                day, month = int(m.group(1)), _MONTHS.get(m.group(2))
+            else:
+                month, day = _MONTHS.get(m.group(3)), int(m.group(4))
+    if not month or not day:
+        return []
+    out = []
+    for y in years:
+        try:
+            out.append(datetime(y, month, day).strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    return out
+
+
+def _brand_key_dates(brand: Dict[str, Any], all_dates: List[str]) -> List[Dict[str, str]]:
+    """[{label, date}] for the brand's key dates that fall inside the plan.
+    Reads the raw list ({label, date}) or to_brand_context's
+    "Label (date), Label (date)" string."""
+    raw = brand.get("key_dates")
+    pairs: List[tuple] = []
+    if isinstance(raw, list):
+        for d in raw:
+            if isinstance(d, dict):
+                pairs.append((str(d.get("label") or d.get("name") or "").strip(), str(d.get("date") or "")))
+    elif isinstance(raw, str) and raw.strip():
+        for m in re.finditer(r"([^,(]+?)\s*\(([^)]+)\)", raw):
+            pairs.append((m.group(1).strip(), m.group(2).strip()))
+    if not all_dates:
+        return []
+    years = sorted({int(all_dates[0][:4]), int(all_dates[-1][:4])})
+    window = set(all_dates)
+    out, seen = [], set()
+    for label, date_raw in pairs:
+        if not label:
+            continue
+        for iso in _parse_key_date(date_raw, years):
+            if iso in window and (label, iso) not in seen:
+                seen.add((label, iso))
+                out.append({"label": label, "date": iso})
+    return out
+
+
+def _is_about(item: Dict[str, Any], label: str) -> bool:
+    words = [w for w in re.findall(r"[a-z0-9]+", label.lower()) if len(w) > 3]
+    text = " ".join(str(item.get(k) or "") for k in
+                    ("subject", "concept_name", "creative_concept_name", "title", "angle")).lower()
+    return bool(words) and sum(w in text for w in words) >= max(1, len(words) // 2)
+
+
+def _enforce_key_dates(dated: List[Dict[str, Any]], brand: Dict[str, Any], all_dates: List[str]) -> List[Dict[str, str]]:
+    """Make sure each key date in the plan's period has its post. Changes the
+    concepts in place; returns the key dates that had to be placed."""
+    placed = []
+    by_date = {it["date"]: it for it in dated}
+    for kd in _brand_key_dates(brand, all_dates):
+        item = by_date.get(kd["date"])
+        if not item or _is_about(item, kd["label"]):
+            continue
+        label = kd["label"]
+        item.update({
+            "subject": label,
+            "angle": f"Mark {label} — what it means for the brand and the people it serves",
+            "concept_name": label,
+            "holiday_tie_in": {"name": label, "date": kd["date"], "source": "brand_key_date"},
+            "key_date": kd,
+        })
+        placed.append(kd)
+    return placed
+
+
 # ── Step 7 — Assign format, dynamic 2-5 slide carousels (PRD §16-17) ───────
 
 def _pick_carousel_slide_count(concept: Dict[str, Any]) -> int:
@@ -899,6 +1004,33 @@ def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_asse
     return result
 
 
+# The Playbook's "Content formats" labels -> the calendar formats they allow.
+# Labels with no calendar format (Poll, Live session) allow nothing extra.
+_PLAYBOOK_FORMATS: Dict[str, Tuple[str, ...]] = {
+    "reels / short video": ("video", "product_video", "ai_video"),
+    "story": ("video", "product_video", "ai_video"),
+    "carousel posts": ("carousel",),
+    "static image": ("image",),
+    "infographic": ("image",),
+    "long-form article": ("text",),
+    "thread / x post": ("text",),
+}
+# When a format has to change, the replacement is the least-used allowed one,
+# ties broken in this order.
+_FORMAT_FALLBACK_ORDER = ("image", "carousel", "video", "text", "product_video", "ai_video")
+
+
+def _allowed_formats(brand: Dict[str, Any]) -> Optional[set]:
+    """The calendar formats the brand chose in its Playbook, or None when it
+    chose none we can plan for (the plan then picks freely, as before).
+    Before this, V2 never read preferred_formats at all (v1 did), so a brand
+    that picked "Carousel posts" + "Static image" still got a video every week."""
+    allowed: set = set()
+    for label in brand.get("preferred_formats") or []:
+        allowed.update(_PLAYBOOK_FORMATS.get(str(label).strip().lower(), ()))
+    return allowed or None
+
+
 def _assign_formats(
     dated: List[Dict[str, Any]], brand: Dict[str, Any], existing_assets_summary: str,
 ) -> List[Dict[str, Any]]:
@@ -909,17 +1041,35 @@ def _assign_formats(
     downgrading to "image" once a week's video quota is already spent.
     Assumes `dated` is already in day_index order (it is — _assign_dates
     walks the plan sequentially)."""
+    allowed = _allowed_formats(brand)
+    video_cap = MAX_VIDEO_FORMATS_PER_WEEK
+    if allowed and allowed & _VIDEO_FORMATS:
+        video_cap = MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN
     video_count_by_week: Dict[int, int] = {}
+    used: Dict[str, int] = {}
     result = []
     for c in dated:
         assigned = _assign_format(c, brand, existing_assets_summary)
         week = c.get("day_index", 0) // 7
-        if assigned.get("format") in _VIDEO_FORMATS:
-            if video_count_by_week.get(week, 0) >= MAX_VIDEO_FORMATS_PER_WEEK:
-                assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
-                assigned["format"] = "image"
+        fmt = assigned.get("format")
+        video_full = video_count_by_week.get(week, 0) >= video_cap
+        if (allowed and fmt not in allowed) or (fmt in _VIDEO_FORMATS and video_full):
+            if not allowed:
+                options = ["image"]
             else:
-                video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+                options = [f for f in _FORMAT_FALLBACK_ORDER
+                           if f in allowed and not (f in _VIDEO_FORMATS and video_full)]
+                if not options:   # only video allowed and this week's quota is spent
+                    options = [f for f in _FORMAT_FALLBACK_ORDER if f in allowed]
+            new_fmt = min(options, key=lambda f: (used.get(f, 0), _FORMAT_FALLBACK_ORDER.index(f)))
+            assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
+            assigned["format"] = new_fmt
+            if new_fmt == "carousel":
+                assigned["carousel_slide_count"] = _pick_carousel_slide_count(c)
+            fmt = new_fmt
+        if fmt in _VIDEO_FORMATS:
+            video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+        used[fmt] = used.get(fmt, 0) + 1
         result.append(assigned)
     return result
 
@@ -1013,6 +1163,140 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
     except Exception as exc:
         print(f"[CalendarV2] ad copy generation failed: {exc}", flush=True)
         return AdCopyV2()
+
+
+# ── Generic AI words: last pass ────────────────────────────────────────────
+# Banning them in the prompt and rewriting failed items wasn't enough: on
+# staging (Oct 2026) the model still wrote "discover" 21 times and "journey"
+# 12 across a plan. So after everything else, every sentence that still uses
+# one is sent back on its own to be reworded, and anything that survives
+# that gets a plain-word swap in code. Covers what readers see and what the
+# draft writer is fed (caption_direction, key_points).
+
+_SCRUB_FIELDS = ("title", "hook", "description", "cta", "caption_direction")
+
+# Fallback swaps: (pattern, replacement). Case of the first letter is kept.
+_PLAIN_WORDS: List[Tuple[str, str]] = [
+    (r"\bdeep dive\b", "close look"), (r"\bdive into\b", "look at"),
+    (r"\bnext level\b", "further"), (r"\bin today's\b", "in the current"),
+    (r"\bnavigate the\b", "handle the"),
+    (r"\bgame-?changing\b", "big"), (r"\bgame-?changers?\b", "big change"),
+    (r"\btransformations?\b", "change"), (r"\btransformative\b", "big"),
+    (r"\btransformed\b", "changed"), (r"\btransforming\b", "changing"),
+    (r"\btransforms\b", "changes"), (r"\btransform\b", "change"),
+    (r"\bdiscovery\b", "finding"), (r"\bdiscoveries\b", "findings"),
+    (r"\bdiscovered\b", "found"), (r"\bdiscovering\b", "finding"),
+    (r"\bdiscovers\b", "finds"), (r"\bdiscover\b", "find"),
+    (r"\bjourneys\b", "paths"), (r"\bjourney\b", "path"),
+    (r"\bunlocked\b", "opened"), (r"\bunlocking\b", "opening"),
+    (r"\bunlocks\b", "opens"), (r"\bunlock\b", "open"),
+    (r"\bseamlessly\b", "smoothly"), (r"\bseamless\b", "smooth"),
+    (r"\beffortlessly\b", "easily"), (r"\beffortless\b", "easy"),
+    (r"\belevated\b", "raised"), (r"\belevating\b", "raising"),
+    (r"\belevates\b", "raises"), (r"\belevate\b", "raise"),
+    (r"\bempowered\b", "helped"), (r"\bempowering\b", "helping"),
+    (r"\bempowerment\b", "support"), (r"\bempowers\b", "helps"), (r"\bempower\b", "help"),
+    (r"\bunleashed\b", "released"), (r"\bunleashing\b", "releasing"),
+    (r"\bunleashes\b", "releases"), (r"\bunleash\b", "release"),
+    (r"\bsupercharged\b", "sped up"), (r"\bsupercharging\b", "speeding up"),
+    (r"\bsupercharges\b", "speeds up"), (r"\bsupercharge\b", "speed up"),
+    (r"\bharnessed\b", "used"), (r"\bharnessing\b", "using"),
+    (r"\bharnesses\b", "uses"), (r"\bharness\b", "use"),
+    (r"\bdelved\b", "dug"), (r"\bdelving\b", "digging"), (r"\bdelves\b", "digs"), (r"\bdelve\b", "dig"),
+    (r"\bskyrocketed\b", "grew fast"), (r"\bskyrocketing\b", "growing fast"),
+    (r"\bskyrockets\b", "grows fast"), (r"\bskyrocket\b", "grow fast"),
+    (r"\brevolutioni[sz]ed\b", "changed"), (r"\brevolutioni[sz]ing\b", "changing"),
+    (r"\brevolutioni[sz]es\b", "changes"), (r"\brevolutioni[sz]e\b", "change"),
+    (r"\brevolutionary\b", "new"), (r"\brevolutions?\b", "shift"),
+]
+
+
+def _plain_words(text: str) -> str:
+    def keep_case(m, word):
+        return word[:1].upper() + word[1:] if m.group(0)[:1].isupper() else word
+    for pat, word in _PLAIN_WORDS:
+        text = re.sub(pat, lambda m, w=word: keep_case(m, w), text, flags=re.I)
+    return text
+
+
+def _scrub_slots(item: Dict[str, Any]):
+    """(getter, setter) for each copy field of an item that the scrub covers."""
+    slots = []
+    for k in _SCRUB_FIELDS:
+        if isinstance(item.get(k), str):
+            slots.append((lambda d=item, k=k: d[k], lambda v, d=item, k=k: d.__setitem__(k, v)))
+    for container, keys in ((item.get("exact_copy"), ("headline", "caption")),
+                            (item.get("video_idea"), ("hook", "cta"))):
+        if isinstance(container, dict):
+            for k in keys:
+                if isinstance(container.get(k), str):
+                    slots.append((lambda d=container, k=k: d[k], lambda v, d=container, k=k: d.__setitem__(k, v)))
+    for lst in (item.get("key_points"), (item.get("video_idea") or {}).get("talking_points")
+                if isinstance(item.get("video_idea"), dict) else None):
+        if isinstance(lst, list):
+            for i, v in enumerate(lst):
+                if isinstance(v, str):
+                    slots.append((lambda l=lst, i=i: l[i], lambda v, l=lst, i=i: l.__setitem__(i, v)))
+    for slide in ((item.get("carousel") or {}).get("slides") or []) if isinstance(item.get("carousel"), dict) else []:
+        if isinstance(slide, dict):
+            for k in ("headline", "body"):
+                if isinstance(slide.get(k), str):
+                    slots.append((lambda d=slide, k=k: d[k], lambda v, d=slide, k=k: d.__setitem__(k, v)))
+    return slots
+
+
+async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
+    """Rewords every text in the plan that still uses a generic AI word.
+    Returns how many texts were changed. Never raises."""
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+
+    todo = []
+    for item in items:
+        for get, put in _scrub_slots(item):
+            if find_banned(get(), GENERIC_AI_WORDS):
+                todo.append((get, put))
+    if not todo:
+        return 0
+
+    async def reword(batch):
+        texts = {str(i): get() for i, (get, _) in enumerate(batch)}
+        prompt = (
+            "Reword each text below so it uses none of these words in any form "
+            f"(\"transforms\", \"discovering\" count too): {', '.join(GENERIC_AI_WORDS)}.\n"
+            "Say the specific, plain thing instead. Keep the meaning, length, tone, language, "
+            "line breaks, emojis and hashtags. Change nothing else.\n\n"
+            "Return ONLY valid JSON mapping each id to its reworded text.\n\n"
+            + json.dumps(texts, ensure_ascii=False)
+        )
+        try:
+            ai_request = AIService.build_ai_model(
+                messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
+            )
+            response = await AIService.chat_completion(ai_request)
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            out = _loads_lenient(raw)
+            return out if isinstance(out, dict) else {}
+        except Exception as exc:
+            print(f"[CalendarV2] generic-word reword failed: {exc}", flush=True)
+            return {}
+
+    batches = [todo[i:i + 30] for i in range(0, len(todo), 30)]
+    results = await asyncio.gather(*[reword(b) for b in batches])
+    changed = 0
+    for batch, out in zip(batches, results):
+        for i, (get, put) in enumerate(batch):
+            new = out.get(str(i))
+            text = new if isinstance(new, str) and new.strip() else get()
+            if find_banned(text, GENERIC_AI_WORDS):
+                text = _plain_words(text)
+            if text != get():
+                put(text)
+                changed += 1
+    return changed
 
 
 # ── Creative diversity + anti-boring validation (PRD §14, §29-30) ──────────
@@ -1256,6 +1540,31 @@ def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[
     return [str(w).strip() for w in find_banned(_collect_item_text(idea), words_to_avoid)]
 
 
+def _reader_text(idea: Dict[str, Any]) -> str:
+    """What the audience actually reads: title, hook, description, CTA, the
+    post's headline/caption and slides, the video's script. Internal notes
+    (reasoning, designer notes) aren't held to the generic-word ban."""
+    parts = [str(idea.get(k) or "") for k in ("title", "hook", "description", "cta")]
+    exact_copy = idea.get("exact_copy") or {}
+    if isinstance(exact_copy, dict):
+        parts += [str(exact_copy.get("headline") or ""), str(exact_copy.get("caption") or "")]
+    carousel = idea.get("carousel") or {}
+    if isinstance(carousel, dict):
+        for slide in (carousel.get("slides") or []):
+            if isinstance(slide, dict):
+                parts += [str(slide.get("headline") or ""), str(slide.get("body") or "")]
+    video_idea = idea.get("video_idea") or {}
+    if isinstance(video_idea, dict):
+        parts += [str(video_idea.get("hook") or ""), str(video_idea.get("cta") or "")]
+        parts += [str(x) for x in (video_idea.get("talking_points") or [])]
+    return " \n ".join(p for p in parts if p)
+
+
+def _generic_words_used(idea: Dict[str, Any]) -> List[str]:
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    return [str(w) for w in find_banned(_reader_text(idea), GENERIC_AI_WORDS)]
+
+
 def _validate_item_v2(
     idea: Dict[str, Any],
     is_carousel: bool,
@@ -1284,6 +1593,11 @@ def _validate_item_v2(
     if banned_hits:
         issues.append(
             f"uses word(s)/phrase(s) the brand asked to avoid: {', '.join(banned_hits)} — rewrite without them"
+        )
+    generic_hits = _generic_words_used(idea)
+    if generic_hits:
+        issues.append(
+            f"uses generic AI word(s): {', '.join(generic_hits)} — rewrite those lines in plain, specific words"
         )
     return issues
 
@@ -1354,7 +1668,9 @@ async def _generate_final_copy(
   Concept: {c.get('concept_name') or c.get('creative_concept_name', '')}
   Objective: {c.get('objective')} | Audience segment: {c.get('audience_segment', '')}
   Format: {_fmt_line(c)}"""
-        + (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else "")
+        + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
+           f"make it the subject of the post, by name." if c.get("key_date")
+           else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
         for i, c in enumerate(concepts_chunk)
     )
 
@@ -1534,7 +1850,7 @@ business's actual customers, not a generic reader?
     _CONCEPT_FIELDS = {
         "territory", "subject", "angle", "creative_device", "format_hint", "format",
         "objective", "audience_segment", "concept_name", "day_index", "date",
-        "carousel_slide_count", "holiday_tie_in", "selection_score",
+        "carousel_slide_count", "holiday_tie_in", "selection_score", "key_date",
     }
     merged = []
     for i, idea in enumerate(items):
@@ -1810,6 +2126,9 @@ async def _build_plan_doc(
 
     # Step 6 — assign dates
     dated = _assign_dates(selected, all_dates, holidays_by_date)
+    key_dates_placed = _enforce_key_dates(dated, brand, all_dates)
+    if key_dates_placed:
+        print(f"[CalendarV2] key dates given their post: {key_dates_placed}")
 
     # Step 7 — assign format, dynamic 2-5 slide carousels, capped video/week
     formatted = _assign_formats(dated, brand, existing_assets_summary)
@@ -1870,8 +2189,12 @@ async def _build_plan_doc(
     if len(llm_flagged) > max(6, len(all_items) // 4):
         print(f"[CalendarV2] LLM diversity check flagged {len(llm_flagged)}/{len(all_items)} — implausible, discarding", flush=True)
         llm_flagged = []
-    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged))
-    print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration", flush=True)
+    # Items that still use a generic AI word after the per-chunk retry get the
+    # regeneration pass too, rather than shipping with only a warning.
+    generic_flagged = [it.get("day_index") for it in all_items if _generic_words_used(it)]
+    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged) | set(generic_flagged))
+    print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration "
+          f"({len(generic_flagged)} for generic words)", flush=True)
 
     # Step 12 — regenerate flagged items only, one bounded pass
     regenerated_day_indices: set = set()
@@ -1889,6 +2212,10 @@ async def _build_plan_doc(
         rule_issues = _rule_based_diversity_issues(all_items)
         still_flagged = set(flagged_day_indices) - regenerated_day_indices
         flagged_day_indices = sorted(set(rule_issues.keys()) | still_flagged)
+
+    scrubbed = await _scrub_generic_words(all_items)
+    if scrubbed:
+        print(f"[CalendarV2] reworded {scrubbed} text(s) that still used generic AI words", flush=True)
 
     flagged_set = set(flagged_day_indices)
     anti_boring_notes = _anti_boring_check(all_items, brand_name=brand.get("brand_name", ""))

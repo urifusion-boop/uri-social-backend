@@ -56,6 +56,10 @@ _DEFAULT_EVENTS = {"post_ready", "post_published"}
 # customer is waiting on a person, whatever alerts they picked.
 _ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply"}
 
+# Sent here whatever channel the brand chose, on top of that channel. WhatsApp
+# only goes to owners who linked a number (see notify).
+_DIRECT_TOO = {"inbox_needs_reply": ["email", "whatsapp"]}
+
 
 def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The brand's notification choices, as keys."""
@@ -97,6 +101,9 @@ def channels_for(event: str, prefs: Dict[str, Any]) -> List[str]:
         out.append("email")  # no channel chosen: these two have always gone by email
     if event == "post_ready":
         out += prefs["approval_channels"]
+    # A customer waiting on a person always reaches the owner directly too: a
+    # Slack or push alert alone is easy to miss, and nobody sits on a dashboard.
+    out += _DIRECT_TOO.get(event, [])
     seen: List[str] = []
     for c in out:
         if c not in seen and c != "dashboard":
@@ -197,6 +204,9 @@ async def notify(
     meta = {**(metadata or {}), "brand_id": brand_id, "dedupe_key": dedupe_key, "link": link}
     results: Dict[str, Any] = {}
     for channel in channels_for(event, prefs):
+        # Added on top rather than chosen: no linked number means nothing to send.
+        if channel == "whatsapp" and prefs["channel"] != "whatsapp" and not user.get("whatsapp_phone"):
+            continue
         try:
             ok, error = await _send(db, channel, user, profile, user_id, title, message, link)
         except Exception as exc:  # a channel must never break the caller
