@@ -160,12 +160,13 @@ def _tiktok_cta(destination_cta_key: str) -> str:
 # exact, unambiguous matches for their objectives. VIDEO_VIEW (what was
 # originally guessed here) turned out to be explicitly marked Deprecated in
 # that same reference; ENGAGED_VIEW ("6-second views") is its live replacement,
-# used here instead. LEAD_GENERATION's own optimization_goal is the one
-# genuinely ambiguous pick: TikTok's enum lists BOTH "LEAD_GENERATION" and
-# "LEADS" as distinct values, both described simply as "Leads," with nothing
-# in the reference distinguishing when to use which — LEADS is used here as
-# the more specifically-worded of the two ("people most likely to convert or
-# share contact information"), but this one specifically could still be wrong.
+# used here instead. LEAD_GENERATION's own optimization_goal was genuinely
+# ambiguous — TikTok's enum lists BOTH "LEAD_GENERATION" and "LEADS" as
+# distinct values, both described simply as "Leads" — and live-confirmed
+# 2026-10-20 (real test launch, checked directly in TikTok Ads Manager): LEADS
+# was rejected and the fallback silently kicked in to TRAFFIC (the launched
+# campaign showed "Objective: Traffic" in TikTok's own UI, not Leads). Fixed
+# to "LEAD_GENERATION", the only remaining candidate — not yet re-tested.
 # billing_event per advertising objective confirmed 2026-10-20 against TikTok's
 # own "Available bidding methods" help-center page (Bidding methods compared
 # table): Reach -> CPM, Video views -> CPV, Traffic -> CPC, Lead generation ->
@@ -183,7 +184,7 @@ _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE: dict[str, tuple[str, str]] = {
     "REACH": ("REACH", "CPM"),
     "TRAFFIC": ("CLICK", "CPC"),  # matches _OPTIMIZATION_GOAL/_BILLING_EVENT below — the confirmed pair
     "VIDEO_VIEWS": ("ENGAGED_VIEW", "CPV"),
-    "LEAD_GENERATION": ("LEADS", "OCPM"),
+    "LEAD_GENERATION": ("LEAD_GENERATION", "OCPM"),
 }
 
 # (enum, inclusive lower bound, inclusive upper bound) — confirmed against
