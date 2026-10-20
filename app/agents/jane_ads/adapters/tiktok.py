@@ -1195,7 +1195,13 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "data_level": "AUCTION_AD",
                     "dimensions": json.dumps(["ad_id"]),
                     "metrics": json.dumps(["spend"]),
-                    "filtering": json.dumps([{"field_name": "campaign_id", "filter_type": "IN", "filter_value": json.dumps([campaign_id])}]),
+                    # Live-caught 2026-10-20: "Invalid value for filter field: campaign_id
+                    # is not supported" — this endpoint's filter field is "campaign_ids"
+                    # (plural, confirmed against TikTok's own filtering examples), not
+                    # "campaign_id", and filter_value is a plain comma-separated string
+                    # ("123,456"), not a JSON-encoded array — unlike campaign/get/'s own
+                    # filtering param elsewhere in this file, which really is a JSON object.
+                    "filtering": json.dumps([{"field_name": "campaign_ids", "filter_type": "IN", "filter_value": campaign_id}]),
                     "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
                     "end_date": now.strftime("%Y-%m-%d"),
                     "page": 1,
@@ -1252,7 +1258,13 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "data_level": "AUCTION_CAMPAIGN",
                     "dimensions": json.dumps(["campaign_id"]),
                     "metrics": json.dumps(["clicks", "spend"]),
-                    "filtering": json.dumps([{"field_name": "campaign_id", "filter_type": "IN", "filter_value": json.dumps([campaign_id])}]),
+                    # Live-caught 2026-10-20: "Invalid value for filter field: campaign_id
+                    # is not supported" — this endpoint's filter field is "campaign_ids"
+                    # (plural, confirmed against TikTok's own filtering examples), not
+                    # "campaign_id", and filter_value is a plain comma-separated string
+                    # ("123,456"), not a JSON-encoded array — unlike campaign/get/'s own
+                    # filtering param elsewhere in this file, which really is a JSON object.
+                    "filtering": json.dumps([{"field_name": "campaign_ids", "filter_type": "IN", "filter_value": campaign_id}]),
                     "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
                     "end_date": now.strftime("%Y-%m-%d"),
                     "page": 1,
@@ -1351,7 +1363,13 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "data_level": "AUCTION_CAMPAIGN",
                     "dimensions": json.dumps(["campaign_id"]),
                     "metrics": json.dumps(["impressions", "reach", "clicks", "spend"]),
-                    "filtering": json.dumps([{"field_name": "campaign_id", "filter_type": "IN", "filter_value": json.dumps([campaign_id])}]),
+                    # Live-caught 2026-10-20: "Invalid value for filter field: campaign_id
+                    # is not supported" — this endpoint's filter field is "campaign_ids"
+                    # (plural, confirmed against TikTok's own filtering examples), not
+                    # "campaign_id", and filter_value is a plain comma-separated string
+                    # ("123,456"), not a JSON-encoded array — unlike campaign/get/'s own
+                    # filtering param elsewhere in this file, which really is a JSON object.
+                    "filtering": json.dumps([{"field_name": "campaign_ids", "filter_type": "IN", "filter_value": campaign_id}]),
                     "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
                     "end_date": now.strftime("%Y-%m-%d"),
                     "page": 1,
