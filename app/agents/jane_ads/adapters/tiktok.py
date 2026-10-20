@@ -127,21 +127,17 @@ def _tiktok_objective_type(objective: CampaignObjective) -> str:
     return _TIKTOK_OBJECTIVE.get(objective, "TRAFFIC")
 
 
-# ── call_to_action mapping (2026-10-19) ────────────────────────────────────────
+# ── call_to_action mapping (2026-10-19, confirmed 2026-10-20) ──────────────────
 # ad/create previously hardcoded call_to_action to "CONTACT_US" regardless of
 # which button the client actually picked (plan.destination_cta, a key into
 # destination.CTA_CHOICES) — link_for_plan(plan) was only ever read for its
-# .link, .cta was discarded entirely. TikTok's own call_to_action field is
-# documented as a free string in their SDK (no enforced enum found there,
-# unlike Meta's strict enum) — best-guess below assumes TikTok accepts the
-# same SCREAMING_SNAKE_CASE values Meta does for the ones that are genuinely
-# standard across ad platforms (confirmed as real TikTok CTA display options
-# via their own marketing docs: Learn More, Shop Now, Order Now, Book Now,
-# Sign Up, Contact Us). GET_OFFER has no confirmed TikTok equivalent, so it
-# stays CONTACT_US. NOT independently verified against a live TikTok account —
-# same discipline as _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE: tried first, and the
-# ad/create call below falls back to CONTACT_US on any rejection rather than
-# failing the whole launch over a button label.
+# .link, .cta was discarded entirely. Confirmed directly against TikTok's own
+# canonical "Call-to-action (call_to_action)" Enumerations reference — every
+# value below (LEARN_MORE, SHOP_NOW, ORDER_NOW, BOOK_NOW, SIGN_UP, CONTACT_US)
+# appears there verbatim. GET_OFFER has no TikTok equivalent in that same
+# enum, so it stays CONTACT_US. The fallback-to-CONTACT_US retry below is kept
+# as a defensive safety net (TikTok can still reject a CTA for other reasons,
+# e.g. an account's own eligibility), not because these values are in doubt.
 _TIKTOK_CTA = {
     "LEARN_MORE": "LEARN_MORE",
     "SHOP_NOW": "SHOP_NOW",
@@ -158,21 +154,35 @@ def _tiktok_cta(destination_cta_key: str) -> str:
     return _TIKTOK_CTA.get(meta_cta_value, "CONTACT_US")
 
 
-# optimization_goal/billing_event per objective_type — NOT independently verified
-# against TikTok's own docs (portal access was unavailable 2026-10-19; best-guess
-# from TikTok's own established SCREAMING_SNAKE_CASE enum convention, confirmed
-# elsewhere in this file, plus general ad-platform billing patterns: reach/
-# impression objectives bill CPM, click objectives bill CPC, view objectives bill
-# CPV). TRAFFIC's pair is the one actually confirmed live. Every other pair is
-# tried first but never trusted blindly — see the try/except around campaign+
-# adgroup creation below, which falls back to the confirmed TRAFFIC/CLICK/CPC
-# combination on ANY rejection from TikTok's API, so a wrong guess here degrades
-# to today's known-working behavior instead of breaking the launch outright.
+# optimization_goal/billing_event per objective_type. optimization_goal values
+# are each confirmed to exist against TikTok's own canonical "Optimization Goal
+# (optimization_goal)" Enumerations reference (2026-10-20) — REACH and CLICK are
+# exact, unambiguous matches for their objectives. VIDEO_VIEW (what was
+# originally guessed here) turned out to be explicitly marked Deprecated in
+# that same reference; ENGAGED_VIEW ("6-second views") is its live replacement,
+# used here instead. LEAD_GENERATION's own optimization_goal is the one
+# genuinely ambiguous pick: TikTok's enum lists BOTH "LEAD_GENERATION" and
+# "LEADS" as distinct values, both described simply as "Leads," with nothing
+# in the reference distinguishing when to use which — LEADS is used here as
+# the more specifically-worded of the two ("people most likely to convert or
+# share contact information"), but this one specifically could still be wrong.
+# billing_event values are NOT cross-referenced against optimization_goal in
+# what's been checked so far (the docs page literally titled "Corresponding
+# billing event for an optimization goal" hasn't been reached) — CPM/CPC/CPV
+# below follow the Billing Event enum's own confirmed values, paired by the
+# general ad-platform convention (impression/reach goals bill CPM, click goals
+# bill CPC, view goals bill CPV), not a confirmed TikTok-specific pairing.
+# TRAFFIC's full combination (CLICK/CPC/NO_BID/SMOOTH) is the one actually
+# confirmed live end-to-end. Every other combination is tried first but never
+# trusted blindly — see the try/except around campaign+adgroup creation below,
+# which falls back to TRAFFIC/CLICK/CPC on ANY rejection from TikTok's API, so
+# a wrong guess here degrades to today's known-working behavior instead of
+# breaking the launch outright.
 _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE: dict[str, tuple[str, str]] = {
     "REACH": ("REACH", "CPM"),
     "TRAFFIC": ("CLICK", "CPC"),  # matches _OPTIMIZATION_GOAL/_BILLING_EVENT below — the confirmed pair
-    "VIDEO_VIEWS": ("VIDEO_VIEW", "CPV"),
-    "LEAD_GENERATION": ("LEAD_GENERATION", "CPM"),
+    "VIDEO_VIEWS": ("ENGAGED_VIEW", "CPV"),
+    "LEAD_GENERATION": ("LEADS", "CPM"),
 }
 
 # (enum, inclusive lower bound, inclusive upper bound) — confirmed against
