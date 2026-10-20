@@ -929,7 +929,37 @@ class ApprovalWorkflowService:
                                                 connection=None, reason="token invalidated (detected via scheduled-post poll)",
                                             )
                                     else:
-                                        print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
+                                        # Live-reported bug: Outstand can simply never answer
+                                        # "published" or "failed" for a post_id (seen in prod,
+                                        # October 2026 — a scheduled Facebook post sat here with
+                                        # platform_post_id set and untouched updated_at for 4+
+                                        # days). The 24h overdue-expiry sweep above only matches
+                                        # drafts with platform_post_id=None, so it can never
+                                        # catch this case. Give up after 24h past the scheduled
+                                        # time — same bound and wording as publish_confirmation.
+                                        # py's GIVE_UP_AFTER — instead of waiting on Outstand
+                                        # forever with no error and no sign anything is wrong.
+                                        _sched_dt = draft.get("scheduled_date")
+                                        _age_from = _sched_dt if isinstance(_sched_dt, datetime) else draft.get("updated_at")
+                                        if isinstance(_age_from, datetime) and (current_time - _age_from) >= timedelta(hours=24):
+                                            await db["content_drafts"].update_one(
+                                                {"id": draft["id"]},
+                                                {"$set": {
+                                                    "status": "publish_failed",
+                                                    "error_message": (
+                                                        "We couldn't confirm this post reached "
+                                                        f"{draft.get('platform', 'the network').capitalize()} "
+                                                        "after 24 hours. Check your page — if it isn't there, publish it again."
+                                                    ),
+                                                    # Clear it so the retry_result sweep above can
+                                                    # pick this up for a fresh attempt (capped at 3).
+                                                    "platform_post_id": None,
+                                                    "updated_at": current_time,
+                                                }},
+                                            )
+                                            print(f"⏰ Gave up confirming draft_id={draft['id']} post_id={existing_post_id} — no answer from Outstand 24h+ past scheduled_date")
+                                        else:
+                                            print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
                             except Exception as e:
                                 print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
                                 # 404 = Outstand no longer has the post, so it can't be
