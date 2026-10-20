@@ -130,8 +130,11 @@ class TestV2GuideRespectsLogoPosition:
             "logo_size": "small",
         }
 
+        # _overlay_logo(return_geometry=True) returns (b64, geometry) — same
+        # contract the standard (non-V2) generation path already relies on.
+        fake_geometry = {"x": 940, "y": 20, "width": 120, "height": 120}
         with patch.object(ImageContentService, "_call_dalle_api", side_effect=fake_call_dalle_api), patch.object(
-            ImageContentService, "_overlay_logo", return_value="ZmFrZQ=="
+            ImageContentService, "_overlay_logo", return_value=("ZmFrZQ==", fake_geometry)
         ), patch("cloudinary.uploader.upload", return_value={"secure_url": "https://cdn.example/final.png"}):
             result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id="507f1f77bcf86cd799439011",
@@ -151,6 +154,11 @@ class TestV2GuideRespectsLogoPosition:
         # Highest-weighted position in the prompt, matching the default
         # (non-V2) generation path's convention.
         assert captured["prompt"].strip().startswith("🚨 CRITICAL - LOGO OVERLAY ZONE")
+        # Move Logo needs both of these — previously neither was ever
+        # returned from the V2 path, regardless of brand or platform, so a
+        # V2-guide-generated post could never have its logo repositioned.
+        assert result["logo_placement"] == {**fake_geometry, "position": "top_right", "logo_size": "small"}
+        assert result["background_image_url"] == "data:image/webp;base64,ZmFrZQ=="
 
     @pytest.mark.asyncio
     async def test_final_prompt_has_no_logo_note_when_brand_has_no_logo(self):
