@@ -453,6 +453,20 @@ ANTI_BORING_OPENER_STEMS: List[str] = [
     "supercharg", "revolutioni[sz]", "transform",
 ]
 
+# Words that mark a post as AI-written wherever they appear, not just as an
+# opener. Confirmed on prod (Oct 2026): one 30-day plan used "discover" 17
+# times, "journey" 11, "transform" and its family 18, plus "unlock",
+# "seamless", "game-changing" — the opener check above only flagged them.
+# These are banned outright in the calendar's copy: an item using one is
+# rewritten. Matched as word families (brand_brief.find_banned), so
+# "transform" also catches "transforms"/"transformation".
+GENERIC_AI_WORDS: List[str] = [
+    "transform", "unlock", "discover", "journey", "seamless", "game-changing",
+    "game-changer", "revolutionary", "elevate", "empower", "unleash",
+    "supercharge", "harness", "delve", "dive into", "deep dive", "next level",
+    "skyrocket", "effortless", "navigate the", "in today's",
+]
+
 
 def get_creative_framework(industry: str) -> Dict[str, Any]:
     """The one exported function — Step 2 of the pipeline (PRD §35). Returns

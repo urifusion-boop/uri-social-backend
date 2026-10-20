@@ -264,10 +264,12 @@ class TestCalendarPlanUsesRulesPillarsAndDates:
         assert "CONTENT PILLARS: Behind the scenes, Tips." in block
         assert "Anniversary (2026-11-02)" in block
 
-    def test_empty_profile_adds_nothing(self):
+    def test_empty_profile_adds_only_the_generic_word_ban(self):
         from app.agents.content_calendar_v2.services.content_calendar_v2_service import _brand_rules_block
 
-        assert _brand_rules_block({}) == ""
+        block = _brand_rules_block({})
+        assert "NEVER use these generic AI words" in block
+        assert "HARD RULES" not in block and "CONTENT PILLARS" not in block and "IMPORTANT DATES" not in block
 
 
 @pytest.mark.skipif(not _HAS_VIDEO, reason="video creative / voiceover not on this branch")
