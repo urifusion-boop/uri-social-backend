@@ -177,7 +177,7 @@ class _DB(dict):
 class TestNotifyEndToEnd:
     """notify() with a fake database and faked channel senders."""
 
-    def _run(self, profile, monkeypatch, event="post_published"):
+    def _run(self, profile, monkeypatch, event="post_published", phone="+2348000000000"):
         import asyncio
 
         sent = []
@@ -194,7 +194,7 @@ class TestNotifyEndToEnd:
 
         asyncio.run(setup())
         db = _DB()
-        db["users"] = _Coll([{"userId": "u1", "email": "a@b.co", "whatsapp_phone": "+2348000000000"}])
+        db["users"] = _Coll([{"userId": "u1", "email": "a@b.co", "whatsapp_phone": phone}])
         result = asyncio.run(bn.notify(db, "u1", "b1", event, "Title", "Message", profile=profile))
         return result, sent, db["notifications"].docs
 
@@ -206,6 +206,17 @@ class TestNotifyEndToEnd:
         assert len(records) == 1
         assert records[0]["type"] == "content_created"
         assert set(records[0]["metadata"]["deliveries"]) == {"slack", "whatsapp", "dashboard"}
+
+    def test_a_waiting_customer_reaches_email_and_whatsapp(self, monkeypatch):
+        _, sent, records = self._run({"notification_channel": "Slack",
+                                      "slack_webhook_url": "https://hooks.slack.com/x"},
+                                     monkeypatch, "inbox_needs_reply")
+        assert sent == ["send_slack", "send_email", "send_whatsapp"] and len(records) == 1
+
+    def test_no_whatsapp_attempt_without_a_linked_number(self, monkeypatch):
+        _, sent, records = self._run({}, monkeypatch, "inbox_needs_reply", phone="")
+        assert sent == ["send_email"]
+        assert "whatsapp" not in records[0]["metadata"]["deliveries"]
 
     def test_switched_off_alert_sends_and_logs_nothing(self, monkeypatch):
         result, sent, records = self._run({"notification_events": ["Weekly performance report"],
@@ -224,3 +235,12 @@ class TestNotifyEndToEnd:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_escalations_always_go_by_email_and_whatsapp_on_top_of_the_chosen_channel():
+    assert bn.channels_for("inbox_needs_reply", bn.preferences({})) == ["email", "whatsapp"]
+    slack = bn.preferences({"notification_channel": "Slack"})
+    assert bn.channels_for("inbox_needs_reply", slack) == ["slack", "email", "whatsapp"]
+    whatsapp = bn.preferences({"notification_channel": "WhatsApp"})
+    assert bn.channels_for("inbox_needs_reply", whatsapp) == ["whatsapp", "email"]
+    assert bn.channels_for("post_failed", bn.preferences({})) == ["email"]

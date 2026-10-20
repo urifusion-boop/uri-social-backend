@@ -32,7 +32,7 @@ from bson import ObjectId
 
 from . import situation as sit
 from . import voice
-from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, MESSAGES, Direction, Kind, now
+from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, Direction, Kind, now
 from .send import SendRefused, check_eligibility
 
 SETTINGS = "inbox_agent_settings"
@@ -785,7 +785,12 @@ async def notify_needs_reply(db, workspace_id: str, conv: dict, text: str, reaso
     user_id = await _owner_of(db, workspace_id)
     if not user_id:
         return
-    who = conv.get("display_name") or "A customer"
+    who = conv.get("display_name") or ""
+    if not who and ObjectId.is_valid(conv.get("contact_identity_id", "")):
+        ident = await db[IDENTITIES].find_one(
+            {"_id": ObjectId(conv["contact_identity_id"])}, {"display_name": 1})
+        who = (ident or {}).get("display_name") or ""
+    who = who or "A customer"
     told = " Jane told them someone will reply shortly." if held else ""
     try:
         await brand_notifier.notify(

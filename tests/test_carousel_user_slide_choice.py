@@ -43,10 +43,6 @@ class TestUploadSlideImageIndices:
 
 
 class TestCalendarSlideOverride:
-    def test_v1_request_accepts_num_slides(self):
-        assert csm.CalendarCreateDraftRequest(num_slides=8).num_slides == 8
-        assert csm.CalendarCreateDraftRequest().num_slides is None
-
     def test_v2_request_accepts_num_slides(self):
         from app.agents.content_calendar_v2.models import CreateDraftRequestV2
 
@@ -58,10 +54,6 @@ class TestCalendarSlideOverride:
 
         source = inspect.getsource(mod.create_draft_from_item_v2)
         assert "planned_slides = max(2, min(10, int(request.num_slides)))" in source
-
-    def test_v1_endpoint_forces_user_slide_count(self):
-        source = inspect.getsource(csm.create_draft_from_calendar_day)
-        assert '"num_slides": max(2, min(10, int(request.num_slides))), "force_num_slides": True' in source
 
 
 if __name__ == "__main__":

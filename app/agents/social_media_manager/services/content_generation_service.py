@@ -352,10 +352,10 @@ Write one caption. No alternatives, no meta-commentary.
             )
 
         if brand_context.get("business_stage"):
-            # Same wording as content_calendar_service.py's _STAGE_GUIDANCE — a
+            # Same wording as calendar_rules.py's _STAGE_GUIDANCE — a
             # single source of truth so a single post and a calendar week never
             # disagree on what "new"/"growing"/etc. actually means for tone.
-            from .content_calendar_service import _STAGE_GUIDANCE
+            from .calendar_rules import _STAGE_GUIDANCE
             guidance = _STAGE_GUIDANCE.get(brand_context["business_stage"])
             if guidance:
                 parts.append(f'- Business stage: this is {guidance}.')
