@@ -337,12 +337,12 @@ STRUCTURAL_DEVICE_SLIDE_HINT: Dict[str, int] = {
     "a_vs_b": 2,
     "myth_vs_fact": 3,
     "question_answer": 3,
-    "problem_solution": 4,
-    "before_after_structural": 4,
-    "checklist": 4,
-    "decision_tree": 5,
-    "timeline": 5,
-    "ranking": 4,
+    "problem_solution": 3,
+    "before_after_structural": 3,
+    "checklist": 3,
+    "decision_tree": 3,
+    "timeline": 3,
+    "ranking": 3,
     "test": 3,
     "challenge_structural": 3,
 }
@@ -368,7 +368,7 @@ SERIES_TEMPLATES: List[Dict[str, str]] = [
 # ── Validation rules (PRD §14-15, §28) — deterministic, code-enforced ──────
 VALIDATION_RULES: Dict[str, Any] = {
     "item_count": 30,
-    "carousel_slide_range": (2, 5),
+    "carousel_slide_range": (2, 3),  # business requirement (Oct 2026): carousels capped at 3 slides
     "commercial_territory_max_share": TERRITORIES["L_COMMERCIAL"]["max_share"],
     # PRD §15 — minimums, not fixed percentages. Keys are the "creative
     # buckets" a plan must contain at least one of, mapped from territory/
