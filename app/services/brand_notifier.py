@@ -30,6 +30,7 @@ EVENTS = {
     "Content calendar needs refill": "calendar_refill",
     "Engagement spike detected": "engagement_spike",
     "Customer message needs a reply": "inbox_needs_reply",
+    "Ad performance alerts": "ad_growth_alert",
 }
 EVENT_LABELS = {v: k for k, v in EVENTS.items()}
 
@@ -54,7 +55,7 @@ _DEFAULT_EVENTS = {"post_ready", "post_published"}
 
 # Never optional: an owner must hear that a post didn't go out, or that a
 # customer is waiting on a person, whatever alerts they picked.
-_ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply"}
+_ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply", "ad_growth_alert"}
 
 # Sent here whatever channel the brand chose, on top of that channel. WhatsApp
 # only goes to owners who linked a number (see notify).

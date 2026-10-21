@@ -211,6 +211,19 @@ def _job_jane_ads_token_health():
     _run_async("jane_ads_token_health", _run)
 
 
+def _job_jane_ads_growth():
+    """Growth Intelligence: refresh Meta snapshots, detect, diagnose, recommend, run
+    authorised changes and evaluate finished ones."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.growth import engine
+        db = get_db()
+        result = await engine.run_all(
+            db, notify=lambda rec, d, a=None: engine.notify_owner(db, rec, d, a))
+        print(f"📈 Jane Ads growth: {result}")
+    _run_async("jane_ads_growth", _run)
+
+
 def _job_jane_ads_billing():
     """Jane + Ads ad-spend billing — recoups real Meta spend (× markup) from each
     customer's prepaid wallet and pauses any campaign whose wallet can no longer
@@ -414,6 +427,15 @@ def start_notification_scheduler():
         _job_jane_ads_billing,
         CronTrigger(minute=0),
         id="jane_ads_billing",
+        **_JOB_DEFAULTS,
+    )
+
+    # Growth Intelligence hourly, offset from billing so the two don't share Meta's
+    # rate limit in the same minute.
+    _scheduler.add_job(
+        _job_jane_ads_growth,
+        CronTrigger(minute=20),
+        id="jane_ads_growth",
         **_JOB_DEFAULTS,
     )
 

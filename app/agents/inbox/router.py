@@ -170,6 +170,7 @@ async def list_conversations(
             # Present only when the provider supplied it (PRD §8.6).
             "source_post_id": r.get("source_post_id", ""),
             "source_ad_id": r.get("source_ad_id", ""),
+            "lead_stage": r.get("lead_stage", ""),
             "last_direction": (last[0].get("direction") if last else ""),
             **_agent_view(r),
         })

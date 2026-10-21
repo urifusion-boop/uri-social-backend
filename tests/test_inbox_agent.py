@@ -378,6 +378,17 @@ def test_a_held_message_gets_one_holding_line_until_a_person_replies():
     assert out["status"] == "drafted" and len(sent) == 1
 
 
+def test_a_new_wait_days_later_gets_its_own_holding_line():
+    line = agent.HOLDING_REPLIES["question"]
+    s, conv = _settings(), _conv()
+    recent = _history(("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(hours=1)), ("inbound", "", OPEN_HOURS))
+    stale = _history(("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(days=2)), ("inbound", "", OPEN_HOURS))
+    for h in (recent, stale):
+        [m for m in h if m["direction"] == "outbound"][0]["text"] = line
+    assert agent.should_hold(s, conv, recent, OPEN_HOURS) is False
+    assert agent.should_hold(s, conv, stale, OPEN_HOURS) is True
+
+
 def test_holding_lines_fit_the_situation():
     assert agent.holding_reply({"wants_human": True}, "general") == agent.HOLDING_REPLIES["human"]
     assert agent.holding_reply({"intent": "complaint"}, "complaint") == agent.HOLDING_REPLIES["problem"]
@@ -470,3 +481,13 @@ def test_earlier_auto_replies_dont_stop_new_ones():
     s = _settings()
     rows = [("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(hours=2))] * 5 + [("inbound", "", OPEN_HOURS)]
     assert agent.verdict(s, _conv(), _history(*rows), _cls(), _draft(), OPEN_HOURS) == (True, "")
+
+
+def test_alert_emails_are_cleaned_and_survive_a_save_that_omits_them():
+    clean = agent.normalize_settings({"alert_emails": [" Shore@Example.com", "nope", "shore@example.com"]})
+    assert clean["alert_emails"] == ["shore@example.com"]
+    db = Db()
+    _run(agent.save_settings(db, WS, {"alert_emails": ["a@b.co"]}, "u"))
+    saved = _run(agent.save_settings(db, WS, {"auto_reply_enabled": True}, "u"))
+    assert saved["alert_emails"] == ["a@b.co"]
+    assert _run(agent.load_settings(db, WS))["alert_emails"] == ["a@b.co"]
