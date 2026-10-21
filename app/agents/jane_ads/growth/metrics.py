@@ -93,9 +93,15 @@ async def pull(db, adapter, record: dict, today: Optional[date] = None) -> dict:
         await db[SNAPSHOTS].update_one(
             {"campaign_id": campaign_id, "ad_id": r["ad_id"], "date": r["date"]},
             {"$set": {**r, "brand_id": record.get("brand_id")}}, upsert=True)
+    # What Meta actually sent for one row (metrics only), so a parsing problem can be
+    # seen without access to the token.
+    sample = {k: v for k, v in (data[0] if data else {}).items() if k != "actions"}
+    if data:
+        sample["action_types"] = [a.get("action_type") for a in data[0].get("actions") or []][:12]
     await db[HEALTH].update_one({"campaign_id": campaign_id}, {
         "$set": {"last_success_at": now, "last_error": "", "error_count": 0,
-                 "brand_id": record.get("brand_id")}}, upsert=True)
+                 "brand_id": record.get("brand_id"), "rows_last_pull": len(data), "sample_row": sample}},
+        upsert=True)
     return {"ok": True, "rows": len(rows), "error": ""}
 
 

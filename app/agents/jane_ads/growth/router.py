@@ -113,6 +113,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         "totals": t, "daily": [daily[k] for k in sorted(daily)],
         "health": {"last_updated": h.get("last_success_at"), "last_error": h.get("last_error") or "",
                    "landing": h.get("landing") or {}, "source": metrics.SOURCE,
+                   "rows_last_pull": h.get("rows_last_pull"), "sample_row": h.get("sample_row") or {},
                    "attribution": metrics.ATTRIBUTION},
         "goal": await engine.load_goal(db, campaign_id),
         "diagnoses": diagnoses, "recommendations": recs,
