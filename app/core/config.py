@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     META_API_KEY: str = ""
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
+    # WhatsApp in the unified inbox: the Embedded Signup configuration (Facebook Login
+    # for Business) the "Connect WhatsApp" popup uses, and, for numbers in URI's own
+    # business portfolios, a system-user token with the WhatsApp permissions.
+    WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID: str = ""
+    WHATSAPP_SYSTEM_TOKEN: str = ""
     META_SYSTEM_TOKEN: str = ""
     # URI's own Meta Business Manager id — owned by Ibukun. Until this is set,
     # the ads page-connect flow still runs and stores the page token; only the
