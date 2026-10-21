@@ -57,6 +57,13 @@ DEFAULTS: dict[str, Any] = {
         "max_alerts_per_week": 3,
         "digest_max_items": 5,
     },
+    # Learning (PRD §9.1's "learned adjustment from past feedback", §11)
+    "learning": {
+        "feedback_window_days": 60,     # how far back a brand's own dismiss/save history counts
+        "min_feedback_samples": 4,      # fewer than this for a market+type combo: no adjustment yet
+        "dismiss_rate_threshold": 0.7,  # dismiss rate above this starts lowering relevance
+        "max_penalty": 25,              # relevance points subtracted at a 100% dismiss rate
+    },
     # Discovery (keyword lifecycle, PRD §6.3)
     "discovery": {
         "window_days": 10,              # evidence lookback for every status check
