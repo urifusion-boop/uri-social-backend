@@ -91,6 +91,36 @@ class TestBuildBottomMarginRule:
         )
         assert "logo" in rule.lower()
 
+    def test_top_positioned_logo_does_not_reserve_the_bottom(self):
+        """Live bug: a brand with logo_position="top_left" still got the
+        full 30% bottom reservation (this function only checked logo_url,
+        never logo_position), producing a correctly top-left-placed logo
+        plus an entirely separate, pointless, un-filled blank band at the
+        bottom — nothing was ever going to be composited there."""
+        for pos in ("top_left", "top_center", "top_right"):
+            rule = ImageContentService.build_bottom_margin_rule(
+                {"logo_url": "https://example.com/logo.png", "logo_position": pos}
+            )
+            assert "30%" not in rule, f"logo_position={pos} should not reserve the bottom"
+            assert "EMPTY SPACE" not in rule, f"logo_position={pos} should not reserve the bottom"
+
+    def test_bottom_positioned_logo_still_reserves_the_bottom(self):
+        for pos in ("bottom_left", "bottom_center", "bottom_right"):
+            rule = ImageContentService.build_bottom_margin_rule(
+                {"logo_url": "https://example.com/logo.png", "logo_position": pos}
+            )
+            assert "30%" in rule, f"logo_position={pos} should still reserve the bottom"
+
+    def test_unset_logo_position_defaults_to_bottom_right_and_still_reserves(self):
+        """No logo_position key at all — _overlay_logo's own default is
+        bottom_right, so the reservation must match that default exactly,
+        not silently stop reserving for brands that never explicitly set
+        a position."""
+        rule = ImageContentService.build_bottom_margin_rule(
+            {"logo_url": "https://example.com/logo.png"}
+        )
+        assert "30%" in rule
+
 
 class TestV2GuideRespectsLogoPosition:
     """generate_image_with_v2_guide previously built its prompt with zero
