@@ -9,7 +9,7 @@ import httpx
 
 from app.core.config import settings
 from app.database import get_db
-from app.utils.s3_upload import upload_file_path
+from app.utils.s3_upload import upload_bytes, upload_file_path
 
 # Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
 # (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
@@ -202,6 +202,57 @@ _MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
     "fal-ai/ai-avatar/single-text": 1800,
     "minimax/h3-max/lip-sync/image-to-video": 1800,  # same family/speed as the avatar model above
 }
+
+
+async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
+    """minimax/h3-max/lip-sync/image-to-video hard-rejects audio under 5s
+    ("Audio duration must be between 5 and 900 seconds") — live-confirmed
+    2026-10-21: this pipeline chops a script into short (~5-10s) scenes, and
+    a single scene's cloned dialogue routinely comes in under that floor,
+    which previously made the whole talking_dialogue attempt fail over to
+    generic Veo, losing both the cloned voice AND real lip-sync. Pads with
+    trailing silence instead (mouth goes idle for the silent tail, which
+    reads fine) so a short scene still gets the real Nigerian voice.
+    0.2s margin above the bare 5.0s floor, not cutting it exactly that fine.
+
+    Returns the original URL unchanged if it's already long enough, or if it
+    can't be parsed as PCM WAV (fal-ai/f5-tts's own output; some float/non-PCM
+    encoding would fail `wave.open` here) — the caller's own fallback (see
+    _generate_scene_fal) is the last safety net if a clip still gets rejected.
+    """
+    import io
+    import wave
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(audio_url)
+        resp.raise_for_status()
+        raw = resp.content
+
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as w:
+            n_channels = w.getnchannels()
+            sampwidth = w.getsampwidth()
+            framerate = w.getframerate()
+            n_frames = w.getnframes()
+            frames = w.readframes(n_frames)
+    except wave.Error:
+        return audio_url
+
+    duration = n_frames / framerate
+    if duration >= min_seconds:
+        return audio_url
+
+    silence_frames = int((min_seconds - duration) * framerate)
+    silence = b"\x00" * (silence_frames * n_channels * sampwidth)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(n_channels)
+        out.setsampwidth(sampwidth)
+        out.setframerate(framerate)
+        out.writeframes(frames + silence)
+
+    return await upload_bytes(buf.getvalue(), folder="uri-social/generated-audio", resource_type="audio")
 
 
 def _jobs_collection():
@@ -552,40 +603,7 @@ class VideoGenerationService:
             if not dialogue:
                 raise ValueError("Talking Avatar requires a scripted line — this scene has no dialogue")
 
-            if avatar_voice in NIGERIAN_VOICE_REFS:
-                # Clone the reference sample reading this scene's actual line
-                # (fal-ai/f5-tts), then lip-sync that audio to the frame image
-                # (minimax/h3-max/lip-sync/image-to-video) — see NIGERIAN_VOICE_REFS
-                # and the MODEL_REGISTRY entry above for why this two-step path
-                # exists instead of _AVATAR_TALKING's single text_input+voice call.
-                tts_result = await VideoGenerationService._submit_and_poll(
-                    "fal-ai/f5-tts",
-                    {
-                        "gen_text": dialogue,
-                        "ref_audio_url": NIGERIAN_VOICE_REFS[avatar_voice],
-                        "model_type": "F5-TTS",
-                    },
-                    _FAL_SUBSCRIBE_TIMEOUT_SECONDS,
-                    scene_num,
-                    job_id,
-                )
-                cloned_audio_url = tts_result["audio_url"]["url"]
-
-                model = _NG_LIPSYNC
-                info = MODEL_REGISTRY[model]
-                # No duration field on this model — the output simply runs as
-                # long as the supplied audio does. Same word-count estimate
-                # _AVATAR_TALKING's own branch used, as a placeholder; overridden
-                # below with the real reported duration once the call completes.
-                word_count = max(1, len(dialogue.split()))
-                actual_seconds = min(word_count / 3.0, duration_req)
-                arguments = {
-                    "image_url": frame_image_url,
-                    "audio_url": cloned_audio_url,
-                    "resolution": "480P",
-                }
-                print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, cloned), ~{actual_seconds}s")
-            else:
+            def _western_avatar_args(line: str) -> tuple[Dict[str, Any], float]:
                 # No duration field on this model — it's driven by num_frames at
                 # a fixed internal frame rate. fal.ai doesn't publish the fps for
                 # this endpoint; 25fps is the standard rate for the MultiTalk-
@@ -605,19 +623,60 @@ class VideoGenerationService:
                 # under the real synthesized audio rather than risking the same
                 # error from an optimistic guess. Still capped by duration_req so
                 # a long line in a short scene doesn't run past the scene's pacing.
+                wc = max(1, len(line.split()))
+                secs = min(wc / 3.0, duration_req)
+                nf = max(41, min(721, round(secs * fps)))
+                return (
+                    {
+                        "image_url": frame_image_url,
+                        "text_input": line,
+                        "voice": avatar_voice if avatar_voice in AVATAR_VOICES else DEFAULT_AVATAR_VOICE,
+                        "prompt": prompt or line,
+                        "num_frames": nf,
+                        "resolution": "480p",  # fixed — 720p doubles the $/sec rate baked into MODEL_REGISTRY above
+                    },
+                    round(nf / fps, 2),
+                )
+
+            if avatar_voice in NIGERIAN_VOICE_REFS:
+                # Clone the reference sample reading this scene's actual line
+                # (fal-ai/f5-tts), then lip-sync that audio to the frame image
+                # (minimax/h3-max/lip-sync/image-to-video) — see NIGERIAN_VOICE_REFS
+                # and the MODEL_REGISTRY entry above for why this two-step path
+                # exists instead of _AVATAR_TALKING's single text_input+voice call.
+                tts_result = await VideoGenerationService._submit_and_poll(
+                    "fal-ai/f5-tts",
+                    {
+                        "gen_text": dialogue,
+                        "ref_audio_url": NIGERIAN_VOICE_REFS[avatar_voice],
+                        "model_type": "F5-TTS",
+                    },
+                    _FAL_SUBSCRIBE_TIMEOUT_SECONDS,
+                    scene_num,
+                    job_id,
+                )
+                cloned_audio_url = tts_result["audio_url"]["url"]
+                try:
+                    cloned_audio_url = await _pad_wav_silence(cloned_audio_url)
+                except Exception as pad_err:
+                    print(f"[VideoGen] Scene {scene_num}: silence-padding failed ({pad_err}), using clip as-is")
+
+                model = _NG_LIPSYNC
+                info = MODEL_REGISTRY[model]
+                # No duration field on this model — the output simply runs as
+                # long as the supplied audio does. Same word-count estimate
+                # _AVATAR_TALKING's own branch used, as a placeholder; overridden
+                # below with the real reported duration once the call completes.
                 word_count = max(1, len(dialogue.split()))
-                estimated_speech_seconds = word_count / 3.0
-                seconds = min(estimated_speech_seconds, duration_req)
-                num_frames = max(41, min(721, round(seconds * fps)))
-                actual_seconds = round(num_frames / fps, 2)
+                actual_seconds = min(word_count / 3.0, duration_req)
                 arguments = {
                     "image_url": frame_image_url,
-                    "text_input": dialogue,
-                    "voice": avatar_voice if avatar_voice in AVATAR_VOICES else DEFAULT_AVATAR_VOICE,
-                    "prompt": prompt or dialogue,
-                    "num_frames": num_frames,
-                    "resolution": "480p",  # fixed — 720p doubles the $/sec rate baked into MODEL_REGISTRY above
+                    "audio_url": cloned_audio_url,
+                    "resolution": "480P",
                 }
+                print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, cloned), ~{actual_seconds}s")
+            else:
+                arguments, actual_seconds = _western_avatar_args(dialogue)
                 print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}), ~{actual_seconds}s")
 
         else:
@@ -638,6 +697,20 @@ class VideoGenerationService:
                 print(f"[VideoGen] Scene {scene_num}: audio flagged, retrying without audio")
                 toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
                 arguments = {**arguments, toggle_key: False}
+                result = await VideoGenerationService._submit_and_poll(
+                    model, arguments, model_timeout, scene_num, job_id
+                )
+            elif model == _NG_LIPSYNC:
+                # Cloned+padded audio still got rejected (some other validation
+                # issue _pad_wav_silence didn't cover) — degrade to the normal
+                # Western voice for this one scene rather than letting this
+                # propagate up to run_job's own primary/fallback, which would
+                # lose lip-sync entirely by falling through to generic Veo.
+                print(f"[VideoGen] Scene {scene_num}: Nigerian voice path failed ({e}), using default voice instead")
+                model = _AVATAR_TALKING
+                info = MODEL_REGISTRY[model]
+                model_timeout = _MODEL_TIMEOUT_OVERRIDES.get(model, _FAL_SUBSCRIBE_TIMEOUT_SECONDS)
+                arguments, actual_seconds = _western_avatar_args(dialogue)
                 result = await VideoGenerationService._submit_and_poll(
                     model, arguments, model_timeout, scene_num, job_id
                 )
