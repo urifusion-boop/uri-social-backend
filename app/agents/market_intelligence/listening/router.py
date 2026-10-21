@@ -83,9 +83,15 @@ async def listening_status(ctx: dict = Depends(get_active_brand_context),
         signals = await db["mi_listen_signals"].count_documents({"market": key, "status": "active",
                                                                  "expires_at": {"$gt": datetime.utcnow()}})
         topics = await db["mi_market_topics"].count_documents({"market": key})
+        topic_statuses: dict = {}
+        async for row in db["mi_market_topics"].aggregate([
+            {"$match": {"market": key}}, {"$group": {"_id": "$status", "n": {"$sum": 1}}},
+        ]):
+            topic_statuses[row["_id"]] = row["n"]
         out_markets.append({
             "key": key, "label": m.get("label"), "last_collected_at": m.get("last_collected_at"),
-            "learned_terms": m.get("learned_terms") or [], "topics": topics, "active_signals": signals,
+            "learned_terms": m.get("learned_terms") or [], "topics": topics, "topic_statuses": topic_statuses,
+            "active_signals": signals,
             "last_run": {k: (last or {}).get(k) for k in ("status", "started_at", "finished_at", "items_returned",
                                                           "new_items", "covered_from", "note", "per_query")} if last else None,
         })

@@ -56,6 +56,18 @@ DEFAULTS: dict[str, Any] = {
         "alert_min_score": 80,
         "max_alerts_per_week": 3,
     },
+    # Discovery (keyword lifecycle, PRD §6.3)
+    "discovery": {
+        "window_days": 10,              # evidence lookback for every status check
+        "candidate_min_accounts": 3,    # observed -> candidate
+        "candidate_min_relevance": 0.5,
+        "candidate_timeout_days": 21,   # candidate -> retired if never promoted
+        "monitor_min_accounts": 5,      # candidate -> monitored (added to learned_terms)
+        "monitor_min_days": 3,
+        "monitor_min_relevance": 0.6,
+        "pause_min_relevance": 0.3,     # monitored -> paused (dropped from learned_terms)
+        "pause_after_windows": 3,       # consecutive low-yield runs before pausing
+    },
 }
 
 
