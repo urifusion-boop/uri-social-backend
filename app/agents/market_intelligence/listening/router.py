@@ -18,7 +18,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, profile as profile_mod
+from . import collector, discovery, permissions, profile as profile_mod
 from .config import get_config
 from .cycle import run_cycle
 
@@ -308,3 +308,30 @@ async def curation_decide(market_key: str, topic_key: str, body: CurationDecisio
     if not result["found"]:
         raise HTTPException(status_code=404, detail="Topic not found")
     return UriResponse.get_single_data_response("topic", result)
+
+
+# ── Source permission records (PRD §15) — admin-only ─────────────────────────
+
+@router.get("/curation/sources")
+async def list_source_permissions(admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    await permissions.ensure_seeded(db)
+    out = [doc async for doc in db["mi_source_permissions"].find({})]
+    for doc in out:
+        doc.pop("_id", None)
+    return UriResponse.get_single_data_response("sources", out)
+
+
+class SourceApproval(BaseModel):
+    approved: bool
+    notes: Optional[str] = None
+
+
+@router.post("/curation/sources/{source}/approval")
+async def set_source_approval(source: str, body: SourceApproval, admin: dict = Depends(_verify_admin),
+                              db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Approve or revoke a source's permission record. A revoked source
+    stops collecting on its very next run — collect_market checks this
+    before doing anything else."""
+    actor = (admin.get("claims") or {}).get("email") or "admin"
+    result = await permissions.set_approval(db, source, body.approved, actor, body.notes)
+    return UriResponse.get_single_data_response("source", result)
