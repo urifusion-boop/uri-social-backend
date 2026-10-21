@@ -55,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "delivery": {
         "alert_min_score": 80,
         "max_alerts_per_week": 3,
+        "digest_max_items": 5,
     },
     # Discovery (keyword lifecycle, PRD §6.3)
     "discovery": {
