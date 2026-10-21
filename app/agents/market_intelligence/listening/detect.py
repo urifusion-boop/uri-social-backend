@@ -78,7 +78,7 @@ def confidence(authors: int, min_authors: int, coverage: float, history_days: in
                  + min(1.0, history_days / max(min_history, 1)) * 0.2 + reading_conf * 0.15, 3)
 
 
-async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = None) -> list[dict]:
+async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = None, persist: bool = True) -> list[dict]:
     d = cfg["detect"]
     now = hour_floor(now or datetime.utcnow())
     days = d["baseline_days"]
@@ -148,10 +148,11 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
                 signals.append(sig)
 
     signals += await _recurring_needs(db, market, cfg, now, cov)
-    for s in signals:
-        await db["mi_listen_signals"].update_one(
-            {"market": s["market"], "topic": s["topic"], "type": s["type"], "day": s["day"]},
-            {"$set": s, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}}, upsert=True)
+    if persist:
+        for s in signals:
+            await db["mi_listen_signals"].update_one(
+                {"market": s["market"], "topic": s["topic"], "type": s["type"], "day": s["day"]},
+                {"$set": s, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}}, upsert=True)
     return signals
 
 

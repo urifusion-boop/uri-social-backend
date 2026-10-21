@@ -18,8 +18,8 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, permissions, profile as profile_mod, review
-from .config import get_config
+from . import collector, discovery, permissions, profile as profile_mod, replay, review
+from .config import _merge, get_config
 from .cycle import run_cycle
 
 router = APIRouter(prefix="/listening", tags=["Market Intelligence · Listening"])
@@ -368,3 +368,36 @@ async def resolve_pending_review(market_key: str, source_id: str, body: ReviewRe
     if not result["found"]:
         raise HTTPException(status_code=404, detail="Reading not found")
     return UriResponse.get_single_data_response("review", result)
+
+
+# ── Offline replay (PRD §17) — admin-only ─────────────────────────────────────
+
+class ReplayRequest(BaseModel):
+    market: str
+    at: List[str]            # ISO timestamps to replay as of — matches a historical cycle run's own `now`
+    candidate_overrides: dict = {}
+
+
+@router.post("/curation/replay")
+async def replay_detection(body: ReplayRequest, admin: dict = Depends(_verify_admin),
+                           db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Runs a candidate config (e.g. different detection thresholds or
+    score weights) against already-stored history and compares it with
+    what the live config actually produced and stored at the time — PRD
+    §17's offline replay, before a threshold/weight change ships. Nothing
+    here is persisted to mi_listen_signals."""
+    market = await db["mi_markets"].find_one({"key": body.market})
+    if not market:
+        raise HTTPException(status_code=404, detail="Market not found")
+    market.pop("_id", None)
+
+    if not body.at:
+        raise HTTPException(status_code=400, detail="At least one timestamp in 'at' is required")
+    try:
+        timestamps = [datetime.fromisoformat(t) for t in body.at]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="'at' entries must be ISO timestamps")
+
+    candidate_cfg = _merge(await get_config(db), body.candidate_overrides)
+    results = await replay.replay_range(db, market, candidate_cfg, timestamps)
+    return UriResponse.get_single_data_response("replay", results)
