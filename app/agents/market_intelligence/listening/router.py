@@ -15,9 +15,10 @@ from pydantic import BaseModel
 
 from app.dependencies import get_active_brand_context, get_db_dependency
 from app.domain.responses.uri_response import UriResponse
+from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, profile as profile_mod
+from . import collector, discovery, profile as profile_mod
 from .config import get_config
 from .cycle import run_cycle
 
@@ -258,3 +259,52 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
         "card_id": card_id, "draft_ids": draft_ids,
         "request_id": (result.get("responseData") or {}).get("request_id"),
     })
+
+
+# ── Ontology curation (PRD §6.3's curation console, §17's human review) ──────
+# Admin-only: a market and its topics are shared across every subscribed
+# business, not any one tenant's own data, so this isn't gated by
+# require_mi_write_access (brand-scoped) like everything above it.
+
+def _clean_topic(t: dict) -> dict:
+    t = dict(t)
+    t.pop("_id", None)
+    return t
+
+
+@router.get("/curation/topics")
+async def curation_topics(status: Optional[str] = None, market: Optional[str] = None, limit: int = 50,
+                          admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Topics waiting on a human decision: by default, 'observed' and
+    'candidate' — the two states update_market() can't promote out of on
+    its own without more evidence, which is exactly what a curator looks
+    at and decides about instead of waiting."""
+    statuses = [status] if status else ["observed", "candidate"]
+    bad = [s for s in statuses if s not in discovery.VALID_STATUSES]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(discovery.VALID_STATUSES)}")
+    q: dict = {"status": {"$in": statuses}}
+    if market:
+        q["market"] = market
+    topics = [_clean_topic(t) async for t in db["mi_market_topics"].find(q).sort([("last_seen", -1)]).limit(min(limit, 200))]
+    return UriResponse.get_single_data_response("topics", topics)
+
+
+class CurationDecision(BaseModel):
+    status: str
+    reason: Optional[str] = None
+
+
+@router.post("/curation/topics/{market_key}/{topic_key}/decide")
+async def curation_decide(market_key: str, topic_key: str, body: CurationDecision,
+                          admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """A curator's manual override — promote straight to monitored (added
+    to the market's own searches) or demote/retire, bypassing (or
+    confirming ahead of) the automatic evidence thresholds."""
+    if body.status not in discovery.VALID_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(discovery.VALID_STATUSES)}")
+    actor = (admin.get("claims") or {}).get("email") or "curator"
+    result = await discovery.set_topic_status(db, market_key, topic_key, body.status, body.reason, actor=actor)
+    if not result["found"]:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return UriResponse.get_single_data_response("topic", result)
