@@ -114,6 +114,29 @@ class MetaAPIError(Exception):
         return self.code in self._RATE_LIMIT_CODES
 
 
+class WhatsAppNotLinked(MetaAPIError):
+    """Meta refused a WhatsApp ad because the number isn't linked to the Page it runs
+    on. Linking is a manual step in Meta that only the Page's owner can do, so the
+    launch stops and says how — it never quietly becomes a lesser link ad."""
+
+    def __init__(self, message: str, page_id: str, whatsapp_number: str,
+                 code: Optional[int] = None, subcode: Optional[int] = None) -> None:
+        super().__init__(message, code=code, subcode=subcode)
+        self.page_id = page_id
+        self.whatsapp_number = whatsapp_number
+
+
+# How Meta says "this Page can't send people to WhatsApp": the number isn't linked
+# (1487246), review fails on it (2446880), or the ad is refused outright with
+# "Invalid ad campaign destination type" (2446509, live 2026-10-21 on a client Page
+# with no WhatsApp linked).
+_WHATSAPP_REFUSALS = {1487246, 2446880, 2446509}
+
+
+def _whatsapp_refusal(data: dict) -> bool:
+    return (data.get("error") or {}).get("error_subcode") in _WHATSAPP_REFUSALS
+
+
 def _raise_for_error(data: dict, context: str) -> None:
     if "error" in data:
         err = data["error"]
@@ -196,6 +219,15 @@ def _with_city_radius(targeting: dict) -> dict:
         "cities": [{**_CITY_RADIUS, **c} if isinstance(c, dict) and "radius" not in c else c
                    for c in cities],
     }}
+
+
+def _raise_not_linked(data: dict, plan) -> None:
+    err = data.get("error") or {}
+    raise WhatsAppNotLinked(
+        f"WhatsApp {plan.whatsapp_number} isn't linked to Page {plan.page_id}: "
+        f"{err.get('error_user_msg') or err.get('message')}",
+        page_id=plan.page_id, whatsapp_number=plan.whatsapp_number,
+        code=err.get("code"), subcode=err.get("error_subcode"))
 
 
 class MetaAdPlatformAdapter(AdPlatformAdapter):
@@ -544,40 +576,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     adset_data = adset_resp.json()
 
                 # Meta is the only reliable oracle for "is this number linked to this
-                # Page", and it answers by rejecting the create with subcode 1487246.
-                # A failed ad set create leaves NOTHING behind, so retrying as a wa.me
-                # link ad is safe and costs no extra call on the path that works —
-                # unlike the Page-field check this replaced, which returned False for a
-                # Page that Meta happily accepts native ads on and so downgraded every
-                # such campaign (live-verified 2026-09-09 on page 203213912878798).
-                #
-                # Only 1487246 falls back. Every other error must surface as itself
-                # rather than be silently turned into a lesser ad.
-                if (
-                    want_native_whatsapp
-                    and use_native_whatsapp
-                    and (adset_data.get("error") or {}).get("error_subcode") == 1487246
-                ):
-                    print(
-                        f"[MetaAds] {plan.whatsapp_number} is not linked to page "
-                        f"{plan.page_id} — retrying as a wa.me link ad",
-                        flush=True,
-                    )
-                    use_native_whatsapp = False
-                    # A NEW dict rather than mutating the rejected one: httpx holds a
-                    # reference to what was sent, so editing it in place would rewrite
-                    # the record of the first attempt too.
-                    adset_payload = {
-                        k: v for k, v in adset_payload.items()
-                        if k not in ("destination_type", "promoted_object")
-                    }
-                    adset_payload["optimization_goal"] = "LINK_CLICKS"
-                    adset_resp = await client.post(
-                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
-                        params={"access_token": self._access_token},
-                        json=adset_payload,
-                    )
-                    adset_data = adset_resp.json()
+                # Page", and it answers by refusing the create. The ad stays a WhatsApp
+                # ad: the client is told to link the number and launch again, rather
+                # than being given a link ad that can never count a conversation.
+                if want_native_whatsapp and _whatsapp_refusal(adset_data):
+                    _raise_not_linked(adset_data, plan)
 
                 # Named areas carry their REAL boundaries, which are far smaller than
                 # the radius pins they replaced — a named neighbourhood estimates
@@ -719,6 +722,8 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     json=creative_body,
                 )
                 creative_data = creative_resp.json()
+                if want_native_whatsapp and _whatsapp_refusal(creative_data):
+                    _raise_not_linked(creative_data, plan)
                 _raise_for_error(creative_data, "ad creative creation")
                 creative_id = creative_data["id"]
 
@@ -733,6 +738,8 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     },
                 )
                 ad_data = ad_resp.json()
+                if want_native_whatsapp and _whatsapp_refusal(ad_data):
+                    _raise_not_linked(ad_data, plan)
                 _raise_for_error(ad_data, "ad creation")
                 ad_id = ad_data["id"]
         except Exception:
