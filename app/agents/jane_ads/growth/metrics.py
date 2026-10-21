@@ -125,7 +125,10 @@ async def check_landing_page(url: str) -> dict:
         return {"checked": True, "ok": ok, "status": resp.status_code, "seconds": round(secs, 1),
                 "url": url, "checked_at": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
-        return {"checked": True, "ok": False, "status": None, "error": str(e)[:200], "url": url,
+        reason = {"ConnectError": "couldn't connect", "ConnectTimeout": "timed out connecting",
+                  "ReadTimeout": "took too long to respond"}.get(type(e).__name__, type(e).__name__)
+        return {"checked": True, "ok": False, "status": None,
+                "error": f"{reason}{': ' + str(e)[:160] if str(e) else ''}", "url": url,
                 "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
