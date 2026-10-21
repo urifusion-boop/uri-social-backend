@@ -49,7 +49,13 @@ def test_plan_prompt_carries_rules_pillars_and_key_dates():
     assert "HARD RULES" in block and "NEVER mention or reference: politics." in block
     assert "CONTENT PILLARS: Hair care tips, Styling, Behind the scenes" in block
     assert "IMPORTANT DATES for this brand: Store anniversary: 12 March" in block
-    assert svc._brand_rules_block({}) == ""
+    # The generic-AI-word ban always applies, even with no brand-specific
+    # rules at all — only the brand-conditional sections (hard rules,
+    # pillars, key dates, formats) are empty for an empty brand dict.
+    empty_block = svc._brand_rules_block({})
+    assert "NEVER use these generic AI words" in empty_block
+    assert "HARD RULES" not in empty_block
+    assert "CONTENT PILLARS" not in empty_block
 
 
 def test_calendar_checks_guardrail_banned_words_in_every_form():

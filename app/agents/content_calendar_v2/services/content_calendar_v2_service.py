@@ -24,7 +24,7 @@ exists to hold.
 Selection now runs a staged pipeline (PRD §32-38): load creative framework
 -> generate ~80 candidate CONCEPTS (structured only, no copy) -> score on
 9 non-performance dimensions -> diversity-optimized select 30 -> assign
-dates -> assign format (dynamic 2-5 slide carousels, not fixed) -> generate
+dates -> assign format (dynamic 2-3 slide carousels, not fixed) -> generate
 final copy + creative direction (concept-conditioned, one combined call per
 chunk — see _generate_final_copy's docstring for why two stages share one
 network round-trip) -> ad evaluation -> validate (deterministic + semantic
@@ -101,6 +101,10 @@ CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item
 
 MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
 MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN = 3   # the brand picked Reels/video in its Playbook
+MIN_CAROUSEL_FORMATS_PER_WEEK = 1   # business requirement (Oct 2026): 1-2 carousels per week
+MAX_CAROUSEL_FORMATS_PER_WEEK = 2
+MAX_CAPTION_WORDS = 60   # business requirement (Oct 2026): captions were coming back too wordy;
+                         # TEXT DENSITY was only ever a prompt suggestion, never a hard cap
                                   # (video/product_video/ai_video) per 7-day calendar week
 _VIDEO_FORMATS = {"video", "product_video", "ai_video"}
 
@@ -966,7 +970,7 @@ def _enforce_key_dates(dated: List[Dict[str, Any]], brand: Dict[str, Any], all_d
     return placed
 
 
-# ── Step 7 — Assign format, dynamic 2-5 slide carousels (PRD §16-17) ───────
+# ── Step 7 — Assign format, dynamic 2-3 slide carousels (business rule) ───
 
 def _pick_carousel_slide_count(concept: Dict[str, Any]) -> int:
     device_key = (concept.get("creative_device") or {}).get("device", "")
@@ -1035,17 +1039,24 @@ def _assign_formats(
     dated: List[Dict[str, Any]], brand: Dict[str, Any], existing_assets_summary: str,
 ) -> List[Dict[str, Any]]:
     """Runs _assign_format across the whole plan, enforcing
-    MAX_VIDEO_FORMATS_PER_WEEK — user requirement. _assign_format decides
-    each item's format independently with no awareness of any other item, so
-    the weekly cap has to be enforced here: a running per-week counter,
-    downgrading to "image" once a week's video quota is already spent.
+    MAX_VIDEO_FORMATS_PER_WEEK and MAX_CAROUSEL_FORMATS_PER_WEEK — business
+    requirements. _assign_format decides each item's format independently
+    with no awareness of any other item, so the weekly caps have to be
+    enforced here: running per-week counters, downgrading to "image" once a
+    week's video or carousel quota is already spent. A second, best-effort
+    pass then tops up any week that ended with zero carousels (the business
+    wants 1-2 a week, not a bare maximum) by upgrading one of that week's
+    plain "image" items — never a video, never one already pinned to some
+    other format by the brand's own allowed-formats list.
     Assumes `dated` is already in day_index order (it is — _assign_dates
     walks the plan sequentially)."""
     allowed = _allowed_formats(brand)
     video_cap = MAX_VIDEO_FORMATS_PER_WEEK
     if allowed and allowed & _VIDEO_FORMATS:
         video_cap = MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN
+    carousel_cap = MAX_CAROUSEL_FORMATS_PER_WEEK
     video_count_by_week: Dict[int, int] = {}
+    carousel_count_by_week: Dict[int, int] = {}
     used: Dict[str, int] = {}
     result = []
     for c in dated:
@@ -1053,13 +1064,16 @@ def _assign_formats(
         week = c.get("day_index", 0) // 7
         fmt = assigned.get("format")
         video_full = video_count_by_week.get(week, 0) >= video_cap
-        if (allowed and fmt not in allowed) or (fmt in _VIDEO_FORMATS and video_full):
+        carousel_full = carousel_count_by_week.get(week, 0) >= carousel_cap
+        over_quota = (fmt in _VIDEO_FORMATS and video_full) or (fmt == "carousel" and carousel_full)
+        if (allowed and fmt not in allowed) or over_quota:
             if not allowed:
                 options = ["image"]
             else:
                 options = [f for f in _FORMAT_FALLBACK_ORDER
-                           if f in allowed and not (f in _VIDEO_FORMATS and video_full)]
-                if not options:   # only video allowed and this week's quota is spent
+                           if f in allowed and not (f in _VIDEO_FORMATS and video_full)
+                           and not (f == "carousel" and carousel_full)]
+                if not options:   # only the quota-spent format is allowed this week
                     options = [f for f in _FORMAT_FALLBACK_ORDER if f in allowed]
             new_fmt = min(options, key=lambda f: (used.get(f, 0), _FORMAT_FALLBACK_ORDER.index(f)))
             assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
@@ -1069,8 +1083,26 @@ def _assign_formats(
             fmt = new_fmt
         if fmt in _VIDEO_FORMATS:
             video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+        elif fmt == "carousel":
+            carousel_count_by_week[week] = carousel_count_by_week.get(week, 0) + 1
         used[fmt] = used.get(fmt, 0) + 1
         result.append(assigned)
+
+    if allowed is None or "carousel" in allowed:
+        weeks_present = {c.get("day_index", 0) // 7 for c in dated}
+        for week in weeks_present:
+            if carousel_count_by_week.get(week, 0) >= MIN_CAROUSEL_FORMATS_PER_WEEK:
+                continue
+            for item in reversed(result):
+                if (item.get("day_index", 0) // 7) != week:
+                    continue
+                if item.get("format") != "image":
+                    continue
+                item.pop("carousel_slide_count", None)
+                item["format"] = "carousel"
+                item["carousel_slide_count"] = _pick_carousel_slide_count(item)
+                carousel_count_by_week[week] = carousel_count_by_week.get(week, 0) + 1
+                break
     return result
 
 
@@ -1460,25 +1492,46 @@ def _anti_boring_check(items: List[Dict[str, Any]], brand_name: str = "") -> Dic
 
 
 def _clamp_carousel(idea: Dict[str, Any], target: int) -> None:
-    """PRD §17/§28/§53 — 2-5 slides is a HARD rule that code enforces, not a
+    """PRD §17/§28/§53 — 2-3 slides is a HARD rule that code enforces, not a
     hint we hope the model follows (confirmed live: it produced 7-slide
     carousels that then got accepted best-effort after the retry loop gave
-    up). Trims anything over 5 to `target`, keeping the first target-1 slides
-    plus the last (which carries the CTA in the PRD's slide structures), then
+    up). Capped at 3, not the PRD document's original 5, per explicit
+    business direction (Oct 2026): carousels should stay short. Trims
+    anything over 3 to `target`, keeping the first target-1 slides plus the
+    last (which carries the CTA in the PRD's slide structures), then
     re-indexes. Under 2 is genuinely broken — left alone for validation to
     flag, it's rare."""
     carousel = idea.get("carousel")
     if not isinstance(carousel, dict):
         return
     slides = carousel.get("slides")
-    if not isinstance(slides, list) or len(slides) <= 5:
+    if not isinstance(slides, list) or len(slides) <= 3:
         return
-    keep_n = target if 2 <= target <= 5 else 3
+    keep_n = target if 2 <= target <= 3 else 3
     trimmed = slides[: keep_n - 1] + [slides[-1]]
     for new_idx, s in enumerate(trimmed):
         if isinstance(s, dict):
             s["slide_index"] = new_idx
     carousel["slides"] = trimmed
+
+
+def _clamp_caption(idea: Dict[str, Any]) -> None:
+    """Same spirit as _clamp_carousel: a word-count cap the model is told
+    about in the prompt and pushed on via the retry loop, but neither is a
+    guarantee, so code enforces it as a last resort. Trims to the last
+    complete sentence that still fits within MAX_CAPTION_WORDS words rather
+    than cutting mid-sentence; if no sentence boundary exists within the
+    limit (one long run-on), cuts cleanly at the word boundary instead."""
+    exact_copy = idea.get("exact_copy")
+    if not isinstance(exact_copy, dict):
+        return
+    caption = str(exact_copy.get("caption") or "")
+    words = caption.split()
+    if len(words) <= MAX_CAPTION_WORDS:
+        return
+    truncated = " ".join(words[:MAX_CAPTION_WORDS])
+    last_sentence_end = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
+    exact_copy["caption"] = truncated[: last_sentence_end + 1] if last_sentence_end > 0 else truncated
 
 
 _TEXT_FIELDS_FOR_SCANNING = (
@@ -1572,10 +1625,10 @@ def _validate_item_v2(
     words_to_avoid: Optional[List[str]] = None,
 ) -> List[str]:
     """Extends v1's _validate_day (hard deterministic rules, PRD §28) with
-    V2's own required fields. Carousel check enforces the PRD's HARD 2-5
-    rule (§28), not the exact per-concept target — the target is a hint for
-    the model, 2-5 is the constraint. _clamp_carousel already trims anything
-    over 5 before this runs, so this mostly catches under-2."""
+    V2's own required fields. Carousel check enforces the business's HARD
+    2-3 rule, not the exact per-concept target — the target is a hint for
+    the model, 2-3 is the constraint. _clamp_carousel already trims anything
+    over 3 before this runs, so this mostly catches under-2."""
     issues = _validate_day(idea)
     if not str(idea.get("ai_image_prompt") or "").strip():
         issues.append("ai_image_prompt is empty")
@@ -1587,8 +1640,15 @@ def _validate_item_v2(
         issues.append("creative_concept_name is empty")
     if is_carousel:
         slides = ((idea.get("carousel") or {}).get("slides")) or []
-        if not (2 <= len(slides) <= 5):
-            issues.append(f"carousel must have 2-5 slides (PRD hard rule), got {len(slides)}")
+        if not (2 <= len(slides) <= 3):
+            issues.append(f"carousel must have 2-3 slides (business hard rule), got {len(slides)}")
+    caption = str((idea.get("exact_copy") or {}).get("caption") or "")
+    caption_words = len(caption.split())
+    if caption_words > MAX_CAPTION_WORDS:
+        issues.append(
+            f"caption is too long ({caption_words} words, max {MAX_CAPTION_WORDS}) — "
+            f"cut it down to one strong line or two, not a paragraph"
+        )
     banned_hits = _find_banned_words(idea, words_to_avoid or [])
     if banned_hits:
         issues.append(
@@ -1658,7 +1718,7 @@ async def _generate_final_copy(
 
     def _fmt_line(c: Dict[str, Any]) -> str:
         if c.get("format") == "carousel":
-            return f"CAROUSEL — ~{c.get('carousel_slide_count', 3)} slides (2-5 allowed)"
+            return f"CAROUSEL — ~{c.get('carousel_slide_count', 3)} slides (2-3 allowed)"
         return str(c.get("format", "image"))
 
     concepts_block = "\n\n".join(
@@ -1728,6 +1788,10 @@ it, not explain it. Prefer one strong headline + one short supporting line
 over a headline plus a paragraph plus bullet points plus an explanation. For
 a carousel, each slide carries ONE idea — never compress an entire article
 across the slides; the story should read visually as the audience swipes.
+The caption in exact_copy is capped at {MAX_CAPTION_WORDS} words — this is a
+hard limit, not a target to approach. Most captions should land well under
+it: a hook line, one supporting line, the CTA. If you find yourself
+explaining the idea instead of stating it, cut, don't compress harder.
 
 For EACH item, return ALL of these fields:
 - title: max 10 words, punchy, specific to this brand — must clearly reflect its concept's subject+angle and meet the HEADLINE STANDARD above
@@ -1744,7 +1808,7 @@ For EACH item, return ALL of these fields:
 - video_idea: {{"format": one of talking_head|product_demo|testimonial|tutorial|behind_the_scenes|trend_based, "hook": "...", "talking_points": ["..."], "scenes": ["..."], "cta": "..."}}
 - holiday_reference: null unless a real, relevant holiday/observance genuinely
   falls on this item's date for {region or 'the audience region'} — never invent one
-- exact_copy: {{"headline": "publish-ready headline/first-line — must meet the HEADLINE STANDARD above", "caption": "the FULL publish-ready caption text, ready to post as-is, respecting TEXT DENSITY above", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
+- exact_copy: {{"headline": "publish-ready headline/first-line — must meet the HEADLINE STANDARD above", "caption": "the FULL publish-ready caption text, ready to post as-is, max {MAX_CAPTION_WORDS} words — see TEXT DENSITY above", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
 - carousel: null UNLESS this item's format is CAROUSEL (see the exact slide count required above), in which case:
   {{"slides": [{{"slide_index": 0, "headline": "...", "body": "one idea, kept short — see TEXT DENSITY", "visual_note": "..."}}, ...exactly the required number of slides...]}}
 - creative_concept_name: a short, final version of the concept name
@@ -1822,7 +1886,7 @@ business's actual customers, not a generic reader?
             is_carousel = concepts_chunk[i].get("format") == "carousel"
             expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
             if is_carousel:
-                _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-5 hard rule
+                _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-3 hard rule
             issues = _validate_item_v2(
                 idea, is_carousel=is_carousel, expected_slides=expected_slides,
                 words_to_avoid=_all_banned_words(brand),
@@ -1857,6 +1921,8 @@ business's actual customers, not a generic reader?
         concept = concepts_chunk[i]
         if isinstance(idea, dict) and concept.get("format") == "carousel":
             _clamp_carousel(idea, concept.get("carousel_slide_count", 3))  # final safety net if both retries broke
+        if isinstance(idea, dict):
+            _clamp_caption(idea)  # final safety net if both retries still came back too wordy
         idea_safe = {k: v for k, v in idea.items() if k not in _CONCEPT_FIELDS} if isinstance(idea, dict) else {}
         merged.append({**concept, **idea_safe, "day_offset": concept["day_index"]})
     return merged
@@ -2130,7 +2196,7 @@ async def _build_plan_doc(
     if key_dates_placed:
         print(f"[CalendarV2] key dates given their post: {key_dates_placed}")
 
-    # Step 7 — assign format, dynamic 2-5 slide carousels, capped video/week
+    # Step 7 — assign format, dynamic 2-3 slide carousels, capped video/week
     formatted = _assign_formats(dated, brand, existing_assets_summary)
 
     # Step 8+9 — final copy + creative direction, concurrently chunked
@@ -2250,7 +2316,7 @@ async def _build_plan_doc(
     # field — but nothing enforced that. Confirmed live: a real plan carried 6
     # distinct series names, every one used exactly once, which isn't a
     # recurring series, it's noise dressed up as one. Same pattern this
-    # pipeline already uses for its other hard rules (words_to_avoid, the 2-5
+    # pipeline already uses for its other hard rules (words_to_avoid, the 2-3
     # carousel-slide limit) — count actual occurrences across the selected 30
     # and silently drop any series_name that didn't genuinely recur, rather
     # than trusting the model to have followed the instruction.
