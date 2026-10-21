@@ -26,6 +26,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Optional
 
+VALID_STATUSES = {"observed", "candidate", "monitored", "paused", "retired"}
+
 
 async def _window_evidence(db, market: str, topic: str, since: datetime, until: datetime) -> dict:
     accounts: set = set()
@@ -92,3 +94,36 @@ async def update_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
     if learned != before:
         await db["mi_markets"].update_one({"key": market["key"]}, {"$set": {"learned_terms": sorted(learned)}})
     return summary
+
+
+async def set_topic_status(db, market_key: str, topic_key: str, status: str, reason: Optional[str] = None,
+                           actor: str = "curator", now: Optional[datetime] = None) -> dict:
+    """A curator or brand owner's manual override of a topic's lifecycle
+    state — PRD §6.3's "approved by curator/owner" path for promoting a
+    candidate straight to monitored, or demoting/retiring one directly,
+    without waiting for (or instead of) the automatic evidence-based
+    thresholds in update_market(). Carries the same learned_terms side
+    effect the automatic path has: "monitored" adds the topic to the
+    market's own searches, every other status removes it."""
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
+    now = now or datetime.utcnow()
+    topic = await db["mi_market_topics"].find_one({"market": market_key, "key": topic_key})
+    if not topic:
+        return {"found": False}
+
+    await db["mi_market_topics"].update_one(
+        {"_id": topic["_id"]},
+        {"$set": {"status": status, f"{status}_at": now, "decided_by": actor,
+                 "decision_reason": (reason or "")[:300] or None}},
+    )
+    market = await db["mi_markets"].find_one({"key": market_key}) or {}
+    before = set(market.get("learned_terms") or [])
+    learned = set(before)
+    if status == "monitored":
+        learned.add(topic_key)
+    else:
+        learned.discard(topic_key)
+    if learned != before:
+        await db["mi_markets"].update_one({"key": market_key}, {"$set": {"learned_terms": sorted(learned)}})
+    return {"found": True, "status": status, "market": market_key, "topic": topic_key}
