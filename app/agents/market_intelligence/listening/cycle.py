@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import collector, detect, discovery, markets, ontology, permissions, personalize, profile as profile_mod
+from . import collector, detect, discovery, markets, ontology, permissions, personalize, profile as profile_mod, shadow
 from .config import get_config
 
 LOCK_MINUTES = 50
@@ -97,13 +97,18 @@ async def run_cycle(db, only_markets: Optional[list[str]] = None, brand_ids: Opt
                              note=run.get("note"))
                 if run.get("to_read"):
                     entry["reading"] = await collector.read_and_count(db, m, run["to_read"], cfg)
-                sigs = await detect.detect_market(db, m, cfg)
+                detect_now = datetime.utcnow()
+                sigs = await detect.detect_market(db, m, cfg, detect_now)
                 entry["signals"] = len(sigs)
                 disc = await discovery.update_market(db, m, cfg)
                 entry["discovery"] = {k: len(v) for k, v in disc.items()}
                 entry["cadence_hours"] = await markets.update_cadence(db, m, cfg)
                 eff = await collector.update_query_efficiency(db, m, cfg)
                 entry["efficiency"] = {"shrunk": len(eff["shrunk"])}
+                shadow_result = await shadow.run_shadow(db, m, cfg, detect_now)
+                if shadow_result:
+                    entry["shadow"] = {k: shadow_result[k] for k in
+                                       ("candidate_count", "live_count", "new_in_candidate", "missing_in_candidate")}
                 touched.append(m["key"])
             finally:
                 await _unlock(db, mlock, owner)

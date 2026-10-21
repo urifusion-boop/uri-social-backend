@@ -68,6 +68,12 @@ DEFAULTS: dict[str, Any] = {
         "dismiss_rate_threshold": 0.7,  # dismiss rate above this starts lowering relevance
         "max_penalty": 25,              # relevance points subtracted at a 100% dismiss rate
     },
+    # Shadow mode (PRD §17) — off by default; set enabled + candidate_overrides
+    # to compare a not-yet-shipped config against live production in real time.
+    "shadow": {
+        "enabled": False,
+        "candidate_overrides": {},
+    },
     # Human review queue (PRD §17)
     "review": {
         "window_days": 14,
