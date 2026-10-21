@@ -18,7 +18,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, golden, permissions, profile as profile_mod, replay, review
+from . import collector, discovery, golden, metrics, permissions, profile as profile_mod, replay, review
 from .config import _merge, get_config
 from .cycle import run_cycle
 
@@ -429,3 +429,12 @@ async def unmark_golden_example(market_key: str, source_id: str, admin: dict = D
     if not result["removed"]:
         raise HTTPException(status_code=404, detail="Not in the golden set")
     return UriResponse.get_single_data_response("golden", result)
+
+
+# ── Product metrics (PRD §17) — admin-only ────────────────────────────────────
+
+@router.get("/curation/metrics")
+async def product_metrics_endpoint(market: Optional[str] = None, window_days: int = 30,
+                                   admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    result = await metrics.product_metrics(db, market, window_days)
+    return UriResponse.get_single_data_response("metrics", result)
