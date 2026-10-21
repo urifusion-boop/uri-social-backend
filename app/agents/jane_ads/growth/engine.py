@@ -93,12 +93,13 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
                     rows=res["rows"], error=res["error"])
     health = await metrics.health(db, cid)
     rows = await metrics.load(db, cid)
+    ad_rows = await metrics.load(db, cid, level="ad")
     try:
         sched = await adapter.fetch_adset_schedule(cid)
     except Exception as e:
         sched = {"error": str(e)[:200]}
     goal = await load_goal(db, cid)
-    ad_ids = sorted({r["ad_id"] for r in rows if r.get("ad_id")} | {record.get("ad_id") or ""} - {""})
+    ad_ids = sorted({r["ad_id"] for r in ad_rows if r.get("ad_id")} | {record.get("ad_id") or ""} - {""})
     spend = sum(float(r.get("spend_ngn") or 0) for r in rows)
     lead_stats = await leads.stats(db, brand, ad_ids, spend)
     followups = await leads.follow_up_gaps(db, brand, ad_ids)
@@ -113,7 +114,7 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
 
     fresh = _aware(health.get("last_success_at"))
     return {
-        "record": record, "rows": rows, "health": health, "schedule": sched, "goal": goal,
+        "record": record, "rows": rows, "ad_rows": ad_rows, "health": health, "schedule": sched, "goal": goal,
         "ad_ids": ad_ids, "leads": lead_stats, "followups": followups, "landing": landing,
         "detect": {
             "today": _now().date(), "status": sched.get("effective_status") or "",
@@ -122,6 +123,7 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
             "daily_budget_ngn": sched.get("daily_ngn") or 0,
             "target_cpl_ngn": goal.get("target_cpl_ngn"),
             "leads": lead_stats, "landing": landing, "followups": followups,
+            "ad_rows": ad_rows,
         },
         "state": {
             "data_fresh": bool(fresh and _now() - fresh <= det.STALE_AFTER),

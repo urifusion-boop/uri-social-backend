@@ -160,7 +160,13 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
                              "benchmark": "target" if ctx.get("target_cpl_ngn") else "baseline",
                              "daily_budget_ngn": budget}, window=win))
 
-    out.extend(_variant_findings(recent_rows + base_rows))
+    ad_rows = ctx.get("ad_rows")
+    if ad_rows is None:
+        ad_rows = recent_rows + base_rows
+    else:
+        keep = set(recent_d) | set(base_d)
+        ad_rows = [r for r in ad_rows if r.get("date") in keep]
+    out.extend(_variant_findings(ad_rows))
     return out
 
 

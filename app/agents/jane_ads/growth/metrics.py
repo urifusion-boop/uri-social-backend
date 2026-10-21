@@ -53,63 +53,82 @@ def parse_rows(campaign_id: str, data: list[dict], retrieved_at: datetime) -> li
     return rows
 
 
+_STATUSES = ["ACTIVE", "PAUSED", "DELETED", "ARCHIVED", "IN_PROCESS", "WITH_ISSUES",
+             "CAMPAIGN_PAUSED", "ADSET_PAUSED", "PENDING_REVIEW", "DISAPPROVED", "PREAPPROVED",
+             "PENDING_BILLING_INFO"]
+
+
+async def _fetch(client, adapter, campaign_id: str, params: dict) -> list[dict]:
+    out: list[dict] = []
+    url: Optional[str] = f"{adapter._graph_base}/{campaign_id}/insights"
+    p: Optional[dict] = {"access_token": adapter._access_token, **params}
+    while url:
+        resp = await client.get(url, params=p)
+        body = resp.json()
+        if "error" in body:
+            raise RuntimeError(body["error"].get("message") or "insights error")
+        out.extend(body.get("data") or [])
+        url = (body.get("paging") or {}).get("next")
+        p = None      # the next link carries every parameter
+    return out
+
+
 async def pull(db, adapter, record: dict, today: Optional[date] = None) -> dict:
-    """Refresh this campaign's snapshots. Returns {"ok", "rows", "error"}."""
+    """Refresh this campaign's snapshots. Returns {"ok", "rows", "error"}.
+
+    Two reads, because they answer different questions. Campaign-level daily rows
+    are the campaign's real totals — ad-level rows leave out ads Meta has archived
+    or deleted, and a relaunched Jane campaign can have delivered through exactly
+    those, which read as a day of zero spend beside real conversations. Ad-level
+    rows, asked for in every status, exist only to compare ads with each other."""
     campaign_id = record["campaign_id"]
     today = today or datetime.now(timezone.utc).date()
     created = record.get("created_at")
     since = today - timedelta(days=LOOKBACK_DAYS)
     if isinstance(created, datetime):
         since = max(since, created.date())
-    params = {
-        "access_token": adapter._access_token,
-        "level": "ad",
-        "time_increment": 1,
-        "time_range": json.dumps({"since": since.isoformat(), "until": today.isoformat()}),
-        "fields": "ad_id,ad_name,adset_id,date_start,spend,impressions,reach,clicks,actions,account_currency",
-        "limit": 500,
-    }
+    window = json.dumps({"since": since.isoformat(), "until": today.isoformat()})
+    base = {"time_increment": 1, "time_range": window, "limit": 500,
+            "fields": "date_start,spend,impressions,reach,clicks,actions,account_currency"}
     now = datetime.now(timezone.utc)
-    data: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            url: Optional[str] = f"{adapter._graph_base}/{campaign_id}/insights"
-            while url:
-                resp = await client.get(url, params=params)
-                body = resp.json()
-                if "error" in body:
-                    raise RuntimeError(body["error"].get("message") or "insights error")
-                data.extend(body.get("data") or [])
-                url = (body.get("paging") or {}).get("next")
-                params = None      # the next link carries every parameter
+            camp = await _fetch(client, adapter, campaign_id, {**base, "level": "campaign"})
+            ads = await _fetch(client, adapter, campaign_id, {
+                **base, "level": "ad",
+                "fields": "ad_id,ad_name,adset_id," + base["fields"],
+                "filtering": json.dumps([{"field": "ad.effective_status", "operator": "IN",
+                                          "value": _STATUSES}])})
     except Exception as e:  # recorded, never raised: one campaign must not stop the sweep
         await db[HEALTH].update_one({"campaign_id": campaign_id}, {
             "$set": {"last_error": str(e)[:300], "last_error_at": now},
             "$inc": {"error_count": 1}}, upsert=True)
         return {"ok": False, "rows": 0, "error": str(e)[:300]}
 
-    rows = parse_rows(campaign_id, data, now)
+    rows = [{**r, "level": "campaign", "ad_id": ""} for r in parse_rows(campaign_id, camp, now)] + \
+        [{**r, "level": "ad"} for r in parse_rows(campaign_id, ads, now)]
     for r in rows:
         await db[SNAPSHOTS].update_one(
-            {"campaign_id": campaign_id, "ad_id": r["ad_id"], "date": r["date"]},
+            {"campaign_id": campaign_id, "level": r["level"], "ad_id": r["ad_id"], "date": r["date"]},
             {"$set": {**r, "brand_id": record.get("brand_id")}}, upsert=True)
     # What Meta actually sent for one row (metrics only), so a parsing problem can be
     # seen without access to the token.
-    sample = {k: v for k, v in (data[0] if data else {}).items() if k != "actions"}
-    if data:
-        sample["action_types"] = [a.get("action_type") for a in data[0].get("actions") or []][:12]
+    sample = {k: v for k, v in (camp[0] if camp else {}).items() if k != "actions"}
     await db[HEALTH].update_one({"campaign_id": campaign_id}, {
         "$set": {"last_success_at": now, "last_error": "", "error_count": 0,
-                 "brand_id": record.get("brand_id"), "rows_last_pull": len(data), "sample_row": sample}},
+                 "brand_id": record.get("brand_id"), "rows_last_pull": len(camp),
+                 "ad_rows_last_pull": len(ads), "sample_row": sample}},
         upsert=True)
     return {"ok": True, "rows": len(rows), "error": ""}
 
 
-async def load(db, campaign_id: str, days: int = LOOKBACK_DAYS) -> list[dict]:
+async def load(db, campaign_id: str, days: int = LOOKBACK_DAYS, level: str = "campaign") -> list[dict]:
+    """Daily rows at one level. Campaign rows are the totals; snapshots stored before
+    campaign-level reads existed have no level and are ad rows."""
     since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
-    return await db[SNAPSHOTS].find(
-        {"campaign_id": campaign_id, "date": {"$gte": since}}, {"_id": 0}
-    ).sort("date", 1).to_list(5000)
+    q: dict = {"campaign_id": campaign_id, "date": {"$gte": since}}
+    q["level"] = "campaign" if level == "campaign" else {"$in": ["ad", None]}
+    return await db[SNAPSHOTS].find(q, {"_id": 0}).sort("date", 1).to_list(5000)
 
 
 async def health(db, campaign_id: str) -> dict:
