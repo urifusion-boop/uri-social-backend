@@ -802,8 +802,8 @@ async def _owner_of(db, workspace_id: str) -> str:
 
 async def notify_needs_reply(db, workspace_id: str, conv: dict, text: str, reason: str,
                              held: bool, also_email: Optional[list[str]] = None) -> None:
-    """Tell the business a customer is waiting on a person. Once an hour per
-    conversation at most; a customer sending five messages is one alert."""
+    """Tell the business a customer is waiting on a person: once per wait, so a
+    customer sending five messages in a row is one alert, not five."""
     from app.services import brand_notifier
 
     user_id = await _owner_of(db, workspace_id)
@@ -828,7 +828,9 @@ async def notify_needs_reply(db, workspace_id: str, conv: dict, text: str, reaso
             db, user_id, workspace_id, "inbox_needs_reply", title=title, message=message,
             link=link,
             metadata={"conversation_id": str(conv["_id"])},
-            dedupe_key=str(conv["_id"]), dedupe_hours=1)
+            # One alert per wait: a fresh holding reply starts a new one, while
+            # follow-ups from a customer already waiting stay quiet for an hour.
+            dedupe_key=str(conv["_id"]), dedupe_hours=0 if held else 1)
         if "skipped" in result:
             return
         owner = ((await db["users"].find_one({"userId": user_id}, {"email": 1})) or {}).get("email", "")
