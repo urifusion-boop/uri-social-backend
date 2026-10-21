@@ -139,7 +139,8 @@ def diagnose(finding: dict, ctx: dict) -> dict:
 
     elif issue == "landing_page":
         hypotheses = [_h("The landing page is down or slow", "high",
-                         f"Status {ev.get('status')}, {ev.get('seconds', '?')}s to load.")]
+                         f"{ev.get('url', 'The page')}: " + (ev.get("error") or
+                         f"status {ev.get('status')}, {ev.get('seconds', '?')}s to load") + ".")]
         recs = [_rec("fix_landing_page", "Fix the page, or pause the campaign until it's back.",
                      "Clicks land on a working page", "None", "Page check passes")]
         if ev.get("status") and ev.get("status") >= 400:

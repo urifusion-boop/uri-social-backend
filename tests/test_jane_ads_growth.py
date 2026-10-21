@@ -333,3 +333,11 @@ def test_emergency_stop_halts_autonomy(fake, monkeypatch):
 
 def test_landing_check_ignores_chat_destinations():
     assert run(metrics.check_landing_page("https://wa.me/2348000000000")) == {"checked": False}
+
+
+def test_a_broken_page_matters_only_while_people_are_sent_there():
+    broken = {"checked": True, "ok": False, "status": None, "error": "couldn't connect", "url": "https://x.test"}
+    assert "landing_page" in issues(detect.detect([], ctx(landing=broken)))
+    assert "landing_page" not in issues(detect.detect([], ctx(landing=broken, status="PAUSED")))
+    d = diagnose.diagnose({"issue_type": "landing_page", "evidence": broken}, {})
+    assert "couldn't connect" in d["hypotheses"][0]["why"]

@@ -129,7 +129,8 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
                             window=win))
 
     landing = ctx.get("landing") or {}
-    if landing.get("checked") and not landing.get("ok"):
+    # Only worth an alert while people can actually be sent there.
+    if landing.get("checked") and not landing.get("ok") and (active or recent["clicks"] > 0):
         out.append(_finding("landing_page", "high", landing))
 
     leads = ctx.get("leads") or {}
