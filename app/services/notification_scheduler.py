@@ -307,6 +307,24 @@ def _job_listening_weekly_digest():
     _run_async("listening_weekly_digest", _run)
 
 
+def _job_listening_retention():
+    """Listening Intelligence retention (PRD §12, §15) — daily. Deletes
+    items and readings past the configured retention window; everything
+    derived (topic counts, the topic graph, cards) is kept long-term."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.retention import enforce_retention
+            from app.agents.market_intelligence.listening.config import get_config
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        cfg = await get_config(db)
+        result = await enforce_retention(db, cfg)
+        print(f"👂🗑️ Listening retention: {result}")
+    _run_async("listening_retention", _run)
+
+
 def _job_publish_scheduled_content():
     async def _run():
         from app.database import get_db
@@ -493,6 +511,14 @@ def start_notification_scheduler():
         _job_listening_weekly_digest,
         CronTrigger(hour=9, minute=10),
         id="listening_weekly_digest",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence retention: daily, off-peak.
+    _scheduler.add_job(
+        _job_listening_retention,
+        CronTrigger(hour=3, minute=15),
+        id="listening_retention",
         **_JOB_DEFAULTS,
     )
 
