@@ -68,6 +68,14 @@ DEFAULTS: dict[str, Any] = {
         "dismiss_rate_threshold": 0.7,  # dismiss rate above this starts lowering relevance
         "max_penalty": 25,              # relevance points subtracted at a 100% dismiss rate
     },
+    # Query value optimisation (PRD §6.6)
+    "efficiency": {
+        "window_days": 14,
+        "min_items_for_judgement": 15,  # fewer than this for a query: no verdict yet
+        "min_on_topic_rate": 0.25,      # below this on-topic share: the query is low-yield
+        "shrink_factor": 0.5,           # cap multiplier applied to a low-yield query
+        "min_cap": 10,                  # never shrink a query to zero — keep exploring it at a small scale
+    },
     # Discovery (keyword lifecycle, PRD §6.3)
     "discovery": {
         "window_days": 10,              # evidence lookback for every status check
