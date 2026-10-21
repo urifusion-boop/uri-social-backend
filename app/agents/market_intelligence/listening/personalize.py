@@ -167,6 +167,38 @@ async def _judge_one_retry(profile: dict, sig: dict, error: str, model: str) -> 
     return parsed.items[0] if parsed and parsed.items else None
 
 
+async def _relevance_adjustment(db, brand_id: str, market: str, kind: str, cfg: dict,
+                                now: Optional[datetime] = None) -> float:
+    """§9.1's 'learned adjustment from that business's past feedback on
+    similar signals': this business's own recent dismiss/save/act history
+    for this market + signal type. "Similar" without an embedding index
+    (not built yet) means same market and same signal type — rising vs.
+    recurring_need vs. new_entity are different enough asks that lumping
+    them together would be a worse proxy than keeping them apart.
+
+    Only ever non-positive: §11 is explicit that approving/saving a card is
+    a positive preference signal but "not treated as proof of commercial
+    value", so good feedback here intentionally does not boost relevance —
+    only a sustained dismiss pattern lowers it."""
+    la = cfg["learning"]
+    now = now or datetime.utcnow()
+    since = now - timedelta(days=la["feedback_window_days"])
+    tracked = ("dismissed", "saved", "acted")
+    counts = {a: 0 for a in tracked}
+    async for a in db["mi_listen_card_actions"].find(
+        {"brand_id": brand_id, "market": market, "type": kind, "at": {"$gte": since}, "action": {"$in": tracked}}
+    ):
+        counts[a["action"]] += 1
+    total = sum(counts.values())
+    if total < la["min_feedback_samples"]:
+        return 0.0
+    dismiss_rate = counts["dismissed"] / total
+    if dismiss_rate < la["dismiss_rate_threshold"]:
+        return 0.0
+    span = max(1e-9, 1 - la["dismiss_rate_threshold"])
+    return -round(la["max_penalty"] * min(1.0, (dismiss_rate - la["dismiss_rate_threshold"]) / span), 1)
+
+
 def score(sig: dict, relevance: float, brand_fit: float, weights: dict) -> dict:
     s = {"R": float(relevance), "M": float(sig["scores"]["M"]), "C": float(sig["scores"]["C"]),
          "E": round(float(sig.get("confidence", 0)) * 100, 1), "B": float(brand_fit)}
@@ -222,8 +254,10 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
         j = judged.get(i)
         if not j or not j.action:
             continue
-        s = score(sig, j.relevance, j.brand_fit, sc["weights"])
-        if sig.get("confidence", 0) < sc["min_confidence"] or j.relevance < sc["min_relevance"] or s["total"] < sc["min_score"]:
+        adj = await _relevance_adjustment(db, brand, sig["market"], sig["type"], cfg, now)
+        relevance = max(0.0, j.relevance + adj)
+        s = score(sig, relevance, j.brand_fit, sc["weights"])
+        if sig.get("confidence", 0) < sc["min_confidence"] or relevance < sc["min_relevance"] or s["total"] < sc["min_score"]:
             continue
         allowed = _allowed_numbers(sig, profile)
         why, action = j.why, j.action.dict()
