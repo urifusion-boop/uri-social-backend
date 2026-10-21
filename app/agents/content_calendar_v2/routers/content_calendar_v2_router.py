@@ -336,7 +336,7 @@ async def create_draft_from_item_v2(
             # signal than v1's generic seed_content alone.
             if request.include_images and drafts:
                 from app.agents.social_media_manager.routers.complete_social_manager import (
-                    _generate_image_bg, _BG_IMAGE_TASKS,
+                    _generate_image_bg, _resolve_carousel_shared_context, _BG_IMAGE_TASKS,
                 )
                 if draft_ids:
                     await db["content_drafts"].update_many(
@@ -359,12 +359,29 @@ async def create_draft_from_item_v2(
                 # image…" never resolves) — this mirrors the main Create-tab
                 # flow's carousel loop (complete_social_manager.py) that v1's
                 # own calendar create-draft endpoint is missing too.
+                #
+                # Each slide's task used to receive the same raw brand_context
+                # and resolve its own custom-guide/library-style/CTA choice
+                # independently — the exact bug _resolve_carousel_shared_context
+                # was built to eliminate on the main Create-tab flow, but this
+                # endpoint never called it, so calendar-generated carousels kept
+                # the slide-0-writes-others-read race AND the per-slide library
+                # style drift (confirmed live via a client-reported 3-slide
+                # carousel with 3 different visual styles). Resolve once per
+                # carousel draft here too, before any slide's task is created.
                 _bg_image_tasks: list = []
                 if item.get("format") == "carousel":
                     for d in drafts:
                         draft_id = d.get("draft_id") or d.get("id")
                         slides = d.get("slides") or []
                         total_slides = len(slides)
+                        carousel_brand_context = await _resolve_carousel_shared_context(
+                            db=db,
+                            brand_context=brand_context,
+                            style_override=None,
+                            carousel_id=draft_id,
+                            platform=d.get("platform", "facebook"),
+                        )
                         for slide_index, slide in enumerate(slides):
                             slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
                             enriched_seed = f"{image_seed_content}. This slide: {slide_content}"
@@ -373,7 +390,7 @@ async def create_draft_from_item_v2(
                                 platform=d.get("platform", "facebook"),
                                 content=slide_content or d.get("content", image_seed_content),
                                 seed_content=enriched_seed,
-                                brand_context=brand_context,
+                                brand_context=carousel_brand_context,
                                 db=db,
                                 reference_image=None,
                                 post_type="carousel",
