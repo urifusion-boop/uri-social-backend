@@ -32,6 +32,7 @@ ISSUE_LABELS = {
     "follow_up_gap": "Leads are waiting for a reply",
     "strong_variant": "One ad is clearly outperforming the others",
     "scale_opportunity": "Results are cheap and the budget is the limit",
+    "daily_incomplete": "Meta's day-by-day figures don't add up",
 }
 
 # Evaluation windows: long enough for results and attribution to land.
@@ -71,6 +72,15 @@ def diagnose(finding: dict, ctx: dict) -> dict:
         recs = [_rec("fix_tracking", "Check the ad account connection; no changes run until data is fresh.",
                      "Fresh data before any decision", "None — nothing is changed.",
                      "A successful data pull")]
+
+    elif issue == "daily_incomplete":
+        hypotheses = [_h("Meta's daily breakdown for this campaign is incomplete", "high",
+                         f"Lifetime spend ₦{ev.get('lifetime_spend_ngn') or 0:,.0f}, but the days Meta "
+                         f"reports add up to ₦{ev.get('daily_spend_ngn') or 0:,.0f}.")]
+        alternatives = ["Meta may still be processing recent days."]
+        recs = [_rec("observe", "Totals use Meta's lifetime figures. Trend checks and automatic changes "
+                     "wait until the daily figures add up.", "Decisions only on data that adds up",
+                     "None — nothing is changed.", "Daily figures matching the lifetime total")]
 
     elif issue == "delivery_stalled":
         hypotheses = [_h("The ad was rejected, the budget or schedule ran out, or the account has a "

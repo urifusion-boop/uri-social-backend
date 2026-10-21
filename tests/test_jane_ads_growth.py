@@ -372,3 +372,20 @@ def test_engine_reads_campaign_totals(fake, monkeypatch):
     record = _seed_engine(db, fake, monkeypatch)
     ctx = run(engine.context(db, fake, record, pol.normalize({})))
     assert sum(r["spend_ngn"] for r in ctx["rows"]) == 7000 and len(ctx["ad_rows"]) == 14
+
+
+def test_incomplete_daily_figures_stand_trend_checks_down():
+    zero_spend = rows({n: (0, 0, 0, 5) for n in range(1, 8)})
+    found = detect.detect(zero_spend, ctx(daily_complete=False, lifetime_spend_ngn=3823.66, daily_spend_ngn=0,
+                                          followups={"waiting": 1, "oldest_hours": 2}))
+    assert issues(found) == {"daily_incomplete", "follow_up_gap"}
+    assert [f for f in found if f["issue_type"] == "daily_incomplete"][0]["blocks_actions"]
+    d = diagnose.diagnose([f for f in found if f["issue_type"] == "daily_incomplete"][0], {})
+    assert "₦3,824" in d["hypotheses"][0]["why"] and not d["recommendations"][0]["executable"]
+
+
+def test_lifetime_totals_parse_meta_shape():
+    life = metrics.lifetime_totals([{"spend": "3823.66", "impressions": "4880", "clicks": "56", "reach": "4754",
+                                     "actions": [{"action_type": "onsite_conversion.messaging_conversation_started_7d",
+                                                  "value": "14"}]}])
+    assert life == {"spend_ngn": 3823.66, "impressions": 4880, "reach": 4754, "clicks": 56, "conversations": 14}
