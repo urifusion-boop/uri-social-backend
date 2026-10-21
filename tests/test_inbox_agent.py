@@ -378,6 +378,17 @@ def test_a_held_message_gets_one_holding_line_until_a_person_replies():
     assert out["status"] == "drafted" and len(sent) == 1
 
 
+def test_a_new_wait_days_later_gets_its_own_holding_line():
+    line = agent.HOLDING_REPLIES["question"]
+    s, conv = _settings(), _conv()
+    recent = _history(("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(hours=1)), ("inbound", "", OPEN_HOURS))
+    stale = _history(("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(days=2)), ("inbound", "", OPEN_HOURS))
+    for h in (recent, stale):
+        [m for m in h if m["direction"] == "outbound"][0]["text"] = line
+    assert agent.should_hold(s, conv, recent, OPEN_HOURS) is False
+    assert agent.should_hold(s, conv, stale, OPEN_HOURS) is True
+
+
 def test_holding_lines_fit_the_situation():
     assert agent.holding_reply({"wants_human": True}, "general") == agent.HOLDING_REPLIES["human"]
     assert agent.holding_reply({"intent": "complaint"}, "complaint") == agent.HOLDING_REPLIES["problem"]

@@ -656,6 +656,9 @@ HOLDING_REPLIES = {
 }
 
 
+HOLD_AGAIN_AFTER = timedelta(hours=12)
+
+
 def holding_reply(cls: dict, situation: str) -> str:
     if cls.get("wants_human"):
         return HOLDING_REPLIES["human"]
@@ -668,16 +671,19 @@ def holding_reply(cls: dict, situation: str) -> str:
 def should_hold(settings: dict, conv: dict, history: list[dict],
                 at: Optional[datetime] = None) -> bool:
     """A held reply gets a holding line when nothing but the message itself stopped
-    it, and only once until a person has replied: one "someone will get back to
-    you" is reassuring, three in a row is a bot stalling."""
+    it. Not twice in a row: a customer still waiting on the last "someone will get
+    back to you" doesn't need another. After HOLD_AGAIN_AFTER, though, it's a new
+    wait — a question two days later deserves its own acknowledgement."""
     at = at or now()
     if gate(settings, conv, *_activity(history, at), at):
         return False
-    held = _aware(conv.get("holding_sent_at"))
-    if not held:
+    outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
+    if not outbound:
         return True
-    return any(m["direction"] == Direction.OUTBOUND.value and m["actor_id"] != AGENT_ACTOR
-               and (_aware(m.get("received_at")) or at) > held for m in history)
+    last = outbound[-1]
+    if last["actor_id"] != AGENT_ACTOR or (last.get("text") or "") not in HOLDING_REPLIES.values():
+        return True
+    return (_aware(last.get("received_at")) or at) <= at - HOLD_AGAIN_AFTER
 
 
 async def explain(db, workspace_id: str, result: dict) -> str:
@@ -734,9 +740,6 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
                 held = record.get("delivery") == "accepted"
             except SendRefused:
                 pass
-            if held:
-                await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
-                    "holding_sent_at": now()}})
         if settings["auto_reply_enabled"]:
             await notify_needs_reply(db, workspace_id, conv, result["target"]["text"], reason, held)
         return {"status": "held" if held else "drafted", "reason": reason}
