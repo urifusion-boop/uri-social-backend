@@ -135,7 +135,8 @@ async def unsubscribe_others(db, brand_id: str, keep: list[str]) -> None:
 
 async def due_markets(db, cfg: dict, now: Optional[datetime] = None, only: Optional[list[str]] = None) -> list[dict]:
     """Markets with a subscriber (or marked pilot) whose last collection is
-    older than the cadence."""
+    older than their cadence — a market's own cadence_hours (set by
+    update_cadence, PRD §7.3) if it has one, else the configured default."""
     from datetime import timedelta
     now = now or datetime.utcnow()
     q: dict[str, Any] = {"status": "active", "$or": [{"subscribers.0": {"$exists": True}}, {"pilot": True}]}
@@ -145,6 +146,24 @@ async def due_markets(db, cfg: dict, now: Optional[datetime] = None, only: Optio
     async for m in db["mi_markets"].find(q):
         m.pop("_id", None)
         last = m.get("last_collected_at")
-        if only or not last or now - last >= timedelta(hours=cfg["cadence_hours"]):
+        hours = m.get("cadence_hours") or cfg["cadence_hours"]
+        if only or not last or now - last >= timedelta(hours=hours):
             out.append(m)
     return out
+
+
+async def update_cadence(db, market: dict, cfg: dict, now: Optional[datetime] = None) -> int:
+    """Promote a market to faster collection while it has an active hot
+    signal (rising/spike), cool it back down to the default once it
+    doesn't — PRD §7.3: "Hot topics are automatically promoted to faster
+    cadence and cooled down when momentum fades." Returns the resolved
+    cadence in hours."""
+    c = cfg["cadence"]
+    now = now or datetime.utcnow()
+    hot = await db["mi_listen_signals"].count_documents({
+        "market": market["key"], "status": "active", "expires_at": {"$gt": now},
+        "type": {"$in": c["hot_signal_types"]},
+    })
+    hours = c["hot_hours"] if hot else cfg["cadence_hours"]
+    await db["mi_markets"].update_one({"key": market["key"]}, {"$set": {"cadence_hours": hours}})
+    return hours

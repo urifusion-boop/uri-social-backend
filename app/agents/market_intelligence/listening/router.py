@@ -91,7 +91,7 @@ async def listening_status(ctx: dict = Depends(get_active_brand_context),
         out_markets.append({
             "key": key, "label": m.get("label"), "last_collected_at": m.get("last_collected_at"),
             "learned_terms": m.get("learned_terms") or [], "topics": topics, "topic_statuses": topic_statuses,
-            "active_signals": signals,
+            "active_signals": signals, "cadence_hours": m.get("cadence_hours") or cfg["cadence_hours"],
             "last_run": {k: (last or {}).get(k) for k in ("status", "started_at", "finished_at", "items_returned",
                                                           "new_items", "covered_from", "note", "per_query")} if last else None,
         })

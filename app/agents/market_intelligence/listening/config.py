@@ -14,7 +14,11 @@ DEFAULTS: dict[str, Any] = {
     "enabled": True,
     # Collection
     "source": "x",                    # adapter key in scan_runner.ADAPTER_REGISTRY
-    "cadence_hours": 12,               # how often a market is collected
+    "cadence_hours": 12,               # how often a market is collected, when nothing is hot
+    "cadence": {
+        "hot_hours": 2,                 # collection interval while a market has an active hot signal
+        "hot_signal_types": ["rising", "spike"],
+    },
     "items_per_query": 50,             # starting cap per search per run (test actor minimum is 20)
     "max_items_per_query": 150,        # a measuring search that keeps filling up is raised to at most this
     "max_queries_per_market": 6,
