@@ -101,6 +101,8 @@ async def run_cycle(db, only_markets: Optional[list[str]] = None, brand_ids: Opt
                 disc = await discovery.update_market(db, m, cfg)
                 entry["discovery"] = {k: len(v) for k, v in disc.items()}
                 entry["cadence_hours"] = await markets.update_cadence(db, m, cfg)
+                eff = await collector.update_query_efficiency(db, m, cfg)
+                entry["efficiency"] = {"shrunk": len(eff["shrunk"])}
                 touched.append(m["key"])
             finally:
                 await _unlock(db, mlock, owner)
