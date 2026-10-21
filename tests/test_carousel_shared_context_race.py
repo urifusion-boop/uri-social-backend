@@ -62,6 +62,7 @@ class TestResolveCarouselSharedContextCustomGuide:
 
         resolved = await _resolve_carousel_shared_context(
             db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-1",
+            platform="instagram",
         )
 
         assert resolved["custom_guide_v2_id"] == "507f1f77bcf86cd799439011"
@@ -85,6 +86,7 @@ class TestResolveCarouselSharedContextCustomGuide:
 
         resolved = await _resolve_carousel_shared_context(
             db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-2",
+            platform="instagram",
         )
 
         assert "custom_guide_v2_id" not in resolved
@@ -100,6 +102,7 @@ class TestResolveCarouselSharedContextCustomGuide:
 
         resolved = await _resolve_carousel_shared_context(
             db=db, brand_context=brand_context, style_override=["minimalist"], carousel_id="carousel-3",
+            platform="instagram",
         )
 
         assert "custom_guide_v2_id" not in resolved
@@ -111,9 +114,58 @@ class TestResolveCarouselSharedContextCustomGuide:
 
         resolved = await _resolve_carousel_shared_context(
             db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-4",
+            platform="instagram",
         )
 
         assert resolved["override_cta"] == "Call now"
+
+    @pytest.mark.asyncio
+    async def test_per_platform_guide_override_is_honored_not_silently_ignored(self):
+        """Confirmed live (Oct 2026): a brand could configure a per-platform
+        visual override (saved to selected_custom_guides_v2_by_platform),
+        and it was silently never read by any generation path on prod — no
+        per-platform resolution existed here at all, unlike dev. The brand's
+        OWN flat selected_custom_guides_v2 is empty/different on purpose, to
+        prove the platform-specific one is what actually won."""
+        db, cols = _fake_db(
+            brand_profile={
+                "selected_custom_guides_v2": [],  # no brand-wide guide at all
+                "selected_custom_guides_v2_by_platform": {"instagram": ["507f1f77bcf86cd799439011"]},
+                "style_rotation_index_by_platform": {"instagram": 0},
+            },
+            custom_guide_v2={"original_image_url": "https://example.com/ig-only.png", "name": "IG-only Guide"},
+        )
+        brand_context = {"brand_id": "brand-1"}
+
+        resolved = await _resolve_carousel_shared_context(
+            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-5",
+            platform="instagram",
+        )
+
+        assert resolved["custom_guide_v2_id"] == "507f1f77bcf86cd799439011"
+        # The rotation-index write-back must target the per-platform field,
+        # not the brand-wide one, since that's what actually resolved.
+        guide_write_bp = cols["brand_profiles"].update_one.call_args_list[0]
+        assert "style_rotation_index_by_platform.instagram" in guide_write_bp[0][1]["$set"]
+
+    @pytest.mark.asyncio
+    async def test_a_different_platform_with_no_override_falls_back_to_brand_default(self):
+        db, cols = _fake_db(
+            brand_profile={
+                "selected_custom_guides_v2": ["507f1f77bcf86cd799439011"],  # brand-wide default
+                "selected_custom_guides_v2_by_platform": {"instagram": ["aaaaaaaaaaaaaaaaaaaaaaaa"]},
+                "style_rotation_index": 0,
+            },
+            custom_guide_v2={"original_image_url": "https://example.com/default.png", "name": "Brand Default"},
+        )
+        brand_context = {"brand_id": "brand-1"}
+
+        resolved = await _resolve_carousel_shared_context(
+            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-6",
+            platform="facebook",  # no facebook-specific override configured
+        )
+
+        assert resolved["custom_guide_v2_id"] == "507f1f77bcf86cd799439011"
 
 
 class TestGenerateImageBgSkipsWhenAlreadyResolved:
