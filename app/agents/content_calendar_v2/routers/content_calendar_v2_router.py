@@ -24,6 +24,57 @@ from ..services import content_calendar_v2_service as cal_v2_svc
 router = APIRouter(tags=["Content Calendar V2"])
 
 
+def _build_draft_seed_content(item: dict) -> str:
+    """The plan item's full brief, folded into one seed string for the real
+    draft generator — pulled out of create_draft_from_item_v2 as its own
+    pure function so it's directly testable without mocking credits/DB.
+
+    Leads with the strategic framing that justified this item in the first
+    place — confirmed missing (Oct 2026 consistency audit): the plan's own
+    territory/content_pillar/audience_segment never reached the real draft
+    generator, which only ever saw the brand's WHOLE content_pillars list
+    generically via brand_context, not which one THIS item was actually
+    planned under. The title/hook already carry the topic, but not the
+    strategic intent behind it — put that first, so the downstream writer
+    executes the same brief the plan committed to instead of re-deriving a
+    plausible-but-different one from the topic alone.
+    """
+    seed_parts: list = []
+    _pillar = item.get("content_pillar")
+    _territory = item.get("territory")
+    _audience = item.get("audience_segment")
+    if _pillar or _territory or _audience:
+        framing = []
+        if _pillar:
+            framing.append(f"content pillar: {_pillar}")
+        if _territory:
+            framing.append(f"creative territory: {_territory}")
+        if _audience:
+            framing.append(f"audience segment: {_audience}")
+        seed_parts.append("This post was planned as part of the calendar's " + ", ".join(framing) + ".")
+    seed_parts.append(f"{item.get('title', '')}. {item.get('description', '')}")
+    if item.get("hook"):
+        seed_parts.append(f"Opening hook to use: {item['hook']}")
+    if item.get("key_points"):
+        seed_parts.append("Key points to cover: " + "; ".join(str(p) for p in item["key_points"] if p))
+    if item.get("caption_direction"):
+        seed_parts.append(f"Caption direction: {item['caption_direction']}")
+    if item.get("cta"):
+        seed_parts.append(f"Call to action: {item['cta']}")
+    exact_copy = item.get("exact_copy") or {}
+    if exact_copy.get("caption"):
+        seed_parts.append(f"Publish-ready caption already written for this idea (use as the strong starting point): {exact_copy['caption']}")
+    # Richer creative direction the rewritten engine now produces (no v1
+    # equivalent) — folded into the seed so downstream generation gets
+    # the same visual intent the calendar item already committed to.
+    central_visual_idea = (item.get("creative_direction") or {}).get("central_visual_idea")
+    if central_visual_idea:
+        seed_parts.append(f"Central visual idea: {central_visual_idea}")
+    if item.get("designer_execution_notes"):
+        seed_parts.append(f"Production notes: {item['designer_execution_notes']}")
+    return "\n".join(seed_parts)
+
+
 @router.get("/plan")
 async def get_plan_v2(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
@@ -216,27 +267,7 @@ async def create_draft_from_item_v2(
                     },
                 )
 
-        seed_parts = [f"{item.get('title', '')}. {item.get('description', '')}"]
-        if item.get("hook"):
-            seed_parts.append(f"Opening hook to use: {item['hook']}")
-        if item.get("key_points"):
-            seed_parts.append("Key points to cover: " + "; ".join(str(p) for p in item["key_points"] if p))
-        if item.get("caption_direction"):
-            seed_parts.append(f"Caption direction: {item['caption_direction']}")
-        if item.get("cta"):
-            seed_parts.append(f"Call to action: {item['cta']}")
-        exact_copy = item.get("exact_copy") or {}
-        if exact_copy.get("caption"):
-            seed_parts.append(f"Publish-ready caption already written for this idea (use as the strong starting point): {exact_copy['caption']}")
-        # Richer creative direction the rewritten engine now produces (no v1
-        # equivalent) — folded into the seed so downstream generation gets
-        # the same visual intent the calendar item already committed to.
-        central_visual_idea = (item.get("creative_direction") or {}).get("central_visual_idea")
-        if central_visual_idea:
-            seed_parts.append(f"Central visual idea: {central_visual_idea}")
-        if item.get("designer_execution_notes"):
-            seed_parts.append(f"Production notes: {item['designer_execution_notes']}")
-        seed_content = "\n".join(seed_parts)
+        seed_content = _build_draft_seed_content(item)
 
         profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         raw_profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
