@@ -239,11 +239,14 @@ async def run_all(db, notify=None) -> dict:
     if adapter is None:
         return {"campaigns": 0, "skipped": "Meta ads not configured"}
     totals = {"campaigns": 0, "findings": 0, "new_recommendations": 0, "executed": 0, "errors": 0}
-    # Finished campaigns stop costing API calls; their stored snapshots still
-    # serve any evaluation that is due.
+    # Finished campaigns keep being read for a month — late attribution lands after
+    # the end, and their history is what the Growth screen and evaluations show —
+    # then stop costing API calls.
+    recent = _now() - timedelta(days=30)
     async for record in db[CAMPAIGNS].find({"brand_id": {"$exists": True, "$ne": None},
                                             "campaign_id": {"$exists": True},
-                                            "ended_notified": {"$ne": True}}):
+                                            "$or": [{"ended_notified": {"$ne": True}},
+                                                    {"created_at": {"$gte": recent}}]}):
         try:
             r = await run_campaign(db, adapter, record, notify)
             totals["campaigns"] += 1
