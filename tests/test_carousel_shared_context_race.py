@@ -16,8 +16,16 @@ The fix moves that resolution out of the per-slide task entirely:
 _resolve_carousel_shared_context() runs it exactly once, in the caller,
 before any per-slide task is created, and every slide receives the same
 already-resolved brand_context from the start — nothing left to race on.
-Per-slide LIBRARY style rotation (no custom guide) was never racy to begin
-with, since it's a pure function of slide_index, and stays untouched.
+
+Second, separate fix (Oct 2026, also confirmed live via customer
+screenshot): a brand with NO custom guide — just library style_selections
+— got a visibly DIFFERENT style on every slide of the same carousel. That
+one was never a race; it was the fallback branch's own
+`slide_index % len(style_selections)` correctly doing exactly what it was
+written to do — rotate style PER SLIDE. That's the right behaviour ACROSS
+different posts over time, but wrong WITHIN one carousel. Folded into the
+same pre-resolution step: pick_next_style runs once per carousel here too,
+not once per slide.
 """
 import inspect
 from unittest.mock import AsyncMock, MagicMock
@@ -120,6 +128,48 @@ class TestResolveCarouselSharedContextCustomGuide:
         assert resolved["override_cta"] == "Call now"
 
     @pytest.mark.asyncio
+    async def test_no_custom_guide_resolves_one_library_style_for_the_whole_carousel(self):
+        """The actual customer-reported bug (Oct 2026): a 3-slide carousel
+        with no custom guide, just library style_selections, came back with
+        3 visibly different styles — one per slide, from the fallback
+        branch's slide_index % len(style_selections). This confirms the
+        pre-resolution step now picks ONE style for the whole carousel."""
+        db, cols = _fake_db(brand_profile={
+            "style_selections": ["minimalist", "vibrant", "editorial"],
+            "style_prompt_fragments": ["Minimalist look.", "Vibrant look.", "Editorial look."],
+            "style_rotation_index": 1,
+        })
+        brand_context = {"brand_id": "brand-1"}
+
+        resolved = await _resolve_carousel_shared_context(
+            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-7",
+            platform="instagram",
+        )
+
+        assert resolved["style_slug"] == "vibrant"
+        assert resolved["style_prompt_fragment"] == "Vibrant look."
+        assert resolved["_carousel_context_resolved"] is True
+        guide_write = cols["content_drafts"].update_one.call_args_list[0]
+        assert guide_write[0][1]["$set"]["carousel_style_slug"] == "vibrant"
+        bp_write = cols["brand_profiles"].update_one.call_args_list[0]
+        assert bp_write[0][1]["$set"]["style_rotation_index"] == 2  # advances for the NEXT carousel/post
+
+    @pytest.mark.asyncio
+    async def test_style_override_resolves_once_too_not_per_slide(self):
+        db, cols = _fake_db(brand_profile={"style_selections": ["minimal_studio"]})
+        brand_context = {"brand_id": "brand-1"}
+
+        resolved = await _resolve_carousel_shared_context(
+            db=db, brand_context=brand_context, style_override=["street_editorial"], carousel_id="carousel-8",
+            platform="instagram",
+        )
+
+        # The override wins over the brand's own style_selections, and (like
+        # every other field here) is resolved once for the whole carousel.
+        assert resolved["style_slug"] == "street_editorial"
+        assert resolved["_carousel_context_resolved"] is True
+
+    @pytest.mark.asyncio
     async def test_per_platform_guide_override_is_honored_not_silently_ignored(self):
         """Confirmed live (Oct 2026): a brand could configure a per-platform
         visual override (saved to selected_custom_guides_v2_by_platform),
@@ -173,8 +223,14 @@ class TestGenerateImageBgSkipsWhenAlreadyResolved:
         source = inspect.getsource(csm._generate_image_bg)
         assert '_carousel_context_resolved' in source
         assert '_carousel_context_already_resolved' in source
-        # Both the custom-guide and CTA blocks must short-circuit on the flag.
+        # The custom-guide, library-style, and CTA blocks must all
+        # short-circuit on the flag — the library-style one is the actual
+        # customer-reported bug this covers: without this gate, a carousel
+        # with no custom guide fell through to slide_index % len(...), a
+        # different style per slide, even after the caller had already
+        # resolved one style for the whole carousel.
         assert 'if _all_custom_guide_ids and _carousel_context_already_resolved:' in source
+        assert 'elif _carousel_context_already_resolved:' in source
         assert 'if _carousel_context_already_resolved:' in source
 
     def test_caller_resolves_once_before_spawning_per_slide_tasks(self):
