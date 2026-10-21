@@ -22,7 +22,9 @@ runs:
    names, each used exactly once, which the prompt itself says not to do.
 """
 from app.agents.content_calendar_v2.services.content_calendar_v2_service import (
+    MAX_CAPTION_WORDS,
     _anti_boring_check,
+    _clamp_caption,
     _collect_item_text,
     _find_banned_words,
     _recurring_series_names,
@@ -145,6 +147,59 @@ def test_validate_item_v2_without_words_to_avoid_is_a_no_op():
     idea = _item()
     issues = _validate_item_v2(idea, is_carousel=False, words_to_avoid=None)
     assert issues == []
+
+
+# ── caption word-count cap (business requirement, Oct 2026: too wordy) ──────
+
+def test_validate_item_v2_flags_a_caption_over_the_word_cap():
+    idea = _item(exact_copy={
+        "headline": "Predictable power, finally.",
+        "caption": " ".join(["word"] * (MAX_CAPTION_WORDS + 1)),
+        "hashtags": [],
+    })
+    issues = _validate_item_v2(idea, is_carousel=False)
+    assert any("too long" in issue.lower() for issue in issues)
+
+
+def test_validate_item_v2_passes_a_caption_at_exactly_the_cap():
+    idea = _item(exact_copy={
+        "headline": "Predictable power, finally.",
+        "caption": " ".join(["word"] * MAX_CAPTION_WORDS),
+        "hashtags": [],
+    })
+    assert _validate_item_v2(idea, is_carousel=False) == []
+
+
+def test_validate_item_v2_passes_a_short_caption():
+    idea = _item()  # default caption is well under the cap
+    assert _validate_item_v2(idea, is_carousel=False) == []
+
+
+def test_clamp_caption_trims_to_the_last_full_sentence_within_the_cap():
+    words = ["word"] * (MAX_CAPTION_WORDS - 2) + ["ends", "here."] + ["extra"] * 10
+    idea = _item(exact_copy={"headline": "h", "caption": " ".join(words), "hashtags": []})
+    _clamp_caption(idea)
+    trimmed = idea["exact_copy"]["caption"]
+    assert trimmed.endswith("ends here.")
+    assert len(trimmed.split()) <= MAX_CAPTION_WORDS
+
+
+def test_clamp_caption_cuts_cleanly_when_no_sentence_boundary_exists():
+    idea = _item(exact_copy={"headline": "h", "caption": " ".join(["word"] * (MAX_CAPTION_WORDS + 20)), "hashtags": []})
+    _clamp_caption(idea)
+    assert len(idea["exact_copy"]["caption"].split()) == MAX_CAPTION_WORDS
+
+
+def test_clamp_caption_leaves_a_short_caption_untouched():
+    idea = _item()
+    original = idea["exact_copy"]["caption"]
+    _clamp_caption(idea)
+    assert idea["exact_copy"]["caption"] == original
+
+
+def test_clamp_caption_handles_missing_exact_copy():
+    idea = {"title": "no exact_copy field at all"}
+    _clamp_caption(idea)  # must not raise
 
 
 # ── _anti_boring_check — generic-AI-headline detection ──────────────────────
