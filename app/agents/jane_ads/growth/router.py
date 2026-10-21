@@ -55,6 +55,17 @@ def _adapter(db):
     return adapter
 
 
+def _with_lifetime(t: dict, health: dict) -> dict:
+    """Meta's lifetime totals when we have them: the daily rows can leave spend out."""
+    life = health.get("lifetime")
+    if not life:
+        return t
+    from .stats import derive
+    out = derive({**life, "days": t.get("days", 0)})
+    out["daily_complete"] = health.get("daily_complete", True)
+    return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in out.items()}
+
+
 def _clean(doc: dict) -> dict:
     return {k: v for k, v in doc.items() if k != "_id"}
 
@@ -70,7 +81,7 @@ async def overview(db: AsyncIOMotorDatabase = Depends(get_db_dependency),
         rows = await metrics.load(db, cid)
         h = await metrics.health(db, cid)
         goal = await engine.load_goal(db, cid)
-        t = totals_for_ui(rows)
+        t = _with_lifetime(totals_for_ui(rows), h)
         open_count = await db[engine.DIAGNOSES].count_documents({"campaign_id": cid, "status": "open"})
         out.append({
             "campaign_id": cid, "name": r.get("display_name") or "Campaign",
@@ -97,7 +108,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
     ad_rows = await metrics.load(db, campaign_id, level="ad")
     h = await metrics.health(db, campaign_id)
     ad_ids = sorted({x["ad_id"] for x in ad_rows if x.get("ad_id")} | {r.get("ad_id") or ""} - {""})
-    t = totals_for_ui(rows)
+    t = _with_lifetime(totals_for_ui(rows), h)
     diagnoses = [_clean(d) for d in await db[engine.DIAGNOSES].find(
         {"campaign_id": campaign_id}).sort("created_at", -1).limit(30).to_list(30)]
     recs = [_clean(x) for x in await db[engine.RECOMMENDATIONS].find(

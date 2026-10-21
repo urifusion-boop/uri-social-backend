@@ -77,6 +77,13 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
         }, blocks_actions=True))
         return out
 
+    if ctx.get("daily_complete") is False:
+        out.append(_finding("daily_incomplete", "low", {
+            "lifetime_spend_ngn": ctx.get("lifetime_spend_ngn"),
+            "daily_spend_ngn": ctx.get("daily_spend_ngn")}, blocks_actions=True))
+        out.extend(_non_trend_findings(ctx))
+        return out
+
     recent_rows, base_rows, recent_d, base_d = windows(rows, today)
     recent, base = totals(recent_rows), totals(base_rows)
     win = {"recent": [recent_d[0], recent_d[-1]], "baseline": [base_d[0], base_d[-1]]}
@@ -128,16 +135,8 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
                             {"recent": _round(recent), "landing": ctx.get("landing") or {}},
                             window=win))
 
-    landing = ctx.get("landing") or {}
-    # Only worth an alert while people can actually be sent there.
-    if landing.get("checked") and not landing.get("ok") and (active or recent["clicks"] > 0):
-        out.append(_finding("landing_page", "high", landing))
-
+    out.extend(_non_trend_findings(ctx, recent["clicks"]))
     leads = ctx.get("leads") or {}
-    with_outcome = leads.get("with_outcome", 0)
-    if with_outcome >= MIN_LEADS_WITH_OUTCOME and \
-            (leads.get("qualified_rate") or 0) < LOW_QUALIFIED_RATE:
-        out.append(_finding("low_lead_quality", "medium", {"leads": leads}))
 
     # Meta reports no conversations but the inbox has people who came from this ad.
     if recent["clicks"] > 0 and recent["conversations"] == 0 and leads.get("recent_from_ads", 0) >= 3:
@@ -145,10 +144,6 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
                             {"meta_conversations": 0, "inbox_conversations_from_ads": leads["recent_from_ads"]},
                             blocks_actions=True, window=win))
 
-    followups = ctx.get("followups") or {}
-    if followups.get("waiting", 0) >= 1:
-        out.append(_finding("follow_up_gap", "high" if followups["waiting"] >= 3 else "medium",
-                            followups))
 
     # Cheap results and the budget is the limit: room to scale (or to finish sooner).
     target = ctx.get("target_cpl_ngn") or base_cpl
@@ -167,6 +162,25 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
         keep = set(recent_d) | set(base_d)
         ad_rows = [r for r in ad_rows if r.get("date") in keep]
     out.extend(_variant_findings(ad_rows))
+    return out
+
+
+def _non_trend_findings(ctx: dict, recent_clicks: float = 0) -> list[dict]:
+    """Checks that don't depend on Meta's daily breakdown."""
+    out = []
+    active = (ctx.get("status") or "").upper() == "ACTIVE"
+    landing = ctx.get("landing") or {}
+    # Only worth an alert while people can actually be sent there.
+    if landing.get("checked") and not landing.get("ok") and (active or recent_clicks > 0):
+        out.append(_finding("landing_page", "high", landing))
+    leads = ctx.get("leads") or {}
+    if leads.get("with_outcome", 0) >= MIN_LEADS_WITH_OUTCOME and \
+            (leads.get("qualified_rate") or 0) < LOW_QUALIFIED_RATE:
+        out.append(_finding("low_lead_quality", "medium", {"leads": leads}))
+    followups = ctx.get("followups") or {}
+    if followups.get("waiting", 0) >= 1:
+        out.append(_finding("follow_up_gap", "high" if followups["waiting"] >= 3 else "medium",
+                            followups))
     return out
 
 

@@ -94,6 +94,9 @@ async def pull(db, adapter, record: dict, today: Optional[date] = None) -> dict:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             camp = await _fetch(client, adapter, campaign_id, {**base, "level": "campaign"})
+            life = await _fetch(client, adapter, campaign_id, {
+                "level": "campaign", "date_preset": "maximum",
+                "fields": "spend,impressions,reach,clicks,actions"})
             ads = await _fetch(client, adapter, campaign_id, {
                 **base, "level": "ad",
                 "fields": "ad_id,ad_name,adset_id," + base["fields"],
@@ -111,15 +114,28 @@ async def pull(db, adapter, record: dict, today: Optional[date] = None) -> dict:
         await db[SNAPSHOTS].update_one(
             {"campaign_id": campaign_id, "level": r["level"], "ad_id": r["ad_id"], "date": r["date"]},
             {"$set": {**r, "brand_id": record.get("brand_id")}}, upsert=True)
-    # What Meta actually sent for one row (metrics only), so a parsing problem can be
-    # seen without access to the token.
+    lifetime = lifetime_totals(life)
+    daily_spend = sum(r["spend_ngn"] for r in rows if r["level"] == "campaign")
+    # Meta sometimes returns daily rows with conversations but zero spend and
+    # impressions while the lifetime total is right. Trends from such rows would be
+    # fiction, so they are flagged and the trend checks stand down.
+    complete = abs(daily_spend - lifetime["spend_ngn"]) <= max(1.0, 0.05 * lifetime["spend_ngn"])
     sample = {k: v for k, v in (camp[0] if camp else {}).items() if k != "actions"}
     await db[HEALTH].update_one({"campaign_id": campaign_id}, {
         "$set": {"last_success_at": now, "last_error": "", "error_count": 0,
                  "brand_id": record.get("brand_id"), "rows_last_pull": len(camp),
-                 "ad_rows_last_pull": len(ads), "sample_row": sample}},
+                 "ad_rows_last_pull": len(ads), "sample_row": sample,
+                 "lifetime": lifetime, "daily_spend_ngn": round(daily_spend, 2),
+                 "daily_complete": complete}},
         upsert=True)
     return {"ok": True, "rows": len(rows), "error": ""}
+
+
+def lifetime_totals(data: list[dict]) -> dict:
+    d = data[0] if data else {}
+    return {"spend_ngn": float(d.get("spend") or 0), "impressions": int(d.get("impressions") or 0),
+            "reach": int(d.get("reach") or 0), "clicks": int(d.get("clicks") or 0),
+            "conversations": _conversations(d.get("actions"))}
 
 
 async def load(db, campaign_id: str, days: int = LOOKBACK_DAYS, level: str = "campaign") -> list[dict]:

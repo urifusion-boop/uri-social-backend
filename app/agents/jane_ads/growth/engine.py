@@ -100,7 +100,8 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
         sched = {"error": str(e)[:200]}
     goal = await load_goal(db, cid)
     ad_ids = sorted({r["ad_id"] for r in ad_rows if r.get("ad_id")} | {record.get("ad_id") or ""} - {""})
-    spend = sum(float(r.get("spend_ngn") or 0) for r in rows)
+    spend = (health.get("lifetime") or {}).get("spend_ngn") or \
+        sum(float(r.get("spend_ngn") or 0) for r in rows)
     lead_stats = await leads.stats(db, brand, ad_ids, spend)
     followups = await leads.follow_up_gaps(db, brand, ad_ids)
 
@@ -124,6 +125,9 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
             "target_cpl_ngn": goal.get("target_cpl_ngn"),
             "leads": lead_stats, "landing": landing, "followups": followups,
             "ad_rows": ad_rows,
+            "daily_complete": health.get("daily_complete"),
+            "lifetime_spend_ngn": (health.get("lifetime") or {}).get("spend_ngn"),
+            "daily_spend_ngn": health.get("daily_spend_ngn"),
         },
         "state": {
             "data_fresh": bool(fresh and _now() - fresh <= det.STALE_AFTER),
