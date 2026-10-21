@@ -289,6 +289,24 @@ def _job_market_intelligence_digests():
     _run_async("market_intelligence_digests", _run)
 
 
+def _job_listening_weekly_digest():
+    """Listening Intelligence weekly digest (PRD §10) — runs daily; the
+    claim is per ISO week, so whichever day's tick gets there first for a
+    brand sends it and every later tick that week is a no-op."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.digest import send_weekly_digests
+            from app.agents.market_intelligence.listening.config import get_config
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        cfg = await get_config(db)
+        result = await send_weekly_digests(db, cfg)
+        print(f"👂📰 Listening weekly digest: {result}")
+    _run_async("listening_weekly_digest", _run)
+
+
 def _job_publish_scheduled_content():
     async def _run():
         from app.database import get_db
@@ -466,6 +484,15 @@ def start_notification_scheduler():
         _job_listening_cycle,
         CronTrigger(minute=35),
         id="listening_cycle",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence weekly digest: daily tick, the weekly claim
+    # inside the job itself decides whether anything actually sends.
+    _scheduler.add_job(
+        _job_listening_weekly_digest,
+        CronTrigger(hour=9, minute=10),
+        id="listening_weekly_digest",
         **_JOB_DEFAULTS,
     )
 
