@@ -7,7 +7,7 @@ private terms and their cards are not returned anywhere.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -18,7 +18,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, permissions, profile as profile_mod
+from . import collector, discovery, permissions, profile as profile_mod, review
 from .config import get_config
 from .cycle import run_cycle
 
@@ -335,3 +335,36 @@ async def set_source_approval(source: str, body: SourceApproval, admin: dict = D
     actor = (admin.get("claims") or {}).get("email") or "admin"
     result = await permissions.set_approval(db, source, body.approved, actor, body.notes)
     return UriResponse.get_single_data_response("source", result)
+
+
+# ── Human review queue (PRD §17) — admin-only ─────────────────────────────────
+
+@router.get("/curation/reviews")
+async def list_pending_reviews(market: Optional[str] = None, limit: int = 50,
+                               admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Low-confidence readings waiting on a human judgment call, most
+    uncertain first."""
+    cfg = await get_config(db)
+    items = await review.pending_reviews(db, cfg, market, limit)
+    return UriResponse.get_single_data_response("reviews", items)
+
+
+class ReviewResolution(BaseModel):
+    on_topic: Optional[bool] = None
+    intent: Optional[str] = None
+    topics: Optional[List[str]] = None
+    note: Optional[str] = None
+
+
+@router.post("/curation/reviews/{market_key}/{source_id}/resolve")
+async def resolve_pending_review(market_key: str, source_id: str, body: ReviewResolution,
+                                 admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Records a curator's correction against the reading and logs it for
+    training data (PRD §17); does not rewrite counts already computed from
+    the original reading — see review.py's own docstring for why."""
+    actor = (admin.get("claims") or {}).get("email") or "curator"
+    result = await review.resolve_review(db, source_id, market_key, actor, body.on_topic, body.intent,
+                                         body.topics, body.note)
+    if not result["found"]:
+        raise HTTPException(status_code=404, detail="Reading not found")
+    return UriResponse.get_single_data_response("review", result)

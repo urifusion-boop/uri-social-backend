@@ -68,6 +68,11 @@ DEFAULTS: dict[str, Any] = {
         "dismiss_rate_threshold": 0.7,  # dismiss rate above this starts lowering relevance
         "max_penalty": 25,              # relevance points subtracted at a 100% dismiss rate
     },
+    # Human review queue (PRD §17)
+    "review": {
+        "window_days": 14,
+        "confidence_threshold": 0.5,  # readings below this, unreviewed, show up in the queue
+    },
     # Retention (PRD §12, §15)
     "retention": {
         "item_days": 90,  # normalised items + evidence text: 90 days hot, then deleted
