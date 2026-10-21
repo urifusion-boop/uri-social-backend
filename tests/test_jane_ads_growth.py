@@ -257,10 +257,21 @@ def _seed_engine(db, fake, monkeypatch, mode="advisory"):
     weak = rows({n: (500, 2000, 60, 2) for n in range(1, 8)}, ad="weak")
 
     async def pull(db_, adapter, record, today=None):
+        camp: dict = {}
+        for r in good + weak:
+            c = camp.setdefault(r["date"], {**r, "ad_id": "", "level": "campaign", "spend_ngn": 0,
+                                            "impressions": 0, "reach": 0, "clicks": 0, "conversations": 0})
+            for k in ("spend_ngn", "impressions", "reach", "clicks", "conversations"):
+                c[k] += r[k]
+        for c in camp.values():
+            await db_[metrics.SNAPSHOTS].update_one(
+                {"campaign_id": record["campaign_id"], "level": "campaign", "date": c["date"]},
+                {"$set": {**c, "campaign_id": record["campaign_id"], "retrieved_at": NOW}}, upsert=True)
         for r in good + weak:
             await db_[metrics.SNAPSHOTS].update_one(
-                {"campaign_id": record["campaign_id"], "ad_id": r["ad_id"], "date": r["date"]},
-                {"$set": {**r, "campaign_id": record["campaign_id"], "retrieved_at": NOW}}, upsert=True)
+                {"campaign_id": record["campaign_id"], "level": "ad", "ad_id": r["ad_id"], "date": r["date"]},
+                {"$set": {**r, "level": "ad", "campaign_id": record["campaign_id"], "retrieved_at": NOW}},
+                upsert=True)
         await db_[metrics.HEALTH].update_one({"campaign_id": record["campaign_id"]},
                                              {"$set": {"last_success_at": NOW, "last_error": "",
                                                        "landing": {"checked": False, "checked_at": NOW.isoformat()}}},
@@ -341,3 +352,23 @@ def test_a_broken_page_matters_only_while_people_are_sent_there():
     assert "landing_page" not in issues(detect.detect([], ctx(landing=broken, status="PAUSED")))
     d = diagnose.diagnose({"issue_type": "landing_page", "evidence": broken}, {})
     assert "couldn't connect" in d["hypotheses"][0]["why"]
+
+
+def test_totals_come_from_campaign_rows_not_ad_rows():
+    db = mongomock_motor.AsyncMongoMockClient()["growth"]
+    run(db[metrics.SNAPSHOTS].insert_many([
+        {"campaign_id": "c1", "level": "campaign", "ad_id": "", "date": day(1), "spend_ngn": 3800, "conversations": 14},
+        {"campaign_id": "c1", "level": "ad", "ad_id": "a1", "date": day(1), "spend_ngn": 0, "conversations": 14},
+        {"campaign_id": "c1", "ad_id": "old", "date": day(2), "spend_ngn": 5, "conversations": 0},
+    ]))
+    camp = run(metrics.load(db, "c1"))
+    ads = run(metrics.load(db, "c1", level="ad"))
+    assert [r["spend_ngn"] for r in camp] == [3800]
+    assert {r["ad_id"] for r in ads} == {"a1", "old"}
+
+
+def test_engine_reads_campaign_totals(fake, monkeypatch):
+    db = mongomock_motor.AsyncMongoMockClient()["growth"]
+    record = _seed_engine(db, fake, monkeypatch)
+    ctx = run(engine.context(db, fake, record, pol.normalize({})))
+    assert sum(r["spend_ngn"] for r in ctx["rows"]) == 7000 and len(ctx["ad_rows"]) == 14

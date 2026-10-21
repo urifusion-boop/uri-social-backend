@@ -89,8 +89,9 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
     brand = _brand(ctx)
     r = await _campaign(db, brand, campaign_id)
     rows = await metrics.load(db, campaign_id)
+    ad_rows = await metrics.load(db, campaign_id, level="ad")
     h = await metrics.health(db, campaign_id)
-    ad_ids = sorted({x["ad_id"] for x in rows if x.get("ad_id")} | {r.get("ad_id") or ""} - {""})
+    ad_ids = sorted({x["ad_id"] for x in ad_rows if x.get("ad_id")} | {r.get("ad_id") or ""} - {""})
     t = totals_for_ui(rows)
     diagnoses = [_clean(d) for d in await db[engine.DIAGNOSES].find(
         {"campaign_id": campaign_id}).sort("created_at", -1).limit(30).to_list(30)]
@@ -119,7 +120,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         "diagnoses": diagnoses, "recommendations": recs,
         "leads": await leads.stats(db, brand, ad_ids, t["spend_ngn"]),
         "follow_ups": await leads.follow_up_gaps(db, brand, ad_ids),
-        "creative_test": creative.compare(variants, rows) if variants else None,
+        "creative_test": creative.compare(variants, ad_rows) if variants else None,
         "forecast": forecast.project(rows, ends),
     }
 
