@@ -74,6 +74,16 @@ class _Coll:
     async def update_many(self, q, upd, **k):
         return await self._update(q, upd, True)
 
+    async def find_one_and_update(self, q, upd, return_document=None, **k):
+        d = next((d for d in self.docs if _match(d, q)), None)
+        if d is None:
+            return None
+        before = dict(d)
+        d.update(upd.get("$set", {}))
+        for f, n in upd.get("$inc", {}).items():
+            d[f] = d.get(f, 0) + n
+        return dict(d) if return_document else before
+
 
 class _DB(dict):
     def __missing__(self, name):
@@ -156,12 +166,34 @@ class TestExplain:
     def test_expired_facebook_login_says_reconnect(self):
         info = pc.explain("facebook", VCHAIN_ERROR)
         assert info["reconnect"]
+        assert info["category"] == "known"
         assert "Reconnect Facebook in Connected Accounts" in info["message"]
 
     def test_other_errors_keep_the_networks_words(self):
         info = pc.explain("linkedin", "Content is a duplicate")
         assert not info["reconnect"]
+        assert info["category"] == "unknown"
         assert "LinkedIn" in info["message"] and "duplicate" in info["message"]
+
+    def test_lost_page_admin_rights_gets_its_own_accurate_message_not_the_generic_one(self):
+        # Live-reported: MEEQAT TRAVELS AND TOURS LTD's Facebook post failed
+        # this way. The generic "reconnect" message would be misleading here
+        # (reconnecting with the same now-demoted account hits this exact
+        # error again) — this needs its own specific explanation.
+        raw = ("Failed to upload Facebook photo: 400 - The user must be an administrator, editor, or moderator "
+               "of the page in order to impersonate it.")
+        info = pc.explain("facebook", raw)
+        assert info["reconnect"] is True
+        assert info["category"] == "known"
+        assert "no longer an admin, editor or moderator" in info["message"]
+        assert "connection has expired" not in info["message"]
+
+    def test_confirm_your_identity_does_not_ask_to_reconnect(self):
+        raw = "Failed to upload Facebook photo: 400 - Confirm your identity before you can publish as this Page."
+        info = pc.explain("facebook", raw)
+        assert info["reconnect"] is False
+        assert info["category"] == "content"
+        assert "confirm your identity" in info["message"].lower()
 
 
 class TestConfirm:
@@ -177,6 +209,44 @@ class TestConfirm:
         assert conns["c1"].get("needs_reconnect") is True
         assert not conns["c2"].get("needs_reconnect")          # the other brand's page is untouched
         assert _quiet_notifications == [(False, saved["error_message"])]
+
+    def test_unrecognized_error_does_not_flag_reconnect_on_one_failure(self, _quiet_notifications):
+        db, draft = _setup()
+        answer = {"post": {"publishedAt": None, "socialAccounts": [
+            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
+        ]}}
+        assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "failed"
+        assert not db["social_connections"].docs[0].get("needs_reconnect")
+
+    def test_unrecognized_error_flags_reconnect_once_it_keeps_happening(self, _quiet_notifications):
+        # The same uncatalogued error, repeated on the same connection, is a
+        # real pattern — it must escalate even though nobody's written a
+        # pattern for this exact text, instead of being silently ignored
+        # forever.
+        db, draft = _setup()
+        answer = {"post": {"publishedAt": None, "socialAccounts": [
+            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
+        ]}}
+        result = None
+        for _ in range(pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD):
+            draft["status"] = pc.CONFIRMING  # each call re-confirms as if resubmitted/re-polled
+            result = _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
+        assert result == "failed"
+        assert db["social_connections"].docs[0].get("needs_reconnect") is True
+
+    def test_a_success_in_between_resets_the_unrecognized_failure_count(self, _quiet_notifications):
+        db, draft = _setup()
+        answer = {"post": {"publishedAt": None, "socialAccounts": [
+            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
+        ]}}
+        for _ in range(pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD - 1):
+            draft["status"] = pc.CONFIRMING
+            _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD - 1
+        live = {"post": {"publishedAt": "2026-10-15T09:01:00Z", "socialAccounts": [{"status": "published"}]}}
+        draft["status"] = pc.CONFIRMING
+        assert _run(pc.confirm(db, draft, outstand=_Outstand(live), now=NOW)) == "published"
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 0
 
     def test_live_marks_published_and_clears_a_reconnect_flag(self, _quiet_notifications):
         db, draft = _setup()

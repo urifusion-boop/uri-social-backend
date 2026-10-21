@@ -162,7 +162,22 @@ def normalize_settings(raw: Optional[dict]) -> dict:
             "open": _clean_time(hours_in.get("open"), base["business_hours"]["open"]),
             "close": _clean_time(hours_in.get("close"), base["business_hours"]["close"]),
         },
+        "alert_emails": _clean_emails(raw.get("alert_emails")),
     }
+
+
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+MAX_ALERT_EMAILS = 5
+
+
+def _clean_emails(value: Any) -> list[str]:
+    """Extra addresses escalations are emailed to, beside the owner's."""
+    out: list[str] = []
+    for e in value if isinstance(value, list) else []:
+        e = str(e).strip().lower()
+        if _EMAIL.fullmatch(e) and e not in out:
+            out.append(e)
+    return out[:MAX_ALERT_EMAILS]
 
 
 async def load_settings(db, workspace_id: str) -> dict:
@@ -172,9 +187,14 @@ async def load_settings(db, workspace_id: str) -> dict:
 
 async def save_settings(db, workspace_id: str, raw: dict, actor_id: str) -> dict:
     clean = normalize_settings(raw)
+    fields = dict(clean)
+    # A screen that doesn't show the alert emails mustn't wipe them by saving.
+    if "alert_emails" not in (raw or {}):
+        fields.pop("alert_emails")
+        clean["alert_emails"] = (await load_settings(db, workspace_id))["alert_emails"]
     await db[SETTINGS].update_one(
         {"workspace_id": workspace_id},
-        {"$set": {**clean, "updated_at": now(), "updated_by": actor_id},
+        {"$set": {**fields, "updated_at": now(), "updated_by": actor_id},
          "$setOnInsert": {"workspace_id": workspace_id}},
         upsert=True,
     )
@@ -656,6 +676,9 @@ HOLDING_REPLIES = {
 }
 
 
+HOLD_AGAIN_AFTER = timedelta(hours=12)
+
+
 def holding_reply(cls: dict, situation: str) -> str:
     if cls.get("wants_human"):
         return HOLDING_REPLIES["human"]
@@ -668,16 +691,19 @@ def holding_reply(cls: dict, situation: str) -> str:
 def should_hold(settings: dict, conv: dict, history: list[dict],
                 at: Optional[datetime] = None) -> bool:
     """A held reply gets a holding line when nothing but the message itself stopped
-    it, and only once until a person has replied: one "someone will get back to
-    you" is reassuring, three in a row is a bot stalling."""
+    it. Not twice in a row: a customer still waiting on the last "someone will get
+    back to you" doesn't need another. After HOLD_AGAIN_AFTER, though, it's a new
+    wait — a question two days later deserves its own acknowledgement."""
     at = at or now()
     if gate(settings, conv, *_activity(history, at), at):
         return False
-    held = _aware(conv.get("holding_sent_at"))
-    if not held:
+    outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
+    if not outbound:
         return True
-    return any(m["direction"] == Direction.OUTBOUND.value and m["actor_id"] != AGENT_ACTOR
-               and (_aware(m.get("received_at")) or at) > held for m in history)
+    last = outbound[-1]
+    if last["actor_id"] != AGENT_ACTOR or (last.get("text") or "") not in HOLDING_REPLIES.values():
+        return True
+    return (_aware(last.get("received_at")) or at) <= at - HOLD_AGAIN_AFTER
 
 
 async def explain(db, workspace_id: str, result: dict) -> str:
@@ -734,11 +760,9 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
                 held = record.get("delivery") == "accepted"
             except SendRefused:
                 pass
-            if held:
-                await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
-                    "holding_sent_at": now()}})
         if settings["auto_reply_enabled"]:
-            await notify_needs_reply(db, workspace_id, conv, result["target"]["text"], reason, held)
+            await notify_needs_reply(db, workspace_id, conv, result["target"]["text"], reason, held,
+                                     settings["alert_emails"])
         return {"status": "held" if held else "drafted", "reason": reason}
 
     try:
@@ -777,9 +801,9 @@ async def _owner_of(db, workspace_id: str) -> str:
 
 
 async def notify_needs_reply(db, workspace_id: str, conv: dict, text: str, reason: str,
-                             held: bool) -> None:
-    """Tell the business a customer is waiting on a person. Once an hour per
-    conversation at most; a customer sending five messages is one alert."""
+                             held: bool, also_email: Optional[list[str]] = None) -> None:
+    """Tell the business a customer is waiting on a person: once per wait, so a
+    customer sending five messages in a row is one alert, not five."""
     from app.services import brand_notifier
 
     user_id = await _owner_of(db, workspace_id)
@@ -792,14 +816,30 @@ async def notify_needs_reply(db, workspace_id: str, conv: dict, text: str, reaso
         who = (ident or {}).get("display_name") or ""
     who = who or "A customer"
     told = " Jane told them someone will reply shortly." if held else ""
+    from app.core.config import settings as app_settings
+    from app.services import notification_channels
+
+    base = (app_settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"").rstrip("/")
+    link = f"{base}/workspace/?tab=messages"
+    title = f"{who} is waiting for a reply"
+    message = f'"{text[:200]}" — {reason}.{told}'
     try:
-        await brand_notifier.notify(
-            db, user_id, workspace_id, "inbox_needs_reply",
-            title=f"{who} is waiting for a reply",
-            message=f'"{text[:200]}" — {reason}.{told}',
-            link="/workspace/?tab=messages",
+        result = await brand_notifier.notify(
+            db, user_id, workspace_id, "inbox_needs_reply", title=title, message=message,
+            link=link,
             metadata={"conversation_id": str(conv["_id"])},
-            dedupe_key=str(conv["_id"]), dedupe_hours=1)
+            # One alert per wait: a fresh holding reply starts a new one, while
+            # follow-ups from a customer already waiting stay quiet for an hour.
+            dedupe_key=str(conv["_id"]), dedupe_hours=0 if held else 1)
+        if "skipped" in result:
+            return
+        owner = ((await db["users"].find_one({"userId": user_id}, {"email": 1})) or {}).get("email", "")
+        for address in also_email or []:
+            if address != (owner or "").lower():
+                ok, error = await notification_channels.send_email(
+                    address, title, message, link)
+                if not ok:
+                    print(f"[Inbox] alert email to {address} failed: {error}", flush=True)
     except Exception as e:  # an alert failing must never cost the customer's message
         print(f"[Inbox] needs-reply alert failed for {workspace_id}: {e}", flush=True)
 

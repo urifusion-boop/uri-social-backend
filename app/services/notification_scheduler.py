@@ -126,6 +126,19 @@ def _job_publish_confirmations():
     _run_async("publish_confirmations", _run)
 
 
+def _job_connection_health_check():
+    """Asks Outstand directly whether each connected account's session is
+    still alive, instead of only finding out reactively when a publish
+    attempt fails (see connection_health_check.py's module docstring for
+    the live-confirmed gap this closes)."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services import connection_health_check
+        result = await connection_health_check.check_all_connections(get_db())
+        print(f"🔌 connection_health_check: {result}")
+    _run_async("connection_health_check", _run)
+
+
 def _job_weekly_reports():
     _brand_alert_job("brand_weekly_reports", "run_weekly_reports")
 
@@ -196,6 +209,19 @@ def _job_jane_ads_token_health():
         result = await run_token_health_check(db)
         print(f"🔑 Jane Ads token health: {result}")
     _run_async("jane_ads_token_health", _run)
+
+
+def _job_jane_ads_growth():
+    """Growth Intelligence: refresh Meta snapshots, detect, diagnose, recommend, run
+    authorised changes and evaluate finished ones."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.growth import engine
+        db = get_db()
+        result = await engine.run_all(
+            db, notify=lambda rec, d, a=None: engine.notify_owner(db, rec, d, a))
+        print(f"📈 Jane Ads growth: {result}")
+    _run_async("jane_ads_growth", _run)
 
 
 def _job_jane_ads_billing():
@@ -274,6 +300,42 @@ def _job_market_intelligence_digests():
         result = await send_daily_digests(db)
         print(f"📰 Market Intelligence digests: {result}")
     _run_async("market_intelligence_digests", _run)
+
+
+def _job_listening_weekly_digest():
+    """Listening Intelligence weekly digest (PRD §10) — runs daily; the
+    claim is per ISO week, so whichever day's tick gets there first for a
+    brand sends it and every later tick that week is a no-op."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.digest import send_weekly_digests
+            from app.agents.market_intelligence.listening.config import get_config
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        cfg = await get_config(db)
+        result = await send_weekly_digests(db, cfg)
+        print(f"👂📰 Listening weekly digest: {result}")
+    _run_async("listening_weekly_digest", _run)
+
+
+def _job_listening_retention():
+    """Listening Intelligence retention (PRD §12, §15) — daily. Deletes
+    items and readings past the configured retention window; everything
+    derived (topic counts, the topic graph, cards) is kept long-term."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.retention import enforce_retention
+            from app.agents.market_intelligence.listening.config import get_config
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        cfg = await get_config(db)
+        result = await enforce_retention(db, cfg)
+        print(f"👂🗑️ Listening retention: {result}")
+    _run_async("listening_retention", _run)
 
 
 def _job_publish_scheduled_content():
@@ -368,6 +430,15 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Growth Intelligence hourly, offset from billing so the two don't share Meta's
+    # rate limit in the same minute.
+    _scheduler.add_job(
+        _job_jane_ads_growth,
+        CronTrigger(minute=20),
+        id="jane_ads_growth",
+        **_JOB_DEFAULTS,
+    )
+
     # Jane + Ads per-brand ads connection token health, daily at 06:00 UTC — a
     # dead token doesn't stop a launched campaign from delivering wrong (or
     # spending), so this is a proactive pause+notify, not just a read-time check.
@@ -456,6 +527,23 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Listening Intelligence weekly digest: daily tick, the weekly claim
+    # inside the job itself decides whether anything actually sends.
+    _scheduler.add_job(
+        _job_listening_weekly_digest,
+        CronTrigger(hour=9, minute=10),
+        id="listening_weekly_digest",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence retention: daily, off-peak.
+    _scheduler.add_job(
+        _job_listening_retention,
+        CronTrigger(hour=3, minute=15),
+        id="listening_retention",
+        **_JOB_DEFAULTS,
+    )
+
     # Google Ads: one reminder when a link request is still waiting a day later.
     _scheduler.add_job(
         _job_google_ads_link_reminders,
@@ -472,8 +560,17 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Proactively check every Outstand-managed connection's session health —
+    # the push side of what get_user_connections already does on pull.
+    _scheduler.add_job(
+        _job_connection_health_check,
+        CronTrigger(hour="*/6", minute=50),
+        id="connection_health_check",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 14 jobs")
+    print("📅 Notification scheduler started with 15 jobs")
 
 
 def stop_notification_scheduler():

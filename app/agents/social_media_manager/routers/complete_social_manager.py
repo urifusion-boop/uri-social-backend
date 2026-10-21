@@ -767,6 +767,13 @@ async def generate_content(
                 for d in drafts:
                     d["has_image"] = True
 
+            # Per-slide LIBRARY style rotation is a pure function of slide_index,
+            # so it's resolved independently inside _generate_image_bg() with no
+            # race. Custom visual guide + CTA are genuinely shared carousel-wide
+            # state though, so those are resolved exactly once here, before any
+            # per-slide task is created — see _resolve_carousel_shared_context's
+            # docstring for why this moved out of _generate_image_bg().
+
             # FastAPI's BackgroundTasks runs queued tasks one at a time, in order —
             # with several drafts that serializes their image generation instead of
             # overlapping it. Fire each draft's (or slide's) generation as its own
@@ -779,6 +786,13 @@ async def generate_content(
                     # Pass total_slides and carousel_id for visual continuity
                     total_slides = len(slides)
                     carousel_id = draft["id"]  # All slides share same carousel_id
+                    carousel_brand_context = await _resolve_carousel_shared_context(
+                        db=db,
+                        brand_context=brand_context_dict,
+                        style_override=request.style_override,
+                        carousel_id=carousel_id,
+                        platform=draft["platform"],
+                    )
                     for slide_index, slide in enumerate(slides):
                         # Combine slide-specific content with original seed for richer context
                         slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
@@ -790,7 +804,7 @@ async def generate_content(
                             platform=draft["platform"],
                             content=slide_content or draft["content"],
                             seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
-                            brand_context=brand_context_dict,
+                            brand_context=carousel_brand_context,
                             db=db,
                             reference_image=_slide_reference_image(slide_index),
                             reference_image_meta=_slide_reference_meta(slide_index),
@@ -6030,6 +6044,123 @@ def _resolve_platform_style_pool(bp: Dict[str, Any], platform: str) -> tuple:
     return bp, "style_rotation_index"
 
 
+async def _resolve_carousel_shared_context(
+    db: AsyncIOMotorDatabase,
+    brand_context: Dict[str, Any],
+    style_override: Optional[List[str]],
+    carousel_id: str,
+    platform: str,
+) -> Dict[str, Any]:
+    """
+    Resolve the carousel-wide custom visual guide and CTA exactly once, before
+    any per-slide image-generation task is created, and return a NEW dict for
+    this carousel's slides to share.
+
+    Both the custom guide and the CTA are genuinely shared state for the whole
+    carousel (unlike per-slide library style rotation, which is a pure function
+    of slide_index and has no race to begin with). Previously this was resolved
+    lazily inside _generate_image_bg itself — slide 0's task would resolve+write
+    it, every other slide's task would read it back — but all slides' tasks are
+    fired concurrently with no ordering guarantee, so slides that read before
+    slide 0 finished writing silently got no style/CTA at all. Resolving here,
+    before the per-slide tasks are even created, removes the race entirely
+    while leaving per-slide image generation exactly as parallel as before.
+
+    Returns a new dict (never mutates `brand_context` in place) since the same
+    brand_context object is reused across other drafts/carousels in the same
+    request. `platform` is needed for _resolve_platform_style_pool — a
+    carousel's slides all share one platform, so this is resolved once per
+    carousel just like the guide/CTA choice themselves.
+    """
+    _bc_brand_id = brand_context.get("brand_id", "")
+    _bc_user_id = brand_context.get("user_id", "")
+    _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
+
+    resolved = dict(brand_context)
+
+    _bp = await db["brand_profiles"].find_one(
+        _style_profile_scope,
+        {
+            "style_selections": 1, "style_rotation_index": 1,
+            "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
+            "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
+            "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
+            "cta_rotation_index": 1,
+        },
+    ) or {}
+    _bp, _rotation_field_path = _resolve_platform_style_pool(_bp, platform)
+
+    _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
+    _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
+    _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
+
+    if _all_custom_guide_ids:
+        from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
+
+        _rotation_index = int(_bp.get("style_rotation_index") or 0)
+        _custom_guide_id = _all_custom_guide_ids[_rotation_index % len(_all_custom_guide_ids)]
+        is_v2 = _custom_guide_id in _custom_guide_ids_v2
+
+        if is_v2:
+            custom_guide = await db["custom_visual_guides"].find_one({"_id": ObjectId(_custom_guide_id), "version": "v2"})
+            if custom_guide:
+                _slug = f"custom_v2_{_custom_guide_id[:8]}"
+                _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                _v2_ref = custom_guide.get("original_image_url")
+                resolved.update({
+                    "style_slug": _slug,
+                    "custom_guide_v2_id": _custom_guide_id,
+                    "custom_guide_v2_reference_image": _v2_ref,
+                })
+                await db["content_drafts"].update_one(
+                    {"id": carousel_id},
+                    {"$set": {"carousel_style_slug": _slug, "carousel_custom_guide_v2_id": _custom_guide_id, "carousel_custom_guide_v2_ref": _v2_ref}},
+                )
+                await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {_rotation_field_path: _next_index}})
+                print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] resolved once for carousel {carousel_id}")
+        else:
+            custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
+            if custom_guide:
+                _fragment = custom_guide.get("prompt_fragment", "")
+                _slug = f"custom_{_custom_guide_id[:8]}"
+                _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                resolved.update({"style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id})
+                await db["content_drafts"].update_one(
+                    {"id": carousel_id},
+                    {"$set": {"carousel_style_slug": _slug, "carousel_style_fragment": _fragment}},
+                )
+                await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {_rotation_field_path: _next_index}})
+                await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+                print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] resolved once for carousel {carousel_id}")
+
+    _carousel_cta = brand_context.get("override_cta")
+    if not _carousel_cta:
+        _cta_styles_list = brand_context.get("cta_styles", [])
+        if isinstance(_cta_styles_list, list) and _cta_styles_list:
+            _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+            if _cta_rotation_index >= len(_cta_styles_list):
+                _cta_rotation_index = 0
+            _carousel_cta = _cta_styles_list[_cta_rotation_index]
+            _cta_next_index = (_cta_rotation_index + 1) % len(_cta_styles_list)
+            await db["brand_profiles"].update_one(
+                _style_profile_scope,
+                {"$set": {"cta_rotation_index": _cta_next_index}},
+            )
+        else:
+            _carousel_cta = brand_context.get("default_link", "Link in bio")
+    await db["content_drafts"].update_one(
+        {"id": carousel_id}, {"$set": {"carousel_cta_text": _carousel_cta}}
+    )
+    resolved["override_cta"] = _carousel_cta
+    print(f"🎯 CTA [{_carousel_cta}] resolved once for carousel {carousel_id}")
+
+    # Tells _generate_image_bg's carousel branch that custom-guide + CTA are
+    # already resolved for every slide — skip its own resolve-or-reuse logic.
+    resolved["_carousel_context_resolved"] = True
+
+    return resolved
+
+
 async def _generate_image_bg(
     draft_id: str,
     platform: str,
@@ -6096,6 +6227,15 @@ async def _generate_image_bg(
             # mid-carousel isn't what a "custom guide" selection is for, and an
             # explicit style_override always means the user picked library styles
             # for this generation, so it takes priority over any custom guide.
+            # The caller (complete_social_manager's generate_content) now resolves
+            # the custom guide + CTA exactly once per carousel, before any slide's
+            # task is created, via _resolve_carousel_shared_context — brand_context
+            # already carries the resolved fields in that case, flagged by
+            # _carousel_context_resolved. Fall back to resolving it here (the
+            # original slide-0-writes/others-read behaviour) only when some other
+            # caller invokes this function directly without pre-resolving.
+            _carousel_context_already_resolved = bool(brand_context.get("_carousel_context_resolved"))
+
             _bp = await db["brand_profiles"].find_one(
                 _style_profile_scope,
                 {
@@ -6116,7 +6256,9 @@ async def _generate_image_bg(
             _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
             _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
-            if _all_custom_guide_ids:
+            if _all_custom_guide_ids and _carousel_context_already_resolved:
+                print(f"🎨 Custom guide already resolved by caller for carousel {carousel_id}, slide {slide_index + 1}/{total_slides}")
+            elif _all_custom_guide_ids:
                 # Custom guide: still locked to first slide, reused for the rest.
                 if slide_index == 0:
                     from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
@@ -6202,7 +6344,9 @@ async def _generate_image_bg(
             # all sharing the same brand_context dict — so without locking it here,
             # each slide could race onto a different cta_rotation_index and end up
             # with a different CTA than its neighbours in the same carousel.
-            if slide_index == 0:
+            if _carousel_context_already_resolved:
+                print(f"🎯 CTA already resolved by caller for carousel {carousel_id}, slide {slide_index + 1}/{total_slides}")
+            elif slide_index == 0:
                 _carousel_cta = brand_context.get("override_cta")
                 if not _carousel_cta:
                     _cta_styles_list = brand_context.get("cta_styles", [])
@@ -6428,7 +6572,16 @@ async def _generate_image_bg(
             # generated successfully" immediately followed by "BG image gen failed... None").
             image_result = {
                 "status": _v2_result.get("success", False),
-                "responseData": {"image_url": _v2_result.get("image_url")},
+                "responseData": {
+                    "image_url": _v2_result.get("image_url"),
+                    # Were dropped here even though generate_image_with_v2_guide
+                    # now returns them — a V2-guide image could never have its
+                    # logo moved, regardless of platform or brand, because this
+                    # normalization step discarded the data before it ever
+                    # reached the code below that saves it to the draft.
+                    "background_image_url": _v2_result.get("background_image_url"),
+                    "logo_placement": _v2_result.get("logo_placement"),
+                },
                 "responseMessage": None if _v2_result.get("success") else "V2 guide image generation failed",
             }
         else:

@@ -14,7 +14,11 @@ DEFAULTS: dict[str, Any] = {
     "enabled": True,
     # Collection
     "source": "x",                    # adapter key in scan_runner.ADAPTER_REGISTRY
-    "cadence_hours": 12,               # how often a market is collected
+    "cadence_hours": 12,               # how often a market is collected, when nothing is hot
+    "cadence": {
+        "hot_hours": 2,                 # collection interval while a market has an active hot signal
+        "hot_signal_types": ["rising", "spike"],
+    },
     "items_per_query": 50,             # starting cap per search per run (test actor minimum is 20)
     "max_items_per_query": 150,        # a measuring search that keeps filling up is raised to at most this
     "max_queries_per_market": 6,
@@ -55,6 +59,49 @@ DEFAULTS: dict[str, Any] = {
     "delivery": {
         "alert_min_score": 80,
         "max_alerts_per_week": 3,
+        "digest_max_items": 5,
+    },
+    # Learning (PRD §9.1's "learned adjustment from past feedback", §11)
+    "learning": {
+        "feedback_window_days": 60,     # how far back a brand's own dismiss/save history counts
+        "min_feedback_samples": 4,      # fewer than this for a market+type combo: no adjustment yet
+        "dismiss_rate_threshold": 0.7,  # dismiss rate above this starts lowering relevance
+        "max_penalty": 25,              # relevance points subtracted at a 100% dismiss rate
+    },
+    # Shadow mode (PRD §17) — off by default; set enabled + candidate_overrides
+    # to compare a not-yet-shipped config against live production in real time.
+    "shadow": {
+        "enabled": False,
+        "candidate_overrides": {},
+    },
+    # Human review queue (PRD §17)
+    "review": {
+        "window_days": 14,
+        "confidence_threshold": 0.5,  # readings below this, unreviewed, show up in the queue
+    },
+    # Retention (PRD §12, §15)
+    "retention": {
+        "item_days": 90,  # normalised items + evidence text: 90 days hot, then deleted
+    },
+    # Query value optimisation (PRD §6.6)
+    "efficiency": {
+        "window_days": 14,
+        "min_items_for_judgement": 15,  # fewer than this for a query: no verdict yet
+        "min_on_topic_rate": 0.25,      # below this on-topic share: the query is low-yield
+        "shrink_factor": 0.5,           # cap multiplier applied to a low-yield query
+        "min_cap": 10,                  # never shrink a query to zero — keep exploring it at a small scale
+    },
+    # Discovery (keyword lifecycle, PRD §6.3)
+    "discovery": {
+        "window_days": 10,              # evidence lookback for every status check
+        "candidate_min_accounts": 3,    # observed -> candidate
+        "candidate_min_relevance": 0.5,
+        "candidate_timeout_days": 21,   # candidate -> retired if never promoted
+        "monitor_min_accounts": 5,      # candidate -> monitored (added to learned_terms)
+        "monitor_min_days": 3,
+        "monitor_min_relevance": 0.6,
+        "pause_min_relevance": 0.3,     # monitored -> paused (dropped from learned_terms)
+        "pause_after_windows": 3,       # consecutive low-yield runs before pausing
     },
 }
 
