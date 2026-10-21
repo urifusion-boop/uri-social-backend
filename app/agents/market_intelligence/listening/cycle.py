@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import collector, detect, markets, ontology, personalize, profile as profile_mod
+from . import collector, detect, discovery, markets, ontology, personalize, profile as profile_mod
 from .config import get_config
 
 LOCK_MINUTES = 50
@@ -98,6 +98,8 @@ async def run_cycle(db, only_markets: Optional[list[str]] = None, brand_ids: Opt
                     entry["reading"] = await collector.read_and_count(db, m, run["to_read"], cfg)
                 sigs = await detect.detect_market(db, m, cfg)
                 entry["signals"] = len(sigs)
+                disc = await discovery.update_market(db, m, cfg)
+                entry["discovery"] = {k: len(v) for k, v in disc.items()}
                 touched.append(m["key"])
             finally:
                 await _unlock(db, mlock, owner)
