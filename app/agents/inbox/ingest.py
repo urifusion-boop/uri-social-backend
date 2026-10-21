@@ -135,6 +135,9 @@ def parse_meta_event(payload: dict) -> list[dict]:
     half-understood event in an agent's inbox is worse than a gap the health check
     reports.
     """
+    if payload.get("object") == "whatsapp_business_account":
+        from .whatsapp import parse
+        return parse(payload)
     events: list[dict] = []
     for entry in payload.get("entry") or []:
         account_id = str(entry.get("id") or "")
