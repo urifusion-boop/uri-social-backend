@@ -71,7 +71,23 @@ def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
             status_code=429,
             detail="Meta is briefly rate-limiting this ad account from heavy usage — please wait a few minutes and try again.",
         )
+    from .adapters.meta import WhatsAppNotLinked
+    if isinstance(e, WhatsAppNotLinked):
+        raise HTTPException(status_code=409, detail=whatsapp_not_linked_message(e.whatsapp_number))
     raise HTTPException(status_code=502, detail=str(e))
+
+
+def whatsapp_not_linked_message(number: str) -> str:
+    """What a client sees when Meta won't run their WhatsApp ad: why, and the steps."""
+    shown = f"+{number}" if number and not number.startswith("+") else (number or "your WhatsApp number")
+    return (
+        f"Your Facebook Page doesn't have WhatsApp linked yet, so Meta won't run an ad that "
+        f"opens a WhatsApp chat. To link it:\n"
+        f"1. Open your Facebook Page and switch into it.\n"
+        f"2. Go to Settings → Linked accounts → WhatsApp → Connect.\n"
+        f"3. Enter {shown} and the code WhatsApp sends to that phone.\n"
+        f"Then launch again — your plan is saved and you haven't been charged."
+    )
 
 
 def _raise_http_for_tiktok_error(e: "TikTokAdsAPIError") -> None:
