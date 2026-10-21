@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import enrich, markets, ontology, topics
+from . import enrich, markets, ontology, permissions, topics
 
 # Bump when collection/counting rules change: markets then re-backfill.
 # v2: measuring vs discovery searches; coverage and counts from measuring only.
@@ -73,6 +73,15 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
     now = now or datetime.utcnow()
     run = {"id": str(uuid.uuid4()), "market": market["key"], "source": cfg["source"], "started_at": now,
            "status": "running", "cost_usd": 0.0}
+
+    # §15: "each connector has a permission record... approved before
+    # production use." Not a policy statement someone has to remember to
+    # check — a source with no approved record simply never collects.
+    if not await permissions.is_approved(db, cfg["source"]):
+        run.update(status="blocked_unapproved_source",
+                   note=f"source '{cfg['source']}' has no approved permission record (PRD §15)", finished_at=now)
+        await db["mi_listen_runs"].insert_one(dict(run))
+        return run
 
     spent = await spent_this_month(db, now)
     if spent >= cfg["monthly_budget_usd"]:

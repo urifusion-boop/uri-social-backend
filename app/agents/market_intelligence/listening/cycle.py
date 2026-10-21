@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import collector, detect, discovery, markets, ontology, personalize, profile as profile_mod
+from . import collector, detect, discovery, markets, ontology, permissions, personalize, profile as profile_mod
 from .config import get_config
 
 LOCK_MINUTES = 50
@@ -68,6 +68,7 @@ async def run_cycle(db, only_markets: Optional[list[str]] = None, brand_ids: Opt
         return summary
     try:
         await ontology.ensure_seeded(db)
+        await permissions.ensure_seeded(db)
         for key in cfg.get("pilot_markets") or []:
             cid, _, country = key.partition(":")
             await markets.ensure_market(db, cid, country or "GLOBAL", pilot=True)

@@ -303,8 +303,9 @@ def test_full_measuring_search_widens_and_coverage_ignores_broad_samples():
     db = fresh_db()
 
     async def go():
-        from app.agents.market_intelligence.listening import ontology
+        from app.agents.market_intelligence.listening import ontology, permissions
         await ontology.ensure_seeded(db)
+        await permissions.ensure_seeded(db)
         await db["mi_markets"].insert_one({**MARKET, "status": "active", "subscribers": ["b1"], "last_collected_at": None})
         res = await collector.collect_market(db, dict(MARKET), CFG, _FakeAdapter(50), NOW)
         m = await db["mi_markets"].find_one({"key": MARKET["key"]})
@@ -325,9 +326,17 @@ def test_full_measuring_search_widens_and_coverage_ignores_broad_samples():
 
 def test_collection_stops_at_the_monthly_budget():
     db = fresh_db()
+    from app.agents.market_intelligence.listening import permissions
+    run(permissions.ensure_seeded(db))
     run(db["mi_listen_runs"].insert_one({"market": "x", "started_at": NOW, "cost_usd": 99.0}))
     res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), NOW))
     assert res["status"] == "skipped_budget"
+
+
+def test_collection_is_blocked_for_a_source_with_no_approved_permission_record():
+    db = fresh_db()  # permissions never seeded
+    res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), NOW))
+    assert res["status"] == "blocked_unapproved_source"
 
 
 def test_business_that_fits_no_category_gets_its_own(monkeypatch):
