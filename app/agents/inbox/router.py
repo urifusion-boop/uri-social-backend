@@ -75,6 +75,9 @@ async def receive_meta_webhook(
         return {"status": "ignored", "reason": "unparseable body"}
 
     events = parse_meta_event(payload)
+    if payload.get("object") == "whatsapp_business_account":
+        from .whatsapp import apply_statuses
+        await apply_statuses(db, payload)
     # Logged on EVERY delivery, including ones that parse to nothing: silence in
     # the log then means Meta sent nothing, rather than us dropping it quietly.
     print(f"[Inbox] webhook received: object={payload.get('object')!r} "
@@ -379,8 +382,8 @@ async def unlink_channels(
     """Stop this workspace's inbox receiving an account's messages, without touching
     its publishing connection. A workspace that no longer uses a Page here must be
     able to give up its claim, or the workspace that does use it gets nothing."""
-    if platform and platform not in ("instagram", "facebook"):
-        raise HTTPException(status_code=400, detail="Platform must be instagram or facebook.")
+    if platform and platform not in ("instagram", "facebook", "whatsapp"):
+        raise HTTPException(status_code=400, detail="Platform must be instagram, facebook or whatsapp.")
     removed = await release_channels(db, brand_ctx.get("brand_id"), platform=platform)
     return {"removed": removed}
 
@@ -525,3 +528,108 @@ async def correct_classification(
         raise HTTPException(status_code=400, detail="Unknown conversation or label.")
     conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id)})
     return _agent_view(conv or {})
+
+
+# ── WhatsApp ─────────────────────────────────────────────────────────────────
+
+@router.get("/whatsapp/config")
+async def whatsapp_config() -> dict:
+    """What the "Connect WhatsApp" popup needs. Nothing secret."""
+    return {"app_id": settings.META_APP_ID,
+            "config_id": settings.WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID,
+            "graph_version": getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0",
+            "available": bool(settings.META_APP_ID and settings.WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID)}
+
+
+@router.post("/whatsapp/connect")
+async def whatsapp_connect(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Finish Embedded Signup: {code, waba_id, phone_number_id, coexistence}.
+
+    Without a code, a number in one of URI's own business portfolios can be connected
+    with the configured system token — how URI tests before Meta grants the advanced
+    access that clients' numbers need."""
+    from . import whatsapp
+    waba_id = str(payload.get("waba_id") or "").strip()
+    phone_number_id = str(payload.get("phone_number_id") or "").strip()
+    if not (waba_id.isdigit() and phone_number_id.isdigit()):
+        raise HTTPException(status_code=400, detail="waba_id and phone_number_id are required.")
+    try:
+        if payload.get("code"):
+            token = await whatsapp.exchange_code(str(payload["code"]))
+        elif settings.WHATSAPP_SYSTEM_TOKEN:
+            token = settings.WHATSAPP_SYSTEM_TOKEN
+        else:
+            raise HTTPException(status_code=400, detail="Sign in with Facebook to connect WhatsApp.")
+        number = await whatsapp.connect(
+            db, brand_ctx.get("brand_id"), token=token, waba_id=waba_id,
+            phone_number_id=phone_number_id, coexistence=bool(payload.get("coexistence")),
+            actor=brand_ctx.get("user_id", ""))
+    except whatsapp.WhatsAppConnectError as e:
+        raise HTTPException(status_code=502, detail=f"WhatsApp: {e}")
+    return {"connected": number}
+
+
+async def _whatsapp_conversation(db, workspace_id: str, conversation_id: str) -> tuple[dict, dict]:
+    if not ObjectId.is_valid(conversation_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id), "workspace_id": workspace_id})
+    if not conv or conv.get("platform") != "whatsapp":
+        raise HTTPException(status_code=404, detail="Not a WhatsApp conversation.")
+    account = await db[CHANNEL_ACCOUNTS].find_one(
+        {"_id": ObjectId(conv["channel_account_id"])}) if ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+    if not account:
+        raise HTTPException(status_code=409, detail="This WhatsApp number is no longer connected.")
+    return conv, account
+
+
+@router.get("/conversations/{conversation_id}/whatsapp-templates")
+async def whatsapp_templates(
+    conversation_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import whatsapp
+    _, account = await _whatsapp_conversation(db, brand_ctx.get("brand_id"), conversation_id)
+    try:
+        return {"templates": await whatsapp.list_templates(account)}
+    except whatsapp.WhatsAppConnectError as e:
+        raise HTTPException(status_code=502, detail=f"WhatsApp: {e}")
+
+
+@router.post("/conversations/{conversation_id}/whatsapp-template")
+async def send_whatsapp_template(
+    conversation_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Send an approved template — the only message WhatsApp allows after 24 hours."""
+    from . import whatsapp
+    workspace_id = brand_ctx.get("brand_id")
+    conv, account = await _whatsapp_conversation(db, workspace_id, conversation_id)
+    name, language = str(payload.get("name") or ""), str(payload.get("language") or "en")
+    params = [str(p) for p in (payload.get("params") or [])][:10]
+    if not name:
+        raise HTTPException(status_code=400, detail="Pick a template.")
+    templates = {t["name"]: t for t in await whatsapp.list_templates(account)}
+    if name not in templates:
+        raise HTTPException(status_code=400, detail="That template isn't approved for this number.")
+    preview = templates[name]["body"]
+    for i, p in enumerate(params, start=1):
+        preview = preview.replace("{{%d}}" % i, p)
+
+    async def transport(conv_, account_, text_):
+        return await whatsapp.send_template(account_, conv_.get("external_thread_id") or "", name, language, params)
+
+    try:
+        record = await send_reply(
+            db, workspace_id, conversation_id, preview,
+            idempotency_key=str(payload.get("idempotency_key") or f"tpl:{conversation_id}:{name}:{now().isoformat()}"),
+            actor_id=brand_ctx.get("user_id", ""), transport=transport, account=account, template=True)
+    except SendRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail)
+    return {"delivery": record.get("delivery"), "failure_reason": record.get("failure_reason", "")}
