@@ -200,3 +200,61 @@ async def card_action(card_id: str, body: CardAction, ctx: dict = Depends(requir
         "scores": card.get("scores"), "at": now,
     })
     return UriResponse.get_single_data_response("card", {"id": card_id, **update})
+
+
+@router.post("/cards/{card_id}/create")
+async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_access),
+                           db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """§9.3's "Create" deep-link: pass a card's evidence-backed brief straight
+    into the content generator instead of the owner re-typing it by hand.
+
+    Scope for now: text content only, one draft per platform in the brief —
+    no AI image generation and no credit deduction, both of which the normal
+    Create Content flow already owns and which this doesn't try to
+    duplicate or silently re-decide the billing for. Generated drafts land
+    in the normal drafts list exactly like any other Create Content run."""
+    card = await db["mi_listen_cards"].find_one({"id": card_id, "brand_id": ctx["brand_id"]})
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+    if card.get("content_id"):
+        raise HTTPException(status_code=409, detail="Content was already created from this card")
+
+    action = card.get("action") or {}
+    platforms = [p for p in (action.get("platforms") or []) if p]
+    if not platforms:
+        raise HTTPException(status_code=400, detail="This card has no platforms to create content for")
+
+    seed_parts = [action.get("hook"), *(action.get("outline") or []), action.get("cta")]
+    seed_content = ". ".join(p for p in seed_parts if p) or card.get("why") or card.get("observation") or ""
+    if not seed_content:
+        raise HTTPException(status_code=400, detail="This card has no brief to create content from")
+
+    from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+    from app.agents.social_media_manager.services.content_generation_service import ContentGenerationService
+
+    playbook = await _playbook(db, ctx["user_id"], ctx["brand_id"])
+    brand_context = BrandProfileService.to_brand_context(playbook)
+    result = await ContentGenerationService.generate_multi_platform_content(
+        user_id=ctx["user_id"], seed_content=seed_content, platforms=platforms,
+        seed_type="text", brand_context=brand_context, db=db,
+    )
+    if not result.get("status"):
+        raise HTTPException(status_code=502, detail=result.get("responseMessage") or "Content generation failed")
+
+    drafts = (result.get("responseData") or {}).get("drafts") or []
+    draft_ids = [d["id"] for d in drafts if d.get("id")]
+    now = datetime.utcnow()
+    primary_id = draft_ids[0] if draft_ids else None
+    await db["mi_listen_cards"].update_one(
+        {"id": card_id},
+        {"$set": {"status": "acted", "content_id": primary_id, "created_draft_ids": draft_ids, "updated_at": now}},
+    )
+    await db["mi_listen_card_actions"].insert_one({
+        "card_id": card_id, "brand_id": ctx["brand_id"], "user_id": ctx["user_id"], "action": "created",
+        "content_id": primary_id, "market": card["market"], "topic": card["topic"], "type": card["type"],
+        "scores": card.get("scores"), "at": now,
+    })
+    return UriResponse.get_single_data_response("created", {
+        "card_id": card_id, "draft_ids": draft_ids,
+        "request_id": (result.get("responseData") or {}).get("request_id"),
+    })
