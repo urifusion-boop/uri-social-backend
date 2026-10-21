@@ -382,3 +382,25 @@ async def insights_probe(campaign_id: str, level: str = "campaign", time_increme
                           if "conversation" in (a.get("action_type") or "")}
     body.pop("paging", None)
     return body
+
+
+@router.get("/admin/graph-probe")
+async def graph_probe(path: str, fields: str = "", db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                      token: dict = Depends(_jwt())) -> dict:
+    """Ads admins only: a read-only GET of one Graph API node with URI's ads token, to
+    diagnose what Meta holds for a Page, ad set or ad. Never writes."""
+    import re as _re
+    import httpx
+    from ..router import _require_ads_admin
+    _require_ads_admin(token)
+    if not _re.fullmatch(r"[A-Za-z0-9_/]{1,120}", path) or "token" in path.lower():
+        raise HTTPException(status_code=400, detail="path must be a plain node id or edge")
+    adapter = _adapter(db)
+    params = {"access_token": adapter._access_token}
+    if fields:
+        params["fields"] = fields
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{adapter._graph_base}/{path.strip('/')}", params=params)
+    body = resp.json()
+    body.pop("paging", None)
+    return body
