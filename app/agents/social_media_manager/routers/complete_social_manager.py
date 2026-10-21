@@ -188,7 +188,7 @@ class VideoFromStoryboardRequest(BaseModel):
     outcome: str = "quick_video"
     # Only consulted when the outcome routes to the talking-avatar model
     # (currently "talking_dialogue") — one of video_generation_service.
-    # AVATAR_VOICES. Ignored by every other outcome.
+    # AVATAR_VOICES or .NIGERIAN_VOICE_REFS. Ignored by every other outcome.
     avatar_voice: str = "Sarah"
 
 class ContentGenerationRequest(BaseModel):

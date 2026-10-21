@@ -6,6 +6,8 @@ import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from app.core.config import settings
 from app.database import get_db
 from app.services.AIService import client as openai_client
@@ -67,6 +69,12 @@ continuous story and must read that way end to end:
   1's words must lead directly into scene 2's, like one take cut into pieces,
   never separate unrelated lines. If no one speaks on camera in a scene, set
   dialogue to null.
+  GOOD example (one sentence flowing across the cut):
+    scene 1 dialogue: "I used to spend hours every week"
+    scene 2 dialogue: "just trying to figure out what to post."
+  BAD example (two unrelated statements, never do this):
+    scene 1 dialogue: "Welcome to my shop!"
+    scene 2 dialogue: "Buy now and save 20%."
 
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
@@ -231,10 +239,23 @@ class VideoStoryboardService:
         return base64.b64decode(encoded)
 
     @staticmethod
-    async def _generate_scene_frame(scene: dict, brand_images: List[str]) -> Optional[str]:
+    async def _generate_scene_frame(
+        scene: dict, brand_images: List[str], chained_frame_url: Optional[str] = None
+    ) -> Optional[str]:
         """
         Edit the reference brand image for this scene using gpt-image-2 so the frame
         is faithfully grounded in the real brand visual rather than hallucinated.
+
+        chained_frame_url: when a PRIOR scene already established this same subject
+        (same reference_image_index — see run_frame_job), pass that scene's own
+        generated frame here instead of re-deriving fresh from the original brand
+        photo. Each independent edit of the same source photo is its own generative
+        draw — same nominal subject, but gpt-image-2 can render a visibly different
+        face/outfit/hair each time. Editing forward from the LAST generated frame
+        instead compounds the same likeness scene to scene, the standard trick for
+        keeping a consistent character across a sequence with a single-image-edit
+        model. Falls back to the original brand photo if the chained frame can't be
+        downloaded, rather than failing the whole scene over a transient fetch error.
         """
         try:
             ref_idx = scene.get("reference_image_index", 0)
@@ -242,7 +263,17 @@ class VideoStoryboardService:
                 return None
 
             ref_idx = max(0, min(ref_idx, len(brand_images) - 1))
-            img_bytes = VideoStoryboardService._decode_brand_image(brand_images[ref_idx])
+            img_bytes: Optional[bytes] = None
+            if chained_frame_url:
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        resp = await client.get(chained_frame_url)
+                        resp.raise_for_status()
+                        img_bytes = resp.content
+                except Exception as e:
+                    print(f"[StoryboardFrame] chained frame fetch failed ({e}), using original brand photo")
+            if img_bytes is None:
+                img_bytes = VideoStoryboardService._decode_brand_image(brand_images[ref_idx])
 
             shot = scene.get("shot_type", "").replace("_", " ")
             video_prompt = scene.get("video_prompt", "")
@@ -299,12 +330,25 @@ class VideoStoryboardService:
 
     @staticmethod
     async def run_frame_job(job_id: str, scenes: list, brand_images: List[str] = None) -> None:
-        """Background task: generate one frame image per scene, store progressively."""
+        """Background task: generate one frame image per scene, store progressively.
+
+        Scenes are already processed in order (needed for the chaining below, not
+        just incidental) — when a later scene shares a reference_image_index with
+        an earlier one (the storyboard's own signal that it's the SAME subject —
+        see generate_storyboard's continuity rules), its frame is edited forward
+        from that earlier scene's own generated frame instead of the raw brand
+        photo again, so the same likeness compounds across scenes rather than each
+        one being an independent, visually-driftable draw from the same source."""
         col = _frame_jobs_collection()
         brand_images = brand_images or []
+        last_frame_by_subject: Dict[int, str] = {}
         for scene in scenes:
-            url = await VideoStoryboardService._generate_scene_frame(scene, brand_images)
+            ref_idx = scene.get("reference_image_index", 0)
+            url = await VideoStoryboardService._generate_scene_frame(
+                scene, brand_images, chained_frame_url=last_frame_by_subject.get(ref_idx)
+            )
             if url:
+                last_frame_by_subject[ref_idx] = url
                 await col.update_one(
                     {"job_id": job_id},
                     {"$push": {"frames": {
