@@ -12,6 +12,11 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.dependencies import get_active_brand_context, get_db_dependency
 
+
+def _jwt():
+    from app.core.auth_bearer import JWTBearer
+    return JWTBearer()
+
 from . import actions as act
 from . import creative, engine, evaluate, forecast, leads, metrics
 from . import policy as pol
@@ -336,3 +341,33 @@ async def set_lead_stage(conversation_id: str, payload: dict = Body(...),
     if not res.matched_count:
         raise HTTPException(status_code=404, detail="Not found")
     return {"status": "ok", "stage": stage}
+
+
+@router.get("/admin/insights-probe/{campaign_id}")
+async def insights_probe(campaign_id: str, level: str = "campaign", time_increment: str = "1",
+                         date_preset: str = "", since: str = "", until: str = "",
+                         fields: str = "date_start,spend,impressions,clicks,actions",
+                         db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                         token: dict = Depends(_jwt())) -> dict:
+    """Ads admins only: one raw, read-only insights query, to see exactly what Meta
+    returns for given parameters. Never writes anything."""
+    import httpx
+    from ..router import _require_ads_admin
+    _require_ads_admin(token)
+    adapter = _adapter(db)
+    params = {"access_token": adapter._access_token, "level": level, "fields": fields, "limit": 100}
+    if time_increment:
+        params["time_increment"] = time_increment
+    if date_preset:
+        params["date_preset"] = date_preset
+    if since and until:
+        import json as _json
+        params["time_range"] = _json.dumps({"since": since, "until": until})
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{adapter._graph_base}/{campaign_id}/insights", params=params)
+    body = resp.json()
+    for row in body.get("data") or []:
+        row["actions"] = {a.get("action_type"): a.get("value") for a in row.get("actions") or []
+                          if "conversation" in (a.get("action_type") or "")}
+    body.pop("paging", None)
+    return body
