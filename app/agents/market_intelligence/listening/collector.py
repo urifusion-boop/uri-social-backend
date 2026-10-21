@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import enrich, markets, ontology, topics
+from . import enrich, markets, ontology, permissions, topics
 
 # Bump when collection/counting rules change: markets then re-backfill.
 # v2: measuring vs discovery searches; coverage and counts from measuring only.
@@ -74,6 +74,15 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
     run = {"id": str(uuid.uuid4()), "market": market["key"], "source": cfg["source"], "started_at": now,
            "status": "running", "cost_usd": 0.0}
 
+    # §15: "each connector has a permission record... approved before
+    # production use." Not a policy statement someone has to remember to
+    # check — a source with no approved record simply never collects.
+    if not await permissions.is_approved(db, cfg["source"]):
+        run.update(status="blocked_unapproved_source",
+                   note=f"source '{cfg['source']}' has no approved permission record (PRD §15)", finished_at=now)
+        await db["mi_listen_runs"].insert_one(dict(run))
+        return run
+
     spent = await spent_this_month(db, now)
     if spent >= cfg["monthly_budget_usd"]:
         run.update(status="skipped_budget", note=f"monthly listening budget reached (${spent:.2f} of "
@@ -107,7 +116,7 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
         for ev in res["items"]:
             total += 1
             doc = ev.dict()
-            add = {"markets": market["key"]}
+            add = {"markets": market["key"], "found_by_queries": res.get("id")}
             if measured:
                 add["measured"] = market["key"]  # found by a fully-read search: may be counted
             r = await db["mi_listen_items"].update_one(
@@ -159,6 +168,64 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
                                           {"$set": {"last_collected_at": now, "collector_version": COLLECTOR_VERSION}})
     run["to_read"] = list(dict.fromkeys(new_ids))
     return run
+
+
+async def update_query_efficiency(db, market: dict, cfg: dict, now: Optional[datetime] = None) -> dict:
+    """Query value optimisation (PRD §6.6): "spend collection budget where
+    expected useful evidence per unit cost is highest."
+
+    A full multi-armed bandit (ranking every candidate query by expected
+    value, with a reserved exploration budget) needs richer per-query cost
+    tracking than exists yet. This is the load-bearing first half of the
+    same idea: every stored item now remembers which query/queries found
+    it (collect_market's $addToSet on found_by_queries), so each query's
+    own on-topic rate — the fraction of what it returns that genuinely
+    belongs to this market, from AI readings already done for other
+    reasons — can be measured directly. A query that's consistently
+    low-yield gets its next-run item cap shrunk, freeing exactly the
+    budget collect_market's existing cap-growth step would otherwise keep
+    spending on it. Never shrunk to zero — min_cap keeps exploring it at a
+    small scale rather than dropping it outright, the bandit's
+    "exploration budget" in miniature.
+    """
+    e = cfg["efficiency"]
+    now = now or datetime.utcnow()
+    since = now - timedelta(days=e["window_days"])
+
+    stats: dict[str, dict] = {}
+    async for item in db["mi_listen_items"].find(
+        {"markets": market["key"], "found_by_queries": {"$exists": True, "$ne": []},
+         "published_at": {"$gte": since}},
+        {"source_id": 1, "found_by_queries": 1},
+    ):
+        reading = await db["mi_listen_readings"].find_one(
+            {"source_id": item["source_id"], "market": market["key"]}, {"on_topic": 1})
+        if not reading:
+            continue  # not read yet; judge it once it has been
+        for qid in item.get("found_by_queries") or []:
+            s = stats.setdefault(qid, {"items": 0, "on_topic": 0})
+            s["items"] += 1
+            if reading.get("on_topic"):
+                s["on_topic"] += 1
+
+    caps = dict(market.get("query_caps") or {})
+    changed = False
+    shrunk = []
+    for qid, s in stats.items():
+        if s["items"] < e["min_items_for_judgement"]:
+            continue
+        rate = s["on_topic"] / s["items"]
+        if rate < e["min_on_topic_rate"]:
+            cur = int(caps.get(qid) or cfg["items_per_query"])
+            nxt = max(e["min_cap"], int(cur * e["shrink_factor"]))
+            if nxt < cur:
+                caps[qid] = nxt
+                changed = True
+                shrunk.append({"query_id": qid, "on_topic_rate": round(rate, 2), "items": s["items"], "cap": nxt})
+
+    if changed:
+        await db["mi_markets"].update_one({"key": market["key"]}, {"$set": {"query_caps": caps}})
+    return {"shrunk": shrunk}
 
 
 async def read_and_count(db, market: dict, source_ids: list[str], cfg: dict) -> dict:

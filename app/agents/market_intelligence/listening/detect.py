@@ -21,6 +21,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
+from . import permissions
+
 NEED_INTENTS = {"question", "complaint", "recommendation", "purchase"}
 COMMERCIAL = {"purchase", "recommendation"}
 
@@ -76,7 +78,7 @@ def confidence(authors: int, min_authors: int, coverage: float, history_days: in
                  + min(1.0, history_days / max(min_history, 1)) * 0.2 + reading_conf * 0.15, 3)
 
 
-async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = None) -> list[dict]:
+async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = None, persist: bool = True) -> list[dict]:
     d = cfg["detect"]
     now = hour_floor(now or datetime.utcnow())
     days = d["baseline_days"]
@@ -146,10 +148,11 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
                 signals.append(sig)
 
     signals += await _recurring_needs(db, market, cfg, now, cov)
-    for s in signals:
-        await db["mi_listen_signals"].update_one(
-            {"market": s["market"], "topic": s["topic"], "type": s["type"], "day": s["day"]},
-            {"$set": s, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}}, upsert=True)
+    if persist:
+        for s in signals:
+            await db["mi_listen_signals"].update_one(
+                {"market": s["market"], "topic": s["topic"], "type": s["type"], "day": s["day"]},
+                {"$set": s, "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}}, upsert=True)
     return signals
 
 
@@ -168,6 +171,15 @@ async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: dat
         {"source_id": 1, "url": 1, "text": 1, "raw_metrics": 1, "published_at": 1, "author_handle": 1})}
     ranked = sorted(items.values(), key=lambda i: -sum((i.get("raw_metrics") or {}).values()))
     tdoc = await db["mi_market_topics"].find_one({"market": market["key"], "key": topic}) or {}
+
+    # §15 display rules, enforced here rather than left as policy text: how
+    # much of a post's own words a sample may quote, and whether a sample
+    # with no link back to the original post may be shown at all.
+    dr = await permissions.display_rules(db, cfg["source"])
+    if dr.get("require_link", True):
+        ranked = [i for i in ranked if i.get("url")]
+    max_chars = int(dr.get("max_excerpt_chars") or 280)
+
     return {
         "market": market["key"], "market_label": market["label"], "topic": topic,
         "topic_name": tdoc.get("name") or topic, "aliases": tdoc.get("aliases") or [],
@@ -176,7 +188,7 @@ async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: dat
         "needs": [n for n, _ in needs.most_common(3)],
         "top_author_share": round(max(authors.values()) / len(rows), 2),
         "reading_confidence": round(sum(r.get("confidence", 0) for r in rows) / len(rows), 2),
-        "samples": [{"url": i.get("url"), "text": (i.get("text") or "")[:280], "author": i.get("author_handle"),
+        "samples": [{"url": i.get("url"), "text": (i.get("text") or "")[:max_chars], "author": i.get("author_handle"),
                      "published_at": i.get("published_at")} for i in ranked[:5]],
         "status": "active", "computed_at": datetime.utcnow(),
         "expires_at": b + timedelta(days=cfg["score"]["card_ttl_days"]),
