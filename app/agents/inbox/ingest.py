@@ -144,7 +144,12 @@ def parse_meta_event(payload: dict) -> list[dict]:
             msg = m.get("message") or {}
             if not msg or msg.get("is_echo"):
                 continue      # echoes are our own sends coming back
+            # A click-to-message ad says which ad opened the thread. Provider-supplied
+            # only; never guessed from the wording.
+            ref = msg.get("referral") or m.get("referral") or {}
+            ad_id = str(ref.get("ad_id") or "") if (ref.get("source") or "").upper() in ("ADS", "") else ""
             events.append({
+                "source_ad_id": ad_id,
                 "type": "dm",
                 "external_account_id": account_id,
                 "external_user_id": str((m.get("sender") or {}).get("id") or ""),
@@ -224,7 +229,8 @@ async def _upsert_conversation(db, workspace_id: str, channel_account_id: str,
     for field in ("source_post_id", "source_ad_id"):
         if ev.get(field):
             on_insert[field] = ev[field]
-            on_insert["attribution_evidence"] = "provider_webhook"
+            on_insert["attribution_evidence"] = "referral" if ev["type"] == "dm" else "provider_webhook"
+    on_insert["created_at"] = now()
 
     set_fields: dict[str, Any] = {
         "last_activity_at": ev.get("provider_timestamp") or now(),
@@ -246,6 +252,12 @@ async def _upsert_conversation(db, workspace_id: str, channel_account_id: str,
     )
     if doc.get("status") == "resolved":
         await db[CONVERSATIONS].update_one({"_id": doc["_id"]}, {"$set": {"status": "open"}})
+    # A thread that already existed and is now reopened from an ad: the ad gets the
+    # credit for this lead, but only if nothing claimed it first.
+    if ev.get("source_ad_id") and not doc.get("source_ad_id"):
+        await db[CONVERSATIONS].update_one(
+            {"_id": doc["_id"], "source_ad_id": {"$in": ["", None]}},
+            {"$set": {"source_ad_id": ev["source_ad_id"], "attribution_evidence": "referral"}})
     return str(doc["_id"])
 
 
