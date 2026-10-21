@@ -18,7 +18,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, permissions, profile as profile_mod, replay, review
+from . import collector, discovery, golden, permissions, profile as profile_mod, replay, review
 from .config import _merge, get_config
 from .cycle import run_cycle
 
@@ -401,3 +401,31 @@ async def replay_detection(body: ReplayRequest, admin: dict = Depends(_verify_ad
     candidate_cfg = _merge(await get_config(db), body.candidate_overrides)
     results = await replay.replay_range(db, market, candidate_cfg, timestamps)
     return UriResponse.get_single_data_response("replay", results)
+
+
+# ── Golden datasets (PRD §17) — admin-only ────────────────────────────────────
+
+@router.get("/curation/golden")
+async def list_golden_examples(market: Optional[str] = None, limit: int = 200,
+                               admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    examples = await golden.list_golden(db, market, limit)
+    return UriResponse.get_single_data_response("golden", examples)
+
+
+@router.post("/curation/golden/{market_key}/{source_id}")
+async def mark_golden_example(market_key: str, source_id: str, admin: dict = Depends(_verify_admin),
+                              db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    actor = (admin.get("claims") or {}).get("email") or "curator"
+    result = await golden.mark_golden(db, source_id, market_key, actor)
+    if not result["found"]:
+        raise HTTPException(status_code=404, detail="Reading not found")
+    return UriResponse.get_single_data_response("golden", result)
+
+
+@router.delete("/curation/golden/{market_key}/{source_id}")
+async def unmark_golden_example(market_key: str, source_id: str, admin: dict = Depends(_verify_admin),
+                                db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    result = await golden.unmark_golden(db, source_id, market_key)
+    if not result["removed"]:
+        raise HTTPException(status_code=404, detail="Not in the golden set")
+    return UriResponse.get_single_data_response("golden", result)
