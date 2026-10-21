@@ -753,16 +753,23 @@ class ImageContentService:
 
     @staticmethod
     def build_bottom_margin_rule(brand_context: Optional[Dict[str, Any]]) -> str:
-        """The large 30% bottom reservation only earns its keep when a logo
-        is actually going to be composited into it afterward — without one,
-        nothing ever fills that space, and a third of the canvas left blank
-        reads as broken, not intentional. Confirmed live: identical designs
-        with vs. without a logo, the no-logo one has a conspicuous empty
-        band at the bottom where the logo would have sat. No logo
-        configured means no bottom-dwelling element, so this just needs the
-        same edge-clipping safety margin as the other three sides."""
+        """The large 30% bottom reservation only earns its keep when the
+        logo is actually going to be composited into THAT strip afterward —
+        i.e. only when logo_position is a bottom corner. Without a
+        bottom-positioned logo, nothing ever fills that space, and a third
+        of the canvas left blank reads as broken, not intentional.
+        Confirmed live: a brand with logo_position="top_left" still had
+        this fire unconditionally off logo_url alone, producing a correctly
+        top-left-placed logo (via build_logo_space_note, which IS
+        position-aware) plus an entirely separate, pointless, un-filled 30%
+        blank band reserved at the bottom for a logo that was never going
+        there. This must stay in sync with logo_position, not just
+        logo_url — a top/center-positioned logo gets the same plain
+        20%-margin treatment as no logo at all."""
         bc = brand_context or {}
-        if bc.get('logo_url'):
+        logo_position = bc.get('logo_position', 'bottom_right')
+        bottom_positions = {"bottom_left", "bottom_center", "bottom_right"}
+        if bc.get('logo_url') and logo_position in bottom_positions:
             return (
                 "⚠️ BOTTOM MARGIN — CRITICAL: CTA text, footers, and any bottom text must END at least\n"
                 "30% from the bottom edge (leave the bottom 30% of image height as EMPTY SPACE below any text) —\n"
@@ -770,7 +777,8 @@ class ImageContentService:
             )
         return (
             "Maintain a minimum 20% safe-zone margin from the bottom edge too, same as the other three edges.\n"
-            "No logo is configured for this brand, so there's no need to reserve extra empty space beyond that —\n"
+            "No bottom-positioned logo needs this space reserved, so there's no need for extra empty space "
+            "beyond that —\n"
             "content may extend naturally into the lower part of the canvas."
         )
 
