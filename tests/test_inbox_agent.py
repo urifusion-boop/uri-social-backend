@@ -481,3 +481,13 @@ def test_earlier_auto_replies_dont_stop_new_ones():
     s = _settings()
     rows = [("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(hours=2))] * 5 + [("inbound", "", OPEN_HOURS)]
     assert agent.verdict(s, _conv(), _history(*rows), _cls(), _draft(), OPEN_HOURS) == (True, "")
+
+
+def test_alert_emails_are_cleaned_and_survive_a_save_that_omits_them():
+    clean = agent.normalize_settings({"alert_emails": [" Shore@Example.com", "nope", "shore@example.com"]})
+    assert clean["alert_emails"] == ["shore@example.com"]
+    db = Db()
+    _run(agent.save_settings(db, WS, {"alert_emails": ["a@b.co"]}, "u"))
+    saved = _run(agent.save_settings(db, WS, {"auto_reply_enabled": True}, "u"))
+    assert saved["alert_emails"] == ["a@b.co"]
+    assert _run(agent.load_settings(db, WS))["alert_emails"] == ["a@b.co"]
