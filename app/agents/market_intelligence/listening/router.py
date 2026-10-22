@@ -221,6 +221,19 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
         raise HTTPException(status_code=409, detail="Content was already created from this card")
 
     action = card.get("action") or {}
+    # personalize.py's _Action.type can be video|post|carousel|faq|ad_test —
+    # only post/carousel/faq route through the text generator below. video
+    # and ad_test need their own generators (video render pipeline, Jane
+    # Ads draft campaign) that this endpoint doesn't call — silently
+    # generating a text draft for a card the UI labelled "Format: video"
+    # would hand the owner the wrong thing with no indication anything was
+    # off. Say so plainly instead, same as any other unsupported action.
+    unsupported = {
+        "video": "Video creation from a Listening card isn't wired up yet — use the brief below to create it in Create Video.",
+        "ad_test": "Proposed ad tests from Listening aren't wired up yet — use the brief below to set one up in Campaigns.",
+    }
+    if action.get("type") in unsupported:
+        raise HTTPException(status_code=400, detail=unsupported[action["type"]])
     platforms = [p for p in (action.get("platforms") or []) if p]
     if not platforms:
         raise HTTPException(status_code=400, detail="This card has no platforms to create content for")
