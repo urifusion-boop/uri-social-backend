@@ -3814,16 +3814,13 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         if is_tiktok else
         "Created PAUSED — zero spend. Review and activate in Ads Manager to go live."
     )
-    ads_manager_url = (
-        f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
-        if is_tiktok else
-        f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-        f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
-    )
+    # Never a link into URI's own ad accounts — only into the brand's own Google one.
+    ads_manager_url = ""
     if is_google:
         launch_note = ("Created paused — nothing is spent until you turn it on: Campaign Manager → "
                        "press ▶ on this campaign.")
-        ads_manager_url = google_flow.ads_url(google_conn.get("customer_id", ""))
+        if (await google_flow.get_mode(db, brand_ctx.get("brand_id"))) == "own":
+            ads_manager_url = google_flow.ads_url(google_conn.get("customer_id", ""))
     return {
         "stage": "launched",
         "understood": built.understood,
@@ -4557,6 +4554,7 @@ async def meta_campaigns(
                       if with_metrics and google_records and google_flow.configured() else None)
 
     out = []
+    google_own = (await google_flow.get_mode(db, brand_id)) == "own"
     for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
                              + [("google", r) for r in google_records]):
         is_tiktok = platform_name == "tiktok"
@@ -4596,13 +4594,11 @@ async def meta_campaigns(
             "destination_link": r.get("destination_link") or "",
             "status": "paused",   # everything is created PAUSED (Meta) / DISABLE (TikTok) for now
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
-            "ads_manager_url": (
-                google_flow.ads_url(r.get("customer_id", "")) if is_google else
-                f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
-                if is_tiktok else
-                f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-                f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r.get('campaign_id')}"
-            ),
+            # Only a link into the brand's OWN ad account. Meta, TikTok and URI-run
+            # Google campaigns live in URI's accounts, which clients must not be
+            # pointed at (or shown the account id of).
+            "ads_manager_url": (google_flow.ads_url(r.get("customer_id", ""))
+                                if is_google and google_own else ""),
             "metrics": None,
         }
         if is_google:
