@@ -549,9 +549,9 @@ async def whatsapp_connect(
 ) -> dict:
     """Finish Embedded Signup: {code, waba_id, phone_number_id, coexistence}.
 
-    Without a code, a number in one of URI's own business portfolios can be connected
-    with the configured system token — how URI tests before Meta grants the advanced
-    access that clients' numbers need."""
+    Without a code, a number can be connected with an access token the business
+    generated for it (or the configured system token) — how URI tests before Meta
+    grants the advanced access that clients' numbers need."""
     from . import whatsapp
     waba_id = str(payload.get("waba_id") or "").strip()
     phone_number_id = str(payload.get("phone_number_id") or "").strip()
@@ -560,6 +560,10 @@ async def whatsapp_connect(
     try:
         if payload.get("code"):
             token = await whatsapp.exchange_code(str(payload["code"]))
+        elif str(payload.get("access_token") or "").strip():
+            # A token the business generated itself (a system user's, or the
+            # temporary one on Meta's API Setup page) for its own number.
+            token = str(payload["access_token"]).strip()
         elif settings.WHATSAPP_SYSTEM_TOKEN:
             token = settings.WHATSAPP_SYSTEM_TOKEN
         else:
