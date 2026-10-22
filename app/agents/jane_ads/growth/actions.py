@@ -41,7 +41,13 @@ async def _post(adapter, node_id: str, body: dict) -> dict:
                                  params={"access_token": adapter._access_token}, json=body)
     data = resp.json()
     if "error" in data:
-        raise RuntimeError(data["error"].get("message") or "update failed")
+        err = data["error"]
+        # Meta throttles status changes on one ad to one every ~30 seconds (#613).
+        # Nothing was applied, so it is safe to try again — say so plainly.
+        if err.get("code") in (4, 17, 613, 80004):
+            raise RuntimeError("Meta only allows one change to this every 30 seconds or so — "
+                               "nothing was changed; try again in a moment.")
+        raise RuntimeError(err.get("message") or "update failed")
     return data
 
 
