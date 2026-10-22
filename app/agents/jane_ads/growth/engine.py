@@ -244,6 +244,28 @@ async def _after_execution(db, rec: dict, entry: dict) -> None:
                     recommendation_id=rec["id"], verified=entry.get("verified", False))
 
 
+async def manual_change(db, adapter, record: dict, action: str, params: dict, actor: str) -> dict:
+    """A change the owner picks themselves on the Growth screen. Same executor as an
+    approved recommendation — checked, applied on Meta, read back, logged, undoable."""
+    labels = {"pause_ad": "Paused an ad", "resume_ad": "Turned an ad back on",
+              "pause_campaign": "Paused the campaign", "resume_campaign": "Resumed the campaign",
+              "set_daily_budget": f"Set the daily budget to ₦{float(params.get('to_ngn') or 0):,.0f}"}
+    policy = await load_policy(db, record.get("brand_id"))
+    ctx = await context(db, adapter, record, policy, pull=False)
+    if action == "set_daily_budget":
+        params = {**params, "from_ngn": (ctx["schedule"] or {}).get("daily_ngn") or 0}
+    rec = {"id": f"manual:{uuid.uuid4().hex}", "action_type": action, "parameters": params,
+           "summary": labels.get(action, action), "executable": True, "eval_window_days": 3,
+           "brand_id": record.get("brand_id"), "campaign_id": record["campaign_id"]}
+    ok, why = pol.check(policy, rec, ctx["state"], by_user=True, manual=True)
+    if not ok:
+        return {"status": "refused", "reason": why}
+    entry = await act.execute(db, adapter, record, rec, actor=actor, mode="manual_change")
+    await event(db, rec["brand_id"], rec["campaign_id"], "manual_change", action=action,
+                actor=actor, status=entry["status"])
+    return entry
+
+
 async def approve(db, adapter, record: dict, rec: dict, actor: str) -> dict:
     """A person approved a recommendation: re-check everything, then run it."""
     policy = await load_policy(db, record.get("brand_id"))

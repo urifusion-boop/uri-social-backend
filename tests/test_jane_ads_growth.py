@@ -419,3 +419,28 @@ def test_a_new_target_resolves_a_suggestion_made_against_the_old_one():
     record = run(engine.find_campaign(db, rec["campaign_id"]))
     run(engine.run_campaign(db, demo.DemoAdapter(db), record))
     assert run(db[engine.RECOMMENDATIONS].find_one({"id": rec["id"]}))["status"] == "superseded"
+
+
+def test_owner_changes_apply_to_the_live_campaign_and_can_be_undone():
+    from app.agents.jane_ads.growth import demo
+    db = mongomock_motor.AsyncMongoMockClient()["growth"]
+    run(demo.seed(db, "brnd_demo_z", "u1"))
+    record = run(db[demo.DEMO_CAMPAIGNS].find_one({"campaign_id": {"$regex": "^demo-glow"}}))
+    adapter = demo.DemoAdapter(db)
+    ad = next(iter(record["ads"]))
+    out = run(engine.manual_change(db, adapter, record, "pause_ad", {"ad_id": ad}, "u1"))
+    assert out["status"] == "executed" and out["verified"]
+    # A second change right away isn't held by the cooldown: the owner chose it.
+    out = run(engine.manual_change(db, adapter, record, "set_daily_budget", {"to_ngn": 4500}, "u1"))
+    assert out["status"] == "executed" and out["parameters"]["from_ngn"] == 3000
+    assert run(db[demo.DEMO_CAMPAIGNS].find_one({"campaign_id": record["campaign_id"]}))["daily_ngn"] == 4500
+    out = run(engine.manual_change(db, adapter, record, "resume_ad", {"ad_id": ad}, "u1"))
+    assert out["verified"]
+
+
+def test_an_explicit_cap_still_binds_manual_changes():
+    rec = {"action_type": "set_daily_budget", "executable": True, "parameters": {"from_ngn": 2000, "to_ngn": 9000}}
+    assert not pol.check(pol.normalize({"max_daily_budget_ngn": 5000}), rec, {**STATE, "data_fresh": False},
+                         by_user=True, manual=True)[0]
+    assert pol.check(pol.normalize({}), rec, {**STATE, "data_fresh": False, "budget_raised_7d_pct": 90},
+                     by_user=True, manual=True)[0]

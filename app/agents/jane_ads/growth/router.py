@@ -141,7 +141,53 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         "follow_ups": await leads.follow_up_gaps(db, brand, ad_ids),
         "creative_test": creative.compare(variants, ad_rows) if variants else None,
         "forecast": forecast.project(rows, ends),
+        "controls": await _controls(db, r),
     }
+
+
+async def _controls(db, r: dict) -> dict:
+    """What the owner can change by hand, as Meta holds it right now."""
+    from app.core.config import settings
+    adapter = _adapter(db, r)
+    out: dict = {"status": None, "daily_budget_ngn": None, "ads": [], "ads_manager_url": "", "error": ""}
+    try:
+        sched = await adapter.fetch_adset_schedule(r["campaign_id"])
+        out["status"] = sched.get("effective_status") or sched.get("status")
+        out["daily_budget_ngn"] = sched.get("daily_ngn")
+        out["ads"] = await act.list_ads(adapter, r)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    if not r.get("demo") and settings.META_AD_ACCOUNT_ID:
+        out["ads_manager_url"] = ("https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+                                  f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r['campaign_id']}")
+    return out
+
+
+@router.post("/campaigns/{campaign_id}/changes")
+async def make_change(campaign_id: str, payload: dict = Body(...),
+                      db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                      ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """The owner changes the live campaign themselves: pause/resume it or an ad, or set
+    the daily budget. Applied on Meta and read back, so Ads Manager shows the same."""
+    action = payload.get("action_type")
+    if action not in ("pause_ad", "resume_ad", "pause_campaign", "resume_campaign", "set_daily_budget"):
+        raise HTTPException(status_code=400, detail="Unknown change.")
+    if not await _can_change(db, ctx):
+        raise HTTPException(status_code=403, detail="Only an admin can change a campaign.")
+    r = await _campaign(db, _brand(ctx), campaign_id)
+    params = {k: payload[k] for k in ("ad_id", "to_ngn") if payload.get(k) is not None}
+    if action == "set_daily_budget":
+        try:
+            if float(params.get("to_ngn") or 0) < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Enter a daily budget in naira.")
+    if action in ("pause_ad", "resume_ad") and not params.get("ad_id"):
+        raise HTTPException(status_code=400, detail="Pick an ad.")
+    entry = await engine.manual_change(db, _adapter(db, r), r, action, params, ctx.get("user_id", ""))
+    if entry.get("status") == "refused":
+        raise HTTPException(status_code=409, detail=entry["reason"])
+    return {"action": {k: v for k, v in entry.items() if k != "_id"}}
 
 
 @router.post("/campaigns/{campaign_id}/refresh")
@@ -245,9 +291,9 @@ async def undo(action_id: str, db: AsyncIOMotorDatabase = Depends(get_db_depende
         raise HTTPException(status_code=403, detail="Only an admin can change a campaign.")
     record = await _campaign(db, brand, a["campaign_id"])
     before = a.get("before_state") or {}
-    if a["action_type"] == "pause_ad":
-        raise HTTPException(status_code=400, detail="Turn the ad back on from the campaign page.")
-    reverse = {"pause_campaign": ("resume_campaign", {}),
+    ad = {"ad_id": (a.get("parameters") or {}).get("ad_id")}
+    reverse = {"pause_ad": ("resume_ad", ad), "resume_ad": ("pause_ad", ad),
+               "pause_campaign": ("resume_campaign", {}),
                "resume_campaign": ("pause_campaign", {}),
                "set_daily_budget": ("set_daily_budget", {
                    "from_ngn": (a.get("parameters") or {}).get("to_ngn"),

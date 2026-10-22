@@ -15,7 +15,7 @@ from typing import Optional
 
 from .stats import confidence_label
 
-EXECUTABLE = ("pause_ad", "pause_campaign", "resume_campaign", "set_daily_budget")
+EXECUTABLE = ("pause_ad", "resume_ad", "pause_campaign", "resume_campaign", "set_daily_budget")
 ADVISORY = ("observe", "refresh_creative", "review_offer", "fix_tracking",
             "fix_landing_page", "follow_up_leads", "review_targeting")
 
