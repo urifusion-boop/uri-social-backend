@@ -95,8 +95,10 @@ async def send_reply(
     actor_id: str,
     transport: Transport,
     account: Optional[dict] = None,
+    template: bool = False,
 ) -> dict:
-    """Send one reply. Returns the outbox record.
+    """Send one reply. Returns the outbox record. `template`: a pre-approved WhatsApp
+    template, the one kind of message allowed outside the 24-hour window.
 
     Never raises for a provider failure — a failure is a recorded state, because the
     agent needs to see what happened to their message, not an exception.
@@ -121,7 +123,8 @@ async def send_reply(
         # wrong one. That is the point.
         raise SendRefused("not_found", "No such conversation.")
 
-    check_eligibility(conv)
+    if not template:
+        check_eligibility(conv)
 
     # A comment reply goes to the specific comment, not the post. Resolved here so the
     # transport stays a thin provider call with no queries of its own.
