@@ -448,7 +448,11 @@ def _latest_user_reply(message: str) -> str:
     brief-so-far) — everything after the last period. No length cap, unlike
     `_client_gave_affirmative`'s tail check, since a substantive answer ("10000, ikeja")
     can run longer than a bare "yes" while still being exactly one fresh reply."""
-    return (message or "").strip().split(".")[-1].strip().lower()
+    # The last NON-EMPTY piece: a reply ending in a full stop ("₦10,000 over 5 days.")
+    # used to leave an empty string here, so nothing the client said was seen as said.
+    # Sentence ends only — a full stop inside "urisocial.com" or "₦2.5k" isn't one.
+    pieces = [p.strip() for p in re.split(r"\.(?:\s+|$)", (message or "").strip()) if p.strip()]
+    return pieces[-1].lower() if pieces else ""
 
 
 def _whole_area_answered(message: str) -> str:
@@ -526,6 +530,10 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
     instead of leaving it to infer from a prompt it's already shown it can misread."""
     latest = _latest_user_reply(message)
     stated_now = stated_budget_ngn(latest)
+    # The opening message IS the client's reply: a budget anywhere in it is stated,
+    # not only one in its last sentence ("₦10,000 over 5 days. Send people to …").
+    if stated_now is None and not history:
+        stated_now = stated_budget_ngn(message)
 
     # No remembered budget at all — a fresh thread. The function used to bail here,
     # so a plainly stated figure got no note and the model was left to decide for
@@ -570,7 +578,7 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
             "(not budget again)."
         )
 
-    if str(int(known_budget)) in latest_reply.replace(",", ""):
+    if str(int(known_budget)) in latest_reply.replace(",", "") or stated_now == known_budget:
         return (
             f"\n\nIMPORTANT: the client's latest reply above states ₦{known_budget:,.0f} "
             "themselves — that is a deliberate answer for THIS campaign, not a silent "
@@ -597,7 +605,9 @@ def _budget_grounded(amount: Optional[float], known_budget: Optional[float],
         return True
     needle = str(int(amount))
     client_texts = [message] + [t.get("content", "") for t in history if t.get("role") == "user"]
-    if any(needle in txt for txt in client_texts):
+    # The client writes "₦10,000"; the needle is "10000". Compare without the commas,
+    # or a budget typed exactly as people type budgets counts as never said.
+    if any(needle in (txt or "").replace(",", "") for txt in client_texts):
         return True
     last_assistant = next((t.get("content", "") for t in reversed(history) if t.get("role") == "assistant"), "")
     # Naira amounts in Jane's own text are comma-formatted ("₦5,000") — strip commas
