@@ -2,11 +2,13 @@ import asyncio
 import base64
 import json
 import re
+import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 import httpx
 
+from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.s3_upload import upload_bytes
 from app.agents.social_media_manager.services.video_storyboard_service import (
@@ -14,6 +16,11 @@ from app.agents.social_media_manager.services.video_storyboard_service import (
     VIDEO_STYLE_DIRECTIVES,
     _frame_jobs_collection,
 )
+
+
+def _creative_storyboard_jobs_collection():
+    return get_db()["creative_storyboard_jobs"]
+
 
 # Script + creative-direction writing for the "describe it" flow — a GPT text
 # model, not gpt-image-2 (that one only generates/edits images). gpt-5.4
@@ -66,6 +73,12 @@ continuous story and must read that way end to end:
   1's words must lead directly into scene 2's, like one take cut into pieces,
   never separate unrelated lines. If no one speaks on camera in a scene, set
   dialogue to null.
+  GOOD example (one sentence flowing across the cut):
+    scene 1 dialogue: "I used to spend hours every week"
+    scene 2 dialogue: "just trying to figure out what to post."
+  BAD example (two unrelated statements, never do this):
+    scene 1 dialogue: "Welcome to my shop!"
+    scene 2 dialogue: "Buy now and save 20%."
 
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
@@ -266,6 +279,60 @@ class VideoCreativeService:
             storyboard["creative_direction"] = creative_direction_override.strip()
 
         return {"status": True, "storyboard": storyboard}
+
+    # ── Job wrapper around generate_creative_storyboard above — this step was
+    #    a plain blocking request-response (unlike frame/video generation,
+    #    already job_id+background_tasks based) so a refresh while it was
+    #    still running lost the in-flight work entirely, with no job to
+    #    resume. Same create/run/get shape as create_frame_job/run_frame_job
+    #    below, its own Mongo collection since a storyboard-generation job and
+    #    a frame-generation job are different things with different lifetimes. ──
+
+    @staticmethod
+    async def create_storyboard_job() -> str:
+        job_id = uuid.uuid4().hex
+        await _creative_storyboard_jobs_collection().insert_one({
+            "job_id": job_id,
+            "status": "generating",
+            "storyboard": None,
+            "error": None,
+        })
+        return job_id
+
+    @staticmethod
+    async def run_storyboard_job(
+        job_id: str,
+        brief: str,
+        reference_images: List[str],
+        brand_context: Dict[str, Any],
+        target_platform: str = "instagram_reels",
+        target_duration_seconds: int = 15,
+        video_style: Optional[str] = None,
+        creative_direction_override: Optional[str] = None,
+    ) -> None:
+        result = await VideoCreativeService.generate_creative_storyboard(
+            brief=brief,
+            reference_images=reference_images,
+            brand_context=brand_context,
+            target_platform=target_platform,
+            target_duration_seconds=target_duration_seconds,
+            video_style=video_style,
+            creative_direction_override=creative_direction_override,
+        )
+        if result.get("status"):
+            await _creative_storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "complete", "storyboard": result["storyboard"]}},
+            )
+        else:
+            await _creative_storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "failed", "error": result.get("error", "Creative storyboard generation failed")}},
+            )
+
+    @staticmethod
+    async def get_storyboard_job(job_id: str) -> Optional[Dict[str, Any]]:
+        return await _creative_storyboard_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
 
     # ── Frame generation — reuses VideoStoryboardService's own job collection
     #    and shape (same storyboard_frame_jobs doc, same GET /storyboard-frame-
