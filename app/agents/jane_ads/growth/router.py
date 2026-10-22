@@ -42,14 +42,14 @@ async def _can_change(db, ctx: dict) -> bool:
 
 
 async def _campaign(db, brand: str, campaign_id: str) -> dict:
-    record = await db[engine.CAMPAIGNS].find_one({"campaign_id": campaign_id})
+    record = await engine.find_campaign(db, campaign_id)
     if not record or record.get("brand_id") != brand:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return record
 
 
-def _adapter(db):
-    adapter = engine.adapter_for(db)
+def _adapter(db, record: Optional[dict] = None):
+    adapter = engine.adapter_for_record(db, record) if record else engine.adapter_for(db)
     if adapter is None:
         raise HTTPException(status_code=400, detail="Meta ads aren't configured")
     return adapter
@@ -76,7 +76,10 @@ async def overview(db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     """Campaign Health for every campaign in the brand, plus what needs attention."""
     brand = _brand(ctx)
     out = []
-    async for r in db[engine.CAMPAIGNS].find({"brand_id": brand}).sort("created_at", -1).limit(50):
+    from .demo import DEMO_CAMPAIGNS
+    records = await db[DEMO_CAMPAIGNS].find({"brand_id": brand}).to_list(10) + \
+        await db[engine.CAMPAIGNS].find({"brand_id": brand}).sort("created_at", -1).limit(50).to_list(50)
+    for r in records:
         cid = r["campaign_id"]
         rows = await metrics.load(db, cid)
         h = await metrics.health(db, cid)
@@ -122,7 +125,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
             d[k] += x.get(k) or 0
     ends = None
     try:
-        ends = engine._aware((await _adapter(db).fetch_adset_schedule(campaign_id)).get("end_time"))
+        ends = engine._aware((await _adapter(db, r).fetch_adset_schedule(campaign_id)).get("end_time"))
     except Exception:
         pass
     return {
@@ -145,7 +148,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
 async def refresh(campaign_id: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                   ctx: dict = Depends(get_active_brand_context)) -> dict:
     r = await _campaign(db, _brand(ctx), campaign_id)
-    return await engine.run_campaign(db, _adapter(db), r,
+    return await engine.run_campaign(db, _adapter(db, r), r,
                                      notify=lambda rec, d, a=None: engine.notify_owner(db, rec, d, a))
 
 
@@ -187,7 +190,7 @@ async def approve(rec_id: str, db: AsyncIOMotorDatabase = Depends(get_db_depende
     if not await _can_change(db, ctx):
         raise HTTPException(status_code=403, detail="Only an admin can approve changes to a campaign.")
     record = await _campaign(db, brand, rec["campaign_id"])
-    result = await engine.approve(db, _adapter(db), record, _clean(rec), ctx.get("user_id", ""))
+    result = await engine.approve(db, _adapter(db, record), record, _clean(rec), ctx.get("user_id", ""))
     if result.get("status") == "refused":
         raise HTTPException(status_code=409, detail=result["reason"])
     return {"action": result}
@@ -248,7 +251,7 @@ async def undo(action_id: str, db: AsyncIOMotorDatabase = Depends(get_db_depende
     rec = {"id": f"undo:{action_id}", "action_type": reverse[0], "parameters": reverse[1],
            "summary": f"Undo: {a.get('requested_change')}", "brand_id": brand,
            "campaign_id": a["campaign_id"], "eval_window_days": 1, "executable": True}
-    entry = await act.execute(db, _adapter(db), record, rec, actor=ctx.get("user_id", ""), mode="undo")
+    entry = await act.execute(db, _adapter(db, record), record, rec, actor=ctx.get("user_id", ""), mode="undo")
     await engine.event(db, brand, a["campaign_id"], "action_undone", action_id=action_id,
                        status=entry["status"], actor=ctx.get("user_id", ""))
     return {"action": entry}
@@ -382,3 +385,46 @@ async def insights_probe(campaign_id: str, level: str = "campaign", time_increme
                           if "conversation" in (a.get("action_type") or "")}
     body.pop("paging", None)
     return body
+
+
+@router.get("/admin/graph-probe")
+async def graph_probe(path: str, fields: str = "", db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                      token: dict = Depends(_jwt())) -> dict:
+    """Ads admins only: a read-only GET of one Graph API node with URI's ads token, to
+    diagnose what Meta holds for a Page, ad set or ad. Never writes."""
+    import re as _re
+    import httpx
+    from ..router import _require_ads_admin
+    _require_ads_admin(token)
+    if not _re.fullmatch(r"[A-Za-z0-9_/]{1,120}", path) or "token" in path.lower():
+        raise HTTPException(status_code=400, detail="path must be a plain node id or edge")
+    adapter = _adapter(db)
+    params = {"access_token": adapter._access_token}
+    if fields:
+        params["fields"] = fields
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{adapter._graph_base}/{path.strip('/')}", params=params)
+    body = resp.json()
+    body.pop("paging", None)
+    return body
+
+
+@router.post("/admin/demo")
+async def seed_demo(db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                    ctx: dict = Depends(get_active_brand_context),
+                    token: dict = Depends(_jwt())) -> dict:
+    """Ads admins only: replace the active brand's demo campaigns with fresh ones."""
+    from ..router import _require_ads_admin
+    from . import demo
+    _require_ads_admin(token)
+    return {"campaigns": await demo.seed(db, _brand(ctx), ctx.get("user_id", ""))}
+
+
+@router.delete("/admin/demo")
+async def clear_demo(db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                     ctx: dict = Depends(get_active_brand_context),
+                     token: dict = Depends(_jwt())) -> dict:
+    from ..router import _require_ads_admin
+    from . import demo
+    _require_ads_admin(token)
+    return {"removed": await demo.clear(db, _brand(ctx))}

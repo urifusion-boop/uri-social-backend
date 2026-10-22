@@ -33,11 +33,11 @@ def fresh_db():
     return mongomock_motor.AsyncMongoMockClient()["create_from_card_test"]
 
 
-async def _card(db, card_id="c1", platforms=("instagram", "tiktok"), content_id=None):
+async def _card(db, card_id="c1", platforms=("instagram", "tiktok"), content_id=None, action_type="carousel"):
     doc = {
         "id": card_id, "brand_id": BRAND_ID, "market": "hair_wigs:NG", "topic": "latasha wig", "type": "rising",
         "why": "Fits your catalogue.", "observation": "Rising in your market.",
-        "action": {"type": "video", "title": "Film 3 ways to style it", "platforms": list(platforms),
+        "action": {"type": action_type, "title": "Film 3 ways to style it", "platforms": list(platforms),
                    "format": "Reel 30s", "hook": "Everyone's asking about this wig.",
                    "outline": ["Show it on", "Style it two ways"], "cta": "DM to order", "caption": "Caption"},
         "scores": {"total": 80}, "status": "shown", "content_id": content_id,
@@ -127,6 +127,55 @@ class TestCreateFromCard:
         with pytest.raises(HTTPException) as exc:
             await create_from_card("c1", ctx={"brand_id": "someone-else", "user_id": "u2"}, db=db)
         assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_video_action_is_rejected_not_silently_generated_as_text(self):
+        # Confirmed live: a card labelled "Format: video" generated a plain
+        # text draft when clicked, with nothing telling the owner anything
+        # was off. Must fail loudly instead of handing over the wrong thing.
+        db = fresh_db()
+        await _card(db, action_type="video")
+        with patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(),
+        ) as mock_gen:
+            with pytest.raises(HTTPException) as exc:
+                await create_from_card("c1", ctx=CTX, db=db)
+        assert exc.value.status_code == 400
+        assert "video" in exc.value.detail.lower()
+        mock_gen.assert_not_called()
+        card = await db["mi_listen_cards"].find_one({"id": "c1"})
+        assert card["status"] == "shown" and card["content_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_ad_test_action_is_rejected_not_silently_generated_as_text(self):
+        db = fresh_db()
+        await _card(db, action_type="ad_test")
+        with patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(),
+        ) as mock_gen:
+            with pytest.raises(HTTPException) as exc:
+                await create_from_card("c1", ctx=CTX, db=db)
+        assert exc.value.status_code == 400
+        mock_gen.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_and_faq_actions_still_generate_text_normally(self):
+        # Both route through the same text generator as carousel — only
+        # video/ad_test need their own, not-yet-built generators.
+        for action_type in ("post", "faq"):
+            db = fresh_db()
+            await _card(db, action_type=action_type)
+            with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, patch(
+                "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+                ".generate_multi_platform_content",
+                new=AsyncMock(return_value=_ok_generation()),
+            ):
+                result = await create_from_card("c1", ctx=CTX, db=db)
+            assert result["responseData"]["draft_ids"] == ["d1", "d2"]
 
     @pytest.mark.asyncio
     async def test_generation_failure_is_502_and_card_is_left_untouched(self):
