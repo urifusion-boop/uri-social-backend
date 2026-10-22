@@ -148,7 +148,9 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
 async def _controls(db, r: dict) -> dict:
     """What the owner can change by hand, as Meta holds it right now."""
     adapter = _adapter(db, r)
-    out: dict = {"status": None, "daily_budget_ngn": None, "ads": [], "ads_manager_url": "", "error": ""}
+    from .. import constants as C
+    out: dict = {"status": None, "daily_budget_ngn": None, "min_daily_budget_ngn": C.MIN_DAILY_SPEND_NGN,
+                 "ads": [], "error": ""}
     try:
         sched = await adapter.fetch_adset_schedule(r["campaign_id"])
         out["status"] = sched.get("effective_status") or sched.get("status")

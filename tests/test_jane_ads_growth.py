@@ -444,3 +444,9 @@ def test_an_explicit_cap_still_binds_manual_changes():
                          by_user=True, manual=True)[0]
     assert pol.check(pol.normalize({}), rec, {**STATE, "data_fresh": False, "budget_raised_7d_pct": 90},
                      by_user=True, manual=True)[0]
+
+
+def test_a_budget_below_the_minimum_is_refused_even_by_hand():
+    rec = {"action_type": "set_daily_budget", "executable": True, "parameters": {"from_ngn": 2250, "to_ngn": 1500}}
+    ok, why = pol.check(pol.normalize({}), rec, STATE, by_user=True, manual=True)
+    assert not ok and "₦2,000" in why
