@@ -147,7 +147,6 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
 
 async def _controls(db, r: dict) -> dict:
     """What the owner can change by hand, as Meta holds it right now."""
-    from app.core.config import settings
     adapter = _adapter(db, r)
     out: dict = {"status": None, "daily_budget_ngn": None, "ads": [], "ads_manager_url": "", "error": ""}
     try:
@@ -157,9 +156,6 @@ async def _controls(db, r: dict) -> dict:
         out["ads"] = await act.list_ads(adapter, r)
     except Exception as e:
         out["error"] = str(e)[:200]
-    if not r.get("demo") and settings.META_AD_ACCOUNT_ID:
-        out["ads_manager_url"] = ("https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-                                  f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r['campaign_id']}")
     return out
 
 
