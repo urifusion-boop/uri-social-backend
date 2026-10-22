@@ -337,6 +337,17 @@ async def curation_decide(market_key: str, topic_key: str, body: CurationDecisio
     return UriResponse.get_single_data_response("topic", result)
 
 
+@router.get("/curation/topics/{market_key}/{topic_key}/history")
+async def curation_topic_history(market_key: str, topic_key: str, admin: dict = Depends(_verify_admin),
+                                 db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Appendix A's term_history — every lifecycle transition this topic has
+    ever made, most recent first. The topic doc itself only holds current
+    state, so this is the only place a reverted or repeated decision is
+    still visible."""
+    history = await discovery.term_history(db, market_key, topic_key)
+    return UriResponse.get_single_data_response("history", history)
+
+
 # ── Source permission records (PRD §15) — admin-only ─────────────────────────
 
 @router.get("/curation/sources")

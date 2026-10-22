@@ -210,6 +210,83 @@ def test_paused_topics_are_never_touched():
     assert _topic(db, "retired-ish")["status"] == "paused"  # left alone, no silent revival
 
 
+# ── term_history audit trail (PRD §6.3 "full history", Appendix A) ─────────
+
+def _history(db, topic="latasha wig"):
+    return run(discovery.term_history(db, MARKET_KEY, topic))
+
+
+class TestTermHistory:
+    def test_automatic_promotion_is_recorded(self):
+        db = fresh_db()
+        run(_seed_market(db))
+        run(_seed_topic(db, "latasha wig", "observed"))
+        run(_seed_readings(db, "latasha wig", n_accounts=4))
+
+        _update(db)
+
+        hist = _history(db)
+        assert len(hist) == 1
+        assert hist[0]["old_status"] == "observed"
+        assert hist[0]["new_status"] == "candidate"
+        assert hist[0]["actor"] == "system"
+        assert hist[0]["market"] == MARKET_KEY and hist[0]["topic"] == "latasha wig"
+
+    def test_full_lifecycle_keeps_every_transition_not_just_the_latest(self):
+        # The topic doc itself only ever holds current state — a term that's
+        # promoted, then paused, then manually promoted again must not lose
+        # the earlier decisions the way an overwrite-in-place would.
+        db = fresh_db()
+        run(_seed_market(db))
+        run(_seed_topic(db, "latasha wig", "candidate", candidate_at=NOW - timedelta(days=2)))
+        run(_seed_readings(db, "latasha wig", n_accounts=6, days_ago=1))
+        run(_seed_readings(db, "latasha wig", n_accounts=2, days_ago=4))
+        run(_seed_readings(db, "latasha wig", n_accounts=2, days_ago=7))
+        _update(db)  # candidate -> monitored
+
+        run(discovery.set_topic_status(db, MARKET_KEY, "latasha wig", "paused", "manual pause", "ops@uri",
+                                       NOW + timedelta(minutes=1)))
+        run(discovery.set_topic_status(db, MARKET_KEY, "latasha wig", "monitored", "revived", "ops@uri",
+                                       NOW + timedelta(minutes=2)))
+
+        hist = _history(db)
+        assert len(hist) == 3
+        # most recent first
+        assert [h["new_status"] for h in hist] == ["monitored", "paused", "monitored"]
+        assert hist[0]["actor"] == "ops@uri" and hist[0]["reason"] == "revived"
+
+    def test_manual_override_records_actor_and_reason(self):
+        db = fresh_db()
+        run(_seed_market(db))
+        run(_seed_topic(db, "latasha wig", "candidate"))
+
+        run(discovery.set_topic_status(db, MARKET_KEY, "latasha wig", "monitored", "clearly on-topic", "curator@uri", NOW))
+
+        hist = _history(db)
+        assert len(hist) == 1
+        assert hist[0] == {
+            "market": MARKET_KEY, "topic": "latasha wig", "old_status": "candidate", "new_status": "monitored",
+            "reason": "clearly on-topic", "actor": "curator@uri", "at": NOW,
+        }
+
+    def test_unrelated_topic_or_market_never_appears(self):
+        db = fresh_db()
+        run(_seed_market(db))
+        run(_seed_topic(db, "latasha wig", "observed"))
+        run(_seed_topic(db, "another wig", "observed"))
+        run(_seed_readings(db, "latasha wig", n_accounts=4))
+        run(_seed_readings(db, "another wig", n_accounts=4))
+
+        _update(db)
+
+        assert len(_history(db, "latasha wig")) == 1
+        assert len(_history(db, "another wig")) == 1
+
+    def test_no_history_yet_is_an_empty_list(self):
+        db = fresh_db()
+        assert _history(db) == []
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
