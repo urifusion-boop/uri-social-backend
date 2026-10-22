@@ -7088,6 +7088,7 @@ async def get_storyboard_frame_job(
 @router.post("/generate-creative-storyboard")
 async def generate_creative_storyboard(
     request: CreativeStoryboardRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -7098,6 +7099,12 @@ async def generate_creative_storyboard(
     to /generate-creative-frames below; once scenes carry frame_image_url,
     the existing outcome-routed /generate-video-from-storyboard pipeline
     picks up completely unchanged.
+
+    Job-based (returns a job_id immediately, poll GET /creative-storyboard-
+    job/{job_id}) rather than the plain blocking call this used to be — that
+    made this one specific step (unlike frame/video generation, already
+    job_id-based) lose all in-flight work on a refresh, with nothing to
+    resume. See VideoCreativeService.create_storyboard_job/run_storyboard_job.
     """
     user_id = _get_user_id(token)
     if not user_id:
@@ -7116,20 +7123,37 @@ async def generate_creative_storyboard(
 
     from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
 
-    result = await VideoCreativeService.generate_creative_storyboard(
-        brief=request.brief,
-        reference_images=request.reference_images,
-        brand_context=brand_context,
-        target_platform=request.target_platform,
-        target_duration_seconds=request.target_duration_seconds,
-        video_style=request.video_style,
-        creative_direction_override=request.creative_direction_override,
+    job_id = await VideoCreativeService.create_storyboard_job()
+    background_tasks.add_task(
+        VideoCreativeService.run_storyboard_job,
+        job_id,
+        request.brief,
+        request.reference_images,
+        brand_context,
+        request.target_platform,
+        request.target_duration_seconds,
+        request.video_style,
+        request.creative_direction_override,
     )
 
-    if not result.get("status"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Creative storyboard generation failed"))
+    return UriResponse.get_single_data_response("storyboard_job", {"job_id": job_id, "status": "generating"})
 
-    return UriResponse.get_single_data_response("storyboard", result["storyboard"])
+
+@router.get("/creative-storyboard-job/{job_id}")
+async def get_creative_storyboard_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll for "describe it" storyboard-script generation progress."""
+    from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
+
+    _get_user_id(token)  # auth check
+
+    job = await VideoCreativeService.get_storyboard_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Storyboard job not found")
+
+    return UriResponse.get_single_data_response("storyboard_job", job)
 
 
 @router.post("/generate-creative-frames")
