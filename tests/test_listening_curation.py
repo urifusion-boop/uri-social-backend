@@ -17,7 +17,9 @@ mongomock_motor = pytest.importorskip("mongomock_motor")
 from fastapi import HTTPException
 
 from app.agents.market_intelligence.listening import discovery
-from app.agents.market_intelligence.listening.router import curation_decide, curation_markets, curation_topics
+from app.agents.market_intelligence.listening.router import (
+    curation_decide, curation_markets, curation_topic_history, curation_topics,
+)
 
 NOW = datetime(2026, 10, 21, 12, 0)
 MARKET_KEY = "hair_wigs:NG"
@@ -191,6 +193,31 @@ class TestCurationMarkets:
         with pytest.raises(HTTPException) as exc:
             await curation_decide(MARKET_KEY, "latasha wig", _Body(), admin=ADMIN, db=db)
         assert exc.value.status_code == 400
+
+
+class TestCurationTopicHistory:
+    @pytest.mark.asyncio
+    async def test_returns_the_topics_recorded_transitions_most_recent_first(self):
+        db = fresh_db()
+        await _seed_topic(db, "latasha wig", "candidate")
+
+        class _Body:
+            status, reason = "monitored", "Looks real"
+        await curation_decide(MARKET_KEY, "latasha wig", _Body(), admin=ADMIN, db=db)
+
+        result = await curation_topic_history(MARKET_KEY, "latasha wig", admin=ADMIN, db=db)
+        hist = result["responseData"]
+        assert len(hist) == 1
+        assert hist[0]["new_status"] == "monitored"
+        assert hist[0]["actor"] == "curator@urisocial.com"
+        assert hist[0]["reason"] == "Looks real"
+
+    @pytest.mark.asyncio
+    async def test_no_history_matches_this_api_s_own_empty_convention(self):
+        db = fresh_db()
+        result = await curation_topic_history(MARKET_KEY, "never-decided", admin=ADMIN, db=db)
+        assert result["status"] is False
+        assert result["responseCode"] == 404
 
 
 if __name__ == "__main__":

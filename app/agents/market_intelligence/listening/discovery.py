@@ -29,6 +29,20 @@ from typing import Optional
 VALID_STATUSES = {"observed", "candidate", "monitored", "paused", "retired"}
 
 
+async def _record_history(db, market_key: str, topic_key: str, old_status: Optional[str], new_status: str,
+                          reason: Optional[str], actor: str, now: datetime) -> None:
+    """Appendix A's term_history entity: 'old -> new state, reason, actor,
+    timestamp'. Every status transition gets its own row — the topic doc
+    itself only ever holds the CURRENT state (overwritten on each change),
+    so without this a topic promoted, paused and re-promoted loses every
+    earlier decision. Append-only; never read back to decide anything, so
+    it can't itself introduce a race with update_market/set_topic_status."""
+    await db["mi_term_history"].insert_one({
+        "market": market_key, "topic": topic_key, "old_status": old_status, "new_status": new_status,
+        "reason": (reason or "")[:300] or None, "actor": actor, "at": now,
+    })
+
+
 async def _window_evidence(db, market: str, topic: str, since: datetime, until: datetime) -> dict:
     accounts: set = set()
     days: set = set()
@@ -64,6 +78,8 @@ async def update_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
             if ev["accounts"] >= d["candidate_min_accounts"] and ev["relevance"] >= d["candidate_min_relevance"]:
                 await db["mi_market_topics"].update_one(
                     {"_id": t["_id"]}, {"$set": {"status": "candidate", "candidate_at": now}})
+                await _record_history(db, market["key"], t["key"], "observed", "candidate",
+                                      f"{ev['accounts']} accounts, {ev['relevance']:.2f} relevance", "system", now)
                 summary["candidates"].append(t["key"])
 
         elif status == "candidate":
@@ -72,12 +88,17 @@ async def update_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
                 learned.add(t["key"])
                 await db["mi_market_topics"].update_one(
                     {"_id": t["_id"]}, {"$set": {"status": "monitored", "monitored_at": now, "low_yield_windows": 0}})
+                await _record_history(db, market["key"], t["key"], "candidate", "monitored",
+                                      f"{ev['accounts']} accounts, {ev['days']} days, {ev['relevance']:.2f} relevance",
+                                      "system", now)
                 summary["monitored"].append(t["key"])
             elif t.get("candidate_at") and now - t["candidate_at"] > timedelta(days=d["candidate_timeout_days"]):
                 await db["mi_market_topics"].update_one(
                     {"_id": t["_id"]},
                     {"$set": {"status": "retired", "retired_at": now,
                              "retired_reason": "candidate timed out without enough evidence"}})
+                await _record_history(db, market["key"], t["key"], "candidate", "retired",
+                                      "candidate timed out without enough evidence", "system", now)
                 summary["retired"].append(t["key"])
 
         elif status == "monitored":
@@ -87,6 +108,8 @@ async def update_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
                 learned.discard(t["key"])
                 await db["mi_market_topics"].update_one(
                     {"_id": t["_id"]}, {"$set": {"status": "paused", "paused_at": now, "low_yield_windows": streak}})
+                await _record_history(db, market["key"], t["key"], "monitored", "paused",
+                                      f"low yield for {streak} consecutive windows", "system", now)
                 summary["paused"].append(t["key"])
             else:
                 await db["mi_market_topics"].update_one({"_id": t["_id"]}, {"$set": {"low_yield_windows": streak}})
@@ -117,6 +140,7 @@ async def set_topic_status(db, market_key: str, topic_key: str, status: str, rea
         {"$set": {"status": status, f"{status}_at": now, "decided_by": actor,
                  "decision_reason": (reason or "")[:300] or None}},
     )
+    await _record_history(db, market_key, topic_key, topic.get("status"), status, reason, actor, now)
     market = await db["mi_markets"].find_one({"key": market_key}) or {}
     before = set(market.get("learned_terms") or [])
     learned = set(before)
@@ -127,3 +151,16 @@ async def set_topic_status(db, market_key: str, topic_key: str, status: str, rea
     if learned != before:
         await db["mi_markets"].update_one({"key": market_key}, {"$set": {"learned_terms": sorted(learned)}})
     return {"found": True, "status": status, "market": market_key, "topic": topic_key}
+
+
+async def term_history(db, market_key: str, topic_key: str, limit: int = 100) -> list[dict]:
+    """Every lifecycle transition a term has ever made, most recent first —
+    the curation console's audit trail for a topic (Appendix A's
+    term_history). The topic doc itself only ever holds current state."""
+    out = []
+    async for h in db["mi_term_history"].find(
+        {"market": market_key, "topic": topic_key}
+    ).sort([("at", -1)]).limit(min(limit, 500)):
+        h.pop("_id", None)
+        out.append(h)
+    return out
