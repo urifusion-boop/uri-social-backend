@@ -932,6 +932,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "fields": (
                         "effective_status,"
                         "adsets{end_time},"
+                        "ads{effective_status},"
                         "insights{impressions,reach,spend,actions,cost_per_action_type}"
                     ),
                 },
@@ -941,6 +942,12 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
 
         raw_status = data.get("effective_status", "")
         delivery = _DELIVERY_LABELS.get(raw_status, raw_status.replace("_", " ").title() or "Paused")
+        # The campaign switch alone isn't delivery: a campaign that is on with every ad
+        # paused spends nothing, and showing it as "Active" read as "still running".
+        ad_states = {a.get("effective_status") for a in (data.get("ads") or {}).get("data", [])}
+        if raw_status == "ACTIVE" and ad_states and not ad_states & {
+                "ACTIVE", "IN_PROCESS", "PENDING_REVIEW", "PREAPPROVED", "WITH_ISSUES"}:
+            delivery = "Ad paused"
 
         adsets = data.get("adsets", {}).get("data", [])
         ends_at = adsets[0].get("end_time") if adsets else None
