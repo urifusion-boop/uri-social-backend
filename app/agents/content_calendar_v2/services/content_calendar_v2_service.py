@@ -443,6 +443,64 @@ def _resolve_series_name(name: Optional[str], brand_name: str, industry: str) ->
     return name.replace("[Brand]", brand_name).replace("[Industry]", industry)
 
 
+# ── Step 3b — Listening-sourced candidates (Listening PRD §18) ─────────────
+# NOT the TrendDataService/PerformanceAnalyticsService this file's module
+# docstring bans upstream of candidate generation — those are fabricated/
+# simulated placeholders and real post-performance numbers respectively,
+# exactly the kind of signal that could corrupt autonomous ideation with
+# something false. A Listening card is the opposite: a real, evidence-gated
+# customer signal from this exact business's own market, already passed
+# through its own confidence/relevance gates and fabrication-rejecting
+# validator (market_intelligence/listening/personalize.py) before it ever
+# reaches here. This function does no ideation and calls no model — it only
+# reshapes already-real, already-validated fields into the candidate-concept
+# shape, so it carries zero fabrication risk into the pool it's added to.
+# ad_test cards are skipped: there's no content format for them here, and
+# turning one into a post would misrepresent what it actually is.
+_LISTENING_TERRITORY_BY_TYPE = {
+    "recurring_need": "A_PROBLEM",
+}
+_LISTENING_FORMAT_BY_ACTION_TYPE = {"video": "video", "carousel": "carousel", "faq": "image", "post": "image"}
+
+
+async def _listening_candidate_concepts(
+    db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[str], limit: int = 6,
+) -> List[Dict[str, Any]]:
+    from app.models.brand_account import BrandAccount
+    resolved_brand_id = brand_id or BrandAccount.personal_brand_id(user_id)
+    now = datetime.utcnow()
+    out: List[Dict[str, Any]] = []
+    cursor = db["mi_listen_cards"].find(
+        {"brand_id": resolved_brand_id, "status": {"$in": ["new", "shown", "saved"]}, "expires_at": {"$gt": now}}
+    ).sort([("scores.total", -1)]).limit(limit * 2)  # headroom for ad_test skips
+    async for card in cursor:
+        action = card.get("action") or {}
+        if action.get("type") == "ad_test" or not action.get("platforms"):
+            continue
+        out.append({
+            "territory": _LISTENING_TERRITORY_BY_TYPE.get(card.get("type"), "C_CURIOSITY"),
+            "subject": card.get("topic_name") or card.get("topic", ""),
+            "angle": "The Customer's Question",
+            "creative_device": {"category": "conversational", "device": "Customer question"},
+            "format_hint": _LISTENING_FORMAT_BY_ACTION_TYPE.get(action.get("type"), "image"),
+            "objective": "engagement",
+            "audience_segment": (card.get("why") or "")[:80] or "customers already asking about this",
+            "concept_name": action.get("title") or card.get("topic_name") or card.get("topic", ""),
+            "series_name": None,
+            "source": "listening",
+            "source_card_id": card.get("id"),
+            "listening_brief": {
+                "observation": card.get("observation"),
+                "hook": action.get("hook"),
+                "outline": action.get("outline"),
+                "cta": action.get("cta"),
+            },
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
 async def _generate_candidate_concepts(
@@ -1721,6 +1779,25 @@ async def _generate_final_copy(
             return f"CAROUSEL — ~{c.get('carousel_slide_count', 3)} slides (2-3 allowed)"
         return str(c.get("format", "image"))
 
+    def _listening_line(c: Dict[str, Any]) -> str:
+        # This concept isn't a brainstormed idea — it's a real opportunity
+        # Listening measured in this business's own market (see
+        # _listening_candidate_concepts). Ground the copy in these actual
+        # facts rather than reinventing generic supporting detail; still
+        # write it fresh — these are evidence to build from, not copy verbatim.
+        brief = c.get("listening_brief") or {}
+        if c.get("source") != "listening" or not brief:
+            return ""
+        parts = [f"REAL CUSTOMER EVIDENCE (this is genuinely true, measured in this business's own market — "
+                 f"ground the copy in it): {brief.get('observation', '')}"]
+        if brief.get("hook"):
+            parts.append(f"A hook already considered worth testing: \"{brief['hook']}\"")
+        if brief.get("outline"):
+            parts.append("Points already identified as worth covering: " + "; ".join(brief["outline"]))
+        if brief.get("cta"):
+            parts.append(f"CTA direction already matched to this business's goal: \"{brief['cta']}\"")
+        return "\n  " + " ".join(parts)
+
     concepts_block = "\n\n".join(
         f"""Item {i} — {c['date']}:
   Territory: {c.get('territory')} | Subject: {c.get('subject')} | Angle: {c.get('angle')}
@@ -1731,6 +1808,7 @@ async def _generate_final_copy(
         + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
            f"make it the subject of the post, by name." if c.get("key_date")
            else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
+        + _listening_line(c)
         for i, c in enumerate(concepts_chunk)
     )
 
@@ -2179,6 +2257,20 @@ async def _build_plan_doc(
     )
     if not candidates:
         raise RuntimeError("Content Calendar V2 generation failed — no candidate concepts produced.")
+
+    # Step 3b — real, evidence-backed Listening opportunities join the same
+    # pool and compete on identical scoring terms (Listening PRD §18:
+    # "insight-backed post suggestions; brief passed directly into
+    # generation") — see _listening_candidate_concepts's docstring for why
+    # this isn't the performance/trend data banned above.
+    try:
+        listening_candidates = await _listening_candidate_concepts(db, user_id, brand_id)
+    except Exception as exc:
+        print(f"[CalendarV2] listening candidates skipped ({exc})", flush=True)
+        listening_candidates = []
+    if listening_candidates:
+        print(f"[CalendarV2] {len(listening_candidates)} listening-sourced candidate(s) added to the pool", flush=True)
+        candidates = candidates + listening_candidates
 
     # Step 4 — score (9 named dims, no performance/trend fields — enforced in code)
     scored = await _score_candidates(candidates, brand, framework, creative_memory)

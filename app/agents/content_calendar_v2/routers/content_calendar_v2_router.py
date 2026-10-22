@@ -9,6 +9,7 @@ service — see the plan this was built against for the full isolation
 rationale: /Users/macintoshhd/.claude/plans/enchanted-wiggling-treehouse.md
 """
 import asyncio
+from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -296,6 +297,35 @@ async def create_draft_from_item_v2(
             drafts = result.get("responseData", {}).get("drafts", [])
             draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
             await cal_v2_svc.mark_acted_on_v2(plan_id, item_index, draft_ids, user_id, db, brand_id=brand_id)
+
+            # This item started life as a real Listening opportunity card
+            # (see _listening_candidate_concepts) — now that it's actually
+            # become a draft, close the loop back onto that card the same
+            # way the direct /listening/cards/{id}/create path does: same
+            # field shape as that endpoint's own mi_listen_card_actions
+            # insert (market/type are load-bearing — personalize.py's
+            # relevance-adjustment learning signal queries on them, not
+            # just card_id), so the learning loop (Listening PRD §11:
+            # "content created -> links insight -> asset -> post") sees
+            # this regardless of which of the two routes was used.
+            source_card_id = item.get("source_card_id")
+            if source_card_id and draft_ids:
+                now = datetime.utcnow()
+                source_card = await db["mi_listen_cards"].find_one(
+                    {"id": source_card_id, "brand_id": brand_id, "content_id": None}
+                )
+                if source_card:
+                    await db["mi_listen_cards"].update_one(
+                        {"id": source_card_id},
+                        {"$set": {"status": "acted", "content_id": draft_ids[0], "created_draft_ids": draft_ids,
+                                 "updated_at": now}},
+                    )
+                    await db["mi_listen_card_actions"].insert_one({
+                        "card_id": source_card_id, "brand_id": brand_id, "user_id": user_id, "action": "created",
+                        "content_id": draft_ids[0], "market": source_card["market"], "topic": source_card["topic"],
+                        "type": source_card["type"], "scores": source_card.get("scores"), "at": now,
+                        "via": "content_calendar_v2",
+                    })
 
             request_id = result.get("responseData", {}).get("request_id")
             # V2-only cost rule (deliberately diverges from v1's create_draft_from_calendar_day,
