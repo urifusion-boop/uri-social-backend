@@ -62,7 +62,7 @@ def _aware(at) -> Optional[datetime]:
     return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at
 
 
-def check(policy: dict, rec: dict, state: dict, *, by_user: bool,
+def check(policy: dict, rec: dict, state: dict, *, by_user: bool, manual: bool = False,
           at: Optional[datetime] = None) -> tuple[bool, str]:
     """May this recommendation run now? `state`: last_action_at (this campaign),
     budget_raised_7d_pct, data_fresh, blocked_by (an open tracking incident), active,
@@ -71,9 +71,11 @@ def check(policy: dict, rec: dict, state: dict, *, by_user: bool,
     action = rec["action_type"]
     if not rec.get("executable"):
         return False, "This is a change you make yourself — mark it done when you have."
-    if not state.get("data_fresh"):
+    # A change the owner makes by hand is theirs to make: the data-quality holds and
+    # cooldowns exist to stop URI acting on weak evidence, not to second-guess them.
+    if not manual and not state.get("data_fresh"):
         return False, "Data from Meta is out of date; refresh before changing anything."
-    if state.get("blocked_by"):
+    if not manual and state.get("blocked_by"):
         return False, f"Held while this is unresolved: {state['blocked_by']}."
     if not by_user:
         if policy["emergency_stop"]:
@@ -83,10 +85,13 @@ def check(policy: dict, rec: dict, state: dict, *, by_user: bool,
         if action not in policy["allowed_actions"]:
             return False, "Not in the actions you allowed URI to take on its own."
     last = _aware(state.get("last_action_at"))
-    if last and at - last < timedelta(hours=policy["cooldown_hours"]) and action != "pause_campaign":
+    if not manual and last and at - last < timedelta(hours=policy["cooldown_hours"]) \
+            and action != "pause_campaign":
         return False, (f"Cooling down: the last change was under {policy['cooldown_hours']} hours ago, "
                        "so its results aren't in yet.")
-    if action in ("pause_ad", "pause_campaign") and not state.get("active"):
+    if action == "pause_campaign" and not state.get("active"):
+        return False, "The campaign isn't running."
+    if action == "pause_ad" and not manual and not state.get("active"):
         return False, "The campaign isn't running."
     if action == "set_daily_budget":
         to = float(rec["parameters"].get("to_ngn") or 0)
@@ -105,7 +110,7 @@ def check(policy: dict, rec: dict, state: dict, *, by_user: bool,
                 return False, (f"URI won't raise a budget above the launch budget (₦{ceiling:,.0f}) "
                                "on its own — approve it yourself, or set a cap in Growth → Automation.")
             raised = (state.get("budget_raised_7d_pct") or 0) + (to / frm - 1) * 100 if frm else 100
-            if raised > policy["max_increase_pct_7d"]:
+            if not manual and raised > policy["max_increase_pct_7d"]:
                 return False, f"More than the {policy['max_increase_pct_7d']}% increase allowed in 7 days."
             need = to * float(state.get("markup") or 1)
             if float(state.get("wallet_ngn") or 0) < need:
