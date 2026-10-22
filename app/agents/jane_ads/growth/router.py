@@ -175,6 +175,12 @@ async def set_goal(campaign_id: str, payload: dict = Body(...),
             "updated_by": ctx.get("user_id", ""), "updated_at": datetime.now(timezone.utc)}
     await db[engine.GOALS].update_one({"campaign_id": campaign_id}, {"$set": goal}, upsert=True)
     await engine.event(db, r.get("brand_id"), campaign_id, "goal_updated", actor=ctx.get("user_id", ""))
+    # Judged against the new target straight away: a suggestion made against the old
+    # one shouldn't sit there until the next hourly check.
+    try:
+        await engine.run_campaign(db, _adapter(db, r), r)
+    except Exception as e:
+        print(f"[growth] re-check after goal change failed for {campaign_id}: {e}", flush=True)
     return {"goal": goal}
 
 

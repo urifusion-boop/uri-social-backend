@@ -402,3 +402,20 @@ def test_demo_seed_produces_the_three_recommendations():
     record = run(engine.find_campaign(db, rec["campaign_id"]))
     entry = run(engine.approve(db, demo.DemoAdapter(db), record, rec, "u1"))
     assert entry["status"] == "executed" and entry["verified"]
+
+
+def test_the_cap_message_says_where_to_change_it():
+    rec = {"action_type": "set_daily_budget", "executable": True, "parameters": {"from_ngn": 2500, "to_ngn": 3000}}
+    ok, why = pol.check(pol.normalize({"max_daily_budget_ngn": 250}), rec, STATE, by_user=True)
+    assert not ok and "Growth → Automation" in why and "₦250" in why
+
+
+def test_a_new_target_resolves_a_suggestion_made_against_the_old_one():
+    from app.agents.jane_ads.growth import demo
+    db = mongomock_motor.AsyncMongoMockClient()["growth"]
+    run(demo.seed(db, "brnd_demo_y", "u1"))
+    rec = run(db[engine.RECOMMENDATIONS].find_one({"action_type": "set_daily_budget"}))
+    run(db[engine.GOALS].update_one({"campaign_id": rec["campaign_id"]}, {"$set": {"target_cpl_ngn": 200}}))
+    record = run(engine.find_campaign(db, rec["campaign_id"]))
+    run(engine.run_campaign(db, demo.DemoAdapter(db), record))
+    assert run(db[engine.RECOMMENDATIONS].find_one({"id": rec["id"]}))["status"] == "superseded"
