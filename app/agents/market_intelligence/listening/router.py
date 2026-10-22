@@ -272,6 +272,20 @@ def _clean_topic(t: dict) -> dict:
     return t
 
 
+@router.get("/curation/markets")
+async def curation_markets(admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Every market that exists, for the curation console's market picker —
+    nothing else in this API lists markets across brands (the brand-scoped
+    /listening/status only ever returns the caller's own)."""
+    out = []
+    async for m in db["mi_markets"].find({}).sort([("key", 1)]):
+        m.pop("_id", None)
+        m["subscriber_count"] = len(m.get("subscribers") or [])
+        m.pop("subscribers", None)
+        out.append(m)
+    return UriResponse.get_single_data_response("markets", out)
+
+
 @router.get("/curation/topics")
 async def curation_topics(status: Optional[str] = None, market: Optional[str] = None, limit: int = 50,
                           admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
