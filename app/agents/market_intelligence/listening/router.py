@@ -156,6 +156,27 @@ async def run_now(background_tasks: BackgroundTasks, ctx: dict = Depends(require
     return UriResponse.get_single_data_response("run", {"started": True, "markets": prof.get("markets")})
 
 
+@router.get("/run/active")
+async def active_runs(ctx: dict = Depends(get_active_brand_context), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Real, in-progress collection state for this business's markets — not
+    a simulated percentage. Each query in a run's per_query list flips from
+    "pending" to "done" the moment collector._one_query personally finishes,
+    independently of the others still running alongside it, so a client
+    polling this sees genuine per-source progress (spec §16). Works whether
+    the run was started by this user's own "check now" or the scheduled
+    cycle, and survives a page refresh — the run doc is the source of
+    truth, not any client-side state."""
+    prof = await db["mi_listening_profiles"].find_one({"brand_id": ctx["brand_id"], "status": "active"})
+    if not prof:
+        return UriResponse.get_single_data_response("active_runs", [])
+    runs = [r async for r in db["mi_listen_runs"].find(
+        {"market": {"$in": prof.get("markets") or []}, "status": "running"}
+    ).sort([("started_at", -1)])]
+    for r in runs:
+        r.pop("_id", None)
+    return UriResponse.get_single_data_response("active_runs", runs)
+
+
 @router.get("/cards")
 async def list_cards(ctx: dict = Depends(get_active_brand_context),
                      db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
@@ -221,6 +242,19 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
         raise HTTPException(status_code=409, detail="Content was already created from this card")
 
     action = card.get("action") or {}
+    # personalize.py's _Action.type can be video|post|carousel|faq|ad_test —
+    # only post/carousel/faq route through the text generator below. video
+    # and ad_test need their own generators (video render pipeline, Jane
+    # Ads draft campaign) that this endpoint doesn't call — silently
+    # generating a text draft for a card the UI labelled "Format: video"
+    # would hand the owner the wrong thing with no indication anything was
+    # off. Say so plainly instead, same as any other unsupported action.
+    unsupported = {
+        "video": "Video creation from a Listening card isn't wired up yet — use the brief below to create it in Create Video.",
+        "ad_test": "Proposed ad tests from Listening aren't wired up yet — use the brief below to set one up in Campaigns.",
+    }
+    if action.get("type") in unsupported:
+        raise HTTPException(status_code=400, detail=unsupported[action["type"]])
     platforms = [p for p in (action.get("platforms") or []) if p]
     if not platforms:
         raise HTTPException(status_code=400, detail="This card has no platforms to create content for")
@@ -272,6 +306,20 @@ def _clean_topic(t: dict) -> dict:
     return t
 
 
+@router.get("/curation/markets")
+async def curation_markets(admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Every market that exists, for the curation console's market picker —
+    nothing else in this API lists markets across brands (the brand-scoped
+    /listening/status only ever returns the caller's own)."""
+    out = []
+    async for m in db["mi_markets"].find({}).sort([("key", 1)]):
+        m.pop("_id", None)
+        m["subscriber_count"] = len(m.get("subscribers") or [])
+        m.pop("subscribers", None)
+        out.append(m)
+    return UriResponse.get_single_data_response("markets", out)
+
+
 @router.get("/curation/topics")
 async def curation_topics(status: Optional[str] = None, market: Optional[str] = None, limit: int = 50,
                           admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
@@ -308,6 +356,17 @@ async def curation_decide(market_key: str, topic_key: str, body: CurationDecisio
     if not result["found"]:
         raise HTTPException(status_code=404, detail="Topic not found")
     return UriResponse.get_single_data_response("topic", result)
+
+
+@router.get("/curation/topics/{market_key}/{topic_key}/history")
+async def curation_topic_history(market_key: str, topic_key: str, admin: dict = Depends(_verify_admin),
+                                 db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Appendix A's term_history — every lifecycle transition this topic has
+    ever made, most recent first. The topic doc itself only holds current
+    state, so this is the only place a reverted or repeated decision is
+    still visible."""
+    history = await discovery.term_history(db, market_key, topic_key)
+    return UriResponse.get_single_data_response("history", history)
 
 
 # ── Source permission records (PRD §15) — admin-only ─────────────────────────

@@ -17,7 +17,9 @@ mongomock_motor = pytest.importorskip("mongomock_motor")
 from fastapi import HTTPException
 
 from app.agents.market_intelligence.listening import discovery
-from app.agents.market_intelligence.listening.router import curation_decide, curation_topics
+from app.agents.market_intelligence.listening.router import (
+    curation_decide, curation_markets, curation_topic_history, curation_topics,
+)
 
 NOW = datetime(2026, 10, 21, 12, 0)
 MARKET_KEY = "hair_wigs:NG"
@@ -128,6 +130,35 @@ class TestCurationRouter:
             await curation_topics(status="not-a-status", market=None, limit=50, admin=ADMIN, db=db)
         assert exc.value.status_code == 400
 
+
+class TestCurationMarkets:
+    """The console's market picker — the only place anywhere in this API
+    that lists markets across every brand (everything else is brand-scoped
+    to the caller's own)."""
+
+    @pytest.mark.asyncio
+    async def test_lists_every_market_sorted_by_key_with_a_subscriber_count(self):
+        db = fresh_db()
+        await db["mi_markets"].insert_many([
+            {"key": "hair_wigs:NG", "label": "Hair & Wigs · Nigeria", "subscribers": ["b1", "b2"]},
+            {"key": "beauty_skincare:NG", "label": "Beauty & Skincare · Nigeria", "subscribers": []},
+        ])
+        result = await curation_markets(admin=ADMIN, db=db)
+        markets = result["responseData"]
+        assert [m["key"] for m in markets] == ["beauty_skincare:NG", "hair_wigs:NG"]
+        assert markets[1]["subscriber_count"] == 2
+        assert "subscribers" not in markets[1]  # the raw list isn't needed once it's a count
+
+    @pytest.mark.asyncio
+    async def test_no_markets_yet_matches_this_api_s_own_empty_convention(self):
+        # Same "falsy data -> status False, 404" shape every other listing
+        # endpoint in this API uses (e.g. GET /listening/cards) — not a
+        # crash, and nothing curation-specific to special-case here.
+        db = fresh_db()
+        result = await curation_markets(admin=ADMIN, db=db)
+        assert result["status"] is False
+        assert result["responseCode"] == 404
+
     @pytest.mark.asyncio
     async def test_decide_promotes_and_records_the_admins_email_as_actor(self):
         db = fresh_db()
@@ -162,6 +193,31 @@ class TestCurationRouter:
         with pytest.raises(HTTPException) as exc:
             await curation_decide(MARKET_KEY, "latasha wig", _Body(), admin=ADMIN, db=db)
         assert exc.value.status_code == 400
+
+
+class TestCurationTopicHistory:
+    @pytest.mark.asyncio
+    async def test_returns_the_topics_recorded_transitions_most_recent_first(self):
+        db = fresh_db()
+        await _seed_topic(db, "latasha wig", "candidate")
+
+        class _Body:
+            status, reason = "monitored", "Looks real"
+        await curation_decide(MARKET_KEY, "latasha wig", _Body(), admin=ADMIN, db=db)
+
+        result = await curation_topic_history(MARKET_KEY, "latasha wig", admin=ADMIN, db=db)
+        hist = result["responseData"]
+        assert len(hist) == 1
+        assert hist[0]["new_status"] == "monitored"
+        assert hist[0]["actor"] == "curator@urisocial.com"
+        assert hist[0]["reason"] == "Looks real"
+
+    @pytest.mark.asyncio
+    async def test_no_history_matches_this_api_s_own_empty_convention(self):
+        db = fresh_db()
+        result = await curation_topic_history(MARKET_KEY, "never-decided", admin=ADMIN, db=db)
+        assert result["status"] is False
+        assert result["responseCode"] == 404
 
 
 if __name__ == "__main__":

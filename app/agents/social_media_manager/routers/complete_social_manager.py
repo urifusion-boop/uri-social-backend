@@ -1029,22 +1029,21 @@ async def upload_user_content(
                             # Use custom CTA if provided
                             cta_text = custom_cta
                         else:
-                            # Use brand playbook CTA logic (same as normal generation)
-                            cta_styles_list = brand_context_dict.get("cta_styles", [])
-                            if isinstance(cta_styles_list, list) and cta_styles_list:
-                                import random
-                                cta_text = random.choice(cta_styles_list)
-                            else:
-                                # Fallback to default_link if cta_styles is empty
-                                default_link = brand_context_dict.get("default_link", "")
-                                if default_link:
-                                    cta_text = default_link
-                                    # Remove https:// prefix for cleaner display
-                                    if isinstance(cta_text, str):
-                                        cta_text = cta_text.replace('https://', '').replace('http://', '')
-                                else:
-                                    # Final fallback
-                                    cta_text = "Link in bio"
+                            # Use brand playbook CTA logic — same _pick_rotating_cta
+                            # every other generation path uses, not a one-off copy
+                            # that can drift (this one used to use random.choice,
+                            # so the same brand got a different CTA rotation
+                            # behaviour here than everywhere else it posted from).
+                            _cta_rotation_index = int(brand_context_dict.get("cta_rotation_index", 0) or 0)
+                            cta_text, _cta_next_index = _pick_rotating_cta(
+                                brand_context_dict.get("cta_styles"), _cta_rotation_index,
+                                brand_context_dict.get("default_link"),
+                            )
+                            if _cta_next_index != _cta_rotation_index:
+                                _cta_scope = {"brand_id": active_brand_id} if active_brand_id else {"user_id": user_id}
+                                await db["brand_profiles"].update_one(
+                                    _cta_scope, {"$set": {"cta_rotation_index": _cta_next_index}}
+                                )
 
                         print(f"🎯 CTA text determined: '{cta_text}'")
 
@@ -6003,6 +6002,39 @@ async def analyze_voice_samples(
 # BACKGROUND TASKS
 # ==============================================================================
 
+def _pick_rotating_cta(cta_styles_list: Optional[List[str]], rotation_index: int,
+                       default_link: Optional[str] = None) -> tuple:
+    """The ONE way a CTA is chosen from a brand's cta_styles list — shared by
+    every content-generation path that needs one.
+
+    Confirmed live (Oct 2026): five call sites each independently
+    reimplemented this. Four agreed on deterministic round-robin via
+    cta_rotation_index; the fifth (upload_user_content's inline "same logic
+    as normal generation" copy, which drifted from what it was commented to
+    match) used random.choice instead, so the same brand got a different CTA
+    rotation behaviour depending on which upload path generated the post.
+    One function now, so the five can never drift again.
+
+    Returns (chosen_cta_text, next_rotation_index_to_persist) — the caller
+    only needs to persist next_rotation_index when it actually came from
+    cta_styles (an unchanged rotation_index is returned back when falling
+    through to default_link, so a caller that always writes it back is
+    still safe — it just re-saves the same value).
+
+    default_link falls through to the literal "Link in bio" when unset, with
+    the URL scheme stripped either way for a cleaner on-image/on-post
+    display (the one piece of this logic that used to exist in ONLY the
+    upload_user_content copy — now applied everywhere, not just there).
+    """
+    if isinstance(cta_styles_list, list) and cta_styles_list:
+        idx = rotation_index if 0 <= rotation_index < len(cta_styles_list) else 0
+        return cta_styles_list[idx], (idx + 1) % len(cta_styles_list)
+    link = default_link or "Link in bio"
+    if isinstance(link, str):
+        link = link.replace("https://", "").replace("http://", "")
+    return link, rotation_index
+
+
 def _resolve_platform_style_pool(bp: Dict[str, Any], platform: str) -> tuple:
     """
     Per-platform visual style override resolution. If `platform` has its own
@@ -6056,15 +6088,28 @@ async def _resolve_carousel_shared_context(
     any per-slide image-generation task is created, and return a NEW dict for
     this carousel's slides to share.
 
-    Both the custom guide and the CTA are genuinely shared state for the whole
-    carousel (unlike per-slide library style rotation, which is a pure function
-    of slide_index and has no race to begin with). Previously this was resolved
-    lazily inside _generate_image_bg itself — slide 0's task would resolve+write
-    it, every other slide's task would read it back — but all slides' tasks are
-    fired concurrently with no ordering guarantee, so slides that read before
-    slide 0 finished writing silently got no style/CTA at all. Resolving here,
-    before the per-slide tasks are even created, removes the race entirely
-    while leaving per-slide image generation exactly as parallel as before.
+    The custom guide, the CTA, AND (as of Oct 2026) the library style choice
+    are all genuinely shared state for the whole carousel. Previously this was
+    resolved lazily inside _generate_image_bg itself — slide 0's task would
+    resolve+write it, every other slide's task would read it back — but all
+    slides' tasks are fired concurrently with no ordering guarantee, so slides
+    that read before slide 0 finished writing silently got no style/CTA at
+    all. Resolving here, before the per-slide tasks are even created, removes
+    the race entirely while leaving per-slide image generation exactly as
+    parallel as before.
+
+    Confirmed live (Oct 2026): a brand with NO custom guide configured (just
+    several library style_selections) got a visibly different style on every
+    slide of the SAME carousel — slide 0 got style_selections[0], slide 1 got
+    style_selections[1], etc., via `slide_index % len(style_selections)` in
+    _generate_image_bg's fallback branch. That rotation is correct and
+    intentional ACROSS different posts over time (so a brand's whole feed
+    doesn't look identical) — it was just also, incorrectly, being applied
+    WITHIN one carousel, where every slide must obviously share one style.
+    Resolved here instead: pick_next_style is called exactly once per
+    carousel, the same way the custom-guide branch above already locks one
+    guide for the whole carousel, and style_rotation_index still advances
+    normally from one carousel/post to the next.
 
     Returns a new dict (never mutates `brand_context` in place) since the same
     brand_context object is reused across other drafts/carousels in the same
@@ -6081,7 +6126,7 @@ async def _resolve_carousel_shared_context(
     _bp = await db["brand_profiles"].find_one(
         _style_profile_scope,
         {
-            "style_selections": 1, "style_rotation_index": 1,
+            "style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
             "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
             "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
             "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
@@ -6132,22 +6177,42 @@ async def _resolve_carousel_shared_context(
                 await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {_rotation_field_path: _next_index}})
                 await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
                 print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] resolved once for carousel {carousel_id}")
+    else:
+        # No custom guide: pick ONE library style for the whole carousel —
+        # not per slide. style_rotation_index still advances normally so the
+        # NEXT carousel/post gets a different style, same as a regular post.
+        from app.agents.social_media_manager.services.style_library import pick_next_style, get_prompt_fragment
+
+        _style_selections = style_override or (_bp.get("style_selections") or [])
+        _style_prompt_fragments = [] if style_override else (_bp.get("style_prompt_fragments") or [])
+        _rotation_index = int(_bp.get("style_rotation_index") or 0)
+        _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+        _slug, _fragment, _next_index = pick_next_style(
+            _style_selections, _rotation_index, _industry, _style_prompt_fragments
+        )
+        if _fragment:
+            resolved.update({"style_prompt_fragment": _fragment, "style_slug": _slug})
+            await db["content_drafts"].update_one(
+                {"id": carousel_id},
+                {"$set": {"carousel_style_slug": _slug, "carousel_style_fragment": _fragment}},
+            )
+            # Matches the regular (non-carousel) post branch's own
+            # unconditional write-back below, for the identical reason.
+            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {_rotation_field_path: _next_index}})
+            print(f"🎨 Style [{_slug}] resolved once for carousel {carousel_id}")
 
     _carousel_cta = brand_context.get("override_cta")
     if not _carousel_cta:
-        _cta_styles_list = brand_context.get("cta_styles", [])
-        if isinstance(_cta_styles_list, list) and _cta_styles_list:
-            _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
-            if _cta_rotation_index >= len(_cta_styles_list):
-                _cta_rotation_index = 0
-            _carousel_cta = _cta_styles_list[_cta_rotation_index]
-            _cta_next_index = (_cta_rotation_index + 1) % len(_cta_styles_list)
+        _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+        _carousel_cta, _cta_next_index = _pick_rotating_cta(
+            brand_context.get("cta_styles"), _cta_rotation_index, brand_context.get("default_link")
+        )
+        if _cta_next_index != _cta_rotation_index:
             await db["brand_profiles"].update_one(
                 _style_profile_scope,
                 {"$set": {"cta_rotation_index": _cta_next_index}},
             )
-        else:
-            _carousel_cta = brand_context.get("default_link", "Link in bio")
     await db["content_drafts"].update_one(
         {"id": carousel_id}, {"$set": {"carousel_cta_text": _carousel_cta}}
     )
@@ -6317,8 +6382,22 @@ async def _generate_image_bg(
                         elif draft.get("carousel_style_fragment"):
                             brand_context = {**brand_context, "style_prompt_fragment": draft["carousel_style_fragment"], "style_slug": _slug}
                         print(f"🎨 Reusing carousel custom guide [{_slug}] for slide {slide_index + 1}/{total_slides}")
+            elif _carousel_context_already_resolved:
+                # No custom guide, but the caller already resolved ONE
+                # library style for the whole carousel — brand_context
+                # already carries style_slug/style_prompt_fragment. Do
+                # nothing here; in particular, do NOT fall through to the
+                # per-slide-index rotation below, which is exactly the bug
+                # this whole pre-resolution step exists to prevent (PRD
+                # confirmed live, Oct 2026: a 3-slide carousel came back
+                # with 3 visibly different styles — slide_index % len(...)
+                # picking a different library style per slide).
+                print(f"🎨 Style already resolved by caller for carousel {carousel_id}, slide {slide_index + 1}/{total_slides}")
             else:
                 # Library styles (or an on-the-fly override): rotate per slide.
+                # Fallback only — reached when some other caller invokes this
+                # function directly without pre-resolving via
+                # _resolve_carousel_shared_context.
                 _style_selections = style_override or (_bp.get("style_selections") or [])
                 _style_prompt_fragments = [] if style_override else (_bp.get("style_prompt_fragments") or [])
                 _industry = _bp.get("industry") or brand_context.get("industry", "")
@@ -6349,19 +6428,15 @@ async def _generate_image_bg(
             elif slide_index == 0:
                 _carousel_cta = brand_context.get("override_cta")
                 if not _carousel_cta:
-                    _cta_styles_list = brand_context.get("cta_styles", [])
-                    if isinstance(_cta_styles_list, list) and _cta_styles_list:
-                        _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
-                        if _cta_rotation_index >= len(_cta_styles_list):
-                            _cta_rotation_index = 0
-                        _carousel_cta = _cta_styles_list[_cta_rotation_index]
-                        _cta_next_index = (_cta_rotation_index + 1) % len(_cta_styles_list)
+                    _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+                    _carousel_cta, _cta_next_index = _pick_rotating_cta(
+                        brand_context.get("cta_styles"), _cta_rotation_index, brand_context.get("default_link")
+                    )
+                    if _cta_next_index != _cta_rotation_index:
                         await db["brand_profiles"].update_one(
                             _style_profile_scope,
                             {"$set": {"cta_rotation_index": _cta_next_index}},
                         )
-                    else:
-                        _carousel_cta = brand_context.get("default_link", "Link in bio")
                 await db["content_drafts"].update_one(
                     {"id": carousel_id}, {"$set": {"carousel_cta_text": _carousel_cta}}
                 )
@@ -6536,19 +6611,14 @@ async def _generate_image_bg(
             if override_cta:
                 cta = override_cta
             else:
-                cta_styles_list = brand_context.get("cta_styles", [])
-                if isinstance(cta_styles_list, list) and cta_styles_list:
-                    # Use round-robin rotation for even CTA distribution
-                    cta_rotation_index = brand_context.get("cta_rotation_index", 0)
-                    if cta_rotation_index >= len(cta_styles_list):
-                        cta_rotation_index = 0
-                    cta = cta_styles_list[cta_rotation_index]
+                cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+                cta, next_index = _pick_rotating_cta(
+                    brand_context.get("cta_styles"), cta_rotation_index, brand_context.get("default_link")
+                )
+                if next_index != cta_rotation_index:
                     # Update for next time (will be saved by main flow)
-                    next_index = (cta_rotation_index + 1) % len(cta_styles_list)
                     brand_context["cta_rotation_index"] = next_index
-                    print(f"🔄 V2 Guide CTA rotation: using '{cta}' (index {cta_rotation_index}/{len(cta_styles_list)-1}), next: {next_index}")
-                else:
-                    cta = brand_context.get("default_link", "Learn more")
+                    print(f"🔄 V2 Guide CTA rotation: using '{cta}' (index {cta_rotation_index}), next: {next_index}")
 
             _v2_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id=v2_guide_id,
@@ -8257,8 +8327,15 @@ async def edit_video(
         profile_data   = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_name    = profile_data.get("brand_name", "")
         tagline       = profile_data.get("tagline", "")
-        cta_styles    = profile_data.get("cta_styles") or []
-        brand_cta     = cta_styles[0] if cta_styles else (profile_data.get("default_link") or "")
+        # Same rotating CTA every other generation path uses — this used to
+        # always take cta_styles[0], so a brand with several CTA styles never
+        # saw any but the first on a video outro, no matter how many it posted.
+        _cta_rotation_index = int(profile_data.get("cta_rotation_index", 0) or 0)
+        brand_cta, _cta_next_index = _pick_rotating_cta(
+            profile_data.get("cta_styles"), _cta_rotation_index, profile_data.get("default_link")
+        )
+        if _cta_next_index != _cta_rotation_index:
+            await db["brand_profiles"].update_one({"user_id": user_id}, {"$set": {"cta_rotation_index": _cta_next_index}})
         brand_colors  = profile_data.get("brand_colors") or []
         logo_url      = profile_data.get("logo_url") or ""
         logo_position = profile_data.get("logo_position") or "bottom_right"

@@ -37,23 +37,32 @@ async def spent_this_month(db, now: Optional[datetime] = None) -> float:
     return total
 
 
-async def _one_query(adapter, q: dict, excluded: list[str], since: datetime, until: datetime, per: int) -> dict:
-    """Run one search to completion; returns its posts and coverage."""
+async def _one_query(adapter, q: dict, excluded: list[str], since: datetime, until: datetime, per: int,
+                     db=None, run_id: Optional[str] = None) -> dict:
+    """Run one search to completion; returns its posts and coverage.
+
+    db/run_id are optional and purely for live progress — when given, this
+    writes its own completion into the run doc's per_query array the moment
+    IT finishes, independent of the other queries running alongside it in
+    the same gather(). No polling, no fabricated percentage: the UI shows
+    exactly which real searches have finished and what they found, as they
+    actually finish (spec §16: "show progress per source; do not invent a
+    completion percentage")."""
     out = {"query": q["q"], "kind": q["kind"], "role": q.get("role", "sample"), "id": q.get("id"),
            "cap": per, "items": [], "cost": 0.0, "error": None, "capped": False}
     try:
-        run_id = await adapter.start_collection([q["q"]], excluded, since, until, items_per_query=per)
-        out["run_id"] = run_id
+        run_id_provider = await adapter.start_collection([q["q"]], excluded, since, until, items_per_query=per)
+        out["run_id"] = run_id_provider
         cursor = None
         for _ in range(20):
-            page = await adapter.fetch_page(run_id, cursor)
+            page = await adapter.fetch_page(run_id_provider, cursor)
             out["items"] += page.evidence
             if page.gaps:
                 out["error"] = "; ".join(page.gaps)
             if not page.has_more or not page.next_cursor:
                 break
             cursor = page.next_cursor
-        out["cost"] = float(await adapter.actual_cost(run_id) or 0)
+        out["cost"] = float(await adapter.actual_cost(run_id_provider) or 0)
     except Exception as e:
         out["error"] = str(e)[:300]
     returned = len(out["items"])
@@ -65,6 +74,14 @@ async def _one_query(adapter, q: dict, excluded: list[str], since: datetime, unt
         out["covered_from"] = min(pubs)     # read completely from its oldest post onward
     else:
         out["covered_from"] = since         # read the whole window
+    if db is not None and run_id is not None:
+        await db["mi_listen_runs"].update_one(
+            {"id": run_id, "per_query.id": out["id"]},
+            {"$set": {
+                "per_query.$.status": "done", "per_query.$.items": returned, "per_query.$.capped": out["capped"],
+                "per_query.$.cost": out["cost"], "per_query.$.error": out["error"],
+            }},
+        )
     return out
 
 
@@ -80,20 +97,20 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
     if not await permissions.is_approved(db, cfg["source"]):
         run.update(status="blocked_unapproved_source",
                    note=f"source '{cfg['source']}' has no approved permission record (PRD §15)", finished_at=now)
-        await db["mi_listen_runs"].insert_one(dict(run))
+        await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
         return run
 
     spent = await spent_this_month(db, now)
     if spent >= cfg["monthly_budget_usd"]:
         run.update(status="skipped_budget", note=f"monthly listening budget reached (${spent:.2f} of "
                                                   f"${cfg['monthly_budget_usd']:.2f})", finished_at=now)
-        await db["mi_listen_runs"].insert_one(dict(run))
+        await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
         return run
 
     category = await ontology.category(db, market["category_id"])
     if not category:
         run.update(status="failed", note=f"unknown category {market['category_id']}", finished_at=now)
-        await db["mi_listen_runs"].insert_one(dict(run))
+        await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
         return run
     patterns = await ontology.intent_patterns(db)
     plan = markets.compile_queries(category, market["country"], patterns, market.get("learned_terms") or [],
@@ -105,9 +122,21 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
     since = (last - timedelta(hours=cfg["overlap_hours"])) if last else now - timedelta(days=cfg["backfill_days"])
     run.update(since=since, until=now, queries=[q["q"] for q in plan["queries"]], dropped_queries=plan["dropped"])
 
+    # Written now, before a single query has finished, so a client polling
+    # for "what's happening" sees the real query plan immediately — every
+    # entry "pending" — rather than nothing at all until the whole run ends.
+    # _one_query flips its own entry to "done" the moment IT personally
+    # finishes (see its docstring); this doc is the one place live progress
+    # actually lives, not a client-side simulation of one.
+    run["per_query"] = [{"id": q.get("id"), "q": q["q"], "kind": q["kind"], "role": q.get("role", "sample"),
+                         "status": "pending", "items": None, "capped": None, "cost": None, "error": None}
+                        for q in plan["queries"]]
+    await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
+
     caps = market.get("query_caps") or {}
     results = await asyncio.gather(*[
-        _one_query(adapter, q, plan["excluded"], since, now, int(caps.get(q["id"], cfg["items_per_query"])))
+        _one_query(adapter, q, plan["excluded"], since, now, int(caps.get(q["id"], cfg["items_per_query"])),
+                  db=db, run_id=run["id"])
         for q in plan["queries"]])
 
     new_ids, total = [], 0
@@ -162,7 +191,7 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
                 too_broad.append(r["query"])
     await db["mi_markets"].update_one({"key": market["key"]},
                                       {"$set": {"query_caps": new_caps, "too_broad_queries": too_broad}})
-    await db["mi_listen_runs"].insert_one(dict(run))
+    await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
     if run["status"] != "failed":
         await db["mi_markets"].update_one({"key": market["key"]},
                                           {"$set": {"last_collected_at": now, "collector_version": COLLECTOR_VERSION}})
