@@ -99,7 +99,11 @@ def check(policy: dict, rec: dict, state: dict, *, by_user: bool,
             ceiling = policy["max_daily_budget_ngn"] or \
                 (None if by_user else (state.get("launch_daily_ngn") or frm))
             if ceiling is not None and to > ceiling:
-                return False, f"Above the daily budget cap of ₦{ceiling:,.0f}."
+                if policy["max_daily_budget_ngn"]:
+                    return False, (f"Your Automation settings cap daily budgets at ₦{ceiling:,.0f}. "
+                                   "Raise the cap in Growth → Automation to approve this.")
+                return False, (f"URI won't raise a budget above the launch budget (₦{ceiling:,.0f}) "
+                               "on its own — approve it yourself, or set a cap in Growth → Automation.")
             raised = (state.get("budget_raised_7d_pct") or 0) + (to / frm - 1) * 100 if frm else 100
             if raised > policy["max_increase_pct_7d"]:
                 return False, f"More than the {policy['max_increase_pct_7d']}% increase allowed in 7 days."
