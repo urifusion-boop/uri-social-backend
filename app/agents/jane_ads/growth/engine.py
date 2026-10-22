@@ -83,9 +83,26 @@ def adapter_for(db):
     return MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
 
 
+async def find_campaign(db, campaign_id: str) -> Optional[dict]:
+    from .demo import DEMO_CAMPAIGNS
+    return await db[CAMPAIGNS].find_one({"campaign_id": campaign_id}) or \
+        await db[DEMO_CAMPAIGNS].find_one({"campaign_id": campaign_id})
+
+
+def adapter_for_record(db, record: dict):
+    if record.get("demo"):
+        from .demo import DemoAdapter
+        return DemoAdapter(db)
+    return adapter_for(db)
+
+
 async def context(db, adapter, record: dict, policy: dict, pull: bool = True) -> dict:
     """Everything detection and the policy check need, gathered once."""
     cid, brand = record["campaign_id"], record.get("brand_id")
+    if record.get("demo"):
+        from .demo import refresh
+        await refresh(db, record)
+        pull = False
     if pull:
         await event(db, brand, cid, "metric_snapshot_requested")
         res = await metrics.pull(db, adapter, record)
@@ -150,6 +167,10 @@ async def _open_blocker(db, cid: str) -> str:
 
 
 async def run_campaign(db, adapter, record: dict, notify=None) -> dict:
+    # Demo campaigns (scripts/seed_growth_demo.py) have no Meta counterpart: a pull
+    # would fail and resolve every seeded diagnosis as "No longer detected".
+    if record.get("_seeded"):
+        return {"findings": 0, "new_recommendations": 0, "executed": 0}
     cid, brand = record["campaign_id"], record.get("brand_id")
     policy = await load_policy(db, brand)
     ctx = await context(db, adapter, record, policy)
@@ -261,6 +282,13 @@ async def run_all(db, notify=None) -> dict:
         except Exception as e:  # one campaign never stops the sweep
             totals["errors"] += 1
             print(f"[growth] {record.get('campaign_id')}: {e}", flush=True)
+
+    from .demo import DEMO_CAMPAIGNS, DemoAdapter
+    async for record in db[DEMO_CAMPAIGNS].find({}):
+        try:
+            await run_campaign(db, DemoAdapter(db), record, None)
+        except Exception as e:
+            print(f"[growth] demo {record.get('campaign_id')}: {e}", flush=True)
 
     async def rows_for(cid):
         return await metrics.load(db, cid, days=60)

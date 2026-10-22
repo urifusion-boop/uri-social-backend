@@ -389,3 +389,16 @@ def test_lifetime_totals_parse_meta_shape():
                                      "actions": [{"action_type": "onsite_conversion.messaging_conversation_started_7d",
                                                   "value": "14"}]}])
     assert life == {"spend_ngn": 3823.66, "impressions": 4880, "reach": 4754, "clicks": 56, "conversations": 14}
+
+
+def test_demo_seed_produces_the_three_recommendations():
+    from app.agents.jane_ads.growth import demo
+    db = mongomock_motor.AsyncMongoMockClient()["growth"]
+    run(demo.seed(db, "brnd_demo_x", "u1"))
+    acts = {r["action_type"] for r in run(db[engine.RECOMMENDATIONS].find({"brand_id": "brnd_demo_x"}).to_list(50))}
+    assert {"pause_ad", "pause_campaign", "set_daily_budget"} <= acts
+    assert run(db[engine.CAMPAIGNS].count_documents({})) == 0
+    rec = run(db[engine.RECOMMENDATIONS].find_one({"action_type": "pause_ad"}, {"_id": 0}))
+    record = run(engine.find_campaign(db, rec["campaign_id"]))
+    entry = run(engine.approve(db, demo.DemoAdapter(db), record, rec, "u1"))
+    assert entry["status"] == "executed" and entry["verified"]

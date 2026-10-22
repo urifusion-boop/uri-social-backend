@@ -22,6 +22,8 @@ ACTIONS = "jane_ads_growth_actions"
 
 
 async def _read(adapter, node_id: str, fields: str) -> dict:
+    if getattr(adapter, "demo", False):
+        return await adapter.read(node_id, fields)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(f"{adapter._graph_base}/{node_id}",
                                 params={"access_token": adapter._access_token, "fields": fields})
@@ -32,6 +34,8 @@ async def _read(adapter, node_id: str, fields: str) -> dict:
 
 
 async def _post(adapter, node_id: str, body: dict) -> dict:
+    if getattr(adapter, "demo", False):
+        return await adapter.post(node_id, body)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(f"{adapter._graph_base}/{node_id}",
                                  params={"access_token": adapter._access_token}, json=body)
