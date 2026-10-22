@@ -28,6 +28,10 @@ async def meta_transport(conv: dict, account: dict, text: str) -> str:
     Raises ProviderTimeout when Meta never answered — that is NOT the same as a
     rejection, and send.py records it differently for exactly that reason.
     """
+    if conv.get("platform") == Platform.WHATSAPP.value:
+        from .whatsapp import send_text
+        return await send_text(account, conv.get("external_thread_id") or "", text)
+
     token = account.get("access_token") or ""
     if not token:
         raise Exception("no access token for this channel account")
