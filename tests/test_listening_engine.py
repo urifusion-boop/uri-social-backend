@@ -333,6 +333,58 @@ def test_collection_stops_at_the_monthly_budget():
     assert res["status"] == "skipped_budget"
 
 
+# ── live progress (no fabricated percentage — real per-query completion) ────
+
+class _SlowAdapter:
+    """Every query blocks on the same event until the test releases it —
+    simulates a real in-flight collection run long enough to inspect the
+    run doc mid-flight, something _FakeAdapter's instant responses can't."""
+
+    def __init__(self, n, block_event):
+        self.n, self.block_event = n, block_event
+
+    async def start_collection(self, kw, ex, since, until, items_per_query=None):
+        await self.block_event.wait()
+        return "run1"
+
+    async def fetch_page(self, run_id, cursor=None):
+        return _Page([RawEvidence(provider="x", platform="x", source_id=f"x:{i}", text=f"who sells wig {i}",
+                                  published_at=NOW - timedelta(hours=i), collected_at=NOW, author_handle=f"@u{i}")
+                      for i in range(self.n)])
+
+    async def actual_cost(self, run_id):
+        return 0.01
+
+
+def test_run_doc_shows_pending_queries_before_any_have_finished():
+    db = fresh_db()
+    block = asyncio.Event()
+
+    async def go():
+        from app.agents.market_intelligence.listening import ontology, permissions
+        await ontology.ensure_seeded(db)
+        await permissions.ensure_seeded(db)
+        await db["mi_markets"].insert_one({**MARKET, "status": "active", "subscribers": ["b1"], "last_collected_at": None})
+        task = asyncio.create_task(collector.collect_market(db, dict(MARKET), CFG, _SlowAdapter(5, block), NOW))
+        await asyncio.sleep(0.05)  # let collect_market reach the gather() and write its initial "running" doc
+        mid_run = await db["mi_listen_runs"].find_one({"market": MARKET["key"]})
+        block.set()  # release every blocked query now
+        result = await task
+        doc_count = await db["mi_listen_runs"].count_documents({"market": MARKET["key"]})
+        return mid_run, result, doc_count
+
+    mid_run, result, doc_count = run(go())
+    assert mid_run is not None
+    assert mid_run["status"] == "running"
+    assert len(mid_run["per_query"]) > 0
+    assert all(q["status"] == "pending" and q["items"] is None for q in mid_run["per_query"])
+    assert result["status"] == "completed"
+    assert all(q["items"] is not None for q in result["per_query"])
+    # Same doc throughout (upsert, not insert) — not a duplicate left behind
+    # from the early "running" write.
+    assert doc_count == 1
+
+
 def test_collection_is_blocked_for_a_source_with_no_approved_permission_record():
     db = fresh_db()  # permissions never seeded
     res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), NOW))
