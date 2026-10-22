@@ -156,6 +156,27 @@ async def run_now(background_tasks: BackgroundTasks, ctx: dict = Depends(require
     return UriResponse.get_single_data_response("run", {"started": True, "markets": prof.get("markets")})
 
 
+@router.get("/run/active")
+async def active_runs(ctx: dict = Depends(get_active_brand_context), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Real, in-progress collection state for this business's markets — not
+    a simulated percentage. Each query in a run's per_query list flips from
+    "pending" to "done" the moment collector._one_query personally finishes,
+    independently of the others still running alongside it, so a client
+    polling this sees genuine per-source progress (spec §16). Works whether
+    the run was started by this user's own "check now" or the scheduled
+    cycle, and survives a page refresh — the run doc is the source of
+    truth, not any client-side state."""
+    prof = await db["mi_listening_profiles"].find_one({"brand_id": ctx["brand_id"], "status": "active"})
+    if not prof:
+        return UriResponse.get_single_data_response("active_runs", [])
+    runs = [r async for r in db["mi_listen_runs"].find(
+        {"market": {"$in": prof.get("markets") or []}, "status": "running"}
+    ).sort([("started_at", -1)])]
+    for r in runs:
+        r.pop("_id", None)
+    return UriResponse.get_single_data_response("active_runs", runs)
+
+
 @router.get("/cards")
 async def list_cards(ctx: dict = Depends(get_active_brand_context),
                      db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
