@@ -98,6 +98,12 @@ def check(policy: dict, rec: dict, state: dict, *, by_user: bool, manual: bool =
         frm = float(rec["parameters"].get("from_ngn") or 0)
         if to <= 0:
             return False, "A daily budget must be above zero."
+        from .. import constants as C
+        # The same floor Jane launches with: below it Meta delivers too thinly to
+        # learn anything, and under ~₦1,610 it refuses the ad set outright.
+        if to < C.MIN_DAILY_SPEND_NGN:
+            return False, (f"The minimum daily budget is ₦{C.MIN_DAILY_SPEND_NGN:,.0f} — below that the ad "
+                           "barely delivers, and Meta refuses budgets this low.")
         if to > frm:
             # An explicit cap binds everyone. Without one, a person approving may
             # raise it; URI on its own may not go above the launch budget.
