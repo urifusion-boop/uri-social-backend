@@ -307,6 +307,95 @@ def violations(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
     return find_banned(text, banned_words(bc))
 
 
+# Natural-sounding fallback for each word in CaptionValidatorService.BANNED_WORDS —
+# used only by strip_banned_words() below, the last-resort, no-model guarantee
+# that runs after every AI rewrite attempt. A prompt-based retry can still fail
+# to comply (confirmed live: "effortlessly" shipped in a real carousel slide
+# even after a rewrite was specifically asked to remove "effortless" — the
+# retry mechanism only ever kept "whichever draft had fewer issues," never
+# guaranteed zero). This map makes the word physically impossible to ship,
+# independent of what any model does.
+_BANNED_WORD_FALLBACK: Dict[str, str] = {
+    "elevate": "improve", "curated": "selected", "seamless": "smooth",
+    "premium": "quality", "bespoke": "custom", "artisanal": "handmade",
+    "handcrafted": "handmade", "meticulously": "carefully", "next-level": "better",
+    "game-changer": "big help", "must-have": "useful", "cutting-edge": "modern",
+    "innovative": "smart", "revolutionary": "major", "transformative": "powerful",
+    "unparalleled": "rare", "synergy": "teamwork", "leverage": "use",
+    "holistic": "complete", "paradigm": "approach", "drumroll": "",
+    "spoiler alert": "", "plot twist": "turn", "pro tip": "tip",
+    "here's the thing": "truth is", "here's why": "here is why",
+    "let that sink in": "think about that", "read that again": "",
+    "can we talk about": "let's talk about", "let's normalize": "let's accept",
+    "i said what i said": "", "understood the assignment": "", "chef's kiss": "great",
+    "transform": "improve", "unlock": "get", "discover": "see", "journey": "process",
+    "empower": "help", "unleash": "use", "supercharge": "boost", "harness": "use",
+    "delve": "look", "dive into": "look at", "deep dive": "closer look",
+    "next level": "better", "skyrocket": "grow fast", "effortless": "simple",
+    "navigate the": "handle the",
+}
+
+
+# A few BANNED_WORD_FALLBACK entries are adjectives whose -ly adverb form is
+# irregular, not "word+ly" ("effortlessly", not "effortlessly" -> "simplely").
+# Confirmed live: the exact bug this backstop exists for was "...all in one
+# place, effortlessly." — worth getting the adverb right since it's the one
+# shape real text keeps using.
+_BANNED_ADVERB_FALLBACK: Dict[str, str] = {
+    "effortless": "simply",
+    "seamless": "smoothly",
+}
+
+
+def _word_strip_pattern(word: str) -> "re.Pattern":
+    """Case-insensitive, word-boundary-safe: matches the word/phrase plus any
+    trailing letters (so banning "effortless" also catches "effortlessly"),
+    without matching mid-word ("ok" must never hit "book"). Simpler and
+    case-insensitive on purpose — unlike banned_pattern() above, which assumes
+    an already-lowercased haystack and is tuned for *detecting* custom brand
+    words, this one *rewrites* real, mixed-case text."""
+    return re.compile(r"(?<!\w)" + re.escape(word.strip().lower()) + r"[a-z]*", re.IGNORECASE)
+
+
+def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None) -> str:
+    """Guarantee, with certainty (no model involved): the text that comes out
+    contains none of CaptionValidatorService.BANNED_WORDS and none of
+    `extra_words` (a brand's own custom list), in any form. This is the floor
+    enforce() applies after every AI rewrite — a model can still fail to
+    comply with a correction prompt; this cannot fail to comply, because
+    nothing here calls a model at all."""
+    if not text:
+        return text
+    from .caption_validator_service import CaptionValidatorService
+    words = list(CaptionValidatorService.BANNED_WORDS) + [str(w) for w in (extra_words or []) if str(w).strip()]
+    out = text
+    for word in words:
+        key = word.strip().lower()
+        if not key:
+            continue
+        default = _BANNED_WORD_FALLBACK.get(key, "")
+        adverb = _BANNED_ADVERB_FALLBACK.get(key)
+
+        def _sub(m: "re.Match") -> str:
+            if adverb and m.group(0).lower().endswith("ly") and not key.endswith("ly"):
+                return adverb
+            return default
+
+        out = _word_strip_pattern(word).sub(_sub, out)
+    if out == text:
+        return text
+    # Tidy the punctuation/spacing artifacts a removal or swap can leave behind.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"[ \t]+([,.!?;:])", r"\1", out)
+    out = re.sub(r",\s*,", ",", out)
+    out = re.sub(r",\s*\.", ".", out)
+    out = re.sub(r"\band\s*,", ",", out, flags=re.IGNORECASE)
+    out = re.sub(r",?\s*\band\s*\.", ".", out, flags=re.IGNORECASE)
+    out = re.sub(r"(?m)^[ \t]*,[ \t]*", "", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
+
+
 # ── 1b. After writing: check, then enforce ───────────────────────────────────
 # Asking for a rule is not the same as getting it. On dev, with every rule in
 # the prompt, captions still came back with an invented "Over 70% of small
@@ -516,12 +605,16 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
     """The rules that can be guaranteed without a model. Runs last, so whatever
     the writer or the rewrite did, these hold on what is saved:
       • "no emojis" — every emoji is removed
+      • no banned word ships, in any form — universal list and the brand's
+        own custom list alike, even if every AI rewrite attempt missed one
+        (confirmed live: they can)
       • the brand's call-to-action closes the piece (append_cta=False where a
         line can't simply be added, e.g. a tweet thread)."""
     bc = bc or {}
     out = text or ""
     if emoji_mode(bc) == "no":
         out = strip_emojis(out)
+    out = strip_banned_words(out, banned_words(bc))
     if append_cta and out.strip() and not has_cta(out, bc):
         cta = ctas(bc)[0].strip()
         if cta[-1:] not in ".!?":
