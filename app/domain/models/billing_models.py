@@ -207,9 +207,13 @@ class PaymentTransaction(BaseModel):
 
     # What this payment is for — subscription tier purchase (default, legacy
     # behavior) or a one-off custom-quantity bonus-credit top-up.
-    purchase_type: Literal["subscription", "custom_credits"] = Field(
-        default="subscription", description="subscription|custom_credits"
+    purchase_type: Literal["subscription", "custom_credits", "onebox"] = Field(
+        default="subscription", description="subscription|custom_credits|onebox"
     )
+
+    # Only set for purchase_type="onebox" — the inbox plan bought for one workspace.
+    workspace_id: Optional[str] = Field(default=None, description="Workspace the Onebox plan is for")
+    onebox_plan_id: Optional[str] = Field(default=None, description="Onebox plan being purchased")
 
     # Subscription details (PRD 8.1 & 8.2) — only set for purchase_type="subscription"
     subscription_tier: Optional[str] = Field(default=None, description="Tier being purchased")

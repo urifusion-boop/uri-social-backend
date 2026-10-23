@@ -271,6 +271,8 @@ from app.agents.inbox.router import router as inbox_router
 from app.agents.inbox.voice_router import router as inbox_voice_router
 app.include_router(inbox_router)
 app.include_router(inbox_voice_router)
+from app.agents.inbox.onebox_router import router as inbox_onebox_router
+app.include_router(inbox_onebox_router)
 from app.agents.jane_ads.growth.router import router as jane_ads_growth_router
 app.include_router(jane_ads_growth_router)
 app.include_router(whatsapp_router)
