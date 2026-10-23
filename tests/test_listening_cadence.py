@@ -108,6 +108,31 @@ def test_cools_back_down_once_the_hot_signal_is_gone():
     assert _update(db) == CFG["cadence_hours"]
 
 
+# ── plan-tier cadence floor (PRD §6.5, §21 open decision #8) ─────────────────
+
+def test_a_faster_tier_floor_overrides_the_plain_default():
+    db = fresh_db()
+    run(_seed_market(db))
+    result = run(markets.update_cadence(db, MARKET, CFG, NOW, tier_floor_hours=2))
+    assert result == 2
+    assert _stored_cadence(db) == 2
+
+
+def test_tier_floor_never_slows_down_an_already_faster_hot_cadence():
+    db = fresh_db()
+    run(_seed_market(db))
+    run(_signal(db, "rising"))  # hot_hours (2) is already faster than a slower tier floor
+    result = run(markets.update_cadence(db, MARKET, CFG, NOW, tier_floor_hours=12))
+    assert result == CFG["cadence"]["hot_hours"]
+
+
+def test_no_tier_floor_behaves_exactly_as_before():
+    db = fresh_db()
+    run(_seed_market(db))
+    result = run(markets.update_cadence(db, MARKET, CFG, NOW, tier_floor_hours=None))
+    assert result == CFG["cadence_hours"]
+
+
 # ── due_markets respects the per-market override ─────────────────────────────
 
 def test_due_markets_uses_the_markets_own_cadence_not_the_flat_default():

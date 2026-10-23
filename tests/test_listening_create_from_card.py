@@ -129,10 +129,12 @@ class TestCreateFromCard:
         assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_video_action_is_rejected_not_silently_generated_as_text(self):
-        # Confirmed live: a card labelled "Format: video" generated a plain
-        # text draft when clicked, with nothing telling the owner anything
-        # was off. Must fail loudly instead of handing over the wrong thing.
+    async def test_video_action_returns_a_prefilled_brief_not_a_fake_text_draft(self):
+        # Confirmed live, once: a card labelled "Format: video" silently
+        # generated a plain text draft when clicked, with nothing telling the
+        # owner anything was off. Now it must hand back a real brief for the
+        # storyboard screen instead — never a text draft masquerading as video,
+        # and never an error either, since the brief itself is real and usable.
         db = fresh_db()
         await _card(db, action_type="video")
         with patch(
@@ -140,16 +142,18 @@ class TestCreateFromCard:
             ".generate_multi_platform_content",
             new=AsyncMock(),
         ) as mock_gen:
-            with pytest.raises(HTTPException) as exc:
-                await create_from_card("c1", ctx=CTX, db=db)
-        assert exc.value.status_code == 400
-        assert "video" in exc.value.detail.lower()
+            result = await create_from_card("c1", ctx=CTX, db=db)
         mock_gen.assert_not_called()
+        data = result["responseData"]
+        assert "Everyone's asking" in data["optional_text"]
+        assert "DM to order" in data["optional_text"]
+        assert data["target_platform"] == "instagram"
         card = await db["mi_listen_cards"].find_one({"id": "c1"})
+        # No draft/video was actually created — nothing to be idempotent about.
         assert card["status"] == "shown" and card["content_id"] is None
 
     @pytest.mark.asyncio
-    async def test_ad_test_action_is_rejected_not_silently_generated_as_text(self):
+    async def test_ad_test_action_opens_a_prefilled_draft_thread_never_auto_launched(self):
         db = fresh_db()
         await _card(db, action_type="ad_test")
         with patch(
@@ -157,10 +161,24 @@ class TestCreateFromCard:
             ".generate_multi_platform_content",
             new=AsyncMock(),
         ) as mock_gen:
-            with pytest.raises(HTTPException) as exc:
-                await create_from_card("c1", ctx=CTX, db=db)
-        assert exc.value.status_code == 400
+            result = await create_from_card("c1", ctx=CTX, db=db)
         mock_gen.assert_not_called()
+        data = result["responseData"]
+        assert data["thread"]["status"] == "draft"
+        assert data["thread"]["brand_id"] == BRAND_ID
+        assert "Everyone's asking" in data["seed_message"]
+        card = await db["mi_listen_cards"].find_one({"id": "c1"})
+        assert card["status"] == "acted" and card["content_id"] == data["thread"]["thread_id"]
+
+    @pytest.mark.asyncio
+    async def test_ad_test_action_is_idempotent_like_every_other_action(self):
+        db = fresh_db()
+        await _card(db, action_type="ad_test")
+        first = await create_from_card("c1", ctx=CTX, db=db)
+        with pytest.raises(HTTPException) as exc:
+            await create_from_card("c1", ctx=CTX, db=db)
+        assert exc.value.status_code == 409
+        assert first["responseData"]["thread"]["thread_id"]
 
     @pytest.mark.asyncio
     async def test_post_and_faq_actions_still_generate_text_normally(self):

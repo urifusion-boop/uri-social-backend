@@ -242,19 +242,67 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
         raise HTTPException(status_code=409, detail="Content was already created from this card")
 
     action = card.get("action") or {}
-    # personalize.py's _Action.type can be video|post|carousel|faq|ad_test —
-    # only post/carousel/faq route through the text generator below. video
-    # and ad_test need their own generators (video render pipeline, Jane
-    # Ads draft campaign) that this endpoint doesn't call — silently
-    # generating a text draft for a card the UI labelled "Format: video"
-    # would hand the owner the wrong thing with no indication anything was
-    # off. Say so plainly instead, same as any other unsupported action.
-    unsupported = {
-        "video": "Video creation from a Listening card isn't wired up yet — use the brief below to create it in Create Video.",
-        "ad_test": "Proposed ad tests from Listening aren't wired up yet — use the brief below to set one up in Campaigns.",
-    }
-    if action.get("type") in unsupported:
-        raise HTTPException(status_code=400, detail=unsupported[action["type"]])
+    action_type = action.get("type")
+
+    if action_type == "video":
+        # The real video pipeline (VideoStoryboardService.generate_storyboard)
+        # has a hard requirement this endpoint cannot satisfy on its own: it
+        # needs real brand images as its creative source, not just text — a
+        # listening card carries no images, and inventing or auto-selecting
+        # some would hand the owner a video they never chose the visuals for.
+        # So this doesn't try to produce a finished video; it hands back the
+        # evidence-backed brief as creative-direction text, pre-sized for the
+        # storyboard screen's own `optional_text`/platform/duration fields —
+        # the owner still picks images there, exactly like every other video,
+        # just without retyping what Uri already worked out (PRD §9.3: "pass
+        # the brief into the content generator, the video creator... — no
+        # copy-pasting"). No draft exists yet, so nothing here is idempotent
+        # to guard — re-opening this brief later is fine.
+        brief_parts = [action.get("hook"), *(action.get("outline") or []), action.get("cta")]
+        creative_direction = ". ".join(p for p in brief_parts if p) or card.get("why") or card.get("observation") or ""
+        if not creative_direction:
+            raise HTTPException(status_code=400, detail="This card has no brief to build a video from")
+        platform = next((p for p in (action.get("platforms") or []) if p), "instagram_reels")
+        now = datetime.utcnow()
+        await db["mi_listen_card_actions"].insert_one({
+            "card_id": card_id, "brand_id": ctx["brand_id"], "user_id": ctx["user_id"], "action": "created",
+            "market": card["market"], "topic": card["topic"], "type": card["type"], "scores": card.get("scores"),
+            "at": now, "note": "video brief handed to Create Video — no draft created, images still required",
+        })
+        return UriResponse.get_single_data_response("video_brief", {
+            "card_id": card_id, "optional_text": creative_direction, "target_platform": platform,
+            "target_duration_seconds": 20, "video_style": "clean_commercial",
+        })
+
+    if action_type == "ad_test":
+        # Jane Ads is a conversational planner (app/agents/jane_ads) — there
+        # is no single "create a draft campaign" call to make. The
+        # established pattern for starting a thread pre-filled with a brief
+        # is threads.seed_message_from_campaign (used by the "duplicate a
+        # launched campaign" flow): build the same shape of plain-English
+        # seed from this card instead, open a fresh draft thread, and return
+        # both so the frontend sends the seed message through the normal
+        # chat flow — exactly like duplicate_thread already does. Nothing
+        # here calls /plan, /creative or any launch step: the thread starts
+        # in "draft" status and stays there until the owner drives it
+        # through Jane Ads themselves, same approval gate every other
+        # campaign goes through (PRD §9.3: "draft only, requires approval").
+        from app.agents.jane_ads.threads import create_thread, seed_message_from_card, title_from_message
+
+        seed = seed_message_from_card(card)
+        thread = await create_thread(db, ctx["brand_id"], ctx["user_id"], title_from_message(seed))
+        now = datetime.utcnow()
+        await db["mi_listen_cards"].update_one(
+            {"id": card_id}, {"$set": {"status": "acted", "content_id": thread["thread_id"], "updated_at": now}})
+        await db["mi_listen_card_actions"].insert_one({
+            "card_id": card_id, "brand_id": ctx["brand_id"], "user_id": ctx["user_id"], "action": "created",
+            "content_id": thread["thread_id"], "market": card["market"], "topic": card["topic"],
+            "type": card["type"], "scores": card.get("scores"), "at": now,
+        })
+        return UriResponse.get_single_data_response("ad_test_thread", {
+            "card_id": card_id, "thread": thread, "seed_message": seed,
+        })
+
     platforms = [p for p in (action.get("platforms") or []) if p]
     if not platforms:
         raise HTTPException(status_code=400, detail="This card has no platforms to create content for")
@@ -496,4 +544,11 @@ async def unmark_golden_example(market_key: str, source_id: str, admin: dict = D
 async def product_metrics_endpoint(market: Optional[str] = None, window_days: int = 30,
                                    admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
     result = await metrics.product_metrics(db, market, window_days)
+    # Cross-tenant, de-identified (PRD §15) — intentionally ignores the
+    # `market` filter above, which is this one tenant's own view; a
+    # minimum-group threshold below which a group is simply absent, never
+    # shown with too little support to mean anything (metrics.py's own
+    # docstring on this function).
+    cfg = await get_config(db)
+    result["category_content_performance"] = await metrics.category_content_performance(db, cfg)
     return UriResponse.get_single_data_response("metrics", result)
