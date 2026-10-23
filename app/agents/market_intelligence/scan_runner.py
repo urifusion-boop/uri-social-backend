@@ -379,9 +379,22 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     """The actual collection→classify→cluster→score→compose pipeline, updating
     the run created by create_scan_run(). See execute_scan() for the crash
     safety net wrapping this."""
+    # Written now, before a single source has started, so a client polling
+    # GET /scans/{id} sees the real source plan immediately — every entry
+    # "pending" — rather than nothing at all until the whole run ends.
+    # Each source flips its own entry to "collecting" then "done"/"failed"
+    # as it personally finishes, independently of the others still running
+    # (same live-progress pattern as listening/collector.py's per_query).
+    per_source_seed = [{"provider": s.provider, "status": "pending", "items": None, "cost": None, "error": None}
+                       for s in topic.sources]
     await db["mi_scans"].update_one(
-        {"id": run_id}, {"$set": {"status": ScanStatus.COLLECTING.value, "started_at": datetime.utcnow()}}
+        {"id": run_id}, {"$set": {"status": ScanStatus.COLLECTING.value, "started_at": datetime.utcnow(),
+                                  "per_source": per_source_seed}}
     )
+
+    async def _mark_source(provider: str, **fields) -> None:
+        sets = {f"per_source.$.{k}": v for k, v in fields.items()}
+        await db["mi_scans"].update_one({"id": run_id, "per_source.provider": provider}, {"$set": sets})
 
     business_context = await _fetch_business_context(db, topic.user_id, topic.brand_id)
     # The topic's own scope, so labelling can tell a competitor's news from a
@@ -441,7 +454,10 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         adapter = ADAPTER_REGISTRY.get(source.provider)
         if adapter is None:
             gaps.append(f"source '{source.provider}' has no registered adapter — skipped")
+            await _mark_source(source.provider, status="failed", error="no registered adapter")
             continue
+
+        await _mark_source(source.provider, status="collecting")
 
         # PRD §9: a shorter available period must never silently replace the
         # requested one — every clamp is recorded as a gap on THIS run, not
@@ -463,6 +479,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
                 provider_run_id = await adapter.start_collection(search_keywords, topic.excluded_keywords, since, until)
         except Exception as e:
             gaps.append(f"source '{source.provider}' collection failed: {e}")
+            await _mark_source(source.provider, status="failed", error=str(e)[:300])
             continue
 
         # PRD §17: "save the provider run ID before fetching results" — saved
@@ -475,11 +492,14 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         # posts. fetch_page waits for a still-running provider run itself.
         cursor: Optional[str] = None
         seen_here: set[str] = set()
+        items_this_source = 0
+        source_error: Optional[str] = None
         for _page_no in range(MAX_PAGES_PER_SOURCE):
             try:
                 page = await adapter.fetch_page(provider_run_id, cursor)
             except Exception as e:
                 gaps.append(f"source '{source.provider}' collection failed: {e}")
+                source_error = str(e)[:300]
                 break
 
             fresh = [raw for raw in page.evidence if raw.source_id not in seen_here]
@@ -498,6 +518,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
                     collection_run_id=run_id,
                 )
                 all_new_evidence.append(evidence)
+                items_this_source += 1
 
             gaps.extend(page.gaps)
             if not page.has_more or not page.next_cursor:
@@ -515,6 +536,13 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
                     actual_costs[source.provider] = cost
             except Exception as e:
                 print(f"[MI][scan] could not read actual cost for {source.provider}: {e}")
+
+        # Flips to "done" even when source_error is set (a page mid-way
+        # failed) — whatever was collected before the failure is still real
+        # and kept; the error is surfaced alongside it, not instead of it,
+        # same as listening's per_query entries do.
+        await _mark_source(source.provider, status="done", items=items_this_source,
+                           cost=actual_costs.get(source.provider), error=source_error)
 
     if all_new_evidence:
         await db["mi_evidence"].insert_many([e.dict() for e in all_new_evidence])
