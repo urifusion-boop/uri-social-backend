@@ -24,7 +24,27 @@ from app.services.AIService import AIService
 from app.services.PostHogService import track_event
 
 PROMPT_VERSION = "mi-listen-recommend-v3"  # v3: validate-retry-fallback instead of strip
-SOURCE_LABEL = {"x": "X (Twitter)", "x_pro": "X (Twitter)"}
+SOURCE_LABEL = {
+    "x": "X (Twitter)", "x_pro": "X (Twitter)",
+    "tiktok": "TikTok", "tiktok_pro": "TikTok",
+    "instagram": "Instagram", "instagram_pro": "Instagram",
+    "youtube": "YouTube", "youtube_pro": "YouTube",
+    "reddit": "Reddit", "reddit_pro": "Reddit",
+    "news": "News/Web", "news_pro": "News/Web",
+}
+
+
+def _evidence_source_label(sig: dict, cfg: dict) -> str:
+    """A signal's evidence can now come from several sources at once (Phase
+    A), so the card's "where this came from" line is built from what its own
+    samples actually are (detect.py now stamps each sample's `platform`),
+    never one fixed cfg["source"] — a card built from an X+Reddit signal
+    must say so, not silently claim it's only X."""
+    platforms = {s.get("platform") for s in (sig.get("samples") or []) if s.get("platform")}
+    if not platforms:
+        return SOURCE_LABEL.get(cfg.get("source", "x"), cfg.get("source", "x"))
+    labels = sorted({SOURCE_LABEL.get(p, p) for p in platforms})
+    return " + ".join(labels)
 
 
 class _Action(BaseModel):
@@ -44,6 +64,12 @@ class _Judged(BaseModel):
     brand_fit: int = Field(description="0-100: can this brand join this conversation credibly and safely?")
     why: str = Field(description="1-2 sentences: why this matters to THIS business. No statistics or numbers.")
     action: Optional[_Action] = Field(default=None, description="The single best action. Omit when relevance < 50.")
+    alternative: Optional[_Action] = Field(
+        default=None,
+        description="PRD §9.3's 'Alternatives': one different-shaped action for the SAME signal, worth "
+                    "considering instead of the primary one — e.g. a carousel FAQ next to a video, or a "
+                    "proposed ad test when buying intent is genuinely strong. Omit when nothing else fits "
+                    "better than the primary action; never just a smaller version of the same idea.")
 
 
 class _Judgement(BaseModel):
@@ -53,8 +79,12 @@ class _Judgement(BaseModel):
 SYSTEM = """You are Jane, a marketing strategist for one small business. You get market signals that URI measured
 from public posts (the numbers are already computed — never add your own figures or percentages).
 For each signal: judge relevance and brand fit for THIS business, explain why it matters in plain words, and
-propose ONE concrete action the owner can do this week (a video, post, carousel, FAQ, or — only when commercial
-intent is strong — an ad test to consider). Use the business's products, voice, goal and platforms.
+propose ONE primary concrete action the owner can do this week (a video, post, carousel, FAQ, or — only when
+commercial intent is strong — an ad test to consider). Use the business's products, voice, goal and platforms.
+Optionally, also propose ONE alternative action for the same signal — a genuinely different shape of response
+worth considering instead (e.g. a carousel FAQ next to a video, or a proposed ad test when buying intent is
+strong) — only when something else really does fit as well as or differently from the primary action; omit it
+rather than padding the card with a weaker, smaller version of the same idea.
 Never claim facts about the products that aren't in the business facts. No medical or guaranteed-result claims.
 "why" may only use what the signal shows (the topic, what people asked, needed or complained about) and the
 business facts. Never generalise about regions, countries, populations or groups ("especially in Africa where...",
@@ -100,14 +130,22 @@ def _allowed_numbers(sig: dict, profile: dict) -> set[str]:
     return nums
 
 
-def _validate_card_numbers(why: str, action: dict, allowed: set[str]) -> Optional[str]:
+def _validate_card_numbers(why: Optional[str], action: dict, allowed: set[str],
+                           require_why: bool = True) -> Optional[str]:
     """None if every statistic-looking number across why/action is grounded
     in `allowed`; otherwise an error string describing the mismatch, for the
-    one-retry-then-fallback flow (mirrors insight_composer._validate_numbers)."""
-    if not (why or "").strip():
+    one-retry-then-fallback flow (mirrors insight_composer._validate_numbers).
+
+    require_why=False skips the empty-why check and leaves why out of the
+    scanned text entirely — used for an alternative action, which has no
+    "why" of its own (the card's one "why" already covers the signal; only
+    the alternative's own action text needs checking)."""
+    if require_why and not (why or "").strip():
         return "why is empty"
     texts = [why, action.get("title", ""), action.get("hook", ""), action.get("cta", ""),
-             action.get("caption", ""), *(action.get("outline") or [])]
+             action.get("caption", ""), *(action.get("outline") or [])] if require_why else [
+        action.get("title", ""), action.get("hook", ""), action.get("cta", ""),
+        action.get("caption", ""), *(action.get("outline") or [])]
     unknown = {m.group(0) for t in texts for m in _NUM.finditer(t or "")
                if m.group(0).rstrip("%").strip() not in allowed}
     if unknown:
@@ -279,16 +317,33 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
                 why, action = _fallback_why(sig), _fallback_action(sig)
             else:
                 why, action = cand_why, cand_action
+
+        # PRD §9.3's "Alternatives": a bonus, never required, so a failed
+        # validation here just drops it rather than spending a second retry
+        # round the way the primary action gets — a card with no alternative
+        # is a completely normal, correct card; one with an unverified
+        # number in it is not.
+        alternative = j.alternative.dict() if j.alternative else None
+        if alternative:
+            alt_err = _validate_card_numbers(None, alternative, allowed, require_why=False)
+            if alt_err:
+                track_event(brand, "card_alternative_dropped", {
+                    "brand_id": brand, "signal_id": sig.get("id"), "topic": sig.get("topic"), "reason": alt_err[:200],
+                })
+                alternative = None
+            elif alternative.get("type") == action.get("type") and alternative.get("title") == action.get("title"):
+                alternative = None  # not actually a different idea — don't pad the card with a near-duplicate
+
         cards.append({
             "id": str(uuid.uuid4()), "brand_id": brand, "user_id": profile["user_id"],
             "signal_id": sig.get("id"), "market": sig["market"], "market_label": sig.get("market_label"),
             "topic": sig["topic"], "topic_name": sig.get("topic_name"), "type": sig["type"],
-            "observation": observation(sig), "why": why, "action": action,
+            "observation": observation(sig), "why": why, "action": action, "alternative": alternative,
             "evidence": {"current": sig.get("current"), "baseline": sig.get("baseline"),
                          "window_start": sig.get("window_start"), "window_end": sig.get("window_end"),
                          "samples": sig.get("samples"), "needs": sig.get("needs"),
                          "intent_mix": sig.get("intent_mix"),
-                         "source": SOURCE_LABEL.get(cfg["source"], cfg["source"]),
+                         "source": _evidence_source_label(sig, cfg),
                          "scope_note": "Counted from the public posts URI collected for this market — not all of the platform."},
             "scores": s, "confidence": sig.get("confidence"), "status": "new",
             "prompt_version": PROMPT_VERSION, "created_at": now, "updated_at": now,

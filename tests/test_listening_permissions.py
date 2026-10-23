@@ -85,7 +85,7 @@ class TestCollectionGate:
         class _Adapter:
             pass  # never called if the gate works
 
-        res = run(collector.collect_market(db, market, cfg, _Adapter(), NOW))
+        res = run(collector.collect_market(db, market, cfg, _Adapter(), "tiktok", NOW))
         assert res["status"] == "blocked_unapproved_source"
 
 

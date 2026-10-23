@@ -197,6 +197,7 @@ class _J:
         self.action = personalize._Action(type="video", title="Film 3 ways to style the Latasha wig",
                                           platforms=["instagram", "tiktok"], format="Reel 30s", hook="Hook",
                                           outline=["a", "b", "c"], cta="DM to order", caption="Caption")
+        self.alternative = None
 
 
 def _seed_and_detect(db):
@@ -264,6 +265,78 @@ def test_fabricated_number_falls_back_when_retry_also_fails(monkeypatch):
     assert cards[0]["action"] == personalize._fallback_action({"topic_name": "latasha wig", "topic": "latasha wig"})
 
 
+# ── alternatives (PRD §9.3) ───────────────────────────────────────────────────
+
+def _alt(**overrides):
+    base = dict(type="faq", title="Answer it as an FAQ", platforms=["instagram"], format="Carousel 3 slides",
+               hook="People keep asking this", outline=["Q", "A"], cta="DM to order", caption="Caption")
+    base.update(overrides)
+    return personalize._Action(**base)
+
+
+def test_a_clean_alternative_is_kept_on_the_card(monkeypatch):
+    db = fresh_db()
+    _seed_and_detect(db)
+
+    async def fake_judge(profile, sigs, model):
+        out = {}
+        for i, s in enumerate(sigs):
+            j = _J(i, 90 if s["topic"] == "latasha wig" else 20, 80)
+            j.alternative = _alt()
+            out[i] = j
+        return out
+    monkeypatch.setattr(personalize, "_judge", fake_judge)
+    prof = {"brand_id": "b1", "user_id": "u1", "markets": [MARKET["key"]], "facts": {}}
+    cards = run(personalize.cards_for(db, prof, CFG, NOW))
+    assert cards[0]["alternative"]["type"] == "faq"
+    assert cards[0]["alternative"]["title"] == "Answer it as an FAQ"
+
+
+def test_an_alternative_with_a_fabricated_number_is_dropped_not_retried(monkeypatch):
+    db = fresh_db()
+    _seed_and_detect(db)
+    retried = []
+
+    async def fake_judge(profile, sigs, model):
+        out = {}
+        for i, s in enumerate(sigs):
+            j = _J(i, 90 if s["topic"] == "latasha wig" else 20, 80)
+            j.alternative = _alt(cta="Demand is up 300% this week — DM now")
+            out[i] = j
+        return out
+
+    async def fake_retry(profile, sig, error, model):
+        retried.append(error)
+        return None
+    monkeypatch.setattr(personalize, "_judge", fake_judge)
+    monkeypatch.setattr(personalize, "_judge_one_retry", fake_retry)
+    prof = {"brand_id": "b1", "user_id": "u1", "markets": [MARKET["key"]], "facts": {}}
+    cards = run(personalize.cards_for(db, prof, CFG, NOW))
+    # The card itself is unaffected (primary action/why had no bad number) —
+    # only the alternative is dropped, and silently: no retry round spent on it.
+    assert cards[0]["alternative"] is None
+    assert cards[0]["action"]["title"] == "Film 3 ways to style the Latasha wig"
+    assert retried == []
+
+
+def test_an_alternative_identical_to_the_primary_action_is_dropped(monkeypatch):
+    db = fresh_db()
+    _seed_and_detect(db)
+
+    async def fake_judge(profile, sigs, model):
+        out = {}
+        for i, s in enumerate(sigs):
+            j = _J(i, 90 if s["topic"] == "latasha wig" else 20, 80)
+            # Same type + title as _J's own default action — not a real alternative.
+            j.alternative = _alt(type="video", title="Film 3 ways to style the Latasha wig")
+            out[i] = j
+        return out
+    monkeypatch.setattr(personalize, "_judge", fake_judge)
+    prof = {"brand_id": "b1", "user_id": "u1", "markets": [MARKET["key"]], "facts": {}}
+    cards = run(personalize.cards_for(db, prof, CFG, NOW))
+    assert cards[0]["alternative"] is None
+
+
 # ── collection ──────────────────────────────────────────────────────────────
 
 class _Page:
@@ -307,7 +380,7 @@ def test_full_measuring_search_widens_and_coverage_ignores_broad_samples():
         await ontology.ensure_seeded(db)
         await permissions.ensure_seeded(db)
         await db["mi_markets"].insert_one({**MARKET, "status": "active", "subscribers": ["b1"], "last_collected_at": None})
-        res = await collector.collect_market(db, dict(MARKET), CFG, _FakeAdapter(50), NOW)
+        res = await collector.collect_market(db, dict(MARKET), CFG, _FakeAdapter(50), "x", NOW)
         m = await db["mi_markets"].find_one({"key": MARKET["key"]})
         item = await db["mi_listen_items"].find_one({"source_id": "x:0"})
         return res, m, item
@@ -329,7 +402,7 @@ def test_collection_stops_at_the_monthly_budget():
     from app.agents.market_intelligence.listening import permissions
     run(permissions.ensure_seeded(db))
     run(db["mi_listen_runs"].insert_one({"market": "x", "started_at": NOW, "cost_usd": 99.0}))
-    res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), NOW))
+    res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), "x", NOW))
     assert res["status"] == "skipped_budget"
 
 
@@ -365,7 +438,7 @@ def test_run_doc_shows_pending_queries_before_any_have_finished():
         await ontology.ensure_seeded(db)
         await permissions.ensure_seeded(db)
         await db["mi_markets"].insert_one({**MARKET, "status": "active", "subscribers": ["b1"], "last_collected_at": None})
-        task = asyncio.create_task(collector.collect_market(db, dict(MARKET), CFG, _SlowAdapter(5, block), NOW))
+        task = asyncio.create_task(collector.collect_market(db, dict(MARKET), CFG, _SlowAdapter(5, block), "x", NOW))
         await asyncio.sleep(0.05)  # let collect_market reach the gather() and write its initial "running" doc
         mid_run = await db["mi_listen_runs"].find_one({"market": MARKET["key"]})
         block.set()  # release every blocked query now
@@ -387,7 +460,7 @@ def test_run_doc_shows_pending_queries_before_any_have_finished():
 
 def test_collection_is_blocked_for_a_source_with_no_approved_permission_record():
     db = fresh_db()  # permissions never seeded
-    res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), NOW))
+    res = run(collector.collect_market(db, MARKET, CFG, _FakeAdapter(5), "x", NOW))
     assert res["status"] == "blocked_unapproved_source"
 
 
