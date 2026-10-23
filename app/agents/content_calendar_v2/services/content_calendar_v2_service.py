@@ -99,6 +99,33 @@ CANDIDATE_CHUNK_SIZE = 20    # concurrent chunks, mirrors the proven content-chu
 CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item cap is
                               # evidence larger single structured-JSON calls degrade
 
+# ── Rate-limit resilience (confirmed live, Oct 2026) ────────────────────────
+# Candidate generation, scoring, and final-copy generation each fire several
+# GPT-4o calls concurrently via asyncio.gather (4, 4, and ~5 respectively).
+# A real OpenAI 429 doesn't reject just one of them — a burst this size can
+# trip the account's own rate limit on its own, especially stacked on other
+# same-account traffic, and it then rejects every concurrent call in the
+# same burst at once. An instant retry just re-fires into the same limit
+# and failed identically both times when this actually happened. Two fixes,
+# applied at every chunked call site below: stagger each chunk's own start
+# slightly so a burst isn't literally simultaneous, and back off briefly
+# before retrying specifically when the failure was rate-limit-shaped (a
+# different error, e.g. a JSON parse glitch, still retries immediately —
+# no reason to slow that down).
+_RATE_LIMIT_MARKER = "temporarily unavailable"   # both AIService 429/quota messages contain this
+_RATE_LIMIT_BACKOFF_SECONDS = 5
+_CHUNK_STAGGER_SECONDS = 0.5
+
+
+def _is_rate_limited(error: Any) -> bool:
+    return _RATE_LIMIT_MARKER in str(error)
+
+
+async def _backoff_if_rate_limited(error: Any) -> None:
+    if _is_rate_limited(error):
+        await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
+
+
 MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
 MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN = 3   # the brand picked Reels/video in its Playbook
 MIN_CAROUSEL_FORMATS_PER_WEEK = 1   # business requirement (Oct 2026): 1-2 carousels per week
@@ -723,6 +750,9 @@ concepts must come purely from business/audience/brand/creative-framework
 reasoning (nothing else exists in this task).
 
 Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys, nothing else."""
+        # Stagger concurrent chunks slightly rather than firing all of them
+        # in the same instant (see _CHUNK_STAGGER_SECONDS's module comment).
+        await asyncio.sleep(chunk_idx * _CHUNK_STAGGER_SECONDS)
         # One retry on parse failure — was a bare try/except with no retry at
         # all, so a single malformed response silently dropped the whole
         # chunk (confirmed live: a framework-config bug made this fail
@@ -762,6 +792,8 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
                 return [c for c in parsed if isinstance(c, dict)]
             except Exception as exc:
                 last_exc = exc
+                if attempt == 0:
+                    await _backoff_if_rate_limited(exc)
         print(f"[CalendarV2] candidate chunk {chunk_idx} failed after retry: {last_exc}", flush=True)
         return []
 
@@ -808,6 +840,9 @@ async def _score_candidates(
         )
 
     async def _score_chunk(chunk: List[Dict[str, Any]], offset: int) -> List[Any]:
+        # Stagger concurrent chunks slightly rather than firing all of them
+        # in the same instant (see _CHUNK_STAGGER_SECONDS's module comment).
+        await asyncio.sleep((offset // CANDIDATE_CHUNK_SIZE) * _CHUNK_STAGGER_SECONDS)
         listing = "\n".join(
             f"{i}: territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}, "
             f"device={(c.get('creative_device') or {}).get('device')}, format_hint={c.get('format_hint')}, "
@@ -2099,6 +2134,7 @@ business's actual customers, not a generic reader?
             # validation-failure retry path below already did.
             print(f"[CalendarV2] final-copy chunk parse failed on attempt {attempt + 1}/2 ({exc})", flush=True)
             if attempt == 0:
+                await _backoff_if_rate_limited(exc)
                 continue
             raise
 
@@ -2452,6 +2488,9 @@ async def _build_plan_doc(
     chunk_starts = list(range(0, PLAN_DAYS, CONTENT_CHUNK_SIZE))
 
     async def _run_chunk(chunk_start_idx: int) -> List[Dict[str, Any]]:
+        # Stagger concurrent chunks slightly rather than firing all of them
+        # in the same instant (see _CHUNK_STAGGER_SECONDS's module comment).
+        await asyncio.sleep((chunk_start_idx // CONTENT_CHUNK_SIZE) * _CHUNK_STAGGER_SECONDS)
         chunk = formatted[chunk_start_idx:chunk_start_idx + CONTENT_CHUNK_SIZE]
         try:
             return await _generate_final_copy(
