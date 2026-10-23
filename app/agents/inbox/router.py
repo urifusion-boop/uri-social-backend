@@ -20,7 +20,7 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
-    link_workspace_channels, release_channels,
+    in_sync_with_connections, link_workspace_channels, release_channels,
 )
 from . import agent
 from .meta_transport import meta_transport
@@ -353,6 +353,13 @@ async def list_channels(
     existing is not proof that Meta will accept a reply through it.
     """
     workspace_id = brand_ctx.get("brand_id")
+    # Kept in step with Connected Accounts: connecting or disconnecting there is all
+    # it takes for the inbox to follow.
+    if not await in_sync_with_connections(db, workspace_id):
+        try:
+            await link_workspace_channels(db, brand_ctx.get("user_id", ""), workspace_id)
+        except Exception as e:
+            print(f"[Inbox] sync with Connected Accounts failed for {workspace_id}: {e}", flush=True)
     rows = await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(50)
 
     out = []
