@@ -200,13 +200,42 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
         if not ok:
             print(f"[Inbox] could not subscribe page {page_id}: {err}", flush=True)
 
+    # The inbox mirrors Connected Accounts: an Instagram/Facebook account this
+    # workspace no longer connects there leaves the inbox too, instead of sitting on
+    # as "connected" with a dead token and an unsubscribed Page.
+    keep = {(k["platform"], k["external_account_id"]) for k in linked}
+    removed = 0
+    for row in await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(200):
+        if row.get("platform") not in ("instagram", "facebook"):
+            continue      # WhatsApp is connected in the inbox itself, not Connected Accounts
+        if (row.get("platform"), row.get("external_account_id")) not in keep:
+            await db[CHANNEL_ACCOUNTS].delete_one({"_id": row["_id"]})
+            removed += 1
+    if removed:
+        print(f"[Inbox] {workspace_id}: removed {removed} channel(s) no longer in Connected Accounts", flush=True)
+
     if not linked:
         print(f"[Inbox] linked nothing for {workspace_id!r}: "
               f"{len(conns)} connection(s) considered, "
               f"{len(skipped)} in other workspaces {sorted(set(skipped))[:5]}", flush=True)
     # Returned, not stashed on the module: a global would be shared across
     # requests and hand one workspace's page ids to the next caller.
-    return {"linked": linked, "subscriptions": subscriptions}
+    return {"linked": linked, "subscriptions": subscriptions, "removed": removed}
+
+
+async def in_sync_with_connections(db, workspace_id: str) -> bool:
+    """Whether the inbox's Instagram/Facebook channels are exactly what Connected
+    Accounts has for this workspace. Reads only our own records — no Meta calls — so
+    it can run on every inbox load and trigger a full link only when they differ."""
+    conns = await db[SOCIAL_CONNECTIONS].find(
+        {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}}).to_list(200)
+    expected = {(r["platform"], r["external_account_id"])
+                for c in conns if _workspace_of(c) == workspace_id
+                for r in channel_rows(c, workspace_id)}
+    have = {(r.get("platform"), r.get("external_account_id"))
+            for r in await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(200)
+            if r.get("platform") in ("instagram", "facebook")}
+    return expected == have
 
 
 async def resolve_page_token(page_id: str, token: str) -> str:

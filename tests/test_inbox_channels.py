@@ -121,7 +121,7 @@ def test_linking_returns_its_results_rather_than_stashing_them():
     workspace's page ids to the next caller."""
     db = _seeded_db([IG_CONN])
     out = _run(link_workspace_channels(db, "u1", "ws_1"))
-    assert set(out) == {"linked", "subscriptions"}
+    assert set(out) == {"linked", "subscriptions", "removed"}
     assert len(out["linked"]) == 2
 
 
@@ -264,3 +264,25 @@ def test_linking_keeps_a_claim_a_live_connection_still_backs():
         {"workspace_id": "ws_1", "platform": "facebook", "external_account_id": "PAGE7"})
     _run(prune_stale_claims(db, "ws_2", "PAGE7"))
     assert len(db[CHANNEL_ACCOUNTS].docs) == 1
+
+
+def test_the_inbox_drops_an_account_connected_accounts_no_longer_has():
+    """Disconnected in Connected Accounts, or replaced by another account: the old
+    channel must not linger as "connected" with a dead token."""
+    from app.agents.inbox.channels import in_sync_with_connections
+    db = _seeded_db([IG_CONN])
+    db[CHANNEL_ACCOUNTS].docs.append({"_id": "old", "workspace_id": "ws_1", "platform": "instagram",
+                                      "external_account_id": "OLD_IG", "access_token": "dead"})
+    assert not _run(in_sync_with_connections(db, "ws_1"))
+    out = _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert out["removed"] == 1
+    assert "OLD_IG" not in {d["external_account_id"] for d in db[CHANNEL_ACCOUNTS].docs}
+    assert _run(in_sync_with_connections(db, "ws_1"))
+
+
+def test_whatsapp_is_not_touched_by_the_sync():
+    db = _seeded_db([IG_CONN])
+    db[CHANNEL_ACCOUNTS].docs.append({"_id": "wa", "workspace_id": "ws_1", "platform": "whatsapp",
+                                      "external_account_id": "PN1", "access_token": "t"})
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert any(d["platform"] == "whatsapp" for d in db[CHANNEL_ACCOUNTS].docs)
