@@ -203,3 +203,44 @@ def test_a_word_only_in_the_wider_list_is_caught_even_when_the_model_fails():
         asyncio.run(svc._scrub_generic_words([item]))
     caption = item["exact_copy"]["caption"].lower()
     assert "premium" not in caption and "curated" not in caption and "bespoke" not in caption
+
+
+# ── confirmed live: no banned word, still read as formulaic ────────────────
+# A real 30-item plan used "simplify"/"simplifies" in ~1/3 of its items —
+# zero banned words anywhere, but a go-to crutch word doing the same job
+# "unlock" would. No fixed word list for this on purpose (that's the same
+# rigidity trap the banned-word list already is for a known set of words) —
+# telling a lazy repeated benefit word ("simplify") apart from legitimate
+# topical repetition ("marketing", the brand name) needs actual judgment,
+# so this extends the one existing semantic-diversity LLM call instead of
+# adding a second deterministic list.
+
+def test_diversity_check_prompt_includes_caption_text_and_the_crutch_word_criterion():
+    items = [{"title": f"T{i}", "hook": f"H{i}", "exact_copy": {"caption": f"Simplify your day {i}."}}
+             for i in range(3)]
+    captured = {}
+
+    async def fake(req):
+        captured["prompt"] = req["messages"][0]["content"]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))])
+
+    with patch.object(svc.AIService, "build_ai_model", side_effect=lambda **kw: kw), \
+         patch.object(svc.AIService, "chat_completion", side_effect=fake):
+        asyncio.run(svc._llm_diversity_check(items, brand={"brand_name": "Acme"}))
+
+    prompt = captured["prompt"]
+    assert "Simplify your day 0" in prompt          # caption text now reaches the prompt
+    assert "CRUTCH WORD" in prompt
+    assert "simplif" in prompt.lower()               # the worked example names the exact word found live
+
+
+def test_diversity_check_still_returns_flagged_indexes_from_the_model():
+    items = [{"title": "A", "hook": "a"}, {"title": "B", "hook": "b"}, {"title": "C", "hook": "c"}]
+
+    async def fake(req):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="[0, 2]"))])
+
+    with patch.object(svc.AIService, "build_ai_model", side_effect=lambda **kw: kw), \
+         patch.object(svc.AIService, "chat_completion", side_effect=fake):
+        flagged = asyncio.run(svc._llm_diversity_check(items))
+    assert flagged == [0, 2]

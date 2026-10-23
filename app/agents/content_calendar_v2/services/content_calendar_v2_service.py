@@ -1495,14 +1495,15 @@ async def _llm_diversity_check(items: List[Dict[str, Any]], brand: Optional[Dict
         context_line = f"\n{brand_name}'s actual customer reality includes: " + "; ".join(psych_bits)
 
     listing = "\n".join(
-        f"{i}: {it.get('title', '')} — {it.get('hook', '')}"
+        f"{i}: {it.get('title', '')} — {it.get('hook', '')} — "
+        f"{((it.get('exact_copy') or {}).get('caption') or '')[:140]}"
         for i, it in enumerate(items)
     )
     prompt = f"""Below are {len(items)} social media post ideas for {brand_name}.{context_line}
 
 {listing}
 
-Flag an index for regeneration if EITHER is true:
+Flag an index for regeneration if ANY of these is true:
 A) DUPLICATE — substantially the SAME underlying idea reworded as another
    index in the list (not just sharing a territory — genuinely the same
    angle/message).
@@ -1512,6 +1513,16 @@ B) GENERIC — the idea fails ANY of these: (1) this exact headline could
    customers (their real pain points, needs, objections, or reasons they
    buy — not just the product category), (3) this business's actual
    customer would not recognise themselves in it.
+C) CRUTCH WORD — this item leans on the same go-to benefit word or phrase
+   (e.g. "simplify"/"simplifies", "boost", "effortless", "seamless") that
+   keeps reappearing across several OTHER items in this list as their
+   payoff word, instead of each idea finding its own specific language.
+   One or two items sharing a word is normal; a word becoming the list's
+   default answer is the problem — read the whole list first to judge this,
+   not any single item alone. Do NOT flag ordinary topical words that
+   legitimately recur because they're what the business actually is
+   (the brand name, "marketing", the industry, the audience) — only a
+   lazy, interchangeable benefit word standing in for real specificity.
 
 Return ONLY a JSON array of indexes to regenerate, e.g. [4, 11] or [] if none
 qualify. Be conservative — only flag a clear case, not a borderline one.
