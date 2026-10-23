@@ -5506,14 +5506,18 @@ async def edit_live_targeting(
 
 
 @router.get("/objectives")
-async def list_objectives() -> dict:
+async def list_objectives(platform: str = "meta") -> dict:
     """Meta's campaign objectives, for the picker Jane opens the conversation with.
 
     Offered in Meta's own words so that what the client chooses here is what Ads
     Manager shows them later — the mismatch that made this necessary was a client
     asking for sales and finding "Objective: Engagement" on their campaign.
+
+    platform="tiktok" swaps in TikTok-accurate blurbs (see objectives.
+    choices_for_platform) — the five choices and what they're stored as are
+    identical either way, only the explanation underneath each one changes.
     """
-    from .objectives import ACTIONS, CHOICES, coerce as objectives_coerce, destinations_for
+    from .objectives import ACTIONS, choices_for_platform, coerce as objectives_coerce, destinations_for
 
     # The follow-ups ship WITH the choices so the client is never asked a question the
     # answer above has already settled, and the frontend never has to hardcode which
@@ -5523,7 +5527,7 @@ async def list_objectives() -> dict:
             {**c,
              "actions": ACTIONS.get(c["value"], []),
              "destinations": destinations_for(objectives_coerce(c["value"]))}
-            for c in CHOICES
+            for c in choices_for_platform(platform == "tiktok")
         ],
     }
 

@@ -85,6 +85,37 @@ CHOICES = [
      "caveat": ""},
 ]
 
+# Same five choices, but what each one actually DOES is platform-specific — the
+# blurbs above describe Meta's own delivery behaviour (e.g. ENGAGEMENT "best for
+# WhatsApp orders" relies on Meta's native Click-to-WhatsApp ad type), which is
+# simply untrue on TikTok. Mirrors adapters/tiktok.py's own
+# _TIKTOK_OBJECTIVE/_TIKTOK_OPTIMIZATION_FOR_OBJECTIVE mapping — kept in sync
+# with that, not independently decided here. Same value/label per choice (the
+# objective the client picks doesn't change), only the explanation underneath.
+_TIKTOK_BLURBS = {
+    CampaignObjective.AWARENESS.value:
+        "Get your video or photo seen by as many people as possible.",
+    CampaignObjective.TRAFFIC.value:
+        "Send people to your link — TikTok charges per click.",
+    CampaignObjective.ENGAGEMENT.value:
+        "Get more views on your video. TikTok has no native WhatsApp ad type the way "
+        "Meta does, so this optimises for video views, not messages.",
+    CampaignObjective.LEADS.value:
+        "Collect enquiries from interested people — TikTok's own lead generation objective.",
+    CampaignObjective.SALES.value:
+        "Find people likely to buy. Runs as Traffic on TikTok today — a dedicated "
+        "sales/conversions objective needs a TikTok Pixel, not set up yet.",
+}
+
+
+def choices_for_platform(tiktok: bool = False) -> list[dict]:
+    """CHOICES, with TikTok-accurate blurbs swapped in when the campaign is
+    running on TikTok. value/label are unchanged — the objective itself
+    doesn't change, only what the client is told it does."""
+    if not tiktok:
+        return list(CHOICES)
+    return [{**c, "blurb": _TIKTOK_BLURBS.get(c["value"], c["blurb"])} for c in CHOICES]
+
 
 # What the objective still needs to know before it can be launched, per objective.
 # Only the question the previous answer makes necessary is asked — AWARENESS never
