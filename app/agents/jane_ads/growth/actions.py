@@ -41,12 +41,18 @@ async def _post(adapter, node_id: str, body: dict) -> dict:
                                  params={"access_token": adapter._access_token}, json=body)
     data = resp.json()
     if "error" in data:
-        raise RuntimeError(data["error"].get("message") or "update failed")
+        err = data["error"]
+        # Meta throttles status changes on one ad to one every ~30 seconds (#613).
+        # Nothing was applied, so it is safe to try again — say so plainly.
+        if err.get("code") in (4, 17, 613, 80004):
+            raise RuntimeError("Meta only allows one change to this every 30 seconds or so — "
+                               "nothing was changed; try again in a moment.")
+        raise RuntimeError(err.get("message") or "update failed")
     return data
 
 
 async def state_of(adapter, record: dict, action: str, params: dict) -> dict:
-    if action == "pause_ad":
+    if action in ("pause_ad", "resume_ad"):
         ad = await _read(adapter, params.get("ad_id") or record.get("ad_id"), "id,status,effective_status")
         return {"ad_id": ad.get("id"), "status": ad.get("status"), "effective_status": ad.get("effective_status")}
     sched = await adapter.fetch_adset_schedule(record["campaign_id"])
@@ -58,6 +64,8 @@ async def state_of(adapter, record: dict, action: str, params: dict) -> dict:
 async def _mutate(adapter, record: dict, action: str, params: dict) -> dict:
     if action == "pause_ad":
         return await _post(adapter, params.get("ad_id") or record["ad_id"], {"status": "PAUSED"})
+    if action == "resume_ad":
+        return await _post(adapter, params.get("ad_id") or record["ad_id"], {"status": "ACTIVE"})
     if action == "pause_campaign":
         return await adapter.set_delivery(record["campaign_id"], False)
     if action == "resume_campaign":
@@ -71,6 +79,8 @@ async def _mutate(adapter, record: dict, action: str, params: dict) -> dict:
 def verified(action: str, params: dict, after: dict) -> bool:
     if action == "pause_ad":
         return after.get("status") == "PAUSED"
+    if action == "resume_ad":
+        return after.get("status") == "ACTIVE"
     if action == "pause_campaign":
         return after.get("campaign_status") == "PAUSED"
     if action == "resume_campaign":
@@ -128,3 +138,19 @@ async def budget_raised_pct_7d(db, campaign_id: str) -> float:
         if frm and to > frm:
             total += (to / frm - 1) * 100
     return total
+
+
+async def list_ads(adapter, record: dict) -> list[dict]:
+    """The campaign's ads as Meta holds them now: id, name, status."""
+    if getattr(adapter, "demo", False):
+        return [{"id": a, "name": a.rsplit("-", 1)[-1].replace("-", " ").title(), "status": st}
+                for a, st in (record.get("ads") or {}).items()]
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{adapter._graph_base}/{record['campaign_id']}/ads",
+                                params={"access_token": adapter._access_token,
+                                        "fields": "id,name,status,effective_status", "limit": 50})
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message") or "couldn't list ads")
+    return [{"id": a["id"], "name": a.get("name") or a["id"], "status": a.get("status"),
+             "effective_status": a.get("effective_status")} for a in data.get("data") or []]

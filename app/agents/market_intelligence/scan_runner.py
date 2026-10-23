@@ -19,6 +19,21 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .adapters.base import AdapterCapabilities, SourceAdapter
 from .adapters.apify_x import PRO_PROFILE, TEST_PROFILE, ApifyXAdapter
+from .adapters.apify_tiktok import (
+    PRO_PROFILE as TIKTOK_PRO_PROFILE, TEST_PROFILE as TIKTOK_TEST_PROFILE, ApifyTikTokAdapter,
+)
+from .adapters.apify_instagram import (
+    PRO_PROFILE as INSTAGRAM_PRO_PROFILE, TEST_PROFILE as INSTAGRAM_TEST_PROFILE, ApifyInstagramAdapter,
+)
+from .adapters.apify_youtube import (
+    PRO_PROFILE as YOUTUBE_PRO_PROFILE, TEST_PROFILE as YOUTUBE_TEST_PROFILE, ApifyYouTubeAdapter,
+)
+from .adapters.apify_reddit import (
+    PRO_PROFILE as REDDIT_PRO_PROFILE, TEST_PROFILE as REDDIT_TEST_PROFILE, ApifyRedditAdapter,
+)
+from .adapters.apify_news import (
+    PRO_PROFILE as NEWS_PRO_PROFILE, TEST_PROFILE as NEWS_TEST_PROFILE, ApifyNewsAdapter,
+)
 from .adapters.mock import MockSourceAdapter
 from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
@@ -63,11 +78,26 @@ NOISE_FILTER_MODEL_NAME = "deterministic-filter"
 NOISE_FILTER_PROMPT_VERSION = "mi-noise-filter-v1"
 
 # One adapter instance per provider — new real adapters register here.
+# Every non-X source below ships unapproved in listening/permissions.py by
+# design: registering an adapter here only makes it *available*, never
+# *active* — collector.py's permissions.is_approved() gate blocks any source
+# until an admin has run a real test scan and approved it through the
+# curation console (see each adapter module's own docstring note).
 ADAPTER_REGISTRY: dict[str, SourceAdapter] = {
     "mock": MockSourceAdapter(),
     # X through Apify: the cheap actor for testing, Tweet Scraper V2 for scale.
     "x": ApifyXAdapter(TEST_PROFILE),
     "x_pro": ApifyXAdapter(PRO_PROFILE),
+    "tiktok": ApifyTikTokAdapter(TIKTOK_TEST_PROFILE),
+    "tiktok_pro": ApifyTikTokAdapter(TIKTOK_PRO_PROFILE),
+    "instagram": ApifyInstagramAdapter(INSTAGRAM_TEST_PROFILE),
+    "instagram_pro": ApifyInstagramAdapter(INSTAGRAM_PRO_PROFILE),
+    "youtube": ApifyYouTubeAdapter(YOUTUBE_TEST_PROFILE),
+    "youtube_pro": ApifyYouTubeAdapter(YOUTUBE_PRO_PROFILE),
+    "reddit": ApifyRedditAdapter(REDDIT_TEST_PROFILE),
+    "reddit_pro": ApifyRedditAdapter(REDDIT_PRO_PROFILE),
+    "news": ApifyNewsAdapter(NEWS_TEST_PROFILE),
+    "news_pro": ApifyNewsAdapter(NEWS_PRO_PROFILE),
 }
 
 # Real collection pages through results; a bound keeps one bad cursor from

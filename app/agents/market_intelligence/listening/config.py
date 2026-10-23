@@ -13,7 +13,16 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     # Collection
-    "source": "x",                    # adapter key in scan_runner.ADAPTER_REGISTRY
+    "source": "x",                    # adapter key in scan_runner.ADAPTER_REGISTRY — kept as the single-source
+                                       # fallback (tests, and any caller that still passes its own adapter)
+    "sources": ["x"],                  # Phase A: every active source the scheduled cycle collects from per
+                                       # market. Each one still has to clear permissions.is_approved on its own
+                                       # (PRD §15) before it actually collects anything — adding a key here only
+                                       # makes a source *eligible*, same as registering it in ADAPTER_REGISTRY.
+                                       # New sources (tiktok/instagram/youtube/reddit/news, each test+pro) ship
+                                       # registered but unapproved; add a key here (and approve it) when ready.
+    "source_budgets": {},              # optional per-source monthly USD cap, e.g. {"tiktok": 5.0} — on top of
+                                       # (never instead of) the global monthly_budget_usd ceiling below.
     "cadence_hours": 12,               # how often a market is collected, when nothing is hot
     "cadence": {
         "hot_hours": 2,                 # collection interval while a market has an active hot signal
@@ -67,6 +76,9 @@ DEFAULTS: dict[str, Any] = {
         "min_feedback_samples": 4,      # fewer than this for a market+type combo: no adjustment yet
         "dismiss_rate_threshold": 0.7,  # dismiss rate above this starts lowering relevance
         "max_penalty": 25,              # relevance points subtracted at a 100% dismiss rate
+        "category_prior_min_samples": 5,  # cross-tenant content-performance groups smaller than this are
+                                           # withheld entirely (PRD §15's minimum-group threshold) — reporting
+                                           # only for now, see metrics.category_content_performance
     },
     # Shadow mode (PRD §17) — off by default; set enabled + candidate_overrides
     # to compare a not-yet-shipped config against live production in real time.
@@ -90,6 +102,23 @@ DEFAULTS: dict[str, Any] = {
         "min_on_topic_rate": 0.25,      # below this on-topic share: the query is low-yield
         "shrink_factor": 0.5,           # cap multiplier applied to a low-yield query
         "min_cap": 10,                  # never shrink a query to zero — keep exploring it at a small scale
+    },
+    # Plan-tier limits (PRD §5's "Operating policy: Plan tier... Scheduler
+    # priority, delivery policy"; §21 open decision #8). Every tier below
+    # starts equal to today's single global values (cadence_hours=12,
+    # delivery.max_alerts_per_week=3, retention.item_days=90) on purpose —
+    # adding this lookup changes nothing about current behaviour by itself;
+    # differentiating a tier is a deliberate later edit to these numbers,
+    # not a side effect of this key existing. "default" is used for any
+    # resolved tier string that isn't one of the named keys below (e.g. an
+    # agency plan_tier or subscription_tier this list hasn't been told
+    # about yet) — never a guess, the same global values either way.
+    "plan_tiers": {
+        "default":        {"cadence_hours": 12, "max_alerts_per_week": 3, "history_days": 90},
+        "starter":        {"cadence_hours": 12, "max_alerts_per_week": 3, "history_days": 90},
+        "growth":         {"cadence_hours": 12, "max_alerts_per_week": 3, "history_days": 90},
+        "pro":            {"cadence_hours": 12, "max_alerts_per_week": 3, "history_days": 90},
+        "agency_starter": {"cadence_hours": 12, "max_alerts_per_week": 3, "history_days": 90},
     },
     # Discovery (keyword lifecycle, PRD §6.3)
     "discovery": {

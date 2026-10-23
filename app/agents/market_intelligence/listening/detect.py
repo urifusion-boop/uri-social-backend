@@ -168,17 +168,35 @@ async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: dat
     needs = Counter((r.get("need") or "").strip().lower() for r in rows if r.get("need"))
     items = {i["source_id"]: i async for i in db["mi_listen_items"].find(
         {"source_id": {"$in": [r["source_id"] for r in rows]}},
-        {"source_id": 1, "url": 1, "text": 1, "raw_metrics": 1, "published_at": 1, "author_handle": 1})}
+        {"source_id": 1, "url": 1, "text": 1, "raw_metrics": 1, "published_at": 1, "author_handle": 1, "provider": 1})}
     ranked = sorted(items.values(), key=lambda i: -sum((i.get("raw_metrics") or {}).values()))
     tdoc = await db["mi_market_topics"].find_one({"market": market["key"], "key": topic}) or {}
 
     # §15 display rules, enforced here rather than left as policy text: how
     # much of a post's own words a sample may quote, and whether a sample
-    # with no link back to the original post may be shown at all.
-    dr = await permissions.display_rules(db, cfg["source"])
-    if dr.get("require_link", True):
-        ranked = [i for i in ranked if i.get("url")]
-    max_chars = int(dr.get("max_excerpt_chars") or 280)
+    # with no link back to the original post may be shown at all. Evidence
+    # for one topic can now come from several sources at once (Phase A), so
+    # this is a per-item lookup keyed by each item's own `provider` — never
+    # one global cfg["source"] rule applied to posts it may not even govern.
+    dr_cache: dict[str, dict] = {}
+
+    async def dr_for(provider: Optional[str]) -> dict:
+        key = provider or cfg.get("source", "x")
+        if key not in dr_cache:
+            dr_cache[key] = await permissions.display_rules(db, key)
+        return dr_cache[key]
+
+    samples = []
+    for i in ranked:
+        dr = await dr_for(i.get("provider"))
+        if dr.get("require_link", True) and not i.get("url"):
+            continue
+        max_chars = int(dr.get("max_excerpt_chars") or 280)
+        samples.append({"url": i.get("url"), "text": (i.get("text") or "")[:max_chars],
+                        "author": i.get("author_handle"), "published_at": i.get("published_at"),
+                        "platform": i.get("provider")})
+        if len(samples) >= 5:
+            break
 
     return {
         "market": market["key"], "market_label": market["label"], "topic": topic,
@@ -188,8 +206,7 @@ async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: dat
         "needs": [n for n, _ in needs.most_common(3)],
         "top_author_share": round(max(authors.values()) / len(rows), 2),
         "reading_confidence": round(sum(r.get("confidence", 0) for r in rows) / len(rows), 2),
-        "samples": [{"url": i.get("url"), "text": (i.get("text") or "")[:max_chars], "author": i.get("author_handle"),
-                     "published_at": i.get("published_at")} for i in ranked[:5]],
+        "samples": samples,
         "status": "active", "computed_at": datetime.utcnow(),
         "expires_at": b + timedelta(days=cfg["score"]["card_ttl_days"]),
     }
