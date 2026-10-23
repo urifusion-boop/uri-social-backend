@@ -184,6 +184,12 @@ class TikTokPostSettingsRequest(BaseModel):
     allow_stitch: bool = False
     brand_organic: bool = False
     brand_content: bool = False
+    description: str = ""   # photo posts only — the caption under the photo(s)
+
+
+class PublishTikTokPhotoDraftRequest(BaseModel):
+    draft_id: str
+    tiktok: TikTokPostSettingsRequest
 
 
 class PublishVideoDraftRequest(BaseModel):
@@ -7576,6 +7582,101 @@ async def publish_video_draft(
     )
 
     return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
+
+
+@router.post("/publish-tiktok-photo-draft")
+async def publish_tiktok_photo_draft(
+    request: PublishTikTokPhotoDraftRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Direct-post an image / carousel draft to TikTok with the user's choices from
+    the Post to TikTok screen (privacy, comments, disclosure). Returns a job_id
+    immediately; poll GET /video-publish-job/{job_id} for status.
+    """
+    from app.agents.social_media_manager.services import tiktok_media_proxy
+    from app.agents.social_media_manager.services.tiktok_direct_service import TikTokPostSettings
+    from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    draft = await db["content_drafts"].find_one({"id": request.draft_id, "user_id": user_id}, {"_id": 0})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("platform") != "tiktok":
+        raise HTTPException(status_code=400, detail="This draft isn't a TikTok post.")
+    if draft.get("video_url"):
+        raise HTTPException(status_code=400, detail="This is a video post; publish it from Saved Video Drafts.")
+
+    image_count = len(tiktok_media_proxy.draft_image_sources(draft))
+    if image_count == 0:
+        raise HTTPException(status_code=400, detail="This post has no image to publish.")
+
+    conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
+        {"_id": 0},
+    )
+    if not conn:
+        raise HTTPException(
+            status_code=400,
+            detail="Connect your TikTok account directly to post. Open Connected Accounts and reconnect TikTok.",
+        )
+
+    tiktok_settings = TikTokPostSettings(**request.tiktok.model_dump())
+    image_urls = tiktok_media_proxy.signed_urls(request.draft_id, image_count)
+
+    job_id = await VideoPublishService.create_job(request.draft_id, "tiktok", user_id)
+    background_tasks.add_task(
+        VideoPublishService.run_tiktok_photo_job,
+        job_id,
+        request.draft_id,
+        image_urls,
+        conn,
+        db,
+        tiktok_settings,
+        bool(draft.get("tiktok_auto_add_music")),
+    )
+    return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
+
+
+@router.get("/tiktok-media/{draft_id}/{filename}")
+async def serve_tiktok_media(
+    draft_id: str,
+    filename: str,
+    exp: int = Query(...),
+    sig: str = Query(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Public, signed image URL that TikTok PULLs photo-post images from (TikTok's
+    photo posting has no upload mode, and requires the URL be under a prefix
+    verified in the Developer Portal — see tiktok_media_proxy.py). The signature
+    and expiry are the only access control, so a bad or expired link is a 404.
+    """
+    from app.agents.social_media_manager.services import tiktok_media_proxy
+
+    stem, _, ext = filename.rpartition(".")
+    if ext.lower() != "jpg" or not stem.isdigit():
+        raise HTTPException(status_code=404, detail="Not found")
+    index = int(stem)
+    if not tiktok_media_proxy.verify(draft_id, index, exp, sig):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    draft = await db["content_drafts"].find_one({"id": draft_id}, {"_id": 0})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        jpeg = await tiktok_media_proxy.render_jpeg(draft, index)
+    except Exception as e:
+        print(f"[TikTokMedia] failed to render {draft_id}/{index}: {e}")
+        raise HTTPException(status_code=404, detail="Not found")
+    if jpeg is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
 
 
 @router.get("/connections/tiktok-direct/creator-info")
