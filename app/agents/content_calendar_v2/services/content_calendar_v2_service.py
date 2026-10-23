@@ -2711,6 +2711,20 @@ async def _build_plan_doc(
 
 # ── Regeneration with versioning (diverges from v1's overwrite-in-place) ───────
 
+# PRD §46 — the written text vs. the visual direction, the two halves
+# "copy only" and "creative only" each keep the other side of untouched.
+# "hook" is narrower still: just the opening line, not the rest of the copy.
+_REGEN_COPY_FIELDS = (
+    "title", "description", "hook", "key_points", "caption_direction",
+    "keywords", "cta", "video_idea", "exact_copy", "carousel",
+)
+_REGEN_CREATIVE_FIELDS = (
+    "ai_image_prompt", "design_style", "layout_direction", "visual_metaphor",
+    "required_assets", "designer_execution_notes",
+)
+_VALID_REGEN_SCOPES = {"full", "hook", "copy", "creative", "format"}
+
+
 async def regenerate_item_v2(
     plan_id: str,
     item_index: int,
@@ -2718,7 +2732,14 @@ async def regenerate_item_v2(
     db: AsyncIOMotorDatabase,
     brand_id: Optional[str] = None,
     reason: str = "",
+    regen_scope: str = "full",
+    new_format: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if regen_scope not in _VALID_REGEN_SCOPES:
+        raise ValueError(f"Unknown regenerate scope {regen_scope!r} — must be one of {sorted(_VALID_REGEN_SCOPES)}")
+    if regen_scope == "format" and not new_format:
+        raise ValueError("new_format is required when scope is 'format'")
+
     scope = _cal_v2_scope(user_id, brand_id)
     plan = await db[COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0})
     if not plan:
@@ -2741,19 +2762,23 @@ async def regenerate_item_v2(
     # format fixed — a manual regenerate re-executes final-copy only,
     # same "don't reinterpret the concept" rule the auto-regen path follows.
     device = item.get("creative_device") or {}
-    slide_count = len(((item.get("carousel") or {}).get("slides")) or []) or 3
+    original_format = item.get("format", "image")
+    # "format" scope is a deliberate override — every other scope keeps the
+    # item's already-approved format exactly as it was.
+    effective_format = new_format if regen_scope == "format" else original_format
+    slide_count = (len(((item.get("carousel") or {}).get("slides")) or []) or 3) if effective_format == "carousel" else 3
     concept = {
         "territory": item.get("territory", ""),
         "subject": item.get("subject", ""),
         "angle": item.get("creative_angle", ""),
         "creative_device": {"category": device.get("category", ""), "device": device.get("device", "")},
-        "format_hint": item.get("format", "image"),
+        "format_hint": effective_format,
         "objective": item.get("primary_kpi", "engagement"),
         "audience_segment": brand.get("target_audience", ""),
         "concept_name": item.get("creative_concept_name", ""),
         "day_index": item_index,
         "date": item.get("date", ""),
-        "format": item.get("format", "image"),
+        "format": effective_format,
         "carousel_slide_count": slide_count,
     }
 
@@ -2777,43 +2802,80 @@ async def regenerate_item_v2(
         "creative_concept_name",
     ]
     snapshot = {f: item.get(f) for f in editable_fields}
-    version_entry = {"snapshot": snapshot, "edited_at": datetime.utcnow().isoformat(), "reason": reason}
+    version_entry = {"snapshot": snapshot, "edited_at": datetime.utcnow().isoformat(),
+                      "reason": reason, "scope": regen_scope}
 
-    update_fields = {
-        "items.$[it].title": new_idea.get("title", ""),
-        "items.$[it].description": new_idea.get("description", ""),
-        "items.$[it].hook": new_idea.get("hook", ""),
-        "items.$[it].key_points": new_idea.get("key_points", []),
-        "items.$[it].caption_direction": new_idea.get("caption_direction", ""),
-        "items.$[it].keywords": new_idea.get("keywords", []),
-        "items.$[it].cta": new_idea.get("cta", ""),
-        "items.$[it].video_idea": new_idea.get("video_idea", {}),
-        "items.$[it].exact_copy": new_idea.get("exact_copy") or {},
-        "items.$[it].carousel": new_idea.get("carousel") if is_carousel else None,
-        "items.$[it].ai_image_prompt": new_idea.get("ai_image_prompt", ""),
-        "items.$[it].creative_direction": {
+    # Every field the regeneration COULD touch, keyed plainly (not yet
+    # prefixed with the Mongo "items.$[it]." path) so scope can filter this
+    # down before anything is sent to the DB.
+    all_candidate_fields: Dict[str, Any] = {
+        "title": new_idea.get("title", ""),
+        "description": new_idea.get("description", ""),
+        "hook": new_idea.get("hook", ""),
+        "key_points": new_idea.get("key_points", []),
+        "caption_direction": new_idea.get("caption_direction", ""),
+        "keywords": new_idea.get("keywords", []),
+        "cta": new_idea.get("cta", ""),
+        "video_idea": new_idea.get("video_idea", {}),
+        "exact_copy": new_idea.get("exact_copy") or {},
+        "carousel": new_idea.get("carousel") if is_carousel else None,
+        "ai_image_prompt": new_idea.get("ai_image_prompt", ""),
+        "creative_direction": {
             "visual_style": new_idea.get("design_style", ""),
             "mood": (new_idea.get("creative_direction") or {}).get("mood", ""),
             "color_note": (new_idea.get("creative_direction") or {}).get("color_note", ""),
             "composition_note": new_idea.get("layout_direction", ""),
             "central_visual_idea": new_idea.get("central_visual_idea", ""),
         },
-        "items.$[it].design_style": new_idea.get("design_style", ""),
-        "items.$[it].layout_direction": new_idea.get("layout_direction", ""),
-        "items.$[it].visual_metaphor": new_idea.get("visual_metaphor", ""),
-        "items.$[it].required_assets": new_idea.get("required_assets", []),
-        "items.$[it].designer_execution_notes": new_idea.get("designer_execution_notes", ""),
-        "items.$[it].reasoning": new_idea.get("reasoning") or item.get("reasoning", ""),
-        "items.$[it].creative_concept_name": new_idea.get("creative_concept_name") or item.get("creative_concept_name", ""),
-        "items.$[it].regenerated_count": item.get("regenerated_count", 0) + 1,
-        "items.$[it].last_regenerated_reason": "manual",
-        "updated_at": datetime.utcnow().isoformat(),
+        "design_style": new_idea.get("design_style", ""),
+        "layout_direction": new_idea.get("layout_direction", ""),
+        "visual_metaphor": new_idea.get("visual_metaphor", ""),
+        "required_assets": new_idea.get("required_assets", []),
+        "designer_execution_notes": new_idea.get("designer_execution_notes", ""),
     }
+
+    # PRD §46 — which half of the regeneration actually lands, per scope.
+    # "full" and "format" touch everything (a format conversion needs a
+    # genuinely different structure — a carousel needs slides, a video
+    # needs a video_idea — so it can't keep the old copy or direction).
+    if regen_scope == "hook":
+        # Narrowest level: just the opening line. exact_copy is merged so
+        # the existing caption/hashtags survive untouched, only the headline
+        # — the copy's own expression of the hook — changes with it.
+        fields_to_apply = {
+            "hook": all_candidate_fields["hook"],
+            "exact_copy": {**(item.get("exact_copy") or {}), "headline": (all_candidate_fields["exact_copy"] or {}).get("headline", "")},
+        }
+    elif regen_scope == "copy":
+        fields_to_apply = {k: all_candidate_fields[k] for k in _REGEN_COPY_FIELDS}
+    elif regen_scope == "creative":
+        fields_to_apply = {k: all_candidate_fields[k] for k in _REGEN_CREATIVE_FIELDS}
+        fields_to_apply["creative_direction"] = all_candidate_fields["creative_direction"]
+    else:  # "full" or "format"
+        fields_to_apply = all_candidate_fields
+
+    update_fields = {f"items.$[it].{k}": v for k, v in fields_to_apply.items()}
+    update_fields["items.$[it].format"] = effective_format
+    update_fields["items.$[it].reasoning"] = new_idea.get("reasoning") or item.get("reasoning", "")
+    update_fields["items.$[it].creative_concept_name"] = (
+        new_idea.get("creative_concept_name") or item.get("creative_concept_name", ""))
+    update_fields["items.$[it].regenerated_count"] = item.get("regenerated_count", 0) + 1
+    update_fields["items.$[it].last_regenerated_reason"] = f"manual:{regen_scope}"
+    update_fields["updated_at"] = datetime.utcnow().isoformat()
+
     await db[COLLECTION].update_one(
         {**scope, "plan_id": plan_id},
         {"$set": update_fields, "$push": {"items.$[it].version_history": version_entry}},
         array_filters=[{"it.day_index": item_index}],
     )
+    if regen_scope == "format" and original_format != effective_format:
+        # carousel_slots is a derived summary array at the plan level
+        # (used elsewhere to quickly locate carousel items without
+        # scanning every item) — keep it in sync with the format change.
+        if effective_format == "carousel":
+            await db[COLLECTION].update_one({**scope, "plan_id": plan_id}, {"$addToSet": {"carousel_slots": item_index}})
+        elif original_format == "carousel":
+            await db[COLLECTION].update_one({**scope, "plan_id": plan_id}, {"$pull": {"carousel_slots": item_index}})
     return await db[COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0})
 
 
