@@ -339,6 +339,63 @@ class PaymentService:
             await self._mark_payment_failed(transaction_ref, {"error": str(e)})
             raise Exception(f"Payment gateway connection failed: {str(e)}")
 
+    async def initialize_onebox_payment(
+        self, user_id: str, user_email: str, workspace_id: str, plan: dict
+    ) -> InitializePaymentResponse:
+        """Squad checkout for a Onebox inbox plan, bought for one workspace. One-off like
+        the content plans: it buys a period, and paying again renews it."""
+        amount = int(plan["price_ngn"])
+        if amount < 1:
+            raise ValueError("This plan has no price set.")
+        transaction_ref = f"URI_OBX_{workspace_id[-8:]}_{plan['plan_id'].upper()}_{int(datetime.utcnow().timestamp())}"
+        payment = PaymentTransaction(
+            user_id=user_id, transaction_ref=transaction_ref, amount=amount, currency="NGN",
+            status="pending", gateway="squad", purchase_type="onebox",
+            workspace_id=workspace_id, onebox_plan_id=plan["plan_id"], created_at=datetime.utcnow())
+        await self.payment_transactions_collection.insert_one(payment.dict(exclude_none=True))
+
+        creds = await self._get_squad_credentials()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{creds['api_url']}/transaction/initiate",
+                    json={"email": user_email, "amount": amount * 100, "currency": "NGN",
+                          "initiate_type": "inline", "transaction_ref": transaction_ref,
+                          "callback_url": self.callback_url},
+                    headers={"Authorization": f"Bearer {creds['secret_key']}", "Content-Type": "application/json"},
+                    timeout=30.0)
+            data = response.json()
+        except httpx.RequestError as e:
+            await self._mark_payment_failed(transaction_ref, {"error": str(e)})
+            raise Exception(f"Payment gateway connection failed: {str(e)}")
+        if response.status_code == 200 and data.get("success"):
+            d = data.get("data", {})
+            url = d.get("checkout_url") or d.get("authorization_url")
+            if not url:
+                raise Exception(f"SQUAD response missing checkout_url: {data}")
+            return InitializePaymentResponse(payment_url=url, transaction_ref=transaction_ref, amount=amount,
+                                             email=user_email, currency="NGN", public_key=creds["public_key"])
+        await self._mark_payment_failed(transaction_ref, data)
+        raise Exception(f"SQUAD initialization failed: {data.get('message')}")
+
+    async def _complete_onebox_purchase(self, transaction_ref: str, squad_response: Dict) -> None:
+        """Activate the workspace's Onebox plan. Claimed atomically, like every other
+        completion here, so the poll and the webhook can't both activate it."""
+        payment_doc = await self.payment_transactions_collection.find_one_and_update(
+            {"transaction_ref": transaction_ref, "status": {"$ne": "completed"}},
+            {"$set": {"status": "completed", "completed_at": datetime.utcnow(), "squad_response": squad_response}},
+            return_document=ReturnDocument.BEFORE)
+        if not payment_doc:
+            return
+        from app.agents.inbox import onebox
+        from app.database import get_db
+        db = get_db()
+        plan = next((p for p in await onebox.list_plans(db, include_inactive=True)
+                     if p["plan_id"] == payment_doc.get("onebox_plan_id")), None)
+        if not plan:
+            raise ValueError(f"Onebox plan not found: {payment_doc.get('onebox_plan_id')}")
+        await onebox.activate_plan(db, payment_doc["workspace_id"], plan)
+
     # ==================== Payment Verification ====================
 
     async def verify_payment(self, transaction_ref: str) -> bool:
@@ -382,7 +439,9 @@ class PaymentService:
 
                     if transaction_status == "success":
                         # Payment successful - route by purchase type
-                        if payment_doc.get("purchase_type") == "custom_credits":
+                        if payment_doc.get("purchase_type") == "onebox":
+                            await self._complete_onebox_purchase(transaction_ref, response_data)
+                        elif payment_doc.get("purchase_type") == "custom_credits":
                             await self._complete_custom_credit_purchase(
                                 transaction_ref=transaction_ref,
                                 user_id=payment_doc["user_id"],
@@ -639,7 +698,9 @@ class PaymentService:
 
         # Handle based on status
         if transaction_status == "success":
-            if payment_doc.get("purchase_type") == "custom_credits":
+            if payment_doc.get("purchase_type") == "onebox":
+                await self._complete_onebox_purchase(transaction_ref, payload)
+            elif payment_doc.get("purchase_type") == "custom_credits":
                 await self._complete_custom_credit_purchase(
                     transaction_ref=transaction_ref,
                     user_id=payment_doc["user_id"],
