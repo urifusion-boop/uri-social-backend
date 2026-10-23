@@ -3,8 +3,14 @@ Carousel slide choice outside Create Post.
 
 Customers asked for more than 5 slides and the same control everywhere:
 Upload Content now takes a slide count and a per-slide image choice (like
-Create Post), and both content calendars let the user override the planned
-slide count (2-10, Instagram's carousel limit).
+Create Post), clamped to 2-10 (Instagram's carousel limit) since a manual
+upload is the user's own photos, not an AI-generated plan.
+
+Content Calendar v2's own override is narrower: a business rule (confirmed
+live, Oct 2026) caps every calendar-sourced carousel at 3 slides regardless
+of what the user picks in the Create Draft modal — the plan's own suggested
+count already respected this; only the manual-override path didn't, until
+now.
 """
 import inspect
 
@@ -49,11 +55,11 @@ class TestCalendarSlideOverride:
         assert CreateDraftRequestV2(num_slides=8).num_slides == 8
         assert CreateDraftRequestV2().num_slides is None
 
-    def test_v2_endpoint_lets_user_choice_win_up_to_ten(self):
+    def test_v2_endpoint_clamps_user_choice_to_the_three_slide_business_rule(self):
         from app.agents.content_calendar_v2.routers import content_calendar_v2_router as mod
 
         source = inspect.getsource(mod.create_draft_from_item_v2)
-        assert "planned_slides = max(2, min(10, int(request.num_slides)))" in source
+        assert "planned_slides = max(2, min(3, int(request.num_slides)))" in source
 
 
 if __name__ == "__main__":
