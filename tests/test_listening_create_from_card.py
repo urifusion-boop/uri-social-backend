@@ -1,13 +1,18 @@
 """
 POST /listening/cards/{card_id}/create — PRD §9.3's "Create" deep-link:
 pass a card's evidence-backed brief straight into the content generator
-instead of the owner re-typing it. Scoped to text drafts only; no AI image
-generation or credit deduction here (that stays on the normal Create
-Content flow). Uses an in-memory MongoDB; the AI-backed generation service
-and the Brand Playbook lookup are both stubbed.
+instead of the owner re-typing it. For post/carousel/faq cards this runs
+the SAME pipeline the normal Create Content screen uses — credit gate,
+real carousel slide generation, credit deduction, background AI image
+generation — not a stripped-down text-only shortcut (confirmed live: the
+old shortcut produced a bare-text, non-carousel draft with no image at all
+for a card labelled "Format: carousel"). Uses an in-memory MongoDB; the
+AI-backed generation services, the Brand Playbook lookup, and background
+image generation are all stubbed — this file tests routing/credits/card
+bookkeeping, not real AI output.
 """
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -17,6 +22,8 @@ mongomock_motor = pytest.importorskip("mongomock_motor")
 from fastapi import HTTPException
 
 from app.agents.market_intelligence.listening.router import create_from_card
+from app.services.CreditService import credit_service
+from app.services.TrialService import trial_service
 
 BRAND_ID, USER_ID = "brand-1", "user-1"
 
@@ -33,7 +40,18 @@ def fresh_db():
     return mongomock_motor.AsyncMongoMockClient()["create_from_card_test"]
 
 
-async def _card(db, card_id="c1", platforms=("instagram", "tiktok"), content_id=None, action_type="carousel"):
+@pytest.fixture(autouse=True)
+def _inject_credit_services():
+    """credit_service/trial_service are process-wide singletons that resolve
+    a real DB connection unless a test substitutes one — same pattern as
+    tests/test_credit_service_comp_exhaustion.py. Reset after every test so
+    nothing leaks into an unrelated one (these are module-level globals)."""
+    yield
+    credit_service._db = None
+    trial_service._db = None
+
+
+async def _card(db, card_id="c1", platforms=("instagram", "tiktok"), content_id=None, action_type="post"):
     doc = {
         "id": card_id, "brand_id": BRAND_ID, "market": "hair_wigs:NG", "topic": "latasha wig", "type": "rising",
         "why": "Fits your catalogue.", "observation": "Rising in your market.",
@@ -49,11 +67,22 @@ async def _card(db, card_id="c1", platforms=("instagram", "tiktok"), content_id=
 CTX = {"brand_id": BRAND_ID, "user_id": USER_ID}
 
 _PATCH_PLAYBOOK = patch(
-    "app.agents.market_intelligence.listening.router._playbook", new=AsyncMock(return_value={"brand_name": "WD"})
+    "app.agents.social_media_manager.services.brand_profile_service.BrandProfileService.get",
+    new=AsyncMock(return_value={"status": True, "responseData": {
+        "brand_name": "WD", "brand_colors": ["#000"], "industry": "beauty",
+    }}),
 )
 _PATCH_TO_BRAND_CONTEXT = patch(
     "app.agents.social_media_manager.services.brand_profile_service.BrandProfileService.to_brand_context",
     return_value={"brand_name": "WD"},
+)
+# Real AI image generation is a fire-and-forget asyncio.create_task in
+# production — stubbed in every test so nothing here hits a real image
+# model or Cloudinary, and so dangling background tasks don't outlive the
+# test's own event loop.
+_PATCH_IMAGE_BG = patch(
+    "app.agents.social_media_manager.routers.complete_social_manager._generate_image_bg",
+    new=AsyncMock(),
 )
 
 
@@ -62,17 +91,49 @@ def _ok_generation(draft_ids=("d1", "d2")):
         "status": True,
         "responseData": {
             "request_id": "req-1",
-            "drafts": [{"id": d, "platform": "instagram"} for d in draft_ids],
+            "drafts": [{"id": d, "platform": "instagram", "content": "caption"} for d in draft_ids],
         },
     }
+
+
+def _ok_carousel(draft_ids=("d1",)):
+    return {
+        "status": True,
+        "responseData": {
+            "request_id": "req-carousel-1",
+            "drafts": [
+                {"id": d, "platform": "instagram", "content": "caption",
+                 "slides": [{"headline": "Slide 1", "body": "body 1"}, {"headline": "Slide 2", "body": "body 2"}]}
+                for d in draft_ids
+            ],
+        },
+    }
+
+
+async def _grant_wallet(db, credits_remaining):
+    await db["user_credits"].insert_one({
+        "user_id": USER_ID, "subscription_tier": "starter", "subscription_source": None,
+        "subscription_credits": credits_remaining, "bonus_credits": 0, "credits_used": 0,
+        "total_credits": credits_remaining, "credits_remaining": credits_remaining,
+        "start_date": datetime.utcnow(), "end_date": datetime.utcnow() + timedelta(days=30),
+        "next_renewal": datetime.utcnow() + timedelta(days=30),
+    })
 
 
 class TestCreateFromCard:
     @pytest.mark.asyncio
     async def test_happy_path_generates_drafts_and_updates_the_card(self):
         db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
         await _card(db)
-        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, patch(
+        # The real ContentGenerationService also inserts content_drafts docs
+        # as a side effect — seeded here so create_from_card's own
+        # update_many(has_image=True) has something real to find, matching
+        # what happens with the real (unmocked) service in production.
+        await db["content_drafts"].insert_many([{"id": "d1", "platform": "instagram"},
+                                                 {"id": "d2", "platform": "instagram"}])
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
             "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
             ".generate_multi_platform_content",
             new=AsyncMock(return_value=_ok_generation()),
@@ -90,6 +151,12 @@ class TestCreateFromCard:
         assert card["created_draft_ids"] == ["d1", "d2"]
         action = await db["mi_listen_card_actions"].find_one({"card_id": "c1"})
         assert action["action"] == "created" and action["content_id"] == "d1"
+
+        # Real Create Content pipeline, not the old shortcut: drafts get
+        # has_image flagged so the frontend shimmer shows, same as
+        # generate_content's own behaviour.
+        draft = await db["content_drafts"].find_one({"id": "d1"})
+        assert draft["has_image"] is True
 
     @pytest.mark.asyncio
     async def test_missing_card_is_404(self):
@@ -181,13 +248,13 @@ class TestCreateFromCard:
         assert first["responseData"]["thread"]["thread_id"]
 
     @pytest.mark.asyncio
-    async def test_post_and_faq_actions_still_generate_text_normally(self):
-        # Both route through the same text generator as carousel — only
-        # video/ad_test need their own, not-yet-built generators.
+    async def test_post_and_faq_actions_use_the_plain_text_generator(self):
         for action_type in ("post", "faq"):
             db = fresh_db()
+            credit_service._db = db
+            trial_service._db = db
             await _card(db, action_type=action_type)
-            with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, patch(
+            with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
                 "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
                 ".generate_multi_platform_content",
                 new=AsyncMock(return_value=_ok_generation()),
@@ -196,8 +263,73 @@ class TestCreateFromCard:
             assert result["responseData"]["draft_ids"] == ["d1", "d2"]
 
     @pytest.mark.asyncio
+    async def test_carousel_action_routes_to_the_real_carousel_service(self):
+        # The exact live bug this fixes: a "Format: carousel" card used to
+        # call the plain text generator (no slides, no images) instead of
+        # CarouselGenerationService — confirmed by reading the old code, now
+        # asserted directly so it can't silently regress back to that.
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, action_type="carousel")
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
+            "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
+            ".generate_multi_platform",
+            new=AsyncMock(return_value=_ok_carousel()),
+        ) as mock_carousel, patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(),
+        ) as mock_plain:
+            result = await create_from_card("c1", ctx=CTX, db=db)
+
+        mock_carousel.assert_called_once()
+        mock_plain.assert_not_called()
+        assert mock_carousel.call_args.kwargs["force_num_slides"] is True
+        # The card's own outline has 2 beats -> 2 slides requested (clamped to >=2).
+        assert mock_carousel.call_args.kwargs["num_slides"] == 2
+        assert result["responseData"]["draft_ids"] == ["d1"]
+
+    @pytest.mark.asyncio
+    async def test_insufficient_credits_blocks_generation_with_a_clear_402(self):
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _grant_wallet(db, credits_remaining=0)
+        await _card(db)
+        with patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(),
+        ) as mock_gen:
+            with pytest.raises(HTTPException) as exc:
+                await create_from_card("c1", ctx=CTX, db=db)
+        assert exc.value.status_code == 402
+        mock_gen.assert_not_called()
+        card = await db["mi_listen_cards"].find_one({"id": "c1"})
+        assert card["status"] == "shown" and card["content_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_successful_generation_deducts_a_real_credit(self):
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _grant_wallet(db, credits_remaining=5)
+        await _card(db)
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(return_value=_ok_generation()),
+        ):
+            await create_from_card("c1", ctx=CTX, db=db)
+        wallet = await db["user_credits"].find_one({"user_id": USER_ID})
+        assert wallet["credits_remaining"] == 4
+
+    @pytest.mark.asyncio
     async def test_generation_failure_is_502_and_card_is_left_untouched(self):
         db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
         await _card(db)
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, patch(
             "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
