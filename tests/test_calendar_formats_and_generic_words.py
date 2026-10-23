@@ -170,3 +170,36 @@ def test_plain_words_keeps_case_and_leaves_other_words():
     assert svc._plain_words("Transformation starts here; discovering a seamless flow") == \
         "Change starts here; finding a smooth flow"
     assert svc._plain_words("Book a call") == "Book a call"
+
+
+# ── confirmed live: a real plan shipped "innovative" in its own caption ─────
+# (Oct 2026) — "innovative" was never in GENERIC_AI_WORDS, the only list this
+# scrub checked, even though it's been in CaptionValidatorService.BANNED_WORDS
+# (the draft pipeline's list) the whole time. The plan preview is what a user
+# sees before ever clicking Create Draft, so it needs the same guarantee.
+
+def test_a_word_only_in_the_wider_caption_validator_list_is_still_caught():
+    item = {"title": "Plain", "exact_copy": {
+        "headline": "Plain", "caption": "Break free with Uri Social's innovative solutions."}}
+
+    async def fake(req):
+        import json
+        texts = json.loads(req["messages"][0]["content"].rsplit("\n\n", 1)[1]) if isinstance(req, dict) else {}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content=json.dumps({k: "Break free with Uri Social's smart solutions." for k in texts})))])
+
+    with patch.object(svc.AIService, "build_ai_model", side_effect=lambda **kw: kw), \
+         patch.object(svc.AIService, "chat_completion", side_effect=fake):
+        n = asyncio.run(svc._scrub_generic_words([item]))
+    assert n == 1
+    assert "innovative" not in item["exact_copy"]["caption"].lower()
+
+
+def test_a_word_only_in_the_wider_list_is_caught_even_when_the_model_fails():
+    item = {"title": "Plain", "exact_copy": {
+        "headline": "Plain", "caption": "Our premium, curated, bespoke experience."}}
+    with patch.object(svc.AIService, "build_ai_model", side_effect=lambda **kw: kw), \
+         patch.object(svc.AIService, "chat_completion", side_effect=RuntimeError("down")):
+        asyncio.run(svc._scrub_generic_words([item]))
+    caption = item["exact_copy"]["caption"].lower()
+    assert "premium" not in caption and "curated" not in caption and "bespoke" not in caption
