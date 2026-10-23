@@ -132,10 +132,16 @@ async def regenerate_item_v2_endpoint(
     try:
         updated = await cal_v2_svc.regenerate_item_v2(
             plan_id, item_index, ctx["user_id"], db, brand_id=ctx["brand_id"], reason=request.reason,
+            regen_scope=request.scope, new_format=request.new_format,
         )
         return UriResponse.get_single_data_response("calendar_plan_v2", updated)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        # Bad scope/new_format is a client input error (400), not a missing
+        # plan/item (404) — regenerate_item_v2 validates scope before ever
+        # looking either up, so the message itself tells them apart.
+        msg = str(e)
+        status = 400 if ("scope" in msg or "new_format" in msg) else 404
+        raise HTTPException(status_code=status, detail=msg)
     except Exception as e:
         import traceback
         print(traceback.format_exc())
