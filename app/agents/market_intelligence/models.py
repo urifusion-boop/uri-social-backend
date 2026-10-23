@@ -437,6 +437,14 @@ class CollectionRun(BaseModel):
     # source provider since one scan can span several sources, each with its
     # own run id from the adapter.
     provider_run_ids: dict[str, str] = Field(default_factory=dict)
+    # Live per-source progress (mirrors listening/collector.py's per_query
+    # pattern): seeded all-"pending" the moment the run starts, each entry
+    # independently flipping to "done"/"failed" as that source finishes — so
+    # a client polling GET /scans/{id} sees genuine per-source progress
+    # instead of a single opaque "collecting" status for the whole run.
+    # Each item: {provider, status: pending|collecting|done|failed, items,
+    # cost, error}.
+    per_source: list[dict] = Field(default_factory=list)
 
 
 # ── Action handoff (PRD §13) ────────────────────────────────────────────────────
