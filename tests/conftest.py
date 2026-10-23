@@ -52,3 +52,14 @@ def brand_profile(client, auth_headers):
     )
     assert r.status_code == 200, f"Brand profile setup failed: {r.text}"
     return r.json()
+
+
+@pytest.fixture(autouse=True)
+def _onebox_off_for_other_inbox_tests(request, monkeypatch):
+    """Onebox gating needs a real database's atomic updates; the other inbox suites run
+    against a hand-rolled fake and test their own features. test_inbox_onebox.py turns
+    it on."""
+    name = request.module.__name__
+    if name.startswith("tests.test_inbox") and name != "tests.test_inbox_onebox":
+        from app.agents.inbox import onebox
+        monkeypatch.setattr(onebox, "ENFORCE", False)
