@@ -183,6 +183,16 @@ DESTINATION_OPTIONS: list[dict] = [
 VALUE_FIELD_FOR_TYPE = {o["value"]: o["field"] for o in DESTINATION_OPTIONS}
 
 
+def options_for_platform(tiktok: bool = False) -> list[dict]:
+    """DESTINATION_OPTIONS, minus Instagram DMs when the campaign is running on
+    TikTok — ig.me is a Meta/Instagram deep link, meaningless on a TikTok ad.
+    Every DESTINATION_OPTIONS caller building a picker response should go
+    through this rather than using the raw list directly."""
+    if not tiktok:
+        return list(DESTINATION_OPTIONS)
+    return [o for o in DESTINATION_OPTIONS if o["value"] != DestinationType.INSTAGRAM_DM.value]
+
+
 def cta_choice_list() -> list[dict]:
     """The button options, in the shape a picker renders."""
     return [{"value": k, "label": v[0]} for k, v in CTA_CHOICES.items()]
