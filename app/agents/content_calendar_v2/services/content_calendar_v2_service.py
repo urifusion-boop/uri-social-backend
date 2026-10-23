@@ -501,6 +501,72 @@ async def _listening_candidate_concepts(
     return out
 
 
+# ── Step 3c — Repurposing candidates (PRD §23) ──────────────────────────────
+# No asset-library/repurposing infrastructure exists anywhere in this
+# codebase (confirmed — see _get_existing_assets_summary's docstring above),
+# so there's no literal "founder interview" or "customer testimonial" raw
+# asset to chain the PRD's worked examples from. What IS real and already
+# queryable: this brand's own past APPROVED drafts — genuine content the
+# business already put out, often with real media already generated. PRD
+# §23's actual goal ("recognize when one source can generate multiple
+# pieces... reduces production burden") maps onto that directly: seed a new
+# angle/format this cycle from a real proven post instead of starting from
+# nothing. Same zero-fabrication-risk shape as _listening_candidate_concepts
+# — real text in, nothing invented — which is why it reuses that function's
+# "listening_brief" grounding field rather than inventing a parallel one.
+_REPURPOSE_FORMAT_BY_POST_TYPE = {
+    # The new format this cycle, given what the source post already was —
+    # never repeats the same format back (that's not repurposing, that's
+    # a duplicate), and always something genuinely producible from the
+    # existing media (PRD §17's "production feasibility" factor).
+    "image": "carousel",      # break the same proven idea into steps
+    "carousel": "image",      # distill it to one punchy quote/graphic
+    "video": "carousel",      # turn a video's key moments into a carousel
+}
+_MIN_REPURPOSE_SOURCE_WORDS = 8   # shorter than this isn't real "source material"
+
+
+async def _repurposing_candidate_concepts(
+    db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[str], limit: int = 4,
+) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+    query.update({
+        "approval_status": "approved",
+        "content": {"$exists": True, "$ne": ""},
+        "$or": [{"has_image": True}, {"video_url": {"$exists": True, "$ne": None}}],
+    })
+    out: List[Dict[str, Any]] = []
+    cursor = db["content_drafts"].find(query).sort([("created_at", -1)]).limit(limit * 4)
+    async for draft in cursor:
+        content = str(draft.get("content") or "").strip()
+        if len(content.split()) < _MIN_REPURPOSE_SOURCE_WORDS:
+            continue
+        new_format = _REPURPOSE_FORMAT_BY_POST_TYPE.get(draft.get("post_type") or "image", "image")
+        out.append({
+            "territory": "E_PROOF",
+            "subject": "A proven idea, retold",
+            "angle": "The Comparison" if new_format == "carousel" else "The Unexpected Truth",
+            # Deliberately NOT "story"/"conversational"+"talking_head" —
+            # _assign_format treats those as unconditional video overrides,
+            # which would silently discard new_format below.
+            "creative_device": {"category": "visual", "device": "Repurposed asset"},
+            "format_hint": new_format,
+            "objective": "engagement",
+            "audience_segment": "an audience that already responded to this once",
+            "concept_name": f"Repurposed: {content[:60]}",
+            "series_name": None,
+            "source": "repurposed",
+            "source_draft_id": draft.get("id"),
+            "listening_brief": {
+                "observation": f"A real post this business already published: \"{content[:300]}\"",
+                "hook": None, "outline": None, "cta": None,
+            },
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
 async def _generate_candidate_concepts(
@@ -1833,16 +1899,23 @@ async def _generate_final_copy(
         return str(c.get("format", "image"))
 
     def _listening_line(c: Dict[str, Any]) -> str:
-        # This concept isn't a brainstormed idea — it's a real opportunity
-        # Listening measured in this business's own market (see
-        # _listening_candidate_concepts). Ground the copy in these actual
-        # facts rather than reinventing generic supporting detail; still
-        # write it fresh — these are evidence to build from, not copy verbatim.
+        # This concept isn't a brainstormed idea — it's grounded in something
+        # real: either a Listening opportunity measured in this business's
+        # own market, or a real post this business already published being
+        # repurposed into a new angle/format (PRD §23 — see
+        # _listening_candidate_concepts / _repurposing_candidate_concepts).
+        # Ground the copy in these actual facts rather than reinventing
+        # generic supporting detail; still write it fresh — evidence to
+        # build from, not copy verbatim.
         brief = c.get("listening_brief") or {}
-        if c.get("source") != "listening" or not brief:
+        source = c.get("source")
+        if source not in ("listening", "repurposed") or not brief:
             return ""
-        parts = [f"REAL CUSTOMER EVIDENCE (this is genuinely true, measured in this business's own market — "
-                 f"ground the copy in it): {brief.get('observation', '')}"]
+        label = ("REAL CUSTOMER EVIDENCE (this is genuinely true, measured in this business's own market"
+                 if source == "listening" else
+                 "REAL PAST CONTENT (a post this business actually published before, now being repurposed "
+                 "into a different format/angle — do not contradict it or invent beyond it")
+        parts = [f"{label} — ground the copy in it): {brief.get('observation', '')}"]
         if brief.get("hook"):
             parts.append(f"A hook already considered worth testing: \"{brief['hook']}\"")
         if brief.get("outline"):
@@ -2324,6 +2397,17 @@ async def _build_plan_doc(
     if listening_candidates:
         print(f"[CalendarV2] {len(listening_candidates)} listening-sourced candidate(s) added to the pool", flush=True)
         candidates = candidates + listening_candidates
+
+    # Step 3c — real past content repurposed into a new angle/format this
+    # cycle (PRD §23) — see _repurposing_candidate_concepts's docstring.
+    try:
+        repurposing_candidates = await _repurposing_candidate_concepts(db, user_id, brand_id)
+    except Exception as exc:
+        print(f"[CalendarV2] repurposing candidates skipped ({exc})", flush=True)
+        repurposing_candidates = []
+    if repurposing_candidates:
+        print(f"[CalendarV2] {len(repurposing_candidates)} repurposing candidate(s) added to the pool", flush=True)
+        candidates = candidates + repurposing_candidates
 
     # Step 4 — score (9 named dims, no performance/trend fields — enforced in code)
     scored = await _score_candidates(candidates, brand, framework, creative_memory)
