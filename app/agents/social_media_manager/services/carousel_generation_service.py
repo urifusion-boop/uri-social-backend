@@ -253,10 +253,20 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
 
         try:
             data = await _write()
-            # One rewrite if the carousel breaks the brand's rules, as captions get.
+            # Rewrite while the carousel still breaks the brand's rules, as
+            # captions get — up to 2 attempts, stopping the moment it's clean.
+            # A single retry could still fail to comply (confirmed live: a
+            # rewrite asked to remove "effortless" shipped "effortlessly"
+            # instead) and the old code just kept whichever draft merely had
+            # *fewer* issues, not necessarily zero. More attempts raise the
+            # odds a real rewrite lands clean; brand_brief.enforce() below is
+            # the actual guarantee regardless of how this loop ends.
             issues = _issues(data)
-            if issues:
-                print(f"📊 Carousel breaks Playbook rules: {[i['code'] + ':' + i['detail'] for i in issues]} — rewriting")
+            attempts = 0
+            while issues and attempts < 2:
+                attempts += 1
+                print(f"📊 Carousel breaks Playbook rules (attempt {attempts}): "
+                      f"{[i['code'] + ':' + i['detail'] for i in issues]} — rewriting")
                 try:
                     retry = await _write(
                         "\n\nCORRECTION: your last attempt broke this brand's rules. Write the carousel again "
@@ -265,8 +275,11 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                     retry_issues = _issues(retry)
                     if retry.get("slides") and len(retry_issues) < len(issues):
                         data, issues = retry, retry_issues
+                    else:
+                        break  # no improvement — stop spending retries, fall back to enforce()
                 except Exception as retry_error:
-                    print(f"⚠️ Carousel rewrite failed, keeping the first version: {retry_error}")
+                    print(f"⚠️ Carousel rewrite failed, keeping the last good version: {retry_error}")
+                    break
 
             caption_raw = data.get("caption", "")
             slides_raw = data.get("slides", [])
