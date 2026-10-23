@@ -1337,13 +1337,28 @@ def _scrub_slots(item: Dict[str, Any]):
 
 async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
     """Rewords every text in the plan that still uses a generic AI word.
-    Returns how many texts were changed. Never raises."""
-    from app.agents.social_media_manager.services.brand_brief import find_banned
+    Returns how many texts were changed. Never raises.
+
+    Confirmed live (Oct 2026): a real plan's own stored caption shipped
+    "...Uri Social's innovative solutions" — "innovative" is banned
+    everywhere else (CaptionValidatorService.BANNED_WORDS, the list the
+    draft pipeline enforces with a hard, no-model-involved guarantee via
+    brand_brief.enforce()) but this plan-level scrub only ever checked
+    GENERIC_AI_WORDS, a narrower 20-word list. The user's own priority on
+    this (explicit): these words "should not be seen at all" — not just at
+    draft time, at the plan-preview stage too, since that's what's shown
+    before a draft is ever created. Checks the full union now, and
+    strip_banned_words() is the same zero-model guarantee the draft
+    pipeline already has, applied here as the final backstop."""
+    from app.agents.social_media_manager.services.brand_brief import find_banned, strip_banned_words
+    from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+
+    all_banned_words = list(dict.fromkeys(GENERIC_AI_WORDS + CaptionValidatorService.BANNED_WORDS))
 
     todo = []
     for item in items:
         for get, put in _scrub_slots(item):
-            if find_banned(get(), GENERIC_AI_WORDS):
+            if find_banned(get(), all_banned_words):
                 todo.append((get, put))
     if not todo:
         return 0
@@ -1352,7 +1367,7 @@ async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
         texts = {str(i): get() for i, (get, _) in enumerate(batch)}
         prompt = (
             "Reword each text below so it uses none of these words in any form "
-            f"(\"transforms\", \"discovering\" count too): {', '.join(GENERIC_AI_WORDS)}.\n"
+            f"(\"transforms\", \"discovering\" count too): {', '.join(all_banned_words)}.\n"
             "Say the specific, plain thing instead. Keep the meaning, length, tone, language, "
             "line breaks, emojis and hashtags. Change nothing else.\n\n"
             "Return ONLY valid JSON mapping each id to its reworded text.\n\n"
@@ -1381,8 +1396,15 @@ async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
         for i, (get, put) in enumerate(batch):
             new = out.get(str(i))
             text = new if isinstance(new, str) and new.strip() else get()
-            if find_banned(text, GENERIC_AI_WORDS):
+            if find_banned(text, all_banned_words):
                 text = _plain_words(text)
+            # Absolute guarantee, same as the draft pipeline: whatever the
+            # reword did or didn't catch, no banned word survives this.
+            # GENERIC_AI_WORDS has two entries strip_banned_words()'s own
+            # default list doesn't ("game-changing", "in today's") — pass
+            # them explicitly so the guarantee covers the same union this
+            # function detects on, not a subset of it.
+            text = strip_banned_words(text, GENERIC_AI_WORDS)
             if text != get():
                 put(text)
                 changed += 1
