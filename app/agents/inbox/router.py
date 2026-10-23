@@ -368,8 +368,11 @@ async def list_channels(
         live = True
         if r.get("platform") in ("instagram", "facebook"):
             ext = str(r.get("external_account_id") or "")
+            # Only the connections the inbox links from — an ADS connection to the same
+            # Page doesn't deliver its messages.
             live = bool(await db[SOCIAL_CONNECTIONS].find_one(
-                {"connection_status": "active", "$or": [{"ig_user_id": ext}, {"page_id": ext}]}, {"_id": 1}))
+                {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]},
+                 "$or": [{"ig_user_id": ext}, {"page_id": ext}]}, {"_id": 1}))
         out.append({
             "platform": r.get("platform"),
             "name": r.get("name") or "",
