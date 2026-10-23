@@ -357,9 +357,19 @@ async def list_channels(
 
     out = []
     for r in rows:
-        last = await db[MESSAGES].find({
-            "workspace_id": workspace_id,
-        }).sort("received_at", -1).limit(1).to_list(1)
+        # THIS channel's latest activity — the workspace-wide latest message made a
+        # channel that had received nothing in weeks read "last event 20 hours ago".
+        last_conv = await db[CONVERSATIONS].find(
+            {"workspace_id": workspace_id, "channel_account_id": str(r["_id"])},
+            {"last_activity_at": 1}).sort("last_activity_at", -1).limit(1).to_list(1)
+        # An Instagram/Facebook row is only live while a social connection still backs
+        # it; one left over from an old connection keeps a dead token and an
+        # unsubscribed Page, so its messages never arrive.
+        live = True
+        if r.get("platform") in ("instagram", "facebook"):
+            ext = str(r.get("external_account_id") or "")
+            live = bool(await db[SOCIAL_CONNECTIONS].find_one(
+                {"connection_status": "active", "$or": [{"ig_user_id": ext}, {"page_id": ext}]}, {"_id": 1}))
         out.append({
             "platform": r.get("platform"),
             "name": r.get("name") or "",
@@ -368,7 +378,8 @@ async def list_channels(
             "connected_at": r.get("connected_at"),
             "updated_at": r.get("updated_at"),
             "has_token": bool(r.get("access_token")),
-            "last_event_at": (last[0].get("received_at") if last else None),
+            "last_event_at": (last_conv[0].get("last_activity_at") if last_conv else None),
+            "needs_reconnect": not live,
         })
     return {"channels": out}
 
