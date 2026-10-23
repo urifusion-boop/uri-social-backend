@@ -235,9 +235,17 @@ async def create_draft_from_item_v2(
             or int(item.get("carousel_slide_count") or 3)
         ) if is_carousel else 1
         if is_carousel and request.num_slides:
-            # The user picked their own slide count — it wins over the plan's
-            # 2-5 suggestion. 10 is Instagram's carousel limit.
-            planned_slides = max(2, min(10, int(request.num_slides)))
+            # The user picked their own slide count — it used to win outright
+            # up to Instagram's 10-slide platform limit, which let a calendar
+            # carousel ship with far more slides than the plan's own "never
+            # more than 3" rule (VALIDATION_RULES["carousel_slide_range"] in
+            # creative_framework.py) — the plan's suggested count already
+            # respects that cap; only this user-override path didn't.
+            # Confirmed live: a manually-picked slide count produced a
+            # published carousel well past 3 slides. Clamped to the same
+            # business rule here too, so it can't be bypassed by picking a
+            # bigger number.
+            planned_slides = max(2, min(3, int(request.num_slides)))
         estimated_credits = planned_slides if is_carousel else 1
 
         is_trial_user = await trial_service.has_active_trial(user_id)

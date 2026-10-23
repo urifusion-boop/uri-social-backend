@@ -237,8 +237,19 @@ Write one caption. No alternatives, no meta-commentary.
         """Every word the brand has said never to use (see brand_brief.banned_words)."""
         return brand_brief.banned_words(brand_context)
 
+    # A calendar-sourced idea already IS a roughly 60-word caption (content_
+    # calendar_v2's own MAX_CAPTION_WORDS) — the platform prompts below ask
+    # for 80-300 words and literally say "CONTENT TO TRANSFORM", which reads
+    # as "expand this" to the model. Confirmed live: calendar-generated
+    # posts came out noticeably wordier than the plan's own preview text for
+    # exactly that reason. This caps what the real draft asks for when the
+    # seed is calendar-sourced, instead of the platform's normal range.
+    CALENDAR_SEED_TYPE = "calendar_v2_idea"
+    CALENDAR_MAX_WORDS = 70
+
     @staticmethod
-    def build_caption_prompt(seed_content: str, platform: str, brand_context: Optional[Dict[str, Any]]) -> str:
+    def build_caption_prompt(seed_content: str, platform: str, brand_context: Optional[Dict[str, Any]],
+                             seed_type: str = "text") -> str:
         """The complete prompt a caption is written from. One place, so real
         posts and "Preview Jane's voice" can never drift apart. Order:
           1. Banned patterns (universal)
@@ -250,6 +261,12 @@ Write one caption. No alternatives, no meta-commentary.
         brand_context = brand_brief.for_platform(brand_context, platform)
         brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
         platform_prompt = ContentGenerationService.PLATFORM_PROMPTS[platform].format(seed_content=seed_content)
+        if seed_type == ContentGenerationService.CALENDAR_SEED_TYPE:
+            platform_prompt += (
+                f"\n\nThis idea already came pre-written and concise — do not expand or pad it into a "
+                f"longer post. Write roughly {ContentGenerationService.CALENDAR_MAX_WORDS} words or fewer, "
+                "ignoring any longer word range suggested above for this platform."
+            )
         voice_instructions = ""
         if brand_context and brand_context.get("voice_profile"):
             voice_profile = dict(brand_context["voice_profile"])
@@ -690,7 +707,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         generation_tasks = []
         for platform in valid_platforms:
             task = ContentGenerationService._generate_platform_content(
-                platform, enriched_seed_content, request_id, user_id, brand_context
+                platform, enriched_seed_content, request_id, user_id, brand_context, seed_type=seed_type
             )
             generation_tasks.append(task)
         
@@ -801,6 +818,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         request_id: str,
         user_id: str,
         brand_context: Optional[Dict[str, Any]] = None,
+        seed_type: str = "text",
     ) -> Dict[str, Any]:
         """
         Generate content for a specific platform using your existing AIService
@@ -814,7 +832,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         brand_context = brand_brief.for_platform(brand_context, platform)
         try:
             # Get platform-specific prompt
-            prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context)
+            prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context, seed_type)
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
@@ -846,10 +864,13 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
             is_thread = platform in ("twitter", "x")
             # Everything the writer was given — a statistic that isn't in here was invented.
             sources = f"{seed_content}\n{json.dumps(brand_context or {}, default=str, ensure_ascii=False)}"
+            max_words = (ContentGenerationService.CALENDAR_MAX_WORDS
+                        if seed_type == ContentGenerationService.CALENDAR_SEED_TYPE else None)
 
             def _check(text: str):
                 style = CaptionValidatorService.validate_caption(
-                    ContentGenerationService._for_validation(text, platform), custom_banned_words)
+                    ContentGenerationService._for_validation(text, platform), custom_banned_words,
+                    max_words=max_words)
                 if is_thread:
                     # A thread is laid out as tweets, not as one phone-screen caption.
                     kept = [i for i in style["issues"] if i not in ("wall_of_text", "insufficient_line_breaks")]
