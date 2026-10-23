@@ -736,6 +736,15 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
                     messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=1.0,
                 )
                 response = await AIService.chat_completion(ai_request)
+                # Confirmed live (Oct 2026): AIService.chat_completion returns a
+                # plain {"error": "..."} dict on failure (auth/rate-limit/quota),
+                # not an exception or a normal response object — without this
+                # check, the real error gets masked behind a useless
+                # "'dict' object has no attribute 'choices'", which was the
+                # actual cause of "no candidate concepts produced" shipping
+                # with zero diagnostic value for a real, live failure.
+                if isinstance(response, dict) and response.get("error"):
+                    raise ValueError(response["error"])
                 raw = response.choices[0].message.content.strip()
                 if raw.startswith("```"):
                     raw = raw.split("```")[1]
@@ -833,6 +842,8 @@ Return ONLY a valid JSON array of exactly {len(chunk)} objects, index-aligned
                 messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
             )
             response = await AIService.chat_completion(ai_request)
+            if isinstance(response, dict) and response.get("error"):
+                raise ValueError(response["error"])
             raw = response.choices[0].message.content.strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
@@ -1309,6 +1320,8 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
             temperature=0.8,
         )
         response = await AIService.chat_completion(ai_request)
+        if isinstance(response, dict) and response.get("error"):
+            raise ValueError(response["error"])
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -1444,6 +1457,8 @@ async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
                 messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
             )
             response = await AIService.chat_completion(ai_request)
+            if isinstance(response, dict) and response.get("error"):
+                raise ValueError(response["error"])
             raw = response.choices[0].message.content.strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
@@ -1598,6 +1613,8 @@ qualify. Be conservative — only flag a clear case, not a borderline one.
             messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.3,
         )
         response = await AIService.chat_completion(ai_request)
+        if isinstance(response, dict) and response.get("error"):
+            raise ValueError(response["error"])
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
