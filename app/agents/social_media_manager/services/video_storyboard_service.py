@@ -227,6 +227,10 @@ def _frame_jobs_collection():
     return get_db()["storyboard_frame_jobs"]
 
 
+def _storyboard_jobs_collection():
+    return get_db()["storyboard_jobs"]
+
+
 class VideoStoryboardService:
 
     @staticmethod
@@ -506,3 +510,56 @@ class VideoStoryboardService:
             return {"status": False, "error": "Failed to parse storyboard from model response."}
 
         return {"status": True, "storyboard": storyboard}
+
+    # ── Job wrapper around generate_storyboard above — this step was a plain
+    #    blocking request-response (unlike frame/video generation, already
+    #    job_id+background_tasks based), so a refresh while it was still running
+    #    lost the in-flight work entirely, with nothing to resume. Same shape as
+    #    VideoCreativeService's create_storyboard_job/run_storyboard_job (the
+    #    "Describe It" flow's equivalent fix), own Mongo collection since a
+    #    storyboard-generation job and a frame-generation job are different
+    #    things with different lifetimes. ──
+
+    @staticmethod
+    async def create_storyboard_job() -> str:
+        job_id = uuid.uuid4().hex
+        await _storyboard_jobs_collection().insert_one({
+            "job_id": job_id,
+            "status": "generating",
+            "storyboard": None,
+            "error": None,
+        })
+        return job_id
+
+    @staticmethod
+    async def run_storyboard_job(
+        job_id: str,
+        brand_images: List[str],
+        optional_text: Optional[str],
+        brand_context: Dict[str, Any],
+        target_platform: str = "instagram_reels",
+        target_duration_seconds: int = 15,
+        video_style: Optional[str] = "clean_commercial",
+    ) -> None:
+        result = await VideoStoryboardService.generate_storyboard(
+            brand_images=brand_images,
+            optional_text=optional_text,
+            brand_context=brand_context,
+            target_platform=target_platform,
+            target_duration_seconds=target_duration_seconds,
+            video_style=video_style,
+        )
+        if result.get("status"):
+            await _storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "complete", "storyboard": result["storyboard"]}},
+            )
+        else:
+            await _storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "failed", "error": result.get("error", "Storyboard generation failed")}},
+            )
+
+    @staticmethod
+    async def get_storyboard_job(job_id: str) -> Optional[Dict[str, Any]]:
+        return await _storyboard_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
