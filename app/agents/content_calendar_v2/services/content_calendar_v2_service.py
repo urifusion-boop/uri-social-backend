@@ -1709,6 +1709,26 @@ def _generic_words_used(idea: Dict[str, Any]) -> List[str]:
     return [str(w) for w in find_banned(_reader_text(idea), GENERIC_AI_WORDS)]
 
 
+def _fabricated_claims_used(idea: Dict[str, Any], brand: Dict[str, Any]) -> List[str]:
+    """PRD §31 — must never fabricate a statistic, named testimonial/citation,
+    price, discount, or guarantee. Until now this was prompt-only
+    (_generate_final_copy's "never fabricate... write around missing
+    specifics" instruction) — the same risk class the banned-word list was
+    before brand_brief.enforce() existed: an instruction a model can still
+    miss under pressure to hit everything else asked of it, not a guarantee.
+    Reuses the exact deterministic detector single-post generation already
+    relies on in production (unverified_numbers/unverified_sources), checked
+    against everything the writer actually had available: the brand profile
+    itself (so a real price_range or business_pulse figure isn't flagged)
+    plus any real Listening evidence attached to this specific item."""
+    from app.agents.social_media_manager.services.brand_brief import unverified_numbers, unverified_sources
+    text = _reader_text(idea)
+    sources = (json.dumps(brand, default=str, ensure_ascii=False) + " "
+               + json.dumps(idea.get("listening_brief") or {}, default=str, ensure_ascii=False))
+    return [f'number: "{p}"' for p in unverified_numbers(text, sources)] + \
+           [f'citation: "{s}"' for s in unverified_sources(text, sources)]
+
+
 def _validate_item_v2(
     idea: Dict[str, Any],
     is_carousel: bool,
@@ -2383,9 +2403,13 @@ async def _build_plan_doc(
     # Items that still use a generic AI word after the per-chunk retry get the
     # regeneration pass too, rather than shipping with only a warning.
     generic_flagged = [it.get("day_index") for it in all_items if _generic_words_used(it)]
-    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged) | set(generic_flagged))
+    # PRD §31 hard rule — a fabricated stat/testimonial/citation is not a
+    # style problem to warn about, it's a false claim; it gets the same
+    # forced regeneration as everything else here, never a shrug.
+    fabrication_flagged = [it.get("day_index") for it in all_items if _fabricated_claims_used(it, brand)]
+    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged) | set(generic_flagged) | set(fabrication_flagged))
     print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration "
-          f"({len(generic_flagged)} for generic words)", flush=True)
+          f"({len(generic_flagged)} for generic words, {len(fabrication_flagged)} for possibly-fabricated claims)", flush=True)
 
     # Step 12 — regenerate flagged items only, one bounded pass
     regenerated_day_indices: set = set()
