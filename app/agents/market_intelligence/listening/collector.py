@@ -29,10 +29,17 @@ def month_start(now: datetime) -> datetime:
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
-async def spent_this_month(db, now: Optional[datetime] = None) -> float:
+async def spent_this_month(db, now: Optional[datetime] = None, source: Optional[str] = None) -> float:
+    """Total listening spend this month — across every source by default, or
+    scoped to one source when given (Phase A Step 6: a per-source budget
+    check alongside the existing global ceiling, so one newly-approved
+    source can't quietly eat the whole market's budget on its own)."""
     now = now or datetime.utcnow()
+    q: dict = {"started_at": {"$gte": month_start(now)}}
+    if source:
+        q["source"] = source
     total = 0.0
-    async for r in db["mi_listen_runs"].find({"started_at": {"$gte": month_start(now)}}, {"cost_usd": 1}):
+    async for r in db["mi_listen_runs"].find(q, {"cost_usd": 1}):
         total += float(r.get("cost_usd") or 0)
     return total
 
@@ -85,18 +92,24 @@ async def _one_query(adapter, q: dict, excluded: list[str], since: datetime, unt
     return out
 
 
-async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[datetime] = None) -> dict:
-    """Collect one market once. Returns the run record."""
+async def collect_market(db, market: dict, cfg: dict, adapter, source: str, now: Optional[datetime] = None) -> dict:
+    """Collect one market from one source once. Returns the run record.
+
+    `source` is explicit (Phase A Step 5) rather than read from cfg["source"]
+    — the caller (cycle.py) now loops over every approved source for this
+    market, calling this once per (market, source) pair, each producing its
+    own run doc. Everything below that used to read cfg["source"] now uses
+    this parameter instead; cfg itself stays source-agnostic."""
     now = now or datetime.utcnow()
-    run = {"id": str(uuid.uuid4()), "market": market["key"], "source": cfg["source"], "started_at": now,
+    run = {"id": str(uuid.uuid4()), "market": market["key"], "source": source, "started_at": now,
            "status": "running", "cost_usd": 0.0}
 
     # §15: "each connector has a permission record... approved before
     # production use." Not a policy statement someone has to remember to
     # check — a source with no approved record simply never collects.
-    if not await permissions.is_approved(db, cfg["source"]):
+    if not await permissions.is_approved(db, source):
         run.update(status="blocked_unapproved_source",
-                   note=f"source '{cfg['source']}' has no approved permission record (PRD §15)", finished_at=now)
+                   note=f"source '{source}' has no approved permission record (PRD §15)", finished_at=now)
         await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
         return run
 
@@ -107,6 +120,20 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
         await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
         return run
 
+    # A per-source sub-budget (optional, cfg["source_budgets"]) stops one
+    # newly-approved source from quietly spending the whole market's global
+    # budget and starving the others — the global ceiling above still
+    # applies regardless, this is an additional, tighter cap when set.
+    source_cap = (cfg.get("source_budgets") or {}).get(source)
+    if source_cap is not None:
+        source_spent = await spent_this_month(db, now, source=source)
+        if source_spent >= source_cap:
+            run.update(status="skipped_budget",
+                       note=f"'{source}' monthly budget reached (${source_spent:.2f} of ${source_cap:.2f})",
+                       finished_at=now)
+            await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
+            return run
+
     category = await ontology.category(db, market["category_id"])
     if not category:
         run.update(status="failed", note=f"unknown category {market['category_id']}", finished_at=now)
@@ -114,7 +141,7 @@ async def collect_market(db, market: dict, cfg: dict, adapter, now: Optional[dat
         return run
     patterns = await ontology.intent_patterns(db)
     plan = markets.compile_queries(category, market["country"], patterns, market.get("learned_terms") or [],
-                                   cfg["max_queries_per_market"])
+                                   cfg["max_queries_per_market"], source=source)
 
     # A market collected under older collection rules is backfilled again, so
     # its history is consistent with how it is counted now.

@@ -159,6 +159,25 @@ async def thread_history(db, brand_id: str, thread_id: str) -> list[dict]:
     return await cur.to_list(length=500)
 
 
+def seed_message_from_card(card: dict) -> str:
+    """Same idea as seed_message_from_campaign, but for a Listening
+    "ad_test" card (PRD §9.3: "Alternatives... a proposed ad test, draft
+    only, requires approval") instead of a past launched campaign — a
+    plain-English brief built from the card's own evidence-backed action,
+    so a thread started from "Propose this as an ad" opens already primed
+    with the real angle instead of a blank "what do you want to advertise?"
+    Nothing here plans, drafts creative or launches anything — it only
+    seeds the first message of an ordinary draft thread the owner then
+    drives through Jane Ads exactly as if they'd typed it themselves."""
+    action = card.get("action") or {}
+    parts = [action.get("title") or f"Run an ad about {card.get('topic_name') or card.get('topic')}"]
+    if action.get("hook"):
+        parts.append(f"angle: {action['hook']}")
+    if action.get("cta"):
+        parts.append(f"goal: {action['cta']}")
+    return ". ".join(p for p in parts if p)
+
+
 def seed_message_from_campaign(camp: dict) -> str:
     """Rebuild a plain-English brief from a launched campaign's stored fields, so a
     duplicated thread starts pre-filled and the user only tweaks what they want. Mirrors

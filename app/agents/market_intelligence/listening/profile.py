@@ -132,6 +132,35 @@ async def _map(db, facts: dict) -> tuple[list[str], Optional[str]]:
     return ids, country or (code if len(code) == 2 or code == "GLOBAL" else None)
 
 
+PLAN_TIER_FALLBACK = "default"
+
+
+async def effective_plan_tier(db, user_id: str, brand_id: str) -> str:
+    """Which plan tier governs this brand's listening cadence and alert
+    budget (PRD §5, §21 open decision #8). An agency-owned brand uses its
+    agency's plan_tier; a solo user's own subscription_tier otherwise —
+    checked in that order since an agency-owned brand has no wallet of its
+    own to read. Neither answering (never subscribed, or a lookup failing)
+    falls back to config.py's plan_tiers["default"] rather than guessing a
+    specific tier, which is the same "no behaviour change by default" value
+    every named tier already starts at."""
+    try:
+        from app.services.AgencyService import AgencyService
+        agency = await AgencyService.get_agency_for_brand(brand_id, db)
+        if agency and agency.plan_tier:
+            return agency.plan_tier
+    except Exception as e:
+        print(f"[MI][listen] agency plan tier lookup failed for brand {brand_id}: {e}")
+    try:
+        from app.services.CreditService import credit_service
+        wallet = await credit_service.get_user_wallet(user_id)
+        if wallet and wallet.subscription_tier:
+            return wallet.subscription_tier
+    except Exception as e:
+        print(f"[MI][listen] user plan tier lookup failed for user {user_id}: {e}")
+    return PLAN_TIER_FALLBACK
+
+
 async def build(db, user_id: str, brand_id: str, playbook: dict, force: bool = False) -> Optional[dict]:
     """Create or refresh this business's listening profile and market
     subscriptions. Returns None when the Playbook doesn't say what it sells."""

@@ -12,21 +12,81 @@ production source as of the pilot (§19 Phase 0), so seeding them here on
 first boot is recording a decision already made, not making a new one. A
 new source added later starts unapproved until someone explicitly
 approves it — collection for it simply won't run until they do.
+
+TikTok, Instagram, YouTube, Reddit and News (added when the module grew
+past X-only) are seeded here specifically so they're *visible* as rows in
+the admin Sources tab with their real caveats attached, rather than being
+invisible until someone already knows the exact source key to approve —
+but every one of them ships with `approved: False`. Each adapter's own
+module docstring explains why: actor ids/pricing/field mappings were
+researched against the live Apify Store, not run and confirmed, so each
+needs one real small test scan reviewed by an admin before approval is
+anything but a guess.
 """
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional
 
+_X_TERMS = "https://developer.x.com/en/developer-terms/agreement-and-policy"
+_ALLOWED_USE = ["evidence_display", "aggregate_counts", "classification"]
+_DISPLAY_RULES = {"max_excerpt_chars": 280, "require_link": True, "require_attribution": True}
+
 _SEED = [
-    {"source": "x", "terms_url": "https://developer.x.com/en/developer-terms/agreement-and-policy",
-     "allowed_use": ["evidence_display", "aggregate_counts", "classification"], "retention_days": 90,
-     "display_rules": {"max_excerpt_chars": 280, "require_link": True, "require_attribution": True},
-     "approved": True, "approved_by": "pilot-default", "notes": "Apify test actor, pilot scale."},
-    {"source": "x_pro", "terms_url": "https://developer.x.com/en/developer-terms/agreement-and-policy",
-     "allowed_use": ["evidence_display", "aggregate_counts", "classification"], "retention_days": 90,
-     "display_rules": {"max_excerpt_chars": 280, "require_link": True, "require_attribution": True},
-     "approved": True, "approved_by": "pilot-default", "notes": "Apify production actor."},
+    {"source": "x", "terms_url": _X_TERMS, "allowed_use": _ALLOWED_USE, "retention_days": 90,
+     "display_rules": _DISPLAY_RULES, "approved": True, "approved_by": "pilot-default",
+     "notes": "Apify test actor, pilot scale."},
+    {"source": "x_pro", "terms_url": _X_TERMS, "allowed_use": _ALLOWED_USE, "retention_days": 90,
+     "display_rules": _DISPLAY_RULES, "approved": True, "approved_by": "pilot-default",
+     "notes": "Apify production actor."},
+    {"source": "tiktok", "terms_url": "https://www.tiktok.com/legal/page/global/terms-of-service/en",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor apidojo~tiktok-scraper — unverified, needs one real test scan before approval."},
+    {"source": "tiktok_pro", "terms_url": "https://www.tiktok.com/legal/page/global/terms-of-service/en",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor clockworks~tiktok-scraper — unverified, needs one real test scan before approval."},
+    {"source": "instagram", "terms_url": "https://help.instagram.com/581066165581870",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor apify~instagram-hashtag-scraper, test cap — unverified, needs one real test scan "
+              "before approval."},
+    {"source": "instagram_pro", "terms_url": "https://help.instagram.com/581066165581870",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor apify~instagram-hashtag-scraper, higher cap — unverified, needs one real test scan "
+              "before approval."},
+    {"source": "youtube", "terms_url": "https://www.youtube.com/t/terms",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor automation-lab~youtube-scraper, test cap — unverified, needs one real test scan "
+              "before approval."},
+    {"source": "youtube_pro", "terms_url": "https://www.youtube.com/t/terms",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor automation-lab~youtube-scraper, higher comment cap — unverified, needs one real "
+              "test scan before approval."},
+    {"source": "reddit", "terms_url": "https://www.redditinc.com/policies/user-agreement",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor clearpath~reddit-search-scraper, test cap — unverified, needs one real test scan "
+              "before approval."},
+    {"source": "reddit_pro", "terms_url": "https://www.redditinc.com/policies/user-agreement",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor clearpath~reddit-search-scraper, higher cap — unverified, needs one real test scan "
+              "before approval."},
+    {"source": "news", "terms_url": "https://policies.google.com/terms",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor cleanscrape~google-news-scraper, test cap — unverified, needs one real test scan "
+              "before approval."},
+    {"source": "news_pro", "terms_url": "https://policies.google.com/terms",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor cleanscrape~google-news-scraper, higher cap — unverified, needs one real test scan "
+              "before approval."},
 ]
 
 DEFAULT_DISPLAY_RULES = {"max_excerpt_chars": 280, "require_link": True, "require_attribution": True}
