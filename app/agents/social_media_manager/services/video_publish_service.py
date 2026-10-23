@@ -97,6 +97,52 @@ class VideoPublishService:
                 {"$set": {"status": "failed", "error": str(e)}},
             )
 
+    @staticmethod
+    async def run_tiktok_photo_job(
+        job_id: str,
+        draft_id: str,
+        image_urls: list,
+        conn: Dict[str, Any],
+        db,
+        tiktok_settings,
+        auto_add_music: bool = False,
+    ) -> None:
+        """Direct-posts an image / carousel draft to TikTok, recording progress on
+        the same job document the video flow uses, so the frontend polls both
+        through /video-publish-job/{job_id}."""
+        from app.agents.social_media_manager.services.tiktok_direct_service import (
+            get_valid_tiktok_access_token,
+            publish_tiktok_photo_direct,
+        )
+
+        col = _jobs_col()
+        try:
+            await col.update_one({"job_id": job_id}, {"$set": {"status": "uploading"}})
+            access_token = await get_valid_tiktok_access_token(db, conn)
+            publish_id, status = await publish_tiktok_photo_direct(
+                access_token, image_urls, tiktok_settings, auto_add_music
+            )
+            print(f"✅ TikTok direct photo publish: publish_id={publish_id} status={status}")
+
+            await col.update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "published", "platform_post_id": publish_id, "post_url": None}},
+            )
+            await db["content_drafts"].update_one(
+                {"id": draft_id},
+                {"$set": {
+                    "status": "published",
+                    "platform_post_id": publish_id,
+                    "published_date": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+        except Exception as e:
+            print(f"[TikTokPhotoPublish {job_id}] failed: {e}")
+            await col.update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "failed", "error": str(e)}},
+            )
+
     # ── Instagram Reels ───────────────────────────────────────────────────────
 
     @staticmethod

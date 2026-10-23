@@ -187,6 +187,9 @@ async def fetch_creator_info(access_token: str) -> dict:
 
 # TikTok's cap on post_info.title for video posts.
 _MAX_TITLE_LENGTH = 2200
+# Photo posts have tighter text limits than video: title 90, description 4000.
+_MAX_PHOTO_TITLE_LENGTH = 90
+_MAX_PHOTO_DESCRIPTION_LENGTH = 4000
 
 
 @dataclass
@@ -204,12 +207,17 @@ class TikTokPostSettings:
     # partnership). Both off means no disclosure.
     brand_organic: bool = False
     brand_content: bool = False
+    # Photo posts only: the caption shown under the photo(s). Video posts carry
+    # their text in `title`.
+    description: str = ""
 
 
-def _validate_settings(settings_: TikTokPostSettings, creator_info: dict) -> None:
+def _validate_settings(settings_: TikTokPostSettings, creator_info: dict, photo: bool = False) -> None:
     """Server-side re-check of what the UI already enforces, so a crafted
     request can't post with a privacy level the creator doesn't offer or
-    turn on an interaction the creator disabled in their TikTok settings."""
+    turn on an interaction the creator disabled in their TikTok settings.
+    photo=True applies the photo-post rules: shorter title, a description
+    limit, and no Duet/Stitch (they don't apply to photos)."""
     options = creator_info.get("privacy_level_options") or []
     if not options:
         raise TikTokDirectAPIError(
@@ -223,8 +231,15 @@ def _validate_settings(settings_: TikTokPostSettings, creator_info: dict) -> Non
     # brand" (Promotional content) on its own may still be Only me.
     if settings_.brand_content and settings_.privacy_level == "SELF_ONLY":
         raise TikTokDirectAPIError("Branded content visibility cannot be set to private.")
-    if len(settings_.title or "") > _MAX_TITLE_LENGTH:
-        raise TikTokDirectAPIError(f"Title is too long (max {_MAX_TITLE_LENGTH} characters).")
+    max_title = _MAX_PHOTO_TITLE_LENGTH if photo else _MAX_TITLE_LENGTH
+    if len(settings_.title or "") > max_title:
+        raise TikTokDirectAPIError(f"Title is too long (max {max_title} characters).")
+    if photo and len(settings_.description or "") > _MAX_PHOTO_DESCRIPTION_LENGTH:
+        raise TikTokDirectAPIError(
+            f"Description is too long (max {_MAX_PHOTO_DESCRIPTION_LENGTH} characters)."
+        )
+    if photo and (settings_.allow_duet or settings_.allow_stitch):
+        raise TikTokDirectAPIError("Duet and Stitch don't apply to photo posts.")
     if settings_.allow_comment and creator_info.get("comment_disabled"):
         raise TikTokDirectAPIError("Comments are disabled in this creator's TikTok settings.")
     if settings_.allow_duet and creator_info.get("duet_disabled"):
@@ -338,11 +353,17 @@ async def publish_tiktok_direct(
                     f"chunk {i + 1}/{total_chunks} upload failed: HTTP {put_resp.status_code} {put_resp.text[:300]}"
                 )
 
-    # Poll publish status until it settles. Endpoint path per TikTok's Content
-    # Posting API reference — third-party sources disagree on the exact path,
-    # so this needs confirming against a live account before this is fully
-    # trusted (see module docstring).
+    return await _wait_for_publish(access_token, publish_id)
+
+
+async def _wait_for_publish(access_token: str, publish_id: str) -> tuple[str, str]:
+    """Poll publish status until it settles. Endpoint path per TikTok's Content
+    Posting API reference — third-party sources disagree on the exact path,
+    so this needs confirming against a live account before this is fully
+    trusted (see module docstring). TikTok's own guidelines ask that users be
+    able to see the status of their post, which the caller surfaces."""
     status = "PROCESSING_DOWNLOAD"
+    fail_reason = ""
     async with httpx.AsyncClient(timeout=30) as client:
         for _ in range(30):  # ~2.5 min max at 5s intervals
             status_resp = await client.post(
@@ -352,12 +373,68 @@ async def publish_tiktok_direct(
             )
             status_data = status_resp.json()
             _raise_for_error(status_data, "publish status")
-            status = (status_data.get("data") or {}).get("status", status)
+            inner = status_data.get("data") or {}
+            status = inner.get("status", status)
+            fail_reason = inner.get("fail_reason") or fail_reason
             if status in ("PUBLISH_COMPLETE", "FAILED"):
                 break
             await asyncio.sleep(5)
 
     if status == "FAILED":
-        raise TikTokDirectAPIError(f"TikTok reported publish failure for publish_id={publish_id}")
+        detail = f": {fail_reason}" if fail_reason else ""
+        raise TikTokDirectAPIError(f"TikTok reported publish failure for publish_id={publish_id}{detail}")
 
     return publish_id, status
+
+
+async def publish_tiktok_photo_direct(
+    access_token: str,
+    image_urls: list[str],
+    settings_: TikTokPostSettings,
+    auto_add_music: bool = False,
+) -> tuple[str, str]:
+    """Direct-posts a photo (single image or carousel) via the Content Posting
+    API's photo endpoint. Unlike video there is no file upload for photos —
+    TikTok pulls each image from a URL, and that URL must sit under a prefix
+    verified in the Developer Portal (otherwise url_ownership_unverified), which
+    is why callers hand this signed URLs from our own API, not Cloudinary's.
+
+    Returns (publish_id, status); raises TikTokDirectAPIError on any failure."""
+    if not image_urls:
+        raise TikTokDirectAPIError("No images to post.")
+    creator_info = await _fetch_creator_info(access_token)
+    _validate_settings(settings_, creator_info, photo=True)
+
+    post_info = {
+        "title": settings_.title or "",
+        "description": settings_.description or "",
+        "privacy_level": settings_.privacy_level,
+        "disable_comment": not settings_.allow_comment,
+        "auto_add_music": bool(auto_add_music),
+    }
+    if settings_.brand_organic or settings_.brand_content:
+        post_info["brand_organic_toggle"] = settings_.brand_organic
+        post_info["brand_content_toggle"] = settings_.brand_content
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{_API_BASE}/post/publish/content/init/",
+            headers=_headers(access_token),
+            json={
+                "media_type": "PHOTO",
+                "post_mode": "DIRECT_POST",
+                "post_info": post_info,
+                "source_info": {
+                    "source": "PULL_FROM_URL",
+                    "photo_cover_index": 0,
+                    "photo_images": image_urls,
+                },
+            },
+        )
+    data = resp.json()
+    _raise_for_error(data, "photo init")
+    publish_id = (data.get("data") or {}).get("publish_id")
+    if not publish_id:
+        raise TikTokDirectAPIError(f"photo init did not return a publish_id: {data}")
+
+    return await _wait_for_publish(access_token, publish_id)
