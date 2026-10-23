@@ -2219,7 +2219,7 @@ async def tiktok_test_launch(
     return {
         "campaign_id": result.campaign_id,
         "ad_ids": result.ad_ids,
-        "note": "Created DISABLE (paused) — zero spend. Review and activate it yourself in TikTok Ads Manager if you want it live.",
+        "note": "Created DISABLE (paused) — zero spend. Review and activate it from Campaign Manager if you want it live.",
         "ads_manager_url": f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}",
     }
 
@@ -2873,7 +2873,7 @@ async def _build_campaign_plan(
     # unrelated "sporteinstein.com" left over from an earlier campaign.
     if req.goal != Goal.FOLLOWERS and requested_destination not in ("", "ask"):
         from .destination import (
-            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
+            VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform, set_brand_destination,
         )
 
         def _early_destination_error(error: str) -> dict:
@@ -2886,7 +2886,7 @@ async def _build_campaign_plan(
                 "question": "Where should people who tap your ad end up?",
                 "destination_options": [
                     {**opt, "current": brand_destination.get(opt["field"], "")}
-                    for opt in DESTINATION_OPTIONS
+                    for opt in options_for_platform(tiktok_preferred)
                 ],
                 "cta_choices": cta_choice_list(),
                 "selected": {
@@ -3242,7 +3242,7 @@ async def _build_campaign_plan(
         and await destination_already_answered(db, brand_ctx.get("brand_id"), body.thread_id)
     )
     if req.goal != Goal.FOLLOWERS and not destination_settled:
-        from .destination import DESTINATION_OPTIONS, cta_choice_list
+        from .destination import cta_choice_list, options_for_platform
 
         def _destination_prompt(error: str = "") -> dict:
             return {"early_return": {
@@ -3253,7 +3253,7 @@ async def _build_campaign_plan(
                 # retypes their own number to change only the button.
                 "destination_options": [
                     {**opt, "current": brand_destination.get(opt["field"], "")}
-                    for opt in DESTINATION_OPTIONS
+                    for opt in options_for_platform(tiktok_preferred)
                 ],
                 "cta_choices": cta_choice_list(),
                 "selected": {
@@ -3810,7 +3810,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     )
 
     launch_note = (
-        "Created DISABLE (paused) — zero spend. Review and activate in TikTok Ads Manager to go live."
+        "Created DISABLE (paused) — zero spend. Review and activate from Campaign Manager to go live."
         if is_tiktok else
         "Created PAUSED — zero spend. Review and activate in Ads Manager to go live."
     )
@@ -4594,7 +4594,17 @@ async def meta_campaigns(
             # destinations existed carry neither field and were all WhatsApp.
             "destination_type": r.get("destination_type") or "whatsapp",
             "destination_link": r.get("destination_link") or "",
-            "status": "paused",   # everything is created PAUSED (Meta) / DISABLE (TikTok) for now
+            # Real last-known state (see the toggle endpoint below, which persists
+            # this on every activate/pause) — "paused" only as the default for a
+            # campaign that's never been toggled, which really is accurate: every
+            # campaign is created PAUSED (Meta) / DISABLE (TikTok). This is the
+            # fallback when with_metrics is off or a live delivery read fails below;
+            # "status" used to be hardcoded to "paused" unconditionally, which kept
+            # showing a PAUSED badge and the wrong play/pause icon on a campaign
+            # that WAS actually running, whenever the live metrics fetch for that
+            # row didn't come back (e.g. the whole class of TikTok reporting
+            # failures fixed in the commit right before this one).
+            "status": r.get("status", "paused"),
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
             "ads_manager_url": (
                 google_flow.ads_url(r.get("customer_id", "")) if is_google else
@@ -5603,9 +5613,19 @@ async def set_meta_campaign_status(
             raise HTTPException(status_code=400, detail="TikTok ads not configured")
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
         try:
-            return await adapter.set_delivery(campaign_id, body.active)
+            result = await adapter.set_delivery(campaign_id, body.active)
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
+        # Persist the new state — /meta/campaigns' own "status" field used to be a
+        # hardcoded "paused" literal for every campaign regardless of this call ever
+        # succeeding (live-confirmed: an activated TikTok campaign kept showing a
+        # PAUSED badge and a play, not pause, button). That endpoint falls back to
+        # this stored value only when a live metrics fetch doesn't return a real
+        # delivery status, so it needs to actually reflect the last thing WE did.
+        await db["jane_ads_tiktok_campaigns"].update_one(
+            {"campaign_id": campaign_id}, {"$set": {"status": "active" if body.active else "paused"}}
+        )
+        return result
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured")
@@ -5627,6 +5647,12 @@ async def set_meta_campaign_status(
                        "We've removed it from your list.",
             )
         _raise_http_for_meta_error(e)
+    # Same reasoning as the TikTok branch above — /meta/campaigns' "status" field
+    # needs a real last-known value to fall back to when live metrics aren't
+    # available, not a permanent "paused" literal.
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": campaign_id}, {"$set": {"status": "active" if body.active else "paused"}}
+    )
     return result
 
 
