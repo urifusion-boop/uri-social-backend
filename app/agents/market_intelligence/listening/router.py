@@ -230,11 +230,16 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
     """§9.3's "Create" deep-link: pass a card's evidence-backed brief straight
     into the content generator instead of the owner re-typing it by hand.
 
-    Scope for now: text content only, one draft per platform in the brief —
-    no AI image generation and no credit deduction, both of which the normal
-    Create Content flow already owns and which this doesn't try to
-    duplicate or silently re-decide the billing for. Generated drafts land
-    in the normal drafts list exactly like any other Create Content run."""
+    For post/carousel/faq cards this now runs the SAME pipeline the normal
+    Create Content screen uses (credit gate, real carousel slide generation,
+    credit deduction, background AI image generation via _generate_image_bg)
+    instead of a stripped-down text-only shortcut — confirmed live: a
+    "Format: carousel" card produced a bare-text, non-carousel draft with no
+    image at all, because the old shortcut called neither
+    CarouselGenerationService nor any image-generation code path. It defaults
+    to no reference image and the brand's own library style rotation (no
+    custom guide/override) — exactly what a plain Create Content submission
+    gets when every optional toggle is left untouched."""
     card = await db["mi_listen_cards"].find_one({"id": card_id, "brand_id": ctx["brand_id"]})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -312,20 +317,108 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
     if not seed_content:
         raise HTTPException(status_code=400, detail="This card has no brief to create content from")
 
-    from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
-    from app.agents.social_media_manager.services.content_generation_service import ContentGenerationService
+    import asyncio
 
-    playbook = await _playbook(db, ctx["user_id"], ctx["brand_id"])
-    brand_context = BrandProfileService.to_brand_context(playbook)
-    result = await ContentGenerationService.generate_multi_platform_content(
-        user_id=ctx["user_id"], seed_content=seed_content, platforms=platforms,
-        seed_type="text", brand_context=brand_context, db=db,
+    from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+    from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
+    from app.agents.social_media_manager.services.content_generation_service import ContentGenerationService
+    from app.agents.social_media_manager.routers.complete_social_manager import (
+        _BG_IMAGE_TASKS, _apply_intelligent_fallbacks, _generate_image_bg, _resolve_carousel_shared_context,
     )
+    from app.services.CreditService import credit_service
+    from app.services.TrialService import trial_service
+
+    # Same credit gate the normal Create Content screen uses — checked BEFORE
+    # generating anything, exactly like generate_content does, instead of
+    # silently generating content for free the way this shortcut used to.
+    is_trial_user = await trial_service.has_active_trial(ctx["user_id"])
+    if not is_trial_user and not await credit_service.check_sufficient_credits(ctx["user_id"]):
+        raise HTTPException(status_code=402, detail="You've run out of credits. Upgrade to continue.")
+
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    missing_fields = [k for k in ("brand_name", "brand_colors", "industry") if not profile_data.get(k)]
+    # A card click has no dialog to ask "continue with defaults?" the way the
+    # Create Content form does — it always proceeds with the same safe
+    # fallbacks that path uses once a user acknowledges, since a one-click
+    # action has no other UI moment to ask that question at all.
+    profile_data = _apply_intelligent_fallbacks(profile_data, missing_fields)
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+    brand_context["user_id"] = ctx["user_id"]
+    brand_context["brand_id"] = ctx["brand_id"]
+
+    post_type = "carousel" if action.get("type") == "carousel" else "feed"
+    if post_type == "carousel":
+        num_slides = max(2, min(10, len(action.get("outline") or []) or 3))
+        result = await CarouselGenerationService.generate_multi_platform(
+            user_id=ctx["user_id"], seed_content=seed_content, platforms=platforms,
+            brand_context=brand_context, num_slides=num_slides, db=db, force_num_slides=True,
+        )
+    else:
+        result = await ContentGenerationService.generate_multi_platform_content(
+            user_id=ctx["user_id"], seed_content=seed_content, platforms=platforms,
+            seed_type="text", brand_context=brand_context, db=db,
+        )
     if not result.get("status"):
         raise HTTPException(status_code=502, detail=result.get("responseMessage") or "Content generation failed")
 
     drafts = (result.get("responseData") or {}).get("drafts") or []
     draft_ids = [d["id"] for d in drafts if d.get("id")]
+    request_id = (result.get("responseData") or {}).get("request_id")
+
+    # Same credit deduction generate_content does — 1 for a plain post/faq,
+    # 1 per carousel draft (the drafts list is per-platform; a known,
+    # pre-existing quirk in that same formula upstream, not something this
+    # endpoint should silently diverge from).
+    credits_to_deduct = len(drafts) if post_type == "carousel" and drafts else 1
+    if request_id:
+        if is_trial_user:
+            await trial_service.deduct_trial_credit(
+                user_id=ctx["user_id"], campaign_id=request_id, reason="campaign_generation",
+                amount=credits_to_deduct,
+            )
+        else:
+            await credit_service.deduct_credit(
+                user_id=ctx["user_id"], campaign_id=request_id, reason="campaign_generation",
+                retry_count=0, amount=credits_to_deduct,
+            )
+
+    # Real AI images, same as a normal Create Content submission with no
+    # advanced options touched: no reference image, no custom guide/style
+    # override — just the brand's own library style rotation. Fired as
+    # tracked asyncio tasks (not FastAPI BackgroundTasks) so several
+    # draft/slide images generate concurrently, same as generate_content.
+    if draft_ids:
+        await db["content_drafts"].update_many(
+            {"id": {"$in": draft_ids}}, {"$set": {"has_image": True, "image_failed": False}})
+        for d in drafts:
+            d["has_image"] = True
+    bg_tasks: list[asyncio.Task] = []
+    for draft in drafts:
+        if post_type == "carousel":
+            slides = draft.get("slides") or []
+            carousel_id = draft["id"]
+            carousel_brand_context = await _resolve_carousel_shared_context(
+                db=db, brand_context=brand_context, style_override=None,
+                carousel_id=carousel_id, platform=draft["platform"],
+            )
+            for slide_index, slide in enumerate(slides):
+                slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+                enriched_seed = f"{seed_content}. This slide: {slide_content}"
+                bg_tasks.append(asyncio.create_task(_generate_image_bg(
+                    draft_id=draft["id"], platform=draft["platform"], content=slide_content or draft["content"],
+                    seed_content=enriched_seed, brand_context=carousel_brand_context, db=db,
+                    post_type=post_type, slide_index=slide_index, total_slides=len(slides), carousel_id=carousel_id,
+                )))
+        else:
+            bg_tasks.append(asyncio.create_task(_generate_image_bg(
+                draft_id=draft["id"], platform=draft["platform"], content=draft["content"],
+                seed_content=seed_content, brand_context=brand_context, db=db, post_type=post_type,
+            )))
+    _BG_IMAGE_TASKS.update(bg_tasks)
+    for t in bg_tasks:
+        t.add_done_callback(_BG_IMAGE_TASKS.discard)
+
     now = datetime.utcnow()
     primary_id = draft_ids[0] if draft_ids else None
     await db["mi_listen_cards"].update_one(
@@ -338,8 +431,7 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
         "scores": card.get("scores"), "at": now,
     })
     return UriResponse.get_single_data_response("created", {
-        "card_id": card_id, "draft_ids": draft_ids,
-        "request_id": (result.get("responseData") or {}).get("request_id"),
+        "card_id": card_id, "draft_ids": draft_ids, "request_id": request_id,
     })
 
 
