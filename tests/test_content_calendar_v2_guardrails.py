@@ -26,6 +26,7 @@ from app.agents.content_calendar_v2.services.content_calendar_v2_service import 
     _anti_boring_check,
     _clamp_caption,
     _collect_item_text,
+    _fabricated_claims_used,
     _find_banned_words,
     _recurring_series_names,
     _resolve_series_name,
@@ -264,6 +265,43 @@ def test_recurring_series_names_keeps_names_that_genuinely_recur():
 def test_recurring_series_names_ignores_none_and_empty():
     assert _recurring_series_names([None, "", None]) == set()
     assert _recurring_series_names([]) == set()
+
+
+# ── _fabricated_claims_used (PRD §31) ───────────────────────────────────────
+# Factuality was prompt-only ("never fabricate...") in the calendar pipeline,
+# unlike single-post generation, which has had a deterministic backstop
+# (brand_brief.unverified_numbers/unverified_sources) in production for a
+# while. Same risk class as the banned-word list before it got a
+# deterministic check: an instruction a model can still miss.
+
+def test_a_statistic_not_given_anywhere_is_flagged():
+    item = _item(exact_copy={
+        "headline": "Did you know?", "caption": "Over 73% of SMEs fail within year one.", "hashtags": []})
+    brand = {"brand_name": "Docerity", "industry": "solar"}
+    flagged = _fabricated_claims_used(item, brand)
+    assert any("73%" in f for f in flagged)
+
+
+def test_a_number_that_appears_in_the_brand_profile_is_not_flagged():
+    item = _item(exact_copy={
+        "headline": "Save more", "caption": "Our plans start at just ₦5,000 a month.", "hashtags": []})
+    brand = {"brand_name": "Docerity", "price_range": "Starting at ₦5,000/month"}
+    assert _fabricated_claims_used(item, brand) == []
+
+
+def test_an_invented_study_citation_is_flagged():
+    item = _item(exact_copy={
+        "headline": "Proven results", "caption": "A study by McKinsey found solar cuts costs by half.",
+        "hashtags": []})
+    brand = {"brand_name": "Docerity"}
+    flagged = _fabricated_claims_used(item, brand)
+    assert any("citation:" in f for f in flagged)
+
+
+def test_ordinary_copy_with_no_numbers_or_citations_is_clean():
+    item = _item()
+    brand = {"brand_name": "Docerity", "industry": "solar financing"}
+    assert _fabricated_claims_used(item, brand) == []
 
 
 if __name__ == "__main__":

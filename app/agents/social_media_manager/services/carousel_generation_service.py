@@ -224,14 +224,49 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 if i["code"] in ("banned_word", "unverified_number", "unverified_source") \
                         and (i["code"], i["detail"]) not in seen:
                     found.append(i)
+            # brand_brief.audit's "banned_word" check only ever reads the
+            # BRAND's own custom words_to_avoid (empty by default) — the
+            # universal generic-AI-slop list (CaptionValidatorService.
+            # BANNED_WORDS, which feed/story posts already check) was never
+            # consulted here. Confirmed live: a real carousel slide headline
+            # came back "...To Seamless Content" despite "seamless" being
+            # banned there since before this fix — carousels simply never
+            # checked that list at all. Checked on the same combined text
+            # single posts use (CaptionValidatorService._for_validation
+            # isn't platform-specific enough to need here; a plain strip of
+            # hashtags, already done above for caption_text, is enough).
+            from .caption_validator_service import CaptionValidatorService
+            for text, origin in ((caption_text, "caption"), (slide_text, "slides")):
+                style = CaptionValidatorService.validate_caption(text)
+                for issue in style["issues"]:
+                    if not issue.startswith("banned_word:"):
+                        continue
+                    word = issue.split(": ", 1)[1].strip("'")
+                    key = ("banned_word", word)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    found.append({"code": "banned_word", "detail": word,
+                                 "fix": f'Remove "{word}" from the {origin} in every form (plural, -ed, -ing) '
+                                        "and say it another way."})
             return found
 
         try:
             data = await _write()
-            # One rewrite if the carousel breaks the brand's rules, as captions get.
+            # Rewrite while the carousel still breaks the brand's rules, as
+            # captions get — up to 2 attempts, stopping the moment it's clean.
+            # A single retry could still fail to comply (confirmed live: a
+            # rewrite asked to remove "effortless" shipped "effortlessly"
+            # instead) and the old code just kept whichever draft merely had
+            # *fewer* issues, not necessarily zero. More attempts raise the
+            # odds a real rewrite lands clean; brand_brief.enforce() below is
+            # the actual guarantee regardless of how this loop ends.
             issues = _issues(data)
-            if issues:
-                print(f"📊 Carousel breaks Playbook rules: {[i['code'] + ':' + i['detail'] for i in issues]} — rewriting")
+            attempts = 0
+            while issues and attempts < 2:
+                attempts += 1
+                print(f"📊 Carousel breaks Playbook rules (attempt {attempts}): "
+                      f"{[i['code'] + ':' + i['detail'] for i in issues]} — rewriting")
                 try:
                     retry = await _write(
                         "\n\nCORRECTION: your last attempt broke this brand's rules. Write the carousel again "
@@ -240,8 +275,11 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                     retry_issues = _issues(retry)
                     if retry.get("slides") and len(retry_issues) < len(issues):
                         data, issues = retry, retry_issues
+                    else:
+                        break  # no improvement — stop spending retries, fall back to enforce()
                 except Exception as retry_error:
-                    print(f"⚠️ Carousel rewrite failed, keeping the first version: {retry_error}")
+                    print(f"⚠️ Carousel rewrite failed, keeping the last good version: {retry_error}")
+                    break
 
             caption_raw = data.get("caption", "")
             slides_raw = data.get("slides", [])

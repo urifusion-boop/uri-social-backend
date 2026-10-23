@@ -197,4 +197,11 @@ async def send_reply(
     await db[CONVERSATIONS].update_one(
         {"_id": conv["_id"]}, {"$set": {"last_activity_at": now()}})
 
+    # A person's reply counts toward the conversation's message cap, and marks it
+    # human-handled (the cap limits the AI's cost, never a person's conversation). The
+    # agent's own substantive replies are counted by the Onebox reservation instead.
+    from .agent import AGENT_ACTOR
+    if actor_id != AGENT_ACTOR:
+        from . import onebox
+        await onebox.record_outbound(db, workspace_id, conv, provider_message_id, actor_id)
     return await _finish(Delivery.ACCEPTED.value, provider_message_id)

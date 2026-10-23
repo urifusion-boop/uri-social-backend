@@ -346,7 +346,7 @@ class TestPlaybookWinsOverOlderDefaults:
 
         # The preview runs the very function real posts are written by.
         assert "ContentGenerationService._generate_platform_content(" in inspect.getsource(csm.preview_playbook_voice)
-        assert "build_caption_prompt(seed_content, platform, brand_context)" in inspect.getsource(
+        assert "build_caption_prompt(seed_content, platform, brand_context, seed_type)" in inspect.getsource(
             ContentGenerationService._generate_platform_content)
 
     def test_full_prompt_carries_language_rule_and_no_contradiction(self):

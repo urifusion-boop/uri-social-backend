@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from bson import ObjectId
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -69,6 +70,12 @@ async def ensure_indexes(db) -> None:
         unique=True, name="uniq_thread")
     await db[CONVERSATIONS].create_index([("workspace_id", 1), ("last_activity_at", -1)])
     await db[RAW_EVENTS].create_index([("received_at", -1)])
+    from . import onebox
+    await db[onebox.EVENTS].create_index([("workspace_id", 1), ("event_id", 1)], unique=True, name="uniq_onebox_event")
+    await db[onebox.LEDGER].create_index(
+        [("workspace_id", 1), ("period_id", 1), ("billing_conversation_id", 1)], unique=True, name="uniq_usage_ledger")
+    await db[onebox.SUBSCRIPTIONS].create_index([("workspace_id", 1)], unique=True, name="uniq_onebox_subscription")
+    await db[onebox.BILLING_CONVERSATIONS].create_index([("workspace_id", 1), ("conversation_id", 1), ("started_at", -1)])
 
 
 async def store_raw(db, platform: str, raw_body: bytes, headers: dict) -> str:
@@ -306,4 +313,11 @@ async def record_event(db, workspace_id: str, channel_account_id: str,
         if "duplicate" in str(e).lower() or "E11000" in str(e):
             return None
         raise
+    # Counted toward its billing conversation (never raises: a billing hiccup must not
+    # cost a customer message).
+    from . import onebox
+    conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id)})
+    if conv:
+        await onebox.record_inbound(db, workspace_id, conv, ev["provider_message_id"],
+                                    ev.get("provider_timestamp"))
     return str(res.inserted_id)

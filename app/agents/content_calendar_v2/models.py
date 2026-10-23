@@ -84,3 +84,10 @@ class CreateDraftRequestV2(BaseModel):
 
 class RegenerateItemRequestV2(BaseModel):
     reason: str = ""   # optional — surfaced in the version_history entry
+    # PRD §46 — regenerate at multiple levels, not just the whole item:
+    # "full" (today's only behavior), "hook" (just the opening line),
+    # "copy" (written text, keep the visual direction), "creative" (visual
+    # direction, keep the written text), "format" (convert to a different
+    # format — requires new_format).
+    scope: str = "full"
+    new_format: Optional[str] = None   # required when scope == "format"

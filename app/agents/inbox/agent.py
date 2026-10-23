@@ -33,6 +33,7 @@ from bson import ObjectId
 from . import situation as sit
 from . import voice
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, Direction, Kind, now
+from . import onebox
 from .send import SendRefused, check_eligibility
 
 SETTINGS = "inbox_agent_settings"
@@ -120,10 +121,14 @@ async def openai_json(system: str, user: str) -> dict:
         model=MODEL,
         response_format={"type": "json_object"},
         temperature=0.2,
+        # A short customer-service answer should never become an essay: the cap keeps
+        # one reply's cost bounded however the model is prompted.
+        max_tokens=onebox.DEFAULT_CONFIG["max_output_tokens"],
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
         timeout=20,
     )
+    onebox.note_usage(MODEL, getattr(resp, "usage", None))
     return json.loads(resp.choices[0].message.content or "{}")
 
 
@@ -721,6 +726,47 @@ async def explain(db, workspace_id: str, result: dict) -> str:
 async def process_inbound(db, workspace_id: str, conversation_id: str, message_id: str,
                           llm: Llm = openai_json, transport=None) -> dict:
     """After a message is stored: label it, draft a reply, and auto-send if allowed."""
+    settings = await load_settings(db, workspace_id)
+    # The Onebox gate runs BEFORE the model is called: a conversation past its message
+    # cap, or a workspace out of allowance, must not cost anything to be told no.
+    if settings["auto_reply_enabled"] and onebox.ENFORCE and ObjectId.is_valid(conversation_id):
+        conv0 = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id), "workspace_id": workspace_id})
+        if conv0:
+            pre = await onebox.authorize(db, workspace_id, conv0, reserve=False)
+            if not pre.allowed:
+                await db[CONVERSATIONS].update_one({"_id": conv0["_id"]}, {"$set": {
+                    "needs_human": True, "handoff_reason": pre.reason, "ai_blocked": pre.code}})
+                await _notify_onebox_blocked(db, workspace_id, conv0, pre)
+                return {"status": "blocked", "reason": pre.reason, "code": pre.code}
+    usage_token = onebox.start_usage()
+    try:
+        return await _process_inbound(db, workspace_id, conversation_id, message_id, llm, transport, settings)
+    finally:
+        await onebox.record_cost(db, workspace_id, conversation_id, usage_token)
+
+
+async def _notify_onebox_blocked(db, workspace_id: str, conv: dict, decision) -> None:
+    """Tell the owner the AI has stopped on a customer, once per conversation."""
+    if decision.code == "message_cap":
+        return                      # a long chat is the conversation's business, not an alert
+    user_id = await _owner_of(db, workspace_id)
+    if not user_id:
+        return
+    from app.core.config import settings as app_settings
+    from app.services import brand_notifier
+    base = (app_settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"").rstrip("/")
+    try:
+        await brand_notifier.notify(
+            db, user_id, workspace_id, "inbox_quota", title="Your AI inbox replies have paused",
+            message=decision.reason + ". Customers are waiting in Customer Messages.",
+            link=f"{base}/workspace/?tab=messages", metadata={"code": decision.code},
+            dedupe_key=f"blocked:{decision.code}", dedupe_hours=24)
+    except Exception as e:
+        print(f"[Onebox] couldn't alert {workspace_id}: {e}", flush=True)
+
+
+async def _process_inbound(db, workspace_id: str, conversation_id: str, message_id: str,
+                           llm: Llm, transport, settings: dict) -> dict:
     result = await suggest(db, workspace_id, conversation_id, llm, message_id)
     if not result:
         return {"status": "skipped"}
@@ -733,7 +779,6 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
     if inbound and inbound[-1]["id"] != result["target"]["id"]:
         return {"status": "superseded"}
 
-    settings = await load_settings(db, workspace_id)
     send, reason = verdict(settings, conv, history, cls, draft)
 
     from .meta_transport import meta_transport
@@ -758,6 +803,11 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
                     actor_id=AGENT_ACTOR, transport=transport or meta_transport,
                     account=account or {})
                 held = record.get("delivery") == "accepted"
+                if held:
+                    # A customer-visible AI line: it counts toward the message cap, but
+                    # it answers nothing, so it is not what bills the conversation.
+                    await onebox.record_outbound(db, workspace_id, conv, record.get("provider_message_id", ""),
+                                                 AGENT_ACTOR)
             except SendRefused:
                 pass
         if settings["auto_reply_enabled"]:
@@ -765,6 +815,12 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
                                      settings["alert_emails"])
         return {"status": "held" if held else "drafted", "reason": reason}
 
+    decision = await onebox.authorize(db, workspace_id, conv, reserve=True)
+    if not decision.allowed:
+        await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
+            "needs_human": True, "handoff_reason": decision.reason, "ai_blocked": decision.code}})
+        await _notify_onebox_blocked(db, workspace_id, conv, decision)
+        return {"status": "blocked", "reason": decision.reason, "code": decision.code}
     try:
         record = await send_reply(
             db, workspace_id, conversation_id, draft["text"],
@@ -774,11 +830,24 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
             account=account or {},
         )
     except SendRefused as e:
+        await onebox.release(db, workspace_id, decision.reservation)
         await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
             "needs_human": True, "handoff_reason": e.detail}})
         return {"status": "refused", "reason": e.detail}
+    except Exception:
+        await onebox.release(db, workspace_id, decision.reservation)
+        raise
 
     accepted = record.get("delivery") == "accepted"
+    # Billed only when the platform ACCEPTED the reply. An ambiguous or failed send
+    # gives the capacity back — the customer is never charged for a reply that didn't go.
+    if accepted:
+        await onebox.commit(db, workspace_id, decision.reservation, record.get("provider_message_id", ""))
+        crossed = await onebox.threshold_crossed(db, workspace_id)
+        if crossed:
+            await _notify_usage_threshold(db, workspace_id, crossed)
+    else:
+        await onebox.release(db, workspace_id, decision.reservation)
     await db[CLASSIFICATIONS].update_one(
         {"_id": ObjectId(result["suggestion_id"])},
         {"$set": {"outcome": {"type": "auto_sent", "delivery": record.get("delivery"),
@@ -791,6 +860,30 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
     }})
     return {"status": "auto_sent" if accepted else "auto_failed",
             "delivery": record.get("delivery")}
+
+
+async def _notify_usage_threshold(db, workspace_id: str, crossed: str) -> None:
+    user_id = await _owner_of(db, workspace_id)
+    if not user_id:
+        return
+    use = await onebox.usage(db, workspace_id)
+    from app.core.config import settings as app_settings
+    from app.services import brand_notifier
+    base = (app_settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"").rstrip("/")
+    if crossed == "exhausted":
+        title = "You've used all your AI conversations"
+        message = (f"{use['used']} of {use['allowance']} conversations used on {use['plan_name']}. New customers "
+                   "won't get AI replies until you upgrade or the plan renews.")
+    else:
+        title = f"{use['percent_used']}% of your AI conversations used"
+        message = f"{use['used']} of {use['allowance']} used on {use['plan_name']}. Upgrade before it runs out."
+    try:
+        await brand_notifier.notify(
+            db, user_id, workspace_id, "inbox_quota", title=title, message=message,
+            link=f"{base}/workspace/?tab=messages", metadata={"threshold": crossed},
+            dedupe_key=f"quota:{use['period_start']}:{crossed}", dedupe_hours=24 * 31)
+    except Exception as e:
+        print(f"[Onebox] couldn't send a usage alert for {workspace_id}: {e}", flush=True)
 
 
 async def _owner_of(db, workspace_id: str) -> str:
