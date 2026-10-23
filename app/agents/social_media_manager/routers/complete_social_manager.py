@@ -173,10 +173,24 @@ class CreativeFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
     reference_images: List[str] = Field(default_factory=list, max_items=5)
 
+class TikTokPostSettingsRequest(BaseModel):
+    """The user's choices from the Post to TikTok screen (TikTok Content Sharing
+    Guidelines). privacy_level is required with no default; interactions are
+    off unless the user turned them on."""
+    title: str = ""
+    privacy_level: str
+    allow_comment: bool = False
+    allow_duet: bool = False
+    allow_stitch: bool = False
+    brand_organic: bool = False
+    brand_content: bool = False
+
+
 class PublishVideoDraftRequest(BaseModel):
     draft_id: str
     platform: str   # "instagram_reels" | "facebook_reels" | "tiktok"
     caption: Optional[str] = None
+    tiktok: Optional[TikTokPostSettingsRequest] = None   # required when platform == "tiktok"
 
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
@@ -7495,6 +7509,13 @@ async def publish_video_draft(
 
     caption = request.caption if request.caption is not None else (draft.get("content") or "")
 
+    tiktok_settings = None
+    if request.platform == "tiktok" and request.tiktok:
+        from app.agents.social_media_manager.services.tiktok_direct_service import TikTokPostSettings
+        tiktok_settings = TikTokPostSettings(**request.tiktok.model_dump())
+        # The title the user edited on the Post to TikTok screen is the caption.
+        caption = tiktok_settings.title
+
     # Resolve connection.
     # instagram_reels → look for "instagram" direct connection
     # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
@@ -7512,17 +7533,21 @@ async def publish_video_draft(
         if not conn.get("ig_user_id"):
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
     elif request.platform == "tiktok":
+        # Only the direct-OAuth connection can be posted to: the Post to TikTok
+        # screen needs creator_info (nickname, allowed privacy levels, disabled
+        # interactions), which the Outstand route can't provide, and TikTok's
+        # guidelines forbid defaulting privacy/interaction choices for the user.
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
             {"_id": 0},
         )
         if not conn:
-            conn = await db["social_connections"].find_one(
-                {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
-                {"_id": 0, "outstand_account_id": 1, "connected_via": 1},
+            raise HTTPException(
+                status_code=400,
+                detail="Connect your TikTok account directly to post. Open Connected Accounts and reconnect TikTok.",
             )
-        if not conn or not (conn.get("outstand_account_id") or conn.get("connected_via") == "tiktok_direct_oauth"):
-            raise HTTPException(status_code=400, detail="No connected TikTok account found. Please connect your account first.")
+        if not request.tiktok:
+            raise HTTPException(status_code=400, detail="TikTok post settings are required (privacy level, interactions).")
     else:  # facebook_reels
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "facebook"},
@@ -7547,9 +7572,59 @@ async def publish_video_draft(
         caption,
         conn,
         db,
+        tiktok_settings,
     )
 
     return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
+
+
+@router.get("/connections/tiktok-direct/creator-info")
+async def get_tiktok_creator_info(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Creator info for the Post to TikTok screen. TikTok requires this be fetched
+    fresh each time that screen renders: the connected account's nickname, the
+    privacy levels it may post with, which interactions it has disabled, and the
+    longest video it can post.
+    """
+    from app.agents.social_media_manager.services.tiktok_direct_service import (
+        fetch_creator_info,
+        get_valid_tiktok_access_token,
+        TikTokDirectAPIError,
+    )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
+        {"_id": 0},
+    )
+    if not conn:
+        raise HTTPException(
+            status_code=400,
+            detail="Connect your TikTok account directly to post. Open Connected Accounts and reconnect TikTok.",
+        )
+
+    try:
+        access_token = await get_valid_tiktok_access_token(db, conn)
+        info = await fetch_creator_info(access_token)
+    except TikTokDirectAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Couldn't load your TikTok account details: {e}")
+
+    return UriResponse.get_single_data_response("tiktok_creator_info", {
+        "creator_nickname": info.get("creator_nickname") or info.get("creator_username") or conn.get("account_name") or "",
+        "creator_username": info.get("creator_username") or "",
+        "creator_avatar_url": info.get("creator_avatar_url") or "",
+        "privacy_level_options": info.get("privacy_level_options") or [],
+        "comment_disabled": bool(info.get("comment_disabled")),
+        "duet_disabled": bool(info.get("duet_disabled")),
+        "stitch_disabled": bool(info.get("stitch_disabled")),
+        "max_video_post_duration_sec": info.get("max_video_post_duration_sec"),
+    })
 
 
 @router.get("/video-publish-job/{job_id}")

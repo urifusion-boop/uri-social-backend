@@ -55,6 +55,7 @@ class VideoPublishService:
         caption: str,
         conn: Dict[str, Any],
         db,
+        tiktok_settings=None,
     ) -> None:
         col = _jobs_col()
         try:
@@ -70,7 +71,7 @@ class VideoPublishService:
                 )
             elif platform == "tiktok":
                 post_id, post_url = await VideoPublishService._publish_tiktok(
-                    conn, video_url, caption, db
+                    conn, video_url, caption, db, tiktok_settings
                 )
             else:
                 raise ValueError(f"Unsupported platform: {platform}")
@@ -196,6 +197,7 @@ class VideoPublishService:
         video_url: str,
         caption: str,
         db,
+        tiktok_settings=None,
     ):
         if conn.get("connected_via") == "tiktok_direct_oauth":
             from app.agents.social_media_manager.services.tiktok_direct_service import (
@@ -203,7 +205,7 @@ class VideoPublishService:
                 publish_tiktok_direct,
             )
             access_token = await get_valid_tiktok_access_token(db, conn)
-            publish_id, status = await publish_tiktok_direct(access_token, video_url, caption)
+            publish_id, status = await publish_tiktok_direct(access_token, video_url, caption, tiktok_settings)
             print(f"✅ TikTok direct publish: publish_id={publish_id} status={status}")
             return publish_id, None
 

@@ -24,6 +24,7 @@ whose redirect_uri hadn't cleared TikTok's review yet. Should get a fully
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -176,21 +177,107 @@ async def _fetch_creator_info(access_token: str) -> dict:
     return data.get("data") or {}
 
 
-async def publish_tiktok_direct(access_token: str, video_url: str, caption: str) -> tuple[str, str]:
+async def fetch_creator_info(access_token: str) -> dict:
+    """Creator info for the "Post to TikTok" screen. TikTok's Content Sharing
+    Guidelines require it be fetched fresh every time that screen renders, so
+    the user sees which account they're posting to and only the privacy
+    levels / interactions that account actually allows."""
+    return await _fetch_creator_info(access_token)
+
+
+# TikTok's cap on post_info.title for video posts.
+_MAX_TITLE_LENGTH = 2200
+
+
+@dataclass
+class TikTokPostSettings:
+    """What the user chose on the Post to TikTok screen. Per TikTok's Content
+    Sharing Guidelines none of this may be defaulted on the user's behalf —
+    privacy_level has no default, and every interaction starts disabled."""
+    title: str
+    privacy_level: str
+    allow_comment: bool = False
+    allow_duet: bool = False
+    allow_stitch: bool = False
+    # Commercial content disclosure. brand_organic = "Your brand" (labelled
+    # Promotional content); brand_content = "Branded content" (labelled Paid
+    # partnership). Both off means no disclosure.
+    brand_organic: bool = False
+    brand_content: bool = False
+
+
+def _validate_settings(settings_: TikTokPostSettings, creator_info: dict) -> None:
+    """Server-side re-check of what the UI already enforces, so a crafted
+    request can't post with a privacy level the creator doesn't offer or
+    turn on an interaction the creator disabled in their TikTok settings."""
+    options = creator_info.get("privacy_level_options") or []
+    if not options:
+        raise TikTokDirectAPIError(
+            "This TikTok account can't be posted to right now. Please try again later."
+        )
+    if settings_.privacy_level not in options:
+        raise TikTokDirectAPIError(
+            f"Privacy level {settings_.privacy_level!r} isn't available for this TikTok account."
+        )
+    # Only "Branded content" (Paid partnership) is barred from private; "Your
+    # brand" (Promotional content) on its own may still be Only me.
+    if settings_.brand_content and settings_.privacy_level == "SELF_ONLY":
+        raise TikTokDirectAPIError("Branded content visibility cannot be set to private.")
+    if len(settings_.title or "") > _MAX_TITLE_LENGTH:
+        raise TikTokDirectAPIError(f"Title is too long (max {_MAX_TITLE_LENGTH} characters).")
+    if settings_.allow_comment and creator_info.get("comment_disabled"):
+        raise TikTokDirectAPIError("Comments are disabled in this creator's TikTok settings.")
+    if settings_.allow_duet and creator_info.get("duet_disabled"):
+        raise TikTokDirectAPIError("Duet is disabled in this creator's TikTok settings.")
+    if settings_.allow_stitch and creator_info.get("stitch_disabled"):
+        raise TikTokDirectAPIError("Stitch is disabled in this creator's TikTok settings.")
+
+
+async def publish_tiktok_direct(
+    access_token: str,
+    video_url: str,
+    caption: str,
+    settings_: Optional[TikTokPostSettings] = None,
+) -> tuple[str, str]:
     """Downloads the video, uploads it to TikTok via FILE_UPLOAD, and polls
     until the post finishes. Returns (publish_id, status). Raises
     TikTokDirectAPIError on any failure — a publish either succeeds or the
-    caller finds out why, never a silent no-op."""
+    caller finds out why, never a silent no-op.
+
+    settings_ carries the user's choices from the Post to TikTok screen. When
+    it's omitted (callers that don't have that screen yet, e.g. the draft
+    approval path) the legacy behaviour applies: public if allowed, otherwise
+    the first level creator_info offers."""
     creator_info = await _fetch_creator_info(access_token)
-    privacy_options = creator_info.get("privacy_level_options") or []
-    if not privacy_options:
-        raise TikTokDirectAPIError(f"creator_info returned no privacy_level_options: {creator_info}")
-    # Prefer public — this is an organic post, not a private test upload —
-    # but fall back to whatever the account/app combo actually allows
-    # (e.g. Sandbox and not-yet-audited Production apps only get SELF_ONLY,
-    # and unaudited clients of any kind are further restricted to posting
-    # only to accounts whose TikTok profile is itself set to Private).
-    privacy_level = "PUBLIC_TO_EVERYONE" if "PUBLIC_TO_EVERYONE" in privacy_options else privacy_options[0]
+    if settings_ is not None:
+        _validate_settings(settings_, creator_info)
+        post_info = {
+            "title": settings_.title or "",
+            "privacy_level": settings_.privacy_level,
+            "disable_comment": not settings_.allow_comment,
+            "disable_duet": not settings_.allow_duet,
+            "disable_stitch": not settings_.allow_stitch,
+        }
+        if settings_.brand_organic or settings_.brand_content:
+            post_info["brand_organic_toggle"] = settings_.brand_organic
+            post_info["brand_content_toggle"] = settings_.brand_content
+    else:
+        privacy_options = creator_info.get("privacy_level_options") or []
+        if not privacy_options:
+            raise TikTokDirectAPIError(f"creator_info returned no privacy_level_options: {creator_info}")
+        # Prefer public — this is an organic post, not a private test upload —
+        # but fall back to whatever the account/app combo actually allows
+        # (e.g. Sandbox and not-yet-audited Production apps only get SELF_ONLY,
+        # and unaudited clients of any kind are further restricted to posting
+        # only to accounts whose TikTok profile is itself set to Private).
+        privacy_level = "PUBLIC_TO_EVERYONE" if "PUBLIC_TO_EVERYONE" in privacy_options else privacy_options[0]
+        post_info = {
+            "title": caption or "",
+            "privacy_level": privacy_level,
+            "disable_duet": bool(creator_info.get("duet_disabled")),
+            "disable_comment": bool(creator_info.get("comment_disabled")),
+            "disable_stitch": bool(creator_info.get("stitch_disabled")),
+        }
 
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         video_resp = await client.get(video_url)
@@ -213,13 +300,7 @@ async def publish_tiktok_direct(access_token: str, video_url: str, caption: str)
             f"{_API_BASE}/post/publish/video/init/",
             headers=_headers(access_token),
             json={
-                "post_info": {
-                    "title": caption or "",
-                    "privacy_level": privacy_level,
-                    "disable_duet": bool(creator_info.get("duet_disabled")),
-                    "disable_comment": bool(creator_info.get("comment_disabled")),
-                    "disable_stitch": bool(creator_info.get("stitch_disabled")),
-                },
+                "post_info": post_info,
                 "source_info": {
                     "source": "FILE_UPLOAD",
                     "video_size": video_size,
