@@ -35,6 +35,21 @@ DEFAULTS: dict[str, Any] = {
     "overlap_hours": 2,                # re-read this much before the last run (late-indexed posts)
     "monthly_budget_usd": 12.0,        # all listening collection, this environment
     "pilot_markets": ["beauty_skincare:NG", "hair_wigs:NG"],  # collected even with no subscriber
+    # Private-term collection (PRD §6.4-6.5): a business's own brand name and
+    # named competitors, searched once per business (never shared across
+    # tenants, unlike everything else above). Small and cheap on purpose —
+    # a handful of literal-name queries per business, not category search.
+    "private": {
+        "backfill_days": 3,
+        "items_per_query": 25,
+    },
+    # Competitor-move signal (PRD §8.3): evidence-based, not a statistical
+    # trend — see competitor_signals.py's docstring for why a 28-day
+    # baseline doesn't fit one business's own low-volume mention stream.
+    "competitor_signal": {
+        "min_authors": 2,
+        "window_days": 7,
+    },
     # Enrichment
     "enrich_batch_size": 15,
     "enrich_model": "gpt-4o-mini",

@@ -85,6 +85,8 @@ Optionally, also propose ONE alternative action for the same signal — a genuin
 worth considering instead (e.g. a carousel FAQ next to a video, or a proposed ad test when buying intent is
 strong) — only when something else really does fit as well as or differently from the primary action; omit it
 rather than padding the card with a weaker, smaller version of the same idea.
+For a competitor_move signal, the action must be a differentiation idea — never copy or imitate the competitor;
+show this business's own, genuinely different answer to the same thing customers are reacting to.
 Never claim facts about the products that aren't in the business facts. No medical or guaranteed-result claims.
 "why" may only use what the signal shows (the topic, what people asked, needed or complained about) and the
 business facts. Never generalise about regions, countries, populations or groups ("especially in Africa where...",
@@ -109,6 +111,9 @@ def observation(sig: dict) -> str:
     if t == "new_entity":
         return (f"“{name}” is new in monitored {mk} posts and already mentioned by {cur.get('authors')} different "
                 f"accounts in the last 24 hours.")
+    if t == "competitor_move":
+        return (f"{cur.get('authors')} different accounts talked about your competitor “{name}” in the last "
+                f"{cur.get('window_days')} days — {cur.get('posts')} posts in total.")
     return (f"{cur.get('authors')} different people asked about, requested or complained about “{name}” on "
             f"{cur.get('days_present')} of the last {cur.get('window_days')} days in {mk}.")
 
@@ -123,7 +128,7 @@ def _allowed_numbers(sig: dict, profile: dict) -> set[str]:
     never checked (see _NUM, which only matches percentages or 2+ digits)."""
     cur, base = sig.get("current") or {}, sig.get("baseline") or {}
     nums = {str(v) for v in (cur.get("authors"), base.get("median_per_day"), base.get("days"),
-                              cur.get("days_present"), cur.get("window_days")) if v is not None}
+                              cur.get("days_present"), cur.get("window_days"), cur.get("posts")) if v is not None}
     for v in (profile.get("facts") or {}).values():
         if v:
             nums.update(re.findall(r"\d+(?:[.,]\d+)?", str(v)))
@@ -277,8 +282,16 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
         {"brand_id": brand, "$or": [{"status": {"$in": ["new", "shown", "saved"]}, "expires_at": {"$gt": now}},
                                     {"status": "dismissed", "updated_at": {"$gt": now - timedelta(days=30)}}]},
         {"market": 1, "topic": 1})}
+    # PRD §6.4-6.5: competitor-move signals live under a synthetic, single-
+    # tenant market key (private_collect.private_market_key) that's never
+    # added to profile["markets"] (that list is shared-market subscriptions
+    # only) — included here explicitly so this one business's own
+    # competitor signals are still found, without a private signal ever
+    # being reachable through another business's markets list.
+    from .private_collect import private_market_key
+    candidate_markets = list(profile.get("markets") or []) + [private_market_key(brand)]
     cands = [s async for s in db["mi_listen_signals"].find(
-        {"market": {"$in": profile.get("markets") or []}, "status": "active", "expires_at": {"$gt": now},
+        {"market": {"$in": candidate_markets}, "status": "active", "expires_at": {"$gt": now},
          "computed_at": {"$gte": now - timedelta(hours=36)}})]
     cands = [s for s in cands if (s["market"], s["topic"]) not in live]
     cands.sort(key=lambda s: -(s["scores"]["M"] + s["scores"]["C"] + 100 * s.get("confidence", 0)))

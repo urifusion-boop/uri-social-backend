@@ -11,7 +11,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import collector, detect, discovery, markets, ontology, permissions, personalize, profile as profile_mod, shadow
+from . import (collector, competitor_signals, detect, discovery, markets, ontology, permissions, personalize,
+              private_collect, profile as profile_mod, shadow)
 from .config import _merge, get_config
 
 LOCK_MINUTES = 50
@@ -171,8 +172,39 @@ async def run_cycle(db, only_markets: Optional[list[str]] = None, brand_ids: Opt
                 await _unlock(db, mlock, owner)
             summary["markets"].append(entry)
 
+        # Private-term collection (PRD §6.4-6.5): a business's own brand name
+        # and named competitors, one small pass per active profile — never
+        # folded into the shared per-market loop above, since a private term
+        # must never be searched on another tenant's behalf. Runs through the
+        # primary configured source only (not every active source the shared
+        # loop uses) — a handful of literal-name queries per business is
+        # cheap, but multiplying that across every source isn't worth the
+        # extra spend for what's typically well covered by one. Not gated by
+        # `touched`: a competitor mentioning something has nothing to do with
+        # whether this cycle happened to collect this business's shared
+        # market, so it needs its own "did anything change" tracking.
+        private_source = cfg.get("source", "x")
+        private_adapter = adapters.get(private_source)
+        privately_touched: set[str] = set()
+        if private_adapter is not None:
+            for p in profiles:
+                if not p or p.get("status") != "active":
+                    continue
+                try:
+                    run = await private_collect.collect_private(db, p, cfg, private_adapter, private_source)
+                    if run.get("to_read"):
+                        await private_collect.read_private(db, p, run["to_read"], cfg)
+                    sigs = await competitor_signals.detect_competitor_moves(db, p, cfg)
+                    if sigs:
+                        privately_touched.add(p["brand_id"])
+                except Exception as e:
+                    print(f"[MI][listen] private collection failed for brand {p.get('brand_id')}: {e}")
+
         for p in profiles:
-            if not p or p.get("status") != "active" or not set(p.get("markets") or []) & set(touched or p.get("markets") or []):
+            if not p or p.get("status") != "active":
+                continue
+            shares_a_touched_market = set(p.get("markets") or []) & set(touched or p.get("markets") or [])
+            if not shares_a_touched_market and p.get("brand_id") not in privately_touched:
                 continue
             cards = await personalize.cards_for(db, p, cfg)
             summary["cards"] += len(cards)
