@@ -13,15 +13,23 @@ first boot is recording a decision already made, not making a new one. A
 new source added later starts unapproved until someone explicitly
 approves it — collection for it simply won't run until they do.
 
-TikTok, Instagram, YouTube, Reddit and News (added when the module grew
-past X-only) are seeded here specifically so they're *visible* as rows in
-the admin Sources tab with their real caveats attached, rather than being
-invisible until someone already knows the exact source key to approve —
-but every one of them ships with `approved: False`. Each adapter's own
-module docstring explains why: actor ids/pricing/field mappings were
-researched against the live Apify Store, not run and confirmed, so each
-needs one real small test scan reviewed by an admin before approval is
-anything but a guess.
+TikTok, Instagram, YouTube, Reddit, News and Facebook (added when the
+module grew past X-only) are seeded here specifically so they're *visible*
+as rows in the admin Sources tab with their real caveats attached, rather
+than being invisible until someone already knows the exact source key to
+approve — but every one of them ships with `approved: False`. Each
+adapter's own module docstring explains why: actor ids/pricing/field
+mappings were researched against the live Apify Store, not run and
+confirmed, so each needs one real small test scan reviewed by an admin
+before approval is anything but a guess.
+
+Nairaland (PRD §7.1) is deliberately NOT here: no Apify actor for it was
+found in a live Apify Store search (Oct 2026) — every result was a tool
+that scrapes the Apify Store itself, not the Nairaland forum. The PRD
+itself calls Nairaland a "custom connector, subject to site terms," not a
+known marketplace actor, so it needs a hand-rolled scraper (a different,
+bigger piece of work, with its own site-terms question to resolve first)
+rather than one more adapter following this module's usual Apify template.
 """
 from __future__ import annotations
 
@@ -87,6 +95,16 @@ _SEED = [
      "approved": False, "approved_by": None,
      "notes": "Apify actor cleanscrape~google-news-scraper, higher cap — unverified, needs one real test scan "
               "before approval."},
+    {"source": "facebook", "terms_url": "https://www.facebook.com/terms.php",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor scrapeflow~facebook-posts-search-scraper, test cap — unverified, needs one real "
+              "test scan before approval."},
+    {"source": "facebook_pro", "terms_url": "https://www.facebook.com/terms.php",
+     "allowed_use": _ALLOWED_USE, "retention_days": 90, "display_rules": _DISPLAY_RULES,
+     "approved": False, "approved_by": None,
+     "notes": "Apify actor scrapeflow~facebook-posts-search-scraper, higher cap — unverified, needs one real "
+              "test scan before approval."},
 ]
 
 DEFAULT_DISPLAY_RULES = {"max_excerpt_chars": 280, "require_link": True, "require_attribution": True}
