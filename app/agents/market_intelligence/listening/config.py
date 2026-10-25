@@ -67,6 +67,9 @@ DEFAULTS: dict[str, Any] = {
         "recurring_min_authors": 6,
         "recurring_min_days": 4,
         "new_entity_days": 3,
+        "objection_z": 1.5,            # lower than rising_z: complaint volume is naturally
+                                       # lower than overall mention volume, worth catching sooner
+        "objection_min_growth": 0.4,
     },
     # Personalisation
     "score": {
@@ -78,6 +81,13 @@ DEFAULTS: dict[str, Any] = {
         "max_cards_per_run": 4,
         "card_ttl_days": 7,
         "model": "gpt-4o-mini",
+        # PRD §9.2: "Evergreen content opportunities (recurring needs) are
+        # ranked on their own track so they are not crowded out by trends."
+        # recurring_need's momentum score is flat and low by design (it's
+        # steady, not trending), so without a reserved slot it always loses
+        # the combined-score sort against any real trend that cycle.
+        "max_evergreen_judged": 3,     # reserved within max_signals_judged
+        "max_evergreen_cards": 1,      # reserved within max_cards_per_run
     },
     # Delivery
     "delivery": {

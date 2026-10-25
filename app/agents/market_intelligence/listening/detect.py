@@ -11,6 +11,13 @@ partial days compare fairly. Baseline: median and MAD of earlier covered days
   emerging   — active now, but not enough history to call it a trend
   new_entity — a topic first seen in the last few days that is already broad
   recurring_need — a steady question/complaint/request from many people across many days
+  objection_shift — same baseline/z maths as rising, but measured only on the topic's
+                    complaint-intent authors, so a rise in doubt/complaint volume is caught
+                    even when the topic's overall mention volume isn't trending
+  cooling    — a topic that had a live rising/spike/new_entity signal has since fallen back
+               toward or below its own baseline (PRD §8.3: "momentum fading... stop
+               recommending; expire cards") — the prior signal and any live card for it are
+               expired immediately rather than left to run out their normal TTL
 Breadth guard: one account can't make a signal (top-author share cap).
 """
 from __future__ import annotations
@@ -56,12 +63,16 @@ def robust_baseline(values: list[float]) -> tuple[float, float]:
 def momentum_score(kind: str, z: float, growth: float) -> float:
     if kind == "rising":
         return min(100.0, 55 + 9 * z)
+    if kind == "objection_shift":
+        return min(90.0, 50 + 8 * z)
     if kind == "spike":
         return min(85.0, 45 + 7 * z)
     if kind == "new_entity":
         return 65.0
     if kind == "emerging":
         return min(60.0, 35 + 10 * max(growth, 0))
+    if kind == "cooling":
+        return 10.0  # momentum is, by definition, fading — never worth promoting
     return 30.0  # recurring_need: steady, not trending
 
 
@@ -95,12 +106,14 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
         win_cov[k] = sum(1 for h in cov if a <= h < b)
 
     per_topic: dict[str, dict[int, set]] = defaultdict(lambda: defaultdict(set))
+    per_topic_complaint: dict[str, dict[int, set]] = defaultdict(lambda: defaultdict(set))
     async for c in db["mi_topic_counts"].find({"market": market["key"], "bucket": {"$gte": start, "$lt": now}}):
         if c["bucket"] not in cov:
             continue
         k = int((now - c["bucket"]).total_seconds() // (24 * 3600))
         if 0 <= k <= days:
             per_topic[c["topic"]][k].update(c.get("authors") or [])
+            per_topic_complaint[c["topic"]][k].update(c.get("complaint_authors") or [])
 
     market_age_days = (now - (market.get("created_at") or now)).days
     signals: list[dict] = []
@@ -147,6 +160,60 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
                                                d["min_history_days"], sig["reading_confidence"])
                 signals.append(sig)
 
+        # objection_shift: same baseline maths, but on the topic's complaint-
+        # intent authors only — a rise in doubt/complaint can matter even
+        # when the topic's overall mention volume isn't trending at all.
+        by_day_c = per_topic_complaint.get(topic, {})
+        cur_c_authors = len(by_day_c.get(0, set()))
+        rate_c = lambda k: len(by_day_c.get(k, set())) * 24.0 / max(win_cov.get(k, 0), 1)
+        base_c_vals = [rate_c(k) for k in history]
+        med_c, mad_c = robust_baseline(base_c_vals)
+        cur_rate_c = rate_c(0)
+        z_c = (cur_rate_c - med_c) / max(1.4826 * mad_c, 1.0)
+        growth_c = (cur_rate_c + 1) / (med_c + 1) - 1
+        if cur_c_authors >= d["min_authors"] and len(history) >= d["min_history_days"] \
+                and z_c >= d["objection_z"] and growth_c >= d["objection_min_growth"]:
+            obj_sig = await _evidence(db, market, topic, "objection_shift", now - timedelta(hours=24), now, cfg,
+                                      intents={"complaint"})
+            if obj_sig and obj_sig["top_author_share"] <= d["max_top_author_share"]:
+                obj_sig.update(current={"authors": cur_c_authors, "rate_per_day": round(cur_rate_c, 1),
+                                        "coverage": round(cur_cov / 24, 2)},
+                              baseline={"median_per_day": round(med_c, 1), "mad": round(mad_c, 1), "days": len(history)},
+                              z=round(z_c, 2), growth=round(growth_c, 2), persistence_days=0)
+                obj_sig["scores"] = {"M": momentum_score("objection_shift", z_c, growth_c),
+                                     "C": commercial_score(obj_sig["intent_mix"], obj_sig["buying_mix"])}
+                obj_sig["confidence"] = confidence(cur_c_authors, d["min_authors"], cur_cov / 24, len(history),
+                                                   d["min_history_days"], obj_sig["reading_confidence"])
+                signals.append(obj_sig)
+
+        # cooling (PRD §8.3: "momentum fading... stop recommending; expire
+        # cards"): a topic that still has a live rising/spike/new_entity
+        # signal, but no longer qualifies this run and has fallen back
+        # toward or below its own baseline. The prior signal and any live
+        # card for it are expired right away rather than left to run out
+        # their normal TTL — a stale "this is trending" card shouldn't
+        # outlive the trend it was about.
+        if kind not in ("rising", "spike") and z < d["rising_z"] and growth <= 0:
+            prior = await db["mi_listen_signals"].find_one(
+                {"market": market["key"], "topic": topic, "type": {"$in": ["rising", "spike", "new_entity"]},
+                 "status": "active", "expires_at": {"$gt": now}})
+            if prior:
+                await db["mi_listen_signals"].update_one({"_id": prior["_id"]}, {"$set": {"expires_at": now}})
+                await db["mi_listen_cards"].update_many(
+                    {"market": market["key"], "topic": topic, "status": {"$in": ["new", "shown", "saved"]}},
+                    {"$set": {"expires_at": now}})
+                cool_sig = await _evidence(db, market, topic, "cooling", now - timedelta(hours=24), now, cfg)
+                if cool_sig:
+                    cool_sig.update(current={"authors": cur_authors, "rate_per_day": round(cur_rate, 1),
+                                             "coverage": round(cur_cov / 24, 2),
+                                             "peak_authors": (prior.get("current") or {}).get("authors")},
+                                   baseline={"median_per_day": round(med, 1), "mad": round(mad, 1), "days": len(history)},
+                                   z=round(z, 2), growth=round(growth, 2), persistence_days=0)
+                    cool_sig["scores"] = {"M": momentum_score("cooling", z, growth),
+                                         "C": commercial_score(cool_sig["intent_mix"], cool_sig["buying_mix"])}
+                    cool_sig["confidence"] = prior.get("confidence", 0.5)
+                    signals.append(cool_sig)
+
     signals += await _recurring_needs(db, market, cfg, now, cov)
     if persist:
         for s in signals:
@@ -156,10 +223,17 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
     return signals
 
 
-async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: datetime, cfg: dict) -> Optional[dict]:
-    rows = [r async for r in db["mi_listen_readings"].find(
-        {"market": market["key"], "topics": topic, "on_topic": True, "measured": True,
-         "published_at": {"$gte": a, "$lt": b}})]
+async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: datetime, cfg: dict,
+                    intents: Optional[set] = None) -> Optional[dict]:
+    """intents narrows the evidence to specific reading intents (e.g.
+    {"complaint"} for objection_shift) — the signal exists because of that
+    subset, so its evidence and samples should come from that subset too,
+    not from every on-topic post about the topic."""
+    query = {"market": market["key"], "topics": topic, "on_topic": True, "measured": True,
+             "published_at": {"$gte": a, "$lt": b}}
+    if intents:
+        query["intent"] = {"$in": list(intents)}
+    rows = [r async for r in db["mi_listen_readings"].find(query)]
     if not rows:
         return None
     authors = Counter(r.get("author") or r["source_id"] for r in rows)
