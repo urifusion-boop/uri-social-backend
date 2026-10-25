@@ -31,6 +31,7 @@ SOURCE_LABEL = {
     "youtube": "YouTube", "youtube_pro": "YouTube",
     "reddit": "Reddit", "reddit_pro": "Reddit",
     "news": "News/Web", "news_pro": "News/Web",
+    "facebook": "Facebook", "facebook_pro": "Facebook",
 }
 
 
