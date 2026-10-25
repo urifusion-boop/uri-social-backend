@@ -62,7 +62,14 @@ def _raise_for_error(data: dict, context: str) -> None:
     err = (data or {}).get("error") or {}
     code = err.get("code")
     if code and code != "ok":
-        raise TikTokDirectAPIError(f"{context}: {err.get('message') or code}", code=code)
+        # The code (invalid_param, url_ownership_unverified, scope_not_authorized,
+        # unaudited_client_can_only_post_to_private_accounts, ...) is what says WHICH
+        # rule failed — TikTok's message is often the same generic "please review our
+        # integration guidelines" for several of them — so it, and the log_id TikTok
+        # support asks for, always go into the error shown to the user and the logs.
+        log_id = err.get("log_id")
+        suffix = f" [{code}{f', log_id={log_id}' if log_id else ''}]"
+        raise TikTokDirectAPIError(f"{context}: {err.get('message') or code}{suffix}", code=code)
 
 
 async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
