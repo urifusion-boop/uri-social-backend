@@ -266,3 +266,75 @@ def test_job_failure_update_distinguishes_processing_from_failed():
     assert proc == {"status": "processing", "error": "still going"}
     failed = VideoPublishService._failure_update(TikTokDirectAPIError("nope"))
     assert failed == {"status": "failed", "error": "nope"}
+
+
+# ── choosing how to post from the connection the user has ─────────────────────
+
+class _FakeCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    async def find_one(self, query, projection=None):
+        for d in self.docs:
+            if all(d.get(k) == v for k, v in query.items()):
+                return {k: v for k, v in d.items() if k != "_id"}
+        return None
+
+
+def _db(docs):
+    return {svc.CONNECTIONS: _FakeCollection(docs)}
+
+
+DIRECT = {"user_id": "u1", "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active", "id": "tt_1"}
+OUTSTAND = {"user_id": "u1", "platform": "tiktok", "connected_via": "outstand", "outstand_account_id": "odpTc"}
+
+
+def test_direct_connection_is_used_when_there_is_one():
+    assert _run(svc.resolve_tiktok_connection(_db([OUTSTAND, DIRECT]), "u1"))[0] == "direct"
+
+
+def test_outstand_connection_is_used_when_that_is_all_there_is():
+    kind, conn = _run(svc.resolve_tiktok_connection(_db([OUTSTAND]), "u1"))
+    assert kind == "outstand" and conn["outstand_account_id"] == "odpTc"
+
+
+def test_pending_direct_connection_does_not_count():
+    pending = {**DIRECT, "connection_status": "pending_user_match"}
+    assert _run(svc.resolve_tiktok_connection(_db([pending, OUTSTAND]), "u1"))[0] == "outstand"
+
+
+def test_no_connection_resolves_to_none():
+    assert _run(svc.resolve_tiktok_connection(_db([]), "u1")) == (None, None)
+    assert _run(svc.resolve_tiktok_connection(_db([OUTSTAND]), "someone-else")) == (None, None)
+
+
+def test_other_users_connections_are_never_used():
+    assert _run(svc.resolve_tiktok_connection(_db([{**DIRECT, "user_id": "u2"}]), "u1")) == (None, None)
+
+
+# ── what is sent to Outstand ──────────────────────────────────────────────────
+
+def test_outstand_config_carries_the_users_choices():
+    from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
+
+    cfg = outstand_tiktok_config(_settings(privacy_level="SELF_ONLY", allow_comment=True, brand_content=True))
+    assert cfg["postMode"] == "DIRECT_POST"
+    assert cfg["privacyLevel"] == "SELF_ONLY"
+    assert cfg["disableComment"] is False
+    assert cfg["disableDuet"] is True and cfg["disableStitch"] is True
+    assert cfg["brandContentToggle"] is True and cfg["brandOrganicToggle"] is False
+    assert "autoAddMusic" not in cfg
+
+
+def test_outstand_config_for_photos_omits_duet_and_stitch_and_adds_music_only_when_asked():
+    from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
+
+    cfg = outstand_tiktok_config(_settings(), auto_add_music=True, photo=True)
+    assert "disableDuet" not in cfg and "disableStitch" not in cfg
+    assert cfg["autoAddMusic"] is True and cfg["disableComment"] is True
+
+
+def test_outstand_config_without_settings_keeps_the_legacy_default():
+    from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
+
+    assert outstand_tiktok_config(None) == {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}

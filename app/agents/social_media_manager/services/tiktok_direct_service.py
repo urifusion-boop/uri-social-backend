@@ -190,6 +190,26 @@ async def _fetch_creator_info(access_token: str) -> dict:
     return data.get("data") or {}
 
 
+async def resolve_tiktok_connection(db, user_id: str):
+    """Which TikTok connection a post should use, from what the user has connected: a
+    direct TikTok-login connection if there is one (posted with the Content Posting API
+    directly), otherwise an Outstand-connected account (posted through Outstand).
+    Returns ("direct" | "outstand" | None, connection document | None)."""
+    direct = await db[CONNECTIONS].find_one(
+        {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
+        {"_id": 0},
+    )
+    if direct:
+        return "direct", direct
+    via_outstand = await db[CONNECTIONS].find_one(
+        {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
+        {"_id": 0},
+    )
+    if via_outstand and via_outstand.get("outstand_account_id"):
+        return "outstand", via_outstand
+    return None, None
+
+
 async def fetch_creator_info(access_token: str) -> dict:
     """Creator info for the "Post to TikTok" screen. TikTok's Content Sharing
     Guidelines require it be fetched fresh every time that screen renders, so

@@ -183,6 +183,24 @@ class OutstandService:
         confirmed = await self.confirm_upload(upload_info["id"], size=len(file_bytes))
         return confirmed["url"]
 
+    async def get_tiktok_creator_info(self, outstand_account_id: str) -> Dict[str, Any]:
+        """TikTok creator info for an Outstand-connected account (GET
+        /v1/tiktok/accounts/{id}/creator-info; works for managed-key and own-key
+        connections). Outstand queries TikTok on every request, as TikTok's guidelines
+        require for the Post to TikTok screen. Raises ValueError with Outstand's reason."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/tiktok/accounts/{outstand_account_id}/creator-info",
+                headers=self.headers,
+            )
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if resp.status_code >= 400 or not body.get("success", resp.status_code < 400):
+            raise ValueError(body.get("error") or f"Outstand creator-info failed (HTTP {resp.status_code})")
+        return body.get("data") or {}
+
     async def get_post_analytics(self, post_id: str) -> Dict[str, Any]:
         """Fetch analytics for a published post from Outstand's GET /v1/posts/{id}/analytics."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
