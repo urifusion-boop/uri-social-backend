@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
 
-from . import markets, ontology
+from . import embeddings, markets, ontology
 
 PROMPT_VERSION = "mi-listen-profile-v1"
 
@@ -199,10 +199,25 @@ async def build(db, user_id: str, brand_id: str, playbook: dict, force: bool = F
     field_origins["country"] = "playbook" if _country_from_text(facts["customer_location"]) else "ai_mapping"
     if private_terms:
         field_origins["private_terms"] = "playbook"
+
+    # PRD §9.1's "semantic similarity between the signal and the business
+    # profile embedding" — computed here, once per real fact change (gated
+    # by the same fingerprint this function already short-circuits on
+    # above), not per card judged. A failed embedding call degrades to
+    # None rather than blocking profile building; personalize.py already
+    # treats a missing embedding as "no semantic signal," not a zero.
+    summary = ". ".join(p for p in (
+        facts.get("what_we_sell"), facts.get("industry"), facts.get("target_audience"),
+        ", ".join(facts.get("products") or []),
+    ) if p)
+    profile_embedding = await embeddings.embed_text(summary) if summary else None
+    if profile_embedding:
+        field_origins["profile_embedding"] = "ai_mapping"
+
     doc = {
         "brand_id": brand_id, "user_id": user_id, "facts": facts, "fingerprint": fp,
         "markets": market_keys, "country": country,
-        "private_terms": private_terms,
+        "private_terms": private_terms, "profile_embedding": profile_embedding,
         "status": "active", "prompt_version": PROMPT_VERSION, "updated_at": now,
         "version": int((existing or {}).get("version", 0)) + 1,
         "field_origins": field_origins,

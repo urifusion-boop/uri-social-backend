@@ -6,12 +6,21 @@ Many wordings of one thing become one topic: "Latasha wig", "latasha wigs",
 Every relevant post is counted into an hourly bucket per market × topic:
 distinct accounts (the headline measure — one account posting ten times is
 one voice), posts, engagement and the intent mix.
+
+Also builds the two PRD §8.1 topic-graph edges this module can produce
+without new infrastructure: an embedding per topic (resolve(), computed
+once when the topic is first created — PRD §8 stage 4), and co-occurrence
+counts between topics mentioned in the same post (count(), since the
+reading it's called with already carries every topic that post resolved
+to, not just this one).
 """
 from __future__ import annotations
 
 import re
 from datetime import datetime
 from typing import Optional
+
+from . import embeddings
 
 GENERIC = {"hair", "skin", "product", "products", "price", "business", "food", "clothes", "fashion", "beauty",
            "love", "buy", "sell", "today", "people", "thing", "things", "shop", "store", "online"}
@@ -53,13 +62,21 @@ async def resolve(db, market: str, phrase: str, now: Optional[datetime] = None) 
             updates["$addToSet"] = {"aliases": key}
         await coll.update_one({"_id": hit["_id"]}, updates)
         return hit["key"]
-    await coll.update_one(
+    result = await coll.update_one(
         {"market": market, "key": key},
         {"$setOnInsert": {"market": market, "key": key, "name": phrase.strip().lower().lstrip("#"),
                           "compact": compact(key), "aliases": [], "first_seen": now, "status": "observed"},
          "$set": {"last_seen": now}},
         upsert=True,
     )
+    if result.upserted_id is not None:
+        # Once per topic, not per post: every business subscribed to this
+        # market reuses the same vector (personalize.py's semantic
+        # relevance component). A failed embedding call just leaves this
+        # topic without one — resolve() has already done its real job.
+        vec = await embeddings.embed_text(key)
+        if vec:
+            await coll.update_one({"_id": result.upserted_id}, {"$set": {"embedding": vec}})
     return key
 
 
@@ -91,3 +108,13 @@ async def count(db, market: str, topic_key: str, item: dict, reading: dict) -> N
          "$push": {"sample": {"$each": [item["source_id"]], "$slice": -20}}},
         upsert=True,
     )
+    # PRD §8.1 topic graph: "edges capture... co-occurrence" — this post
+    # resolved to more than one topic, so each is evidence the two are
+    # related. Counted on this topic's own doc (an edge recorded from both
+    # sides, independently, as each topic gets counted in turn).
+    others = [t for t in (reading.get("topics") or []) if t and t != topic_key]
+    if others:
+        await db["mi_market_topics"].update_one(
+            {"market": market, "key": topic_key},
+            {"$inc": {f"co_occurs.{t}": 1 for t in others}},
+        )
