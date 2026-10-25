@@ -193,3 +193,18 @@ def test_render_converts_png_to_jpeg_and_caps_at_1080():
 
 def test_render_returns_none_for_missing_index():
     assert _run(proxy.render_jpeg({"image_url": _png_data_url((10, 10))}, 3)) is None
+
+
+# ── error reporting ───────────────────────────────────────────────────────────
+
+def test_tiktok_error_code_and_log_id_are_kept_in_the_message():
+    data = {"error": {"code": "invalid_param", "message": "Please review our integration guidelines", "log_id": "L123"}}
+    with pytest.raises(TikTokDirectAPIError) as exc:
+        svc._raise_for_error(data, "photo init")
+    assert "photo init: Please review our integration guidelines" in str(exc.value)
+    assert "invalid_param" in str(exc.value) and "L123" in str(exc.value)
+    assert exc.value.code == "invalid_param"
+
+
+def test_ok_envelope_does_not_raise():
+    svc._raise_for_error({"error": {"code": "ok", "message": "", "log_id": "x"}}, "photo init")
