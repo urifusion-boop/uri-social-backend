@@ -173,6 +173,12 @@ class CreativeFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
     reference_images: List[str] = Field(default_factory=list, max_items=5)
 
+async def _resolve_tiktok_connection(db, user_id: str):
+    """See tiktok_direct_service.resolve_tiktok_connection."""
+    from app.agents.social_media_manager.services.tiktok_direct_service import resolve_tiktok_connection
+    return await resolve_tiktok_connection(db, user_id)
+
+
 class TikTokPostSettingsRequest(BaseModel):
     """The user's choices from the Post to TikTok screen (TikTok Content Sharing
     Guidelines). privacy_level is required with no default; interactions are
@@ -7539,18 +7545,14 @@ async def publish_video_draft(
         if not conn.get("ig_user_id"):
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
     elif request.platform == "tiktok":
-        # Only the direct-OAuth connection can be posted to: the Post to TikTok
-        # screen needs creator_info (nickname, allowed privacy levels, disabled
-        # interactions), which the Outstand route can't provide, and TikTok's
-        # guidelines forbid defaulting privacy/interaction choices for the user.
-        conn = await db["social_connections"].find_one(
-            {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
-            {"_id": 0},
-        )
+        # The post goes out however the account was connected: directly through TikTok
+        # login, or through Outstand. Either way the Post to TikTok screen's choices
+        # (privacy, interactions, disclosure) are required — nothing is defaulted.
+        _conn_type, conn = await _resolve_tiktok_connection(db, user_id)
         if not conn:
             raise HTTPException(
                 status_code=400,
-                detail="Connect your TikTok account directly to post. Open Connected Accounts and reconnect TikTok.",
+                detail="No connected TikTok account found. Connect one in Connected Accounts first.",
             )
         if not request.tiktok:
             raise HTTPException(status_code=400, detail="TikTok post settings are required (privacy level, interactions).")
@@ -7616,22 +7618,26 @@ async def publish_tiktok_photo_draft(
     if image_count == 0:
         raise HTTPException(status_code=400, detail="This post has no image to publish.")
 
-    conn = await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
-        {"_id": 0},
-    )
+    conn_type, conn = await _resolve_tiktok_connection(db, user_id)
     if not conn:
         raise HTTPException(
             status_code=400,
-            detail="Connect your TikTok account directly to post. Open Connected Accounts and reconnect TikTok.",
+            detail="No connected TikTok account found. Connect one in Connected Accounts first.",
         )
 
     tiktok_settings = TikTokPostSettings(**request.tiktok.model_dump())
+    # Signed links on our own API: TikTok pulls from them directly (direct connections,
+    # which need a verified domain), and Outstand re-hosts from them (Outstand ones).
     image_urls = tiktok_media_proxy.signed_urls(request.draft_id, image_count)
 
     job_id = await VideoPublishService.create_job(request.draft_id, "tiktok", user_id)
+    runner = (
+        VideoPublishService.run_tiktok_photo_job
+        if conn_type == "direct"
+        else VideoPublishService.run_tiktok_photo_job_outstand
+    )
     background_tasks.add_task(
-        VideoPublishService.run_tiktok_photo_job,
+        runner,
         job_id,
         request.draft_id,
         image_urls,
@@ -7679,17 +7685,20 @@ async def serve_tiktok_media(
     return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
 
 
-@router.get("/connections/tiktok-direct/creator-info")
+@router.get("/connections/tiktok/creator-info")
+@router.get("/connections/tiktok-direct/creator-info")  # earlier path, kept for open pages
 async def get_tiktok_creator_info(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Creator info for the Post to TikTok screen. TikTok requires this be fetched
-    fresh each time that screen renders: the connected account's nickname, the
-    privacy levels it may post with, which interactions it has disabled, and the
-    longest video it can post.
+    Creator info for the Post to TikTok screen, from whichever TikTok connection the
+    user has (direct TikTok login, or Outstand). TikTok requires it be fetched fresh
+    each time that screen renders: the account's nickname and avatar, the privacy
+    levels it may post with, which interactions it has disabled, and the longest
+    video it can post.
     """
+    from app.agents.social_media_manager.services.outstand_service import OutstandService
     from app.agents.social_media_manager.services.tiktok_direct_service import (
         fetch_creator_info,
         get_valid_tiktok_access_token,
@@ -7700,23 +7709,24 @@ async def get_tiktok_creator_info(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    conn = await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
-        {"_id": 0},
-    )
+    conn_type, conn = await _resolve_tiktok_connection(db, user_id)
     if not conn:
         raise HTTPException(
             status_code=400,
-            detail="Connect your TikTok account directly to post. Open Connected Accounts and reconnect TikTok.",
+            detail="No connected TikTok account found. Connect one in Connected Accounts first.",
         )
 
     try:
-        access_token = await get_valid_tiktok_access_token(db, conn)
-        info = await fetch_creator_info(access_token)
-    except TikTokDirectAPIError as e:
+        if conn_type == "direct":
+            access_token = await get_valid_tiktok_access_token(db, conn)
+            info = await fetch_creator_info(access_token)
+        else:
+            info = await OutstandService().get_tiktok_creator_info(conn["outstand_account_id"])
+    except (TikTokDirectAPIError, ValueError) as e:
         raise HTTPException(status_code=502, detail=f"Couldn't load your TikTok account details: {e}")
 
     return UriResponse.get_single_data_response("tiktok_creator_info", {
+        "connection_type": conn_type,
         "creator_nickname": info.get("creator_nickname") or info.get("creator_username") or conn.get("account_name") or "",
         "creator_username": info.get("creator_username") or "",
         "creator_avatar_url": info.get("creator_avatar_url") or "",
