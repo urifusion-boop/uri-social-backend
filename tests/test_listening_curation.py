@@ -220,6 +220,113 @@ class TestCurationTopicHistory:
         assert result["responseCode"] == 404
 
 
+class TestCurationConfig:
+    """PRD §4's cross-cutting 'admin consoles' over budgets/cadence/
+    thresholds, without a deploy — live-editable through the same
+    mi_listening_config document get_config() already reads."""
+
+    @pytest.mark.asyncio
+    async def test_get_returns_the_merged_live_config(self):
+        from app.agents.market_intelligence.listening.config import DEFAULTS
+        from app.agents.market_intelligence.listening.router import curation_get_config
+        db = fresh_db()
+        result = await curation_get_config(admin=ADMIN, db=db)
+        assert result["responseData"]["score"]["max_cards_per_run"] == DEFAULTS["score"]["max_cards_per_run"]
+
+    @pytest.mark.asyncio
+    async def test_update_changes_a_value_and_persists_across_reads(self):
+        from app.agents.market_intelligence.listening.config import get_config
+        from app.agents.market_intelligence.listening.router import ConfigUpdate, curation_update_config
+        db = fresh_db()
+        result = await curation_update_config(ConfigUpdate(overrides={"score": {"max_cards_per_run": 9}}),
+                                               admin=ADMIN, db=db)
+        assert result["responseData"]["score"]["max_cards_per_run"] == 9
+        assert result["responseData"]["score"]["min_score"] == 55  # untouched sibling keys survive the merge
+
+        live = await get_config(db)
+        assert live["score"]["max_cards_per_run"] == 9
+
+    @pytest.mark.asyncio
+    async def test_unknown_top_level_section_is_rejected(self):
+        from app.agents.market_intelligence.listening.router import ConfigUpdate, curation_update_config
+        db = fresh_db()
+        with pytest.raises(HTTPException) as exc:
+            await curation_update_config(ConfigUpdate(overrides={"buget": {"typo": 1}}), admin=ADMIN, db=db)
+        assert exc.value.status_code == 400
+
+
+class TestCurationOntologyTerms:
+    """PRD §6.1: the ontology is 'grown continuously... reviewed through
+    an internal curation console' — a curator typing a term straight in,
+    without waiting for the discovery pipeline to surface it first."""
+
+    @pytest.mark.asyncio
+    async def test_add_core_term(self):
+        from app.agents.market_intelligence.listening import ontology
+        from app.agents.market_intelligence.listening.router import OntologyTerm, curation_add_ontology_term
+        db = fresh_db()
+        await ontology.ensure_seeded(db)
+        cats = await ontology.categories(db)
+        cid = cats[0]["id"]
+
+        result = await curation_add_ontology_term(cid, OntologyTerm(term="brand new term"), admin=ADMIN, db=db)
+        assert "brand new term" in result["responseData"]["core_terms"]
+
+    @pytest.mark.asyncio
+    async def test_add_local_language_term(self):
+        from app.agents.market_intelligence.listening import ontology
+        from app.agents.market_intelligence.listening.router import OntologyTerm, curation_add_ontology_term
+        db = fresh_db()
+        await ontology.ensure_seeded(db)
+        cid = (await ontology.categories(db))[0]["id"]
+
+        result = await curation_add_ontology_term(cid, OntologyTerm(term="who dey sell", lang="pcm"),
+                                                   admin=ADMIN, db=db)
+        assert "who dey sell" in result["responseData"]["local_terms"]["pcm"]
+
+    @pytest.mark.asyncio
+    async def test_add_term_to_a_missing_category_is_404(self):
+        from app.agents.market_intelligence.listening.router import OntologyTerm, curation_add_ontology_term
+        db = fresh_db()
+        with pytest.raises(HTTPException) as exc:
+            await curation_add_ontology_term("no_such_category", OntologyTerm(term="x"), admin=ADMIN, db=db)
+        assert exc.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_remove_term(self):
+        from app.agents.market_intelligence.listening import ontology
+        from app.agents.market_intelligence.listening.router import (
+            OntologyTerm, curation_add_ontology_term, curation_remove_ontology_term,
+        )
+        db = fresh_db()
+        await ontology.ensure_seeded(db)
+        cid = (await ontology.categories(db))[0]["id"]
+        await curation_add_ontology_term(cid, OntologyTerm(term="temporary term"), admin=ADMIN, db=db)
+
+        result = await curation_remove_ontology_term(cid, "temporary term", lang=None, admin=ADMIN, db=db)
+        assert "temporary term" not in result["responseData"]["core_terms"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_term_is_not_added_twice(self):
+        from app.agents.market_intelligence.listening import ontology
+        from app.agents.market_intelligence.listening.router import OntologyTerm, curation_add_ontology_term
+        db = fresh_db()
+        await ontology.ensure_seeded(db)
+        cid = (await ontology.categories(db))[0]["id"]
+
+        await curation_add_ontology_term(cid, OntologyTerm(term="dup term"), admin=ADMIN, db=db)
+        result = await curation_add_ontology_term(cid, OntologyTerm(term="dup term"), admin=ADMIN, db=db)
+        assert result["responseData"]["core_terms"].count("dup term") == 1
+
+    @pytest.mark.asyncio
+    async def test_list_ontology_returns_seeded_categories(self):
+        from app.agents.market_intelligence.listening.router import curation_list_ontology
+        db = fresh_db()
+        result = await curation_list_ontology(admin=ADMIN, db=db)
+        assert len(result["responseData"]) > 0
+        assert all("core_terms" in c for c in result["responseData"])
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

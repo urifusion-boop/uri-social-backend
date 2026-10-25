@@ -18,8 +18,8 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, golden, metrics, permissions, profile as profile_mod, replay, review
-from .config import _merge, get_config
+from . import collector, discovery, golden, metrics, ontology, permissions, profile as profile_mod, replay, review
+from .config import _merge, get_config, unknown_top_level_keys, update_config
 from .cycle import run_cycle
 
 router = APIRouter(prefix="/listening", tags=["Market Intelligence · Listening"])
@@ -535,6 +535,68 @@ async def set_source_approval(source: str, body: SourceApproval, admin: dict = D
     actor = (admin.get("claims") or {}).get("email") or "admin"
     result = await permissions.set_approval(db, source, body.approved, actor, body.notes)
     return UriResponse.get_single_data_response("source", result)
+
+
+# ── Settings: budgets, cadence, thresholds, experiments ─────────────────────
+
+@router.get("/curation/config")
+async def curation_get_config(admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """The live, merged config (DEFAULTS + whatever's been overridden) —
+    exactly what every scheduled cycle actually reads, not a copy of the
+    defaults in code."""
+    return UriResponse.get_single_data_response("config", await get_config(db))
+
+
+class ConfigUpdate(BaseModel):
+    overrides: dict
+
+
+@router.put("/curation/config")
+async def curation_update_config(body: ConfigUpdate, admin: dict = Depends(_verify_admin),
+                                 db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Change budgets/cadence/thresholds/experiments live, no deploy. Only
+    top-level sections that already exist in DEFAULTS are accepted — a typo
+    ("buget" for "budget") is rejected loudly here rather than silently
+    stored as dead config nothing ever reads."""
+    bad = unknown_top_level_keys(body.overrides)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"unknown config section(s): {bad}")
+    updated = await update_config(db, body.overrides)
+    return UriResponse.get_single_data_response("config", updated)
+
+
+# ── Settings: ontology terms ──────────────────────────────────────────────
+
+@router.get("/curation/ontology")
+async def curation_list_ontology(admin: dict = Depends(_verify_admin), db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    await ontology.ensure_seeded(db)
+    return UriResponse.get_single_data_response("categories", await ontology.categories(db))
+
+
+class OntologyTerm(BaseModel):
+    term: str
+    lang: Optional[str] = None  # None = core_terms; a language code = that language's local_terms
+
+
+@router.post("/curation/ontology/{category_id}/terms")
+async def curation_add_ontology_term(category_id: str, body: OntologyTerm, admin: dict = Depends(_verify_admin),
+                                     db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """A curator typing a term straight in (PRD §6.1), without waiting for
+    the discovery pipeline to surface it as a candidate first."""
+    result = await ontology.add_term(db, category_id, body.term, body.lang)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return UriResponse.get_single_data_response("category", result)
+
+
+@router.delete("/curation/ontology/{category_id}/terms/{term}")
+async def curation_remove_ontology_term(category_id: str, term: str, lang: Optional[str] = None,
+                                        admin: dict = Depends(_verify_admin),
+                                        db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    result = await ontology.remove_term(db, category_id, term, lang)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+    return UriResponse.get_single_data_response("category", result)
 
 
 # ── Human review queue (PRD §17) — admin-only ─────────────────────────────────

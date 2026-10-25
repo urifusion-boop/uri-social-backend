@@ -177,3 +177,28 @@ async def get_config(db) -> dict:
     doc.pop("_id", None)
     doc.pop("id", None)
     return _merge(DEFAULTS, doc)
+
+
+def unknown_top_level_keys(overrides: dict) -> list[str]:
+    return sorted(k for k in (overrides or {}) if k not in DEFAULTS)
+
+
+async def update_config(db, overrides: dict) -> dict:
+    """Admin-editable budgets/cadence/thresholds (PRD §4's cross-cutting
+    "admin consoles"; PRD §21 open question #... "who can edit budgets
+    and thresholds" answered here as: an admin, through this). Stored in
+    the same mi_listening_config document get_config() already reads and
+    merges over DEFAULTS, so a change here takes effect on the very next
+    read — no deploy needed, exactly the module's existing "live values
+    are the config doc, not the code" design (see this file's own
+    docstring). Only top-level sections that already exist in DEFAULTS are
+    accepted — the caller (router.py) is expected to have already checked
+    unknown_top_level_keys and rejected the request if it isn't empty;
+    this function itself still only ever merges, never invents new
+    structure from nothing."""
+    doc = await db["mi_listening_config"].find_one({"id": "global"}) or {}
+    doc.pop("_id", None)
+    doc.pop("id", None)
+    merged = _merge(doc, overrides)
+    await db["mi_listening_config"].update_one({"id": "global"}, {"$set": merged}, upsert=True)
+    return _merge(DEFAULTS, merged)
