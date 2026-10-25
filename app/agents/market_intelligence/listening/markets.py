@@ -42,6 +42,7 @@ SOURCE_QUERY_STYLE: dict[str, str] = {
     "instagram": "flat", "instagram_pro": "flat",
     "youtube": "flat", "youtube_pro": "flat",
     "news": "flat", "news_pro": "flat",
+    "facebook": "flat", "facebook_pro": "flat",
 }
 
 COUNTRY_LANGS = {"NG": ["en", "pcm"], "GH": ["en", "pcm"], "KE": ["en", "sw"], "ZA": ["en"], "GB": ["en"], "US": ["en"]}
