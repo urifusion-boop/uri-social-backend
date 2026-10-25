@@ -34,6 +34,9 @@ from .adapters.apify_reddit import (
 from .adapters.apify_news import (
     PRO_PROFILE as NEWS_PRO_PROFILE, TEST_PROFILE as NEWS_TEST_PROFILE, ApifyNewsAdapter,
 )
+from .adapters.apify_facebook import (
+    PRO_PROFILE as FACEBOOK_PRO_PROFILE, TEST_PROFILE as FACEBOOK_TEST_PROFILE, ApifyFacebookAdapter,
+)
 from .adapters.mock import MockSourceAdapter
 from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
@@ -98,6 +101,8 @@ ADAPTER_REGISTRY: dict[str, SourceAdapter] = {
     "reddit_pro": ApifyRedditAdapter(REDDIT_PRO_PROFILE),
     "news": ApifyNewsAdapter(NEWS_TEST_PROFILE),
     "news_pro": ApifyNewsAdapter(NEWS_PRO_PROFILE),
+    "facebook": ApifyFacebookAdapter(FACEBOOK_TEST_PROFILE),
+    "facebook_pro": ApifyFacebookAdapter(FACEBOOK_PRO_PROFILE),
 }
 
 # Real collection pages through results; a bound keeps one bad cursor from
