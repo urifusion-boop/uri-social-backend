@@ -70,6 +70,8 @@ DEFAULTS: dict[str, Any] = {
         "objection_z": 1.5,            # lower than rising_z: complaint volume is naturally
                                        # lower than overall mention volume, worth catching sooner
         "objection_min_growth": 0.4,
+        "upcoming_window_days": 14,    # how far back to look for dated-future-event mentions
+        "upcoming_min_authors": 3,     # a dated launch/event doesn't need rising's volume to be real
     },
     # Personalisation
     "score": {

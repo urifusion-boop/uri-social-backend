@@ -311,6 +311,7 @@ async def read_and_count(db, market: dict, source_ids: list[str], cfg: dict) -> 
                 "source_id": item["source_id"], "market": market["key"], "on_topic": rd.on_topic, "measured": measured,
                 "intent": rd.intent.value, "need": rd.need, "sentiment": rd.sentiment.value,
                 "buying_intent": rd.buying_intent.value, "topics": topic_keys, "confidence": rd.confidence,
+                "event_date": rd.event_date,
                 "published_at": item.get("published_at"), "author": item.get("author_handle"),
                 "prompt_version": enrich.PROMPT_VERSION, "read_at": datetime.utcnow(),
             }

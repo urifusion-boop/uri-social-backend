@@ -18,6 +18,10 @@ partial days compare fairly. Baseline: median and MAD of earlier covered days
                toward or below its own baseline (PRD §8.3: "momentum fading... stop
                recommending; expire cards") — the prior signal and any live card for it are
                expired immediately rather than left to run out their normal TTL
+  upcoming_development — enough independent people already mentioning a concrete FUTURE
+               date for a launch, event, sale or regulation (enrich.py's event_date field);
+               evidence-based like recurring_need, not baseline/z-score based — a one-off
+               dated event has no reason to need 28 days of history before it's real
 Breadth guard: one account can't make a signal (top-author share cap).
 """
 from __future__ import annotations
@@ -73,6 +77,8 @@ def momentum_score(kind: str, z: float, growth: float) -> float:
         return min(60.0, 35 + 10 * max(growth, 0))
     if kind == "cooling":
         return 10.0  # momentum is, by definition, fading — never worth promoting
+    if kind == "upcoming_development":
+        return 62.0  # time-sensitive and actionable, but not a momentum measurement at all
     return 30.0  # recurring_need: steady, not trending
 
 
@@ -215,6 +221,7 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
                     signals.append(cool_sig)
 
     signals += await _recurring_needs(db, market, cfg, now, cov)
+    signals += await _upcoming_developments(db, market, cfg, now, cov)
     if persist:
         for s in signals:
             await db["mi_listen_signals"].update_one(
@@ -224,15 +231,20 @@ async def detect_market(db, market: dict, cfg: dict, now: Optional[datetime] = N
 
 
 async def _evidence(db, market: dict, topic: str, kind: str, a: datetime, b: datetime, cfg: dict,
-                    intents: Optional[set] = None) -> Optional[dict]:
+                    intents: Optional[set] = None, source_ids: Optional[list] = None) -> Optional[dict]:
     """intents narrows the evidence to specific reading intents (e.g.
-    {"complaint"} for objection_shift) — the signal exists because of that
-    subset, so its evidence and samples should come from that subset too,
-    not from every on-topic post about the topic."""
+    {"complaint"} for objection_shift); source_ids narrows it to specific
+    posts already picked out by the caller (e.g. the ones that actually
+    named a future date, for upcoming_development) — either way, the
+    signal exists because of that subset, so its evidence and samples
+    should come from that subset too, not from every on-topic post about
+    the topic."""
     query = {"market": market["key"], "topics": topic, "on_topic": True, "measured": True,
              "published_at": {"$gte": a, "$lt": b}}
     if intents:
         query["intent"] = {"$in": list(intents)}
+    if source_ids:
+        query["source_id"] = {"$in": list(source_ids)}
     rows = [r async for r in db["mi_listen_readings"].find(query)]
     if not rows:
         return None
@@ -315,4 +327,57 @@ async def _recurring_needs(db, market: dict, cfg: dict, now: datetime, cov: set)
                                            min(1.0, covered_days / max(d["recurring_window_days"], 1)),
                                            covered_days, d["min_history_days"], sig["reading_confidence"])
             out.append(sig)
+    return out
+
+
+def _parse_event_date(raw: Optional[str], now: datetime) -> Optional[datetime.date]:
+    """Only a clean YYYY-MM-DD in the future relative to `now` counts —
+    never guessed, never past-dated (enrich.py is told the same, this is
+    the deterministic backstop in case the model slips)."""
+    if not raw:
+        return None
+    try:
+        d = datetime.strptime(raw.strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, AttributeError):
+        return None
+    return d if d > now.date() else None
+
+
+async def _upcoming_developments(db, market: dict, cfg: dict, now: datetime, cov: set) -> list[dict]:
+    """PRD §8.3: 'Dated event, launch or regulation' — evidence-based like
+    recurring_need, not baseline/z-score based: a one-off future date has
+    no reason to need 28 days of history before it counts as real."""
+    d = cfg["detect"]
+    a = now - timedelta(days=d["upcoming_window_days"])
+    by_topic: dict[str, dict] = defaultdict(lambda: {"authors": set(), "dates": Counter(), "source_ids": []})
+    async for r in db["mi_listen_readings"].find({"market": market["key"], "on_topic": True, "measured": True,
+                                                  "event_date": {"$ne": None},
+                                                  "published_at": {"$gte": a, "$lt": now}}):
+        if hour_floor(r["published_at"]) not in cov:
+            continue
+        ev_date = _parse_event_date(r.get("event_date"), now)
+        if not ev_date:
+            continue
+        for t in r.get("topics") or []:
+            v = by_topic[t]
+            v["authors"].add(r.get("author") or r["source_id"])
+            v["dates"][ev_date] += 1
+            v["source_ids"].append(r["source_id"])
+
+    out = []
+    for topic, v in by_topic.items():
+        if len(v["authors"]) < d["upcoming_min_authors"]:
+            continue
+        event_date, _count = v["dates"].most_common(1)[0]  # the date most people actually agree on
+        sig = await _evidence(db, market, topic, "upcoming_development", a, now, cfg, source_ids=v["source_ids"])
+        if not sig or sig["top_author_share"] > d["max_top_author_share"]:
+            continue
+        sig.update(current={"authors": len(v["authors"]), "event_date": event_date.isoformat(),
+                            "days_until": (event_date - now.date()).days},
+                   baseline=None, z=0.0, growth=0.0, persistence_days=0)
+        sig["scores"] = {"M": momentum_score("upcoming_development", 0, 0),
+                         "C": commercial_score(sig["intent_mix"], sig["buying_mix"])}
+        sig["confidence"] = confidence(len(v["authors"]), d["upcoming_min_authors"], 1.0, 0,
+                                       d["min_history_days"], sig["reading_confidence"])
+        out.append(sig)
     return out
