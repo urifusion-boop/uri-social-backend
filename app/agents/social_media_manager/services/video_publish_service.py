@@ -94,8 +94,20 @@ class VideoPublishService:
             print(f"[VideoPublish {job_id}] failed: {e}")
             await col.update_one(
                 {"job_id": job_id},
-                {"$set": {"status": "failed", "error": str(e)}},
+                {"$set": VideoPublishService._failure_update(e)},
             )
+
+    @staticmethod
+    def _failure_update(exc: Exception) -> Dict[str, Any]:
+        """Job fields for an exception. A TikTok post that was accepted but hasn't
+        reached a final state is "processing" (with the explanation), never
+        "published" and not "failed" either — success needs TikTok's confirmation."""
+        from app.agents.social_media_manager.services.tiktok_direct_service import (
+            TikTokStillProcessingError,
+        )
+        if isinstance(exc, TikTokStillProcessingError):
+            return {"status": "processing", "error": str(exc)}
+        return {"status": "failed", "error": str(exc)}
 
     @staticmethod
     async def run_tiktok_photo_job(
@@ -140,7 +152,7 @@ class VideoPublishService:
             print(f"[TikTokPhotoPublish {job_id}] failed: {e}")
             await col.update_one(
                 {"job_id": job_id},
-                {"$set": {"status": "failed", "error": str(e)}},
+                {"$set": VideoPublishService._failure_update(e)},
             )
 
     # ── Instagram Reels ───────────────────────────────────────────────────────

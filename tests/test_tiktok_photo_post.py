@@ -208,3 +208,61 @@ def test_tiktok_error_code_and_log_id_are_kept_in_the_message():
 
 def test_ok_envelope_does_not_raise():
     svc._raise_for_error({"error": {"code": "ok", "message": "", "log_id": "x"}}, "photo init")
+
+
+# ── never report success without TikTok's confirmation ───────────────────────
+
+def _status_client(statuses):
+    """Fake client whose status/fetch returns the given statuses in order, repeating the last."""
+    seq = list(statuses)
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **k):
+            status = seq.pop(0) if len(seq) > 1 else seq[0]
+            return _FakeResp({"error": {"code": "ok"}, "data": {"status": status}})
+
+    return FakeClient
+
+
+def test_still_processing_after_the_poll_window_is_not_success():
+    with patch.object(svc.httpx, "AsyncClient", _status_client(["PROCESSING_UPLOAD"])), \
+         patch.object(svc.asyncio, "sleep", AsyncMock()):
+        with pytest.raises(svc.TikTokStillProcessingError, match="still processing"):
+            _run(svc._wait_for_publish("tok", "pp1"))
+
+
+def test_complete_is_success():
+    with patch.object(svc.httpx, "AsyncClient", _status_client(["PROCESSING_UPLOAD", "PUBLISH_COMPLETE"])), \
+         patch.object(svc.asyncio, "sleep", AsyncMock()):
+        assert _run(svc._wait_for_publish("tok", "pp1")) == ("pp1", "PUBLISH_COMPLETE")
+
+
+def test_failed_still_raises_a_plain_error_with_the_reason():
+    data = {"error": {"code": "ok"}, "data": {"status": "FAILED", "fail_reason": "picture_size_check_failed"}}
+
+    class FakeClient(_status_client(["FAILED"])):
+        async def post(self, url, **k):
+            return _FakeResp(data)
+
+    with patch.object(svc.httpx, "AsyncClient", FakeClient), patch.object(svc.asyncio, "sleep", AsyncMock()):
+        with pytest.raises(TikTokDirectAPIError, match="picture_size_check_failed") as exc:
+            _run(svc._wait_for_publish("tok", "pp1"))
+    assert not isinstance(exc.value, svc.TikTokStillProcessingError)
+
+
+def test_job_failure_update_distinguishes_processing_from_failed():
+    from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+
+    proc = VideoPublishService._failure_update(svc.TikTokStillProcessingError("still going"))
+    assert proc == {"status": "processing", "error": "still going"}
+    failed = VideoPublishService._failure_update(TikTokDirectAPIError("nope"))
+    assert failed == {"status": "failed", "error": "nope"}
