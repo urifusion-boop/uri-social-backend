@@ -70,3 +70,31 @@ async def add_auto_category(db, label: str, core_terms: list[str], excluded: lis
            "created_at": datetime.utcnow()}
     await db["mi_ontology"].insert_one(dict(doc))
     return doc
+
+
+async def add_term(db, category_id: str, term: str, lang: Optional[str] = None) -> Optional[dict]:
+    """A curator typing a term straight into a category (PRD §6.1: the
+    ontology is "grown continuously... reviewed through an internal
+    curation console") — today that only happens through the discovery
+    pipeline surfacing a candidate first; this is the direct path for a
+    term the curator already knows belongs, without waiting to see it
+    discovered. lang=None adds to core_terms; a language code adds to
+    that language's local_terms list instead."""
+    term = (term or "").strip()
+    if not term:
+        return None
+    field = f"local_terms.{lang}" if lang else "core_terms"
+    result = await db["mi_ontology"].update_one({"kind": "category", "id": category_id},
+                                                {"$addToSet": {field: term}})
+    if result.matched_count == 0:
+        return None
+    return await category(db, category_id)
+
+
+async def remove_term(db, category_id: str, term: str, lang: Optional[str] = None) -> Optional[dict]:
+    field = f"local_terms.{lang}" if lang else "core_terms"
+    result = await db["mi_ontology"].update_one({"kind": "category", "id": category_id},
+                                                {"$pull": {field: term}})
+    if result.matched_count == 0:
+        return None
+    return await category(db, category_id)
