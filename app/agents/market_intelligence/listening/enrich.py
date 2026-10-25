@@ -9,6 +9,7 @@ Posts are untrusted text: they are fenced as data and never obeyed.
 """
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from typing import Optional
 
@@ -17,6 +18,9 @@ from pydantic import BaseModel, Field
 from app.services.AIService import AIService
 
 PROMPT_VERSION = "mi-listen-enrich-v2"  # v2: stricter relevance
+
+_RATE_LIMIT_MARKER = "temporarily unavailable"  # both AIService 429/quota messages contain this
+_RATE_LIMIT_BACKOFF_SECONDS = 5
 
 
 class Intent(str, Enum):
@@ -86,15 +90,26 @@ async def read_batch(market_label: str, posts: list[dict], model: str = "gpt-4o-
         {"role": "system", "content": SYSTEM.format(market=market_label)},
         {"role": "user", "content": f"[POSTS START]\n{block}\n[POSTS END]"},
     ])
-    try:
-        completion = await AIService.structured_chat_completion(req, response_model=_Batch)
-        if isinstance(completion, dict) and "error" in completion:
-            print(f"[MI][listen] enrich failed: {completion['error']}")
+    parsed: Optional[_Batch] = None
+    for attempt in range(2):  # one retry after a backoff, only for a rate-limited call
+        try:
+            completion = await AIService.structured_chat_completion(req, response_model=_Batch)
+            if isinstance(completion, dict) and "error" in completion:
+                if attempt == 0 and _RATE_LIMIT_MARKER in str(completion["error"]):
+                    print(f"[MI][listen] enrich rate-limited, retrying once: {completion['error']}")
+                    await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
+                    continue
+                print(f"[MI][listen] enrich failed: {completion['error']}")
+                return {}
+            parsed = completion.choices[0].message.parsed
+            break
+        except Exception as e:
+            if attempt == 0 and _RATE_LIMIT_MARKER in str(e):
+                print(f"[MI][listen] enrich raised rate-limit, retrying once: {e}")
+                await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            print(f"[MI][listen] enrich raised: {e}")
             return {}
-        parsed: Optional[_Batch] = completion.choices[0].message.parsed
-    except Exception as e:
-        print(f"[MI][listen] enrich raised: {e}")
-        return {}
     out = {}
     for it in (parsed.items if parsed else []):
         if 0 <= it.idx < len(posts):
