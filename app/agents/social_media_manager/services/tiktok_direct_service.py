@@ -55,6 +55,12 @@ class TikTokDirectAPIError(Exception):
         self.code = code
 
 
+class TikTokStillProcessingError(TikTokDirectAPIError):
+    """TikTok accepted the post but hadn't finished (or failed) it when we stopped
+    polling. Not a failure and not a success — callers must not report it as
+    published, since success can only be shown once TikTok confirms it."""
+
+
 def _raise_for_error(data: dict, context: str) -> None:
     # TikTok's envelope: {"data": {...}, "error": {"code": "ok", "message": "...", "log_id": "..."}}
     # — a present-but-"ok" error object is success, not a top-level "error" key
@@ -390,6 +396,11 @@ async def _wait_for_publish(access_token: str, publish_id: str) -> tuple[str, st
     if status == "FAILED":
         detail = f": {fail_reason}" if fail_reason else ""
         raise TikTokDirectAPIError(f"TikTok reported publish failure for publish_id={publish_id}{detail}")
+
+    if status != "PUBLISH_COMPLETE":
+        raise TikTokStillProcessingError(
+            "TikTok is still processing this post. It can take a few minutes — check your TikTok profile shortly."
+        )
 
     return publish_id, status
 
