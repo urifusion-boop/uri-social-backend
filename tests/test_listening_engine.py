@@ -496,6 +496,45 @@ def test_business_that_fits_no_category_gets_its_own(monkeypatch):
     assert market["subscribers"] == ["b1"]
 
 
+def test_field_origins_are_tracked_per_fact_not_as_one_blanket_tag(monkeypatch):
+    """PRD §5: "Every field records its origin: playbook, user-confirmed,
+    AI-suggested or learned." A single "facts": "playbook" tag for the whole
+    bundle can't answer that per field — confirmed as a false claim in the
+    Oct 2026 module audit (the docstring said "every field", the code only
+    tracked three)."""
+    db = fresh_db()
+
+    class _Msg:
+        def __init__(self, parsed):
+            self.parsed, self.refusal = parsed, None
+
+    class _Completion:
+        def __init__(self, parsed):
+            self.choices = [type("C", (), {"message": _Msg(parsed)})()]
+
+    async def fake(req, response_model=None):
+        if response_model is profile_mod._MapLLM:
+            return _Completion(profile_mod._MapLLM(category_ids=["hair_wigs"], new_category=None, country="NG"))
+        return _Completion(profile_mod._NewCategory(label="Hair and wigs", core_terms=["wig", "frontal"], excluded=[]))
+    monkeypatch.setattr(profile_mod.AIService, "structured_chat_completion", fake)
+
+    prof = run(profile_mod.build(db, "u1", "b1", {
+        "brand_name": "LushWigs", "industry": "Hair and beauty", "product_description": "Human hair wigs",
+        "customer_location": "Lagos", "competitor_handles": ["RivalWigsNG"],
+    }))
+    origins = prof["field_origins"]
+    assert origins["brand_name"] == "playbook"
+    assert origins["industry"] == "playbook"
+    assert origins["what_we_sell"] == "playbook"
+    assert origins["competitors"] == "playbook"
+    assert origins["private_terms"] == "playbook"
+    assert origins["markets"] == "ai_mapping"
+    assert origins["country"] == "playbook"  # "Lagos" matched a real location hint
+    assert "facts" not in origins  # no more single blanket tag for the whole bundle
+    # a field the Playbook never supplied has no claimed origin at all
+    assert "target_audience" not in origins
+
+
 def test_locks_are_per_trigger_and_per_market():
     from app.agents.market_intelligence.listening import cycle
     db = fresh_db()

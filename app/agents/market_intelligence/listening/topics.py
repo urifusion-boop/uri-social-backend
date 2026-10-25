@@ -75,9 +75,17 @@ async def count(db, market: str, topic_key: str, item: dict, reading: dict) -> N
         return
     m = item.get("raw_metrics") or {}
     engagement = int(m.get("likes", 0)) + 2 * int(m.get("replies", 0)) + 2 * int(m.get("reposts", 0))
+    author = item.get("author_handle") or item["source_id"]
+    add_to_set = {"authors": author}
+    # Tracked separately from the overall author set so detect.py can baseline
+    # complaint volume on its own (objection_shift, PRD §8.3) — a rise in
+    # doubt/complaint can matter even when the topic's total mention volume
+    # isn't trending at all.
+    if reading["intent"] == "complaint":
+        add_to_set["complaint_authors"] = author
     await db["mi_topic_counts"].update_one(
         {"market": market, "topic": topic_key, "bucket": b},
-        {"$addToSet": {"authors": item.get("author_handle") or item["source_id"]},
+        {"$addToSet": add_to_set,
          "$inc": {"items": 1, "engagement": engagement, f"intents.{reading['intent']}": 1,
                   f"buying.{reading['buying_intent']}": 1},
          "$push": {"sample": {"$each": [item["source_id"]], "$slice": -20}}},

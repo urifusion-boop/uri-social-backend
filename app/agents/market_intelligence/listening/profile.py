@@ -184,14 +184,28 @@ async def build(db, user_id: str, brand_id: str, playbook: dict, force: bool = F
     await markets.unsubscribe_others(db, brand_id, market_keys)
 
     now = datetime.utcnow()
+    private_terms = [t for t in [facts["brand_name"], *facts["competitors"]] if t]
+    # PRD §5: "Every field records its origin: playbook, user-confirmed,
+    # AI-suggested or learned." A single "facts": "playbook" tag for the
+    # whole bundle can't actually answer that per field — e.g. it can't
+    # distinguish a fact the owner typed in the Playbook from one this
+    # module later adds from AI inference or learning, once those paths
+    # exist. Every fact the Playbook actually supplied is tagged
+    # individually instead, so the per-field claim is real today and the
+    # per-field keys are already there for a future AI-suggested/learned
+    # write path to set independently, without widening this dict's shape.
+    field_origins = {f: "playbook" for f, v in facts.items() if v}
+    field_origins["markets"] = "ai_mapping"
+    field_origins["country"] = "playbook" if _country_from_text(facts["customer_location"]) else "ai_mapping"
+    if private_terms:
+        field_origins["private_terms"] = "playbook"
     doc = {
         "brand_id": brand_id, "user_id": user_id, "facts": facts, "fingerprint": fp,
         "markets": market_keys, "country": country,
-        "private_terms": [t for t in [facts["brand_name"], *facts["competitors"]] if t],
+        "private_terms": private_terms,
         "status": "active", "prompt_version": PROMPT_VERSION, "updated_at": now,
         "version": int((existing or {}).get("version", 0)) + 1,
-        "field_origins": {"facts": "playbook", "markets": "ai_mapping", "country": "playbook" if
-                          _country_from_text(facts["customer_location"]) else "ai_mapping"},
+        "field_origins": field_origins,
     }
     await db["mi_listening_profiles"].update_one({"brand_id": brand_id},
                                                  {"$set": doc, "$setOnInsert": {"created_at": now}}, upsert=True)
