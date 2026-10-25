@@ -55,6 +55,27 @@ def brand_profile(client, auth_headers):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_embeddings_in_tests(monkeypatch):
+    """Tests must never make real external API calls or spend real money.
+    A fast, deterministic fake stands in for AIService.create_embedding
+    everywhere (derived from a hash of the input text, so the same text
+    always gets the same fake vector) — a test that needs a specific,
+    controlled vector or wants to simulate a failure just monkeypatches
+    this again itself, which simply overrides it for that one test."""
+    import hashlib
+
+    from app.services.AIService import AIService
+
+    async def _fake_create_embedding(request):
+        h = hashlib.sha256((request.input or "").encode()).digest()
+        vec = [(b / 255.0) * 2 - 1 for b in h[:16]]
+        data = type("_Embedding", (), {"embedding": vec})()
+        return type("_EmbeddingResponse", (), {"data": [data]})()
+
+    monkeypatch.setattr(AIService, "create_embedding", _fake_create_embedding)
+
+
+@pytest.fixture(autouse=True)
 def _onebox_off_for_other_inbox_tests(request, monkeypatch):
     """Onebox gating needs a real database's atomic updates; the other inbox suites run
     against a hand-rolled fake and test their own features. test_inbox_onebox.py turns

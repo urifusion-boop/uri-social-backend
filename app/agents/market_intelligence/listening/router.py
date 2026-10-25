@@ -443,6 +443,7 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
 def _clean_topic(t: dict) -> dict:
     t = dict(t)
     t.pop("_id", None)
+    t.pop("embedding", None)  # a 1536-float vector has no place in an admin list payload
     return t
 
 

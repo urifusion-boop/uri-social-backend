@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field
 from app.services.AIService import AIService
 from app.services.PostHogService import track_event
 
+from . import embeddings
+from .markets import COUNTRY_LANGS
+
 PROMPT_VERSION = "mi-listen-recommend-v3"  # v3: validate-retry-fallback instead of strip
 SOURCE_LABEL = {
     "x": "X (Twitter)", "x_pro": "X (Twitter)",
@@ -230,14 +233,68 @@ async def _judge_one_retry(profile: dict, sig: dict, error: str, model: str) -> 
     return parsed.items[0] if parsed and parsed.items else None
 
 
+async def _relevance_components(db, sig: dict, profile: dict) -> dict:
+    """PRD §9.1's relevance breakdown, made explicit and inspectable
+    (stored on the card for "why am I seeing this", PRD §10) instead of
+    staying folded into one AI number.
+
+    ontology_match and geography_fit are structural guarantees of how a
+    signal reaches this function at all — cards_for only ever considers
+    markets this business is already mapped into (profile.py's own
+    category mapping), and a shared market's key is already scoped to
+    this business's own country — so both are always 100 here; naming
+    them explicitly is more honest than letting them be silently assumed.
+    exclusions_clear is a pass-through for the same reason in reverse: the
+    Business Listening Profile has no exclusions list yet (PRD §5's
+    "Exclusions & safety" isn't captured by profile.py today), so there is
+    nothing to check a signal against — never the reason a card doesn't
+    appear. semantic_similarity (via embeddings.py) and language_fit are
+    the two pieces genuinely computed here."""
+    topic_doc = await db["mi_market_topics"].find_one({"market": sig["market"], "key": sig["topic"]}, {"embedding": 1})
+    sim = embeddings.cosine_similarity(profile.get("profile_embedding"), (topic_doc or {}).get("embedding"))
+
+    facts = profile.get("facts") or {}
+    country = (sig.get("market") or "").split(":")[-1]
+    market_langs = set(COUNTRY_LANGS.get(country.upper(), ["en"]))
+    business_langs = {l.lower() for l in (facts.get("languages") or [])} or {"en"}
+    language_fit = 100.0 if (market_langs & business_langs) else 40.0
+
+    return {
+        "ontology_match": 100.0, "geography_fit": 100.0, "exclusions_clear": 100.0,
+        "semantic_similarity": round(sim * 100, 1) if sim is not None else None,
+        "language_fit": language_fit,
+    }
+
+
+def _component_adjustment(components: dict) -> float:
+    """The two genuinely-computed components above can only ever REDUCE
+    relevance, never inflate it past what the AI judge already decided —
+    same conservative posture _relevance_adjustment already holds for
+    learned feedback ("good feedback... intentionally does not boost
+    relevance — only a sustained dismiss pattern lowers it"). A component
+    with nothing to say (no embedding yet, e.g.) contributes nothing."""
+    adj = 0.0
+    sim = components.get("semantic_similarity")
+    if sim is not None and sim < 15.0:  # well below "probably about something else"
+        adj -= round(5.0 * (15.0 - sim) / 15.0, 1)
+    if components.get("language_fit", 100.0) < 100.0:
+        adj -= 10.0
+    return adj
+
+
 async def _relevance_adjustment(db, brand_id: str, market: str, kind: str, cfg: dict,
                                 now: Optional[datetime] = None) -> float:
     """§9.1's 'learned adjustment from that business's past feedback on
     similar signals': this business's own recent dismiss/save/act history
-    for this market + signal type. "Similar" without an embedding index
-    (not built yet) means same market and same signal type — rising vs.
+    for this market + signal type. "Similar" here means same market and
+    same signal type, not embedding-nearest — unlike
+    _relevance_components' semantic_similarity (the business profile vs.
+    THIS signal's own topic), this is about finding other PAST signals
+    like it, which would need an embedding index over signal history,
+    not just the single comparison embeddings.py does today. Rising vs.
     recurring_need vs. new_entity are different enough asks that lumping
-    them together would be a worse proxy than keeping them apart.
+    them together by market alone would be a worse proxy than keeping
+    them apart.
 
     Only ever non-positive: §11 is explicit that approving/saving a card is
     a positive preference signal but "not treated as proof of commercial
@@ -337,7 +394,8 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
         if not j or not j.action:
             continue
         adj = await _relevance_adjustment(db, brand, sig["market"], sig["type"], cfg, now)
-        relevance = max(0.0, j.relevance + adj)
+        components = await _relevance_components(db, sig, profile)
+        relevance = max(0.0, j.relevance + adj + _component_adjustment(components))
         s = score(sig, relevance, j.brand_fit, sc["weights"])
         if sig.get("confidence", 0) < sc["min_confidence"] or relevance < sc["min_relevance"] or s["total"] < sc["min_score"]:
             continue
@@ -388,7 +446,11 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
                          "samples": sig.get("samples"), "needs": sig.get("needs"),
                          "intent_mix": sig.get("intent_mix"),
                          "source": _evidence_source_label(sig, cfg),
-                         "scope_note": "Counted from the public posts URI collected for this market — not all of the platform."},
+                         "scope_note": "Counted from the public posts URI collected for this market — not all of the platform.",
+                         # PRD §10: "every card can show 'why am I seeing this' with
+                         # the evidence and the score components" — relevance's own
+                         # discrete components (PRD §9.1), not just the final number.
+                         "relevance_components": components, "learned_adjustment": adj},
             "scores": s, "confidence": sig.get("confidence"), "status": "new",
             "prompt_version": PROMPT_VERSION, "created_at": now, "updated_at": now,
             "expires_at": sig.get("expires_at") or now + timedelta(days=sc["card_ttl_days"]),
