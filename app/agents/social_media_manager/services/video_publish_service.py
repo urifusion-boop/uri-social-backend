@@ -56,6 +56,19 @@ def log_outstand_warnings(result: Dict[str, Any]) -> None:
         print(f"⚠️ Outstand reported warnings for this TikTok post (settings it didn't recognise are ignored): {warnings}")
 
 
+def explain_outstand_tiktok_failure(reason: Optional[str]) -> str:
+    """A customer-readable explanation for a TikTok failure reported through Outstand."""
+    low = (reason or "").lower()
+    if "url_ownership_unverified" in low:
+        return (
+            "TikTok couldn't fetch the media: it is hosted on Outstand's domain, which isn't verified for the "
+            "TikTok app this account was connected with. Use Outstand's own TikTok app (remove your TikTok "
+            "credentials under Social Networks in the Outstand dashboard, then reconnect) or connect TikTok "
+            f"with TikTok login instead. [{reason}]"
+        )
+    return f"TikTok publish failed via Outstand: {reason or 'unknown reason'}"
+
+
 def _jobs_col():
     return get_db()["video_publish_jobs"]
 
@@ -395,6 +408,11 @@ class VideoPublishService:
             outstand, post_id, post_url
         )
 
+        # The media domain not being verified is its own problem (fixed by using Outstand's
+        # own TikTok app, not by waiting for an audit) — say so, and don't fall back.
+        if not published and failure_reason and "url_ownership_unverified" in failure_reason.lower():
+            raise ValueError(explain_outstand_tiktok_failure(failure_reason))
+
         audit_block = bool(failure_reason) and (
             "privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower()
         )
@@ -443,6 +461,13 @@ class VideoPublishService:
                 media_post_obj = media_post_obj[0] if media_post_obj else {}
             media_post_id = media_post_obj.get("id")
             if media_post_id:
+                # A draft that TikTok rejected (e.g. media domain not verified) was never
+                # delivered, so check it briefly before saying it was.
+                _, _, media_failure = await VideoPublishService._poll_tiktok_outstand_publish(
+                    outstand, media_post_id, None, max_polls=8
+                )
+                if media_failure:
+                    raise ValueError(explain_outstand_tiktok_failure(media_failure))
                 # MEDIA_UPLOAD never sets publishedAt until the creator manually
                 # finishes it in the TikTok app — not a real publish, so raise
                 # instead of returning a success tuple, with a clear explanation.
@@ -454,19 +479,21 @@ class VideoPublishService:
 
         if not published:
             if failure_reason:
-                raise ValueError(f"TikTok publish failed via Outstand: {failure_reason}")
+                raise ValueError(explain_outstand_tiktok_failure(failure_reason))
             raise TimeoutError("TikTok publish via Outstand timed out")
 
         return post_id, post_url
 
     @staticmethod
-    async def _poll_tiktok_outstand_publish(outstand: "OutstandService", post_id: str, post_url: Optional[str]):
+    async def _poll_tiktok_outstand_publish(
+        outstand: "OutstandService", post_id: str, post_url: Optional[str], max_polls: Optional[int] = None
+    ):
         """Poll Outstand until a TikTok post is confirmed published or fails.
 
         Returns (published, post_url, failure_reason). See the caller for why
         this can't be caught synchronously around publish_post().
         """
-        for _ in range(_OUTSTAND_MAX_POLLS):
+        for _ in range(max_polls or _OUTSTAND_MAX_POLLS):
             await asyncio.sleep(_OUTSTAND_POLL_INTERVAL)
             post_data = await outstand.get_post(post_id)
             post = post_data.get("post") or post_data.get("data") or {}

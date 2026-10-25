@@ -338,3 +338,63 @@ def test_outstand_config_without_settings_keeps_the_legacy_default():
     from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
 
     assert outstand_tiktok_config(None) == {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
+
+
+# ── Outstand failures are reported as what they really are ────────────────────
+
+class _FakeOutstand:
+    """Outstand stand-in: publish_post hands out ids in order, get_post reports the
+    per-account failure registered for that id (or nothing, i.e. still pending)."""
+    def __init__(self, failures):
+        self.failures = failures      # post id -> error text
+        self.published = []           # tiktok blocks sent, in order
+
+    async def publish_post(self, outstand_account_ids, content, media_urls=None, platform_config=None, **k):
+        self.published.append(platform_config["tiktok"])
+        return {"success": True, "post": {"id": f"p{len(self.published)}"}}
+
+    async def get_post(self, post_id):
+        err = self.failures.get(post_id)
+        accounts = [{"status": "failed", "error": err}] if err else [{"status": "pending"}]
+        return {"post": {"id": post_id, "socialAccounts": accounts}}
+
+
+def _publish_via_outstand(fake, settings_):
+    from app.agents.social_media_manager.services import video_publish_service as vps
+
+    with patch.object(vps, "OutstandService", lambda: fake), patch.object(vps.asyncio, "sleep", AsyncMock()):
+        return _run(vps.VideoPublishService._publish_tiktok_via_outstand("acc", "caption", ["u"], settings_))
+
+
+OWNERSHIP = "TikTok API error (url_ownership_unverified): Please review our URL ownership verification rules"
+UNAUDITED = "TikTok API error (unaudited_client_can_only_post_to_private_accounts): Please review our integration guidelines"
+
+
+def test_unverified_media_domain_is_explained_and_does_not_fall_back_to_a_draft():
+    fake = _FakeOutstand({"p1": OWNERSHIP})
+    with pytest.raises(ValueError, match="Outstand's domain") as exc:
+        _publish_via_outstand(fake, _settings(privacy_level="SELF_ONLY"))
+    assert "url_ownership_unverified" in str(exc.value)
+    assert len(fake.published) == 1          # no MEDIA_UPLOAD attempt
+
+
+def test_a_rejected_inbox_draft_is_not_reported_as_delivered():
+    fake = _FakeOutstand({"p1": UNAUDITED, "p2": OWNERSHIP})
+    with pytest.raises(ValueError) as exc:
+        _publish_via_outstand(fake, _settings(privacy_level="SELF_ONLY"))
+    assert "delivered" not in str(exc.value).lower()
+    assert "url_ownership_unverified" in str(exc.value)
+    assert fake.published[1] == {"postMode": "MEDIA_UPLOAD"}
+
+
+def test_an_inbox_draft_that_was_accepted_is_reported_as_delivered():
+    fake = _FakeOutstand({"p1": UNAUDITED})   # p2 (the draft) reports no failure
+    with pytest.raises(ValueError, match="delivered to the connected TikTok account's inbox"):
+        _publish_via_outstand(fake, _settings(privacy_level="SELF_ONLY"))
+
+
+def test_users_privacy_choice_is_not_downgraded_when_the_audit_blocks_it():
+    fake = _FakeOutstand({"p1": UNAUDITED, "p2": OWNERSHIP})
+    with pytest.raises(ValueError):
+        _publish_via_outstand(fake, _settings(privacy_level="PUBLIC_TO_EVERYONE"))
+    assert [c.get("privacyLevel") for c in fake.published if c.get("postMode") == "DIRECT_POST"] == ["PUBLIC_TO_EVERYONE"]
