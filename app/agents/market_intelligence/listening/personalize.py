@@ -85,6 +85,8 @@ Optionally, also propose ONE alternative action for the same signal — a genuin
 worth considering instead (e.g. a carousel FAQ next to a video, or a proposed ad test when buying intent is
 strong) — only when something else really does fit as well as or differently from the primary action; omit it
 rather than padding the card with a weaker, smaller version of the same idea.
+For a competitor_move signal, the action must be a differentiation idea — never copy or imitate the competitor;
+show this business's own, genuinely different answer to the same thing customers are reacting to.
 Never claim facts about the products that aren't in the business facts. No medical or guaranteed-result claims.
 "why" may only use what the signal shows (the topic, what people asked, needed or complained about) and the
 business facts. Never generalise about regions, countries, populations or groups ("especially in Africa where...",
@@ -109,6 +111,16 @@ def observation(sig: dict) -> str:
     if t == "new_entity":
         return (f"“{name}” is new in monitored {mk} posts and already mentioned by {cur.get('authors')} different "
                 f"accounts in the last 24 hours.")
+    if t == "competitor_move":
+        return (f"{cur.get('authors')} different accounts talked about your competitor “{name}” in the last "
+                f"{cur.get('window_days')} days — {cur.get('posts')} posts in total.")
+    if t == "objection_shift":
+        return (f"Complaints or doubts about “{name}” are rising in {mk}: {cur.get('authors')} different accounts "
+                f"in the last 24 hours, against a usual {base.get('median_per_day')} a day over the previous "
+                f"{base.get('days')} days of monitored posts.")
+    if t == "cooling":
+        return (f"“{name}” has cooled off in {mk}: {cur.get('authors')} different accounts in the last 24 hours, "
+                f"down from a peak of {cur.get('peak_authors')} when it was last active.")
     return (f"{cur.get('authors')} different people asked about, requested or complained about “{name}” on "
             f"{cur.get('days_present')} of the last {cur.get('window_days')} days in {mk}.")
 
@@ -123,7 +135,8 @@ def _allowed_numbers(sig: dict, profile: dict) -> set[str]:
     never checked (see _NUM, which only matches percentages or 2+ digits)."""
     cur, base = sig.get("current") or {}, sig.get("baseline") or {}
     nums = {str(v) for v in (cur.get("authors"), base.get("median_per_day"), base.get("days"),
-                              cur.get("days_present"), cur.get("window_days")) if v is not None}
+                              cur.get("days_present"), cur.get("window_days"), cur.get("posts"),
+                              cur.get("peak_authors")) if v is not None}
     for v in (profile.get("facts") or {}).values():
         if v:
             nums.update(re.findall(r"\d+(?:[.,]\d+)?", str(v)))
@@ -277,12 +290,31 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
         {"brand_id": brand, "$or": [{"status": {"$in": ["new", "shown", "saved"]}, "expires_at": {"$gt": now}},
                                     {"status": "dismissed", "updated_at": {"$gt": now - timedelta(days=30)}}]},
         {"market": 1, "topic": 1})}
+    # PRD §6.4-6.5: competitor-move signals live under a synthetic, single-
+    # tenant market key (private_collect.private_market_key) that's never
+    # added to profile["markets"] (that list is shared-market subscriptions
+    # only) — included here explicitly so this one business's own
+    # competitor signals are still found, without a private signal ever
+    # being reachable through another business's markets list.
+    from .private_collect import private_market_key
+    candidate_markets = list(profile.get("markets") or []) + [private_market_key(brand)]
     cands = [s async for s in db["mi_listen_signals"].find(
-        {"market": {"$in": profile.get("markets") or []}, "status": "active", "expires_at": {"$gt": now},
-         "computed_at": {"$gte": now - timedelta(hours=36)}})]
+        {"market": {"$in": candidate_markets}, "status": "active", "expires_at": {"$gt": now},
+         "computed_at": {"$gte": now - timedelta(hours=36)},
+         # cooling has no sensible "create content" action — PRD §8.3's own
+         # action for it is "stop recommending", which detect.py already
+         # carries out directly (expiring the prior signal/card); the
+         # cooling record itself stays in mi_listen_signals for audit only.
+         "type": {"$ne": "cooling"}})]
     cands = [s for s in cands if (s["market"], s["topic"]) not in live]
     cands.sort(key=lambda s: -(s["scores"]["M"] + s["scores"]["C"] + 100 * s.get("confidence", 0)))
-    cands = cands[: sc["max_signals_judged"]]
+    # PRD §9.2: "Evergreen content opportunities (recurring needs) are ranked
+    # on their own track so they are not crowded out by trends." recurring_need's
+    # momentum score is flat and low by design, so a single combined sort+cut
+    # always loses it to any real trend that cycle — reserve its own slots.
+    evergreen = [s for s in cands if s["type"] == "recurring_need"][: sc["max_evergreen_judged"]]
+    trending = [s for s in cands if s["type"] != "recurring_need"][: max(0, sc["max_signals_judged"] - len(evergreen))]
+    cands = trending + evergreen
     if not cands:
         return []
 
@@ -353,7 +385,15 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
     best: dict[tuple, dict] = {}
     for c in cards:  # one card per topic: the strongest reading of it
         best.setdefault((c["market"], c["topic"]), c)
-    cards = list(best.values())[: sc["max_cards_per_run"]]
+    cards = list(best.values())
+    # Same evergreen protection as the candidate cut above, applied again
+    # here: recurring_need's low momentum score means its final weighted
+    # total also tends to lose to any real trend, so without a reserved
+    # slot a business could pass the judge gate and still never see one.
+    evergreen_cards = [c for c in cards if c["type"] == "recurring_need"][: sc["max_evergreen_cards"]]
+    trending_cards = [c for c in cards if c["type"] != "recurring_need"][
+        : max(0, sc["max_cards_per_run"] - len(evergreen_cards))]
+    cards = trending_cards + evergreen_cards
     if cards:
         await db["mi_listen_cards"].insert_many([dict(c) for c in cards])
     return cards
@@ -361,7 +401,19 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
 
 async def notify(db, profile: dict, cards: list[dict], cfg: dict, now: Optional[datetime] = None) -> int:
     """Alert only for the strongest card, within the weekly alert budget; the
-    brand's own notification choices still apply (brand_notifier)."""
+    brand's own notification choices still apply (brand_notifier).
+
+    PRD §5's Business Listening Profile lists quiet hours under "Operating
+    policy", and §10 lists it again under delivery fatigue control — the
+    same real preference (timezone, quiet_hours_start/end_local,
+    urgent_override) the older Market Intelligence insights feature already
+    stores per (user_id, brand_id) in mi_preferences. Reused as-is: to a
+    business owner "don't alert me at night" is one setting, not one per
+    feature, so a second differently-shaped quiet-hours field here would
+    just be a second place to configure the same thing. Quiet hours only
+    gates this immediate ping — the card itself is already stored and
+    visible in-app regardless, and not marking alerted_at here means the
+    weekly alert budget isn't spent on an alert that never actually fired."""
     now = now or datetime.utcnow()
     dl = cfg["delivery"]
     top = [c for c in cards if c["scores"]["total"] >= dl["alert_min_score"]]
@@ -373,6 +425,10 @@ async def notify(db, profile: dict, cards: list[dict], cfg: dict, now: Optional[
         return 0
     c = top[0]
     try:
+        from ..notification_delivery import _in_quiet_hours, get_or_create_preferences
+        prefs = await get_or_create_preferences(db, profile["user_id"], profile["brand_id"])
+        if not prefs.get("urgent_override") and _in_quiet_hours(prefs, now):
+            return 0
         from app.core.config import settings
         from app.services import brand_notifier
         app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")

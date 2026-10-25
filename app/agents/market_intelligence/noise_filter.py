@@ -54,12 +54,15 @@ def _matches_any(text_lower: str, phrases: list[str]) -> str | None:
     return None
 
 
-def deterministic_noise_reason(evidence: RawEvidence) -> str | None:
-    """Returns a human-readable rejection reason if the evidence is
+def noise_reason_for_text(text: str) -> str | None:
+    """Returns a human-readable rejection reason if the text is
     deterministically noise, else None. None means "not caught by this
-    filter" — it does NOT mean the evidence is confirmed genuine; it still
-    goes on to LLM classification for that judgement."""
-    text_lower = evidence.text.lower()
+    filter" — it does NOT mean the text is confirmed genuine; it still
+    goes on to LLM classification for that judgement. Text-only so it has
+    no dependency on RawEvidence, letting other collections (e.g. the
+    listening module's mi_listen_items, which store plain dicts) reuse the
+    exact same patterns instead of re-implementing them."""
+    text_lower = (text or "").lower()
 
     hit = _matches_any(text_lower, BLOCKLIST)
     if hit:
@@ -75,3 +78,9 @@ def deterministic_noise_reason(evidence: RawEvidence) -> str | None:
         return "matched repeated-punctuation spam pattern"
 
     return None
+
+
+def deterministic_noise_reason(evidence: RawEvidence) -> str | None:
+    """Same filter as noise_reason_for_text, for callers that already hold
+    a RawEvidence."""
+    return noise_reason_for_text(evidence.text)

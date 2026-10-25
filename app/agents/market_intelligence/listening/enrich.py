@@ -9,6 +9,7 @@ Posts are untrusted text: they are fenced as data and never obeyed.
 """
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from typing import Optional
 
@@ -16,7 +17,13 @@ from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
 
+from ..noise_filter import noise_reason_for_text
+
 PROMPT_VERSION = "mi-listen-enrich-v2"  # v2: stricter relevance
+NOISE_FILTER_PROMPT_VERSION = "mi-listen-noise-filter-v1"
+
+_RATE_LIMIT_MARKER = "temporarily unavailable"  # both AIService 429/quota messages contain this
+_RATE_LIMIT_BACKOFF_SECONDS = 5
 
 
 class Intent(str, Enum):
@@ -78,26 +85,60 @@ Do not invent facts or locations."""
 
 
 async def read_batch(market_label: str, posts: list[dict], model: str = "gpt-4o-mini") -> dict[int, _Item]:
-    """{idx: reading}. Missing idx = could not be read (left for the next run)."""
+    """{idx: reading}. Missing idx = could not be read (left for the next run).
+
+    PRD §8 stage 3 ("basic filters... spam/bot/promo patterns... drops most
+    noise free, before any AI"): a post that matches the deterministic
+    spam/bot filter never reaches the LLM at all — it gets an immediate,
+    confident off-topic reading instead. This is the same filter already
+    proven in the older Market Intelligence pipeline (noise_filter.py),
+    reused here rather than re-implemented.
+    """
     if not posts:
         return {}
-    block = "\n".join(f"[{i}] {(p.get('text') or '')[:600].replace(chr(10), ' ')}" for i, p in enumerate(posts))
+
+    out: dict[int, _Item] = {}
+    clean_indices: list[int] = []
+    for i, p in enumerate(posts):
+        if noise_reason_for_text(p.get("text") or "") is not None:
+            out[i] = _Item(idx=i, on_topic=False, intent=Intent.other, sentiment=Sentiment.neutral,
+                           buying_intent=Buying.none, confidence=1.0)
+        else:
+            clean_indices.append(i)
+
+    if not clean_indices:
+        return out
+
+    clean_posts = [posts[i] for i in clean_indices]
+    block = "\n".join(f"[{i}] {(p.get('text') or '')[:600].replace(chr(10), ' ')}" for i, p in enumerate(clean_posts))
     req = AIService.build_ai_model(model=model, temperature=0, messages=[
         {"role": "system", "content": SYSTEM.format(market=market_label)},
         {"role": "user", "content": f"[POSTS START]\n{block}\n[POSTS END]"},
     ])
-    try:
-        completion = await AIService.structured_chat_completion(req, response_model=_Batch)
-        if isinstance(completion, dict) and "error" in completion:
-            print(f"[MI][listen] enrich failed: {completion['error']}")
-            return {}
-        parsed: Optional[_Batch] = completion.choices[0].message.parsed
-    except Exception as e:
-        print(f"[MI][listen] enrich raised: {e}")
-        return {}
-    out = {}
+    parsed: Optional[_Batch] = None
+    for attempt in range(2):  # one retry after a backoff, only for a rate-limited call
+        try:
+            completion = await AIService.structured_chat_completion(req, response_model=_Batch)
+            if isinstance(completion, dict) and "error" in completion:
+                if attempt == 0 and _RATE_LIMIT_MARKER in str(completion["error"]):
+                    print(f"[MI][listen] enrich rate-limited, retrying once: {completion['error']}")
+                    await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
+                    continue
+                print(f"[MI][listen] enrich failed: {completion['error']}")
+                return out
+            parsed = completion.choices[0].message.parsed
+            break
+        except Exception as e:
+            if attempt == 0 and _RATE_LIMIT_MARKER in str(e):
+                print(f"[MI][listen] enrich raised rate-limit, retrying once: {e}")
+                await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            print(f"[MI][listen] enrich raised: {e}")
+            return out
     for it in (parsed.items if parsed else []):
-        if 0 <= it.idx < len(posts):
+        if 0 <= it.idx < len(clean_posts):
+            orig_idx = clean_indices[it.idx]
+            it.idx = orig_idx
             it.confidence = max(0.0, min(1.0, float(it.confidence or 0)))
-            out[it.idx] = it
+            out[orig_idx] = it
     return out
