@@ -88,6 +88,8 @@ strong) — only when something else really does fit as well as or differently f
 rather than padding the card with a weaker, smaller version of the same idea.
 For a competitor_move signal, the action must be a differentiation idea — never copy or imitate the competitor;
 show this business's own, genuinely different answer to the same thing customers are reacting to.
+For an upcoming_development signal, the action must be content planned to publish BEFORE the date shown in the
+signal, timed to that date — never a generic post with no connection to the event.
 Never claim facts about the products that aren't in the business facts. No medical or guaranteed-result claims.
 "why" may only use what the signal shows (the topic, what people asked, needed or complained about) and the
 business facts. Never generalise about regions, countries, populations or groups ("especially in Africa where...",
@@ -122,6 +124,9 @@ def observation(sig: dict) -> str:
     if t == "cooling":
         return (f"“{name}” has cooled off in {mk}: {cur.get('authors')} different accounts in the last 24 hours, "
                 f"down from a peak of {cur.get('peak_authors')} when it was last active.")
+    if t == "upcoming_development":
+        return (f"{cur.get('authors')} different accounts in {mk} are already talking about something happening "
+                f"with “{name}” around {cur.get('event_date')} — {cur.get('days_until')} days from now.")
     return (f"{cur.get('authors')} different people asked about, requested or complained about “{name}” on "
             f"{cur.get('days_present')} of the last {cur.get('window_days')} days in {mk}.")
 
@@ -137,7 +142,13 @@ def _allowed_numbers(sig: dict, profile: dict) -> set[str]:
     cur, base = sig.get("current") or {}, sig.get("baseline") or {}
     nums = {str(v) for v in (cur.get("authors"), base.get("median_per_day"), base.get("days"),
                               cur.get("days_present"), cur.get("window_days"), cur.get("posts"),
-                              cur.get("peak_authors")) if v is not None}
+                              cur.get("peak_authors"), cur.get("days_until")) if v is not None}
+    if cur.get("event_date"):
+        # the card may quote the date whole ("2026-12-01") or spell it out
+        # ("December 1, 2026") — either way, every numeric piece of it
+        # (year, month, day) needs to be allowed, not just the raw string.
+        nums.add(str(cur["event_date"]))
+        nums.update(re.findall(r"\d+", str(cur["event_date"])))
     for v in (profile.get("facts") or {}).values():
         if v:
             nums.update(re.findall(r"\d+(?:[.,]\d+)?", str(v)))

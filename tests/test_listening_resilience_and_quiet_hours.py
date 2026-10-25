@@ -11,6 +11,9 @@ patterns... drops most noise free, before any AI" and PRD §5/§10's
    preference (mi_preferences) the older Market Intelligence insights
    feature already uses, so an immediate alert doesn't ping an owner at
    night; the card itself stays live in-app either way.
+3. enrich.read_batch now also tells the model each post's own posted-date,
+   so it can resolve relative future dates ("next month") into the
+   event_date field upcoming_development (detect.py) needs.
 
 Uses an in-memory MongoDB; no real AI calls (AIService is stubbed).
 """
@@ -201,3 +204,31 @@ def test_notify_sends_normally_outside_quiet_hours(monkeypatch):
     assert len(calls) == 1
     stored = run(db["mi_listen_cards"].find_one({"id": "card-1"}))
     assert stored.get("alerted_at") == now
+
+
+# ── upcoming_development's event_date extraction (PRD §8.3) ────────────────
+
+def test_each_post_s_own_posted_date_is_given_so_relative_dates_resolve(monkeypatch):
+    captured = {}
+
+    async def fake_ai(req, response_model=None):
+        captured["prompt"] = req.messages[-1].content
+        return _FakeCompletion([enrich._Item(idx=0, on_topic=True, intent="trend", need=None, sentiment="neutral",
+                                             buying_intent="low", topics=[], event_date="2026-12-01", confidence=0.8)])
+    monkeypatch.setattr(AIService, "structured_chat_completion", fake_ai)
+
+    posts = [{"text": "launching our new store next month", "published_at": datetime(2026, 11, 1)}]
+    out = run(enrich.read_batch("skincare", posts))
+
+    assert "(posted 2026-11-01)" in captured["prompt"]
+    assert out[0].event_date == "2026-12-01"
+
+
+def test_missing_published_at_does_not_crash_the_prompt(monkeypatch):
+    async def fake_ai(req, response_model=None):
+        return _FakeCompletion([enrich._Item(idx=0, on_topic=True, intent="other", need=None, sentiment="neutral",
+                                             buying_intent="none", topics=[], confidence=0.5)])
+    monkeypatch.setattr(AIService, "structured_chat_completion", fake_ai)
+
+    out = run(enrich.read_batch("skincare", [{"text": "no date on this one"}]))
+    assert out[0].event_date is None

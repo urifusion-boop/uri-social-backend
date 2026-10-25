@@ -61,6 +61,12 @@ class _Item(BaseModel):
     topics: list[str] = Field(default_factory=list, description="0-3 SPECIFIC things the post is about, 1-4 words, "
                               "lower-case: product/style/ingredient/brand names or concrete problems "
                               "(e.g. 'latasha wig', 'korean skincare', 'hyperpigmentation'). Not generic words like 'hair'.")
+    event_date: Optional[str] = Field(default=None, description="YYYY-MM-DD, ONLY when the post states a concrete "
+                                      "FUTURE date for a launch, event, sale or regulation (PRD §8.3's "
+                                      "'upcoming development'). Resolve relative dates ('next Friday', 'this "
+                                      "month') against the post's own posted-date shown next to it. null "
+                                      "otherwise — never guess, and never a date already past relative to "
+                                      "when it was posted.")
     confidence: float = Field(description="0-1 confidence in this reading.")
 
 
@@ -80,6 +86,9 @@ For every post return one item with its idx:
 - need: the customer's underlying need/problem in a few words, only if the post expresses one.
 - topics: 0-3 specific things the post is about, as people name them (product, style, ingredient, brand, concrete
   problem). Use the most common everyday name; lower-case; no hashtags symbol; never generic category words.
+- event_date: only when the post names a concrete FUTURE date for a launch, event, sale or regulation — resolve
+  relative dates ("next Friday", "this month") against the post's own posted-date shown next to it. null
+  otherwise; never a date already past relative to when the post was made.
 - confidence: how sure you are.
 Do not invent facts or locations."""
 
@@ -110,7 +119,11 @@ async def read_batch(market_label: str, posts: list[dict], model: str = "gpt-4o-
         return out
 
     clean_posts = [posts[i] for i in clean_indices]
-    block = "\n".join(f"[{i}] {(p.get('text') or '')[:600].replace(chr(10), ' ')}" for i, p in enumerate(clean_posts))
+    def _posted(p: dict) -> str:
+        d = p.get("published_at")
+        return d.strftime("%Y-%m-%d") if d else "date unknown"
+    block = "\n".join(f"[{i}] (posted {_posted(p)}) {(p.get('text') or '')[:600].replace(chr(10), ' ')}"
+                      for i, p in enumerate(clean_posts))
     req = AIService.build_ai_model(model=model, temperature=0, messages=[
         {"role": "system", "content": SYSTEM.format(market=market_label)},
         {"role": "user", "content": f"[POSTS START]\n{block}\n[POSTS END]"},
