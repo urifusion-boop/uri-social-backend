@@ -374,7 +374,19 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
 
 async def notify(db, profile: dict, cards: list[dict], cfg: dict, now: Optional[datetime] = None) -> int:
     """Alert only for the strongest card, within the weekly alert budget; the
-    brand's own notification choices still apply (brand_notifier)."""
+    brand's own notification choices still apply (brand_notifier).
+
+    PRD §5's Business Listening Profile lists quiet hours under "Operating
+    policy", and §10 lists it again under delivery fatigue control — the
+    same real preference (timezone, quiet_hours_start/end_local,
+    urgent_override) the older Market Intelligence insights feature already
+    stores per (user_id, brand_id) in mi_preferences. Reused as-is: to a
+    business owner "don't alert me at night" is one setting, not one per
+    feature, so a second differently-shaped quiet-hours field here would
+    just be a second place to configure the same thing. Quiet hours only
+    gates this immediate ping — the card itself is already stored and
+    visible in-app regardless, and not marking alerted_at here means the
+    weekly alert budget isn't spent on an alert that never actually fired."""
     now = now or datetime.utcnow()
     dl = cfg["delivery"]
     top = [c for c in cards if c["scores"]["total"] >= dl["alert_min_score"]]
@@ -386,6 +398,10 @@ async def notify(db, profile: dict, cards: list[dict], cfg: dict, now: Optional[
         return 0
     c = top[0]
     try:
+        from ..notification_delivery import _in_quiet_hours, get_or_create_preferences
+        prefs = await get_or_create_preferences(db, profile["user_id"], profile["brand_id"])
+        if not prefs.get("urgent_override") and _in_quiet_hours(prefs, now):
+            return 0
         from app.core.config import settings
         from app.services import brand_notifier
         app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
