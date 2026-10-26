@@ -110,6 +110,11 @@ jobs:
             --task-definition social-backend-service-prod-ecs-task \
             --query taskDefinition > task-definition.json
 
+      # A newly added SSM parameter is not on the downloaded base, so it would
+      # never reach the container. Idempotent.
+      - name: Ensure required secrets are on the task definition
+        run: python3 .github/scripts/ensure_task_secrets.py task-definition.json
+
       # Swap in the new SHA-tagged image, register a new task definition
       # revision, then create a CodeDeploy blue/green deployment for it —
       # this is the step that was missing entirely before. deployment-group
