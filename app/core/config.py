@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     # business portfolios, a system-user token with the WhatsApp permissions.
     WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID: str = ""
     WHATSAPP_SYSTEM_TOKEN: str = ""
+    META_WEBHOOK_VERIFY_TOKEN: str = ""
     META_SYSTEM_TOKEN: str = ""
     # URI's own Meta Business Manager id — owned by Ibukun. Until this is set,
     # the ads page-connect flow still runs and stores the page token; only the
