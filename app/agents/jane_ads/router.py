@@ -4632,6 +4632,10 @@ async def meta_campaigns(
                 row["status"] = summary["delivery"].lower()
                 if is_google:
                     row["serving_note"] = google_flow.serving_note(summary)
+                elif summary.get("delivery_note"):
+                    # TikTok: switched on, but in review / rejected / out of balance. The
+                    # card renders serving_note for any platform.
+                    row["serving_note"] = summary["delivery_note"]
                 # A wa.me link ad reports 0 conversations forever — Meta only fires
                 # the conversation metric for native Click-to-WhatsApp. Rendering that
                 # raw would tell a client their ad produced nothing when the truth is
@@ -4656,6 +4660,9 @@ async def meta_campaigns(
                     "impressions": summary["impressions"],
                     "reach": summary["reach"],
                     "delivery": summary["delivery"],
+                    # What the badge shows when it differs from the on/off state (e.g.
+                    # "In review" while delivery is "Active"). Empty = same as delivery.
+                    "delivery_display": summary.get("delivery_display") or summary["delivery"],
                     "ends_at": summary["ends_at"],
                 }
             except Exception as e:
