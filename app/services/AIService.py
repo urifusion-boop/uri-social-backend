@@ -12,6 +12,36 @@ import asyncio
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 
+async def _alert_openai_out_of_credit(error_message: str) -> None:
+    """OpenAI gives no API to check remaining balance (a long-standing, known
+    gap in their own API, not something specific to us) — the only signal an
+    app ever gets is this exact error, the moment a real call fails. This is
+    the one place every AI call in the platform passes through, so it's the
+    one place that can turn "a customer complains days later" into "the
+    admin sees it on their dashboard, and gets an email, the moment it
+    actually happens" (app/services/platform_alerts.py — not Sentry, which
+    nobody is actively watching). get_db() is called directly rather than
+    threaded through as a parameter: this static service has no request
+    context to inject a db handle from, and get_db() is the same
+    already-connected client every request-scoped dependency uses. Never
+    allowed to break the real error path if the DB or email is unreachable."""
+    try:
+        from app.database import get_db
+        from app.services import platform_alerts
+        await platform_alerts.raise_alert(
+            get_db(),
+            kind="openai_insufficient_quota",
+            title="OpenAI account is out of credit",
+            detail=(
+                "Every AI feature on the platform (Content Calendar, Social Listening, and anything "
+                "else that calls OpenAI) is down until the balance is topped up or auto-reload is "
+                f"enabled on the OpenAI account. Raw error: {error_message[:300]}"
+            ),
+        )
+    except Exception as e:
+        print(f"[AIService] failed to raise the out-of-credit platform alert: {e}")
+
+
 class AIService:
     @staticmethod
     def construct_user_prompt(prompt: str):
@@ -53,13 +83,22 @@ class AIService:
         except Exception as e:
             error_message = str(e)
 
-            if "RateLimitError" in str(type(e)) or "429" in error_message:
-                print("⚠️ OpenAI rate limit exceeded - quota exhausted")
-                return {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
-
+            # insufficient_quota is checked BEFORE the generic RateLimitError/429
+            # branch below — OpenAI raises the exact same RateLimitError class and
+            # 429 status for both a real rate limit AND a zero/negative account
+            # balance, so the generic check used to catch every insufficient_quota
+            # error first and this branch was unreachable dead code. That's why
+            # this service could never actually report "out of credit" even
+            # though it tried to — every failure of either kind came out as the
+            # same generic "temporarily unavailable" message.
             if "insufficient_quota" in error_message:
                 print("⚠️ OpenAI quota insufficient - credits exhausted")
+                await _alert_openai_out_of_credit(error_message)
                 return {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
+
+            if "RateLimitError" in str(type(e)) or "429" in error_message:
+                print("⚠️ OpenAI rate limit exceeded")
+                return {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
 
             if "authentication" in error_message.lower() or "401" in error_message:
                 print("⚠️ OpenAI authentication error - invalid API key")
@@ -97,13 +136,17 @@ class AIService:
                 print("⚠️ OpenAI response truncated due to length limit")
                 return {"error": "Response was truncated due to length limit."}
 
-            if "RateLimitError" in str(type(e)) or "429" in error_message:
-                print("⚠️ OpenAI rate limit exceeded - quota exhausted")
-                return {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
-
+            # See chat_completion's matching comment: insufficient_quota must be
+            # checked before the generic RateLimitError/429 branch, since OpenAI
+            # raises the same exception class and status for both.
             if "insufficient_quota" in error_message:
                 print("⚠️ OpenAI quota insufficient - credits exhausted")
+                await _alert_openai_out_of_credit(error_message)
                 return {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
+
+            if "RateLimitError" in str(type(e)) or "429" in error_message:
+                print("⚠️ OpenAI rate limit exceeded")
+                return {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
 
             if "authentication" in error_message.lower() or "401" in error_message:
                 print("⚠️ OpenAI authentication error - invalid API key")
