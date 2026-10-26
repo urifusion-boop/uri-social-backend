@@ -230,6 +230,22 @@ def _raise_not_linked(data: dict, plan) -> None:
         code=err.get("code"), subcode=err.get("error_subcode"))
 
 
+def creative_text(creative) -> tuple[str, str]:
+    """The headline and description every ad is launched with. A creative that arrives
+    without them gets them from its own copy, never a blank: a blank headline reads as
+    an unfinished ad in Ads Manager and underperforms on Meta's own ad-quality checks."""
+    body = (getattr(creative, "primary_text", "") or "").strip()
+    headline = (getattr(creative, "headline", "") or "").strip()
+    if not headline and body:
+        headline = body.split(".")[0].split("!")[0].split("?")[0].strip()
+    headline = headline[:40].rstrip(" ,;:-")
+    # The description is the line under the headline: the copy's own closing sentence if
+    # it has more than one, else the headline's neighbour in the body.
+    sentences = [x.strip() for x in body.replace("!", ".").replace("?", ".").split(".") if x.strip()]
+    description = next((x for x in reversed(sentences) if x.lower() != headline.lower()), "")
+    return headline, description[:90].rstrip(" ,;:-")
+
+
 class MetaAdPlatformAdapter(AdPlatformAdapter):
     """One instance per request/job. Backed by Mongo so the campaign_id ->
     business_id/ad_id mapping (and the conversation-count watermark) survives
@@ -324,6 +340,15 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         )
         destination = link_for_plan(plan)
         dest_link = destination.link
+        headline, description = creative_text(plan.creative)
+        # A WhatsApp ad uses Meta's own WhatsApp destination or it doesn't launch — never
+        # quietly a link ad pointing at wa.me, which Meta flags ("To receive messages in
+        # WhatsApp, you must set it as the destination", #2446860), can't count a
+        # conversation and can't be edited in Ads Manager.
+        if (not is_followers_goal and destination.type == DestinationType.WHATSAPP
+                and not plan.whatsapp_number):
+            raise ValueError("Add your WhatsApp number in Connected Accounts, so people who tap "
+                             "your ad can message you on WhatsApp.")
         if not is_followers_goal and not dest_link:
             raise ValueError(
                 f"CampaignPlan has no usable destination link for destination_type="
@@ -393,6 +418,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # real create would give: valid means native works, subcode 1487246 means
         # that number is not linked to this Page. It runs after the campaign
         # exists because validation needs a real campaign_id.
+        # A WhatsApp ad uses Meta's own WhatsApp destination or it doesn't launch. It is
+        # never quietly built as a link ad pointing at wa.me: Meta flags those ("To
+        # receive messages in WhatsApp, you must set it as the destination", #2446860),
+        # they can't count a conversation, and Ads Manager rejects their edits.
         want_native_whatsapp = bool(
             not is_followers_goal
             and destination.type == DestinationType.WHATSAPP
@@ -651,6 +680,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             "video_id": video_id,
                             "image_url": video_thumbnail_url,
                             "message": message,
+                            # Left out, Ads Manager shows "no headline / no description"
+                            # on the ad.
+                            **({"title": headline} if headline else {}),
+                            **({"link_description": description} if description else {}),
                             "call_to_action": cta,
                         },
                     }
@@ -659,6 +692,8 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         "page_id": plan.page_id,
                         "link_data": {
                             "message": message,
+                            **({"name": headline} if headline else {}),
+                            **({"description": description} if description else {}),
                             # LIKE_PAGE ignores this link (the button does the follow action
                             # itself), so the Page's own URL is the sensible placeholder
                             # there. For every other goal this is the REAL destination:

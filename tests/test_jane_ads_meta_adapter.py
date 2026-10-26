@@ -967,3 +967,27 @@ def test_the_multi_inbox_video_creative_carries_a_headline_and_welcome_message()
     assert video["title"] == "Book your spot"
     assert video["call_to_action"]["value"]["app_destination"] == "MESSENGER"
     assert "ice_breakers" in video["page_welcome_message"]
+
+
+def test_every_ad_is_launched_with_a_headline_and_a_description(whatsapp_only):
+    """Ads Manager showed "no headline / no description" on Jane's ads."""
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    plan = _plan(creative=AdCreative(image_url="https://cdn/ad.png", headline="",
+                                     primary_text="Running ads is hard. Let us handle it for you."))
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(plan, _auth()))
+    link = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]["link_data"]
+    assert link["name"] == "Running ads is hard" and link["description"] == "Let us handle it for you"
+
+
+def test_a_whatsapp_ad_without_a_number_never_becomes_a_link_ad(whatsapp_only):
+    plan = _plan()
+    plan.whatsapp_number = ""
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{"id": "cmp_1"}])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(ValueError, match="WhatsApp number"):
+            _run(_adapter().launch_campaign(plan, _auth()))
+    assert mock_client.post.call_count == 0          # nothing created on Meta
