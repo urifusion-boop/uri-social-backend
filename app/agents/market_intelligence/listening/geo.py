@@ -193,6 +193,7 @@ async def resolve_or_create_place(db, city: str, country: str) -> Optional[dict]
     if not city:
         return None
     place_id = f"{_slugify(city)}_{code.lower()}"
+    await db["mi_known_places"].create_index("id", unique=True)
     existing = await get_place(db, place_id)
     if existing:
         return existing
@@ -209,9 +210,13 @@ async def resolve_or_create_place(db, city: str, country: str) -> Optional[dict]
         },
         "created_at": datetime.utcnow(),
     }
-    await db["mi_known_places"].insert_one(dict(doc))
-    doc.pop("_id", None)
-    return doc
+    # Atomic upsert, not insert_one: two businesses typing the same
+    # brand-new city at nearly the same moment must never create two
+    # documents with the same id — $setOnInsert only writes `doc` the
+    # first time; a concurrent second call becomes a no-op write that
+    # still returns the (first writer's) real, single document below.
+    await db["mi_known_places"].update_one({"id": place_id}, {"$setOnInsert": doc}, upsert=True)
+    return await get_place(db, place_id)
 
 
 def resolve_countries(scope: LocationScope) -> list[str]:
