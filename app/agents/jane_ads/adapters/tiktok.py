@@ -127,6 +127,22 @@ def _tiktok_objective_type(objective: CampaignObjective) -> str:
     return _TIKTOK_OBJECTIVE.get(objective, "TRAFFIC")
 
 
+def _tiktok_objective_for_creative(objective: CampaignObjective, is_carousel: bool) -> str:
+    """The TikTok objective to create the campaign with, given the creative.
+
+    A Carousel Ad is only offered under Traffic, Web Conversions, App Promotion, Lead
+    Generation and Reach (TikTok's own Carousel Ads help page); Video Views is not one
+    of them. The Engagement pick maps to VIDEO_VIEWS, and the campaign and ad group are
+    created happily under it — then ad/create rejects the carousel with "Objective type
+    not supported" (live 2026-10-26), after the campaign-level TRAFFIC fallback has
+    already been passed. A carousel therefore runs under TRAFFIC, the objective carousels
+    were confirmed live with (2026-09-22)."""
+    mapped = _tiktok_objective_type(objective)
+    if is_carousel and mapped == "VIDEO_VIEWS":
+        return "TRAFFIC"
+    return mapped
+
+
 # ── call_to_action mapping (2026-10-19, confirmed 2026-10-20) ──────────────────
 # ad/create previously hardcoded call_to_action to "CONTACT_US" regardless of
 # which button the client actually picked (plan.destination_cta, a key into
@@ -914,7 +930,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     new_adgroup_id = str(adgroup_data["data"]["adgroup_id"])
                     return new_campaign_id, new_adgroup_id
 
-                guessed_objective = _tiktok_objective_type(plan.objective)
+                guessed_objective = _tiktok_objective_for_creative(plan.objective, is_carousel)
                 guessed_optimization, guessed_billing = _TIKTOK_OPTIMIZATION_FOR_OBJECTIVE.get(
                     guessed_objective, (_OPTIMIZATION_GOAL, _BILLING_EVENT),
                 )
