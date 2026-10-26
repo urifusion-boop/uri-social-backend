@@ -31,6 +31,7 @@ _PLATFORM_LABELS = {
     Platform.GOOGLE: "Google",
     Platform.TIKTOK: "TikTok",
 }
+_SHORT_PLATFORM_NAMES = {Platform.META: "Meta", Platform.GOOGLE: "Google", Platform.TIKTOK: "TikTok"}
 
 
 class ReasonedValue(BaseModel):
@@ -67,6 +68,11 @@ class CampaignSummary(BaseModel):
 
 def _naira(n: float) -> str:
     return f"₦{n:,.0f}"
+
+
+def _days_label(days: int) -> str:
+    """"1 day", "7 days" — a one-day TikTok run read "1 days" on the plan card."""
+    return f"{days} day" if days == 1 else f"{days} days"
 
 
 def _reach_bounds(delivery_estimate: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
@@ -132,9 +138,12 @@ def build_campaign_summary(
 
     # Platforms — the resolved behaviour is why we landed here.
     plat_label = ", ".join(_PLATFORM_LABELS.get(p.platform, p.platform.value) for p in plan.platforms)
+    # The short name the reasons use ("Meta", "TikTok") — plat_label is the display value and
+    # reads "Meta (Instagram & Facebook)", which would be wrong inside a sentence.
+    short_label = ", ".join(_SHORT_PLATFORM_NAMES.get(p.platform, p.platform.value) for p in plan.platforms)
     platforms = ReasonedValue(
         value=plat_label,
-        reason=(f"Your customers discover businesses like yours by scrolling, so Meta's feed "
+        reason=(f"Your customers discover businesses like yours by scrolling, so {short_label}'s feed "
                 f"placements fit best." if plan.behaviour.value == "discover"
                 else f"Chosen for a '{plan.behaviour.value}' buying pattern."),
     )
@@ -143,7 +152,7 @@ def build_campaign_summary(
     if len(plan.platforms) == 1:
         p = plan.platforms[0]
         budget_allocation = ReasonedValue(
-            value=f"{_naira(p.budget_ngn)} over {p.days} days on {_PLATFORM_LABELS.get(p.platform, p.platform.value)}",
+            value=f"{_naira(p.budget_ngn)} over {_days_label(p.days)} on {_PLATFORM_LABELS.get(p.platform, p.platform.value)}",
             reason=f"Your full {_naira(total_budget)} goes to the one platform that fits, for the strongest signal.",
         )
     else:
@@ -156,8 +165,8 @@ def build_campaign_summary(
     # Duration — days, with the Meta daily-floor reasoning that set it.
     daily = total_budget / days if days else total_budget
     duration = ReasonedValue(
-        value=f"{days} days",
-        reason=(f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear Meta's "
+        value=_days_label(days),
+        reason=(f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear {short_label}'s "
                 f"minimum daily budget so the ad actually delivers, without stretching too thin."),
     )
 
@@ -166,7 +175,7 @@ def build_campaign_summary(
     # to message you" on a campaign pointing at a website.
     from .destination import clicks_label, coerce_type, optimization_for
     _dest = coerce_type(getattr(plan, "destination_type", "") or "")
-    _opt_value, _opt_reason = optimization_for(_dest)
+    _opt_value, _opt_reason = optimization_for(_dest, platform_label=short_label)
     optimization = ReasonedValue(value=_opt_value, reason=_opt_reason)
 
     # Estimates. Audience size = Meta's addressable pool for the targeting (real data,

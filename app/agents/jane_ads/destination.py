@@ -183,6 +183,25 @@ DESTINATION_OPTIONS: list[dict] = [
 VALUE_FIELD_FOR_TYPE = {o["value"]: o["field"] for o in DESTINATION_OPTIONS}
 
 
+TIKTOK_WHATSAPP_INPUT_NOTE = "People who tap your TikTok ad will message this number on WhatsApp."
+
+
+def options_for_platform(tiktok: bool = False) -> list[dict]:
+    """DESTINATION_OPTIONS, minus Instagram DMs when the campaign is running on
+    TikTok — ig.me is a Meta/Instagram deep link, meaningless on a TikTok ad.
+    Every DESTINATION_OPTIONS caller building a picker response should go
+    through this rather than using the raw list directly."""
+    if not tiktok:
+        return list(DESTINATION_OPTIONS)
+    options = [o for o in DESTINATION_OPTIONS if o["value"] != DestinationType.INSTAGRAM_DM.value]
+    # The WhatsApp number note ("linked to your Facebook Page in Meta") is a Meta
+    # requirement; a TikTok ad opens a plain wa.me link, so there is no Page to match.
+    return [
+        {**o, "input_note": TIKTOK_WHATSAPP_INPUT_NOTE} if o["value"] == DestinationType.WHATSAPP.value else o
+        for o in options
+    ]
+
+
 def cta_choice_list() -> list[dict]:
     """The button options, in the shape a picker renders."""
     return [{"value": k, "label": v[0]} for k, v in CTA_CHOICES.items()]
@@ -289,19 +308,22 @@ def image_cta(destination_type: DestinationType) -> str:
 # message you" on a website campaign. Live-reported.
 _OPTIMIZATION = {
     DestinationType.WHATSAPP: ("WhatsApp link clicks",
-        "Meta optimises delivery toward people most likely to tap through and message you."),
+        "%s optimises delivery toward people most likely to tap through and message you."),
     DestinationType.WEBSITE: ("Website link clicks",
-        "Meta optimises delivery toward people most likely to tap through to your site."),
+        "%s optimises delivery toward people most likely to tap through to your site."),
     DestinationType.INSTAGRAM_DM: ("Instagram DM clicks",
-        "Meta optimises delivery toward people most likely to tap through and DM you."),
+        "%s optimises delivery toward people most likely to tap through and DM you."),
     DestinationType.CUSTOM: ("Link clicks",
-        "Meta optimises delivery toward people most likely to tap through to your link."),
+        "%s optimises delivery toward people most likely to tap through to your link."),
 }
 
 
-def optimization_for(destination_type: DestinationType) -> tuple[str, str]:
-    """The plan card's OPTIMIZATION row — its value and its reason."""
-    return _OPTIMIZATION.get(destination_type, _OPTIMIZATION[DEFAULT_DESTINATION])
+def optimization_for(destination_type: DestinationType, platform_label: str = "Meta") -> tuple[str, str]:
+    """The plan card's OPTIMIZATION row — its value and its reason. `platform_label` names
+    the platform actually delivering the ad (defaults to "Meta" so every pre-existing call
+    site keeps its exact wording unless it opts in to naming a different platform)."""
+    value, reason_template = _OPTIMIZATION.get(destination_type, _OPTIMIZATION[DEFAULT_DESTINATION])
+    return value, reason_template % platform_label
 
 
 def clicks_label(destination_type: DestinationType) -> str:

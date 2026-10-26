@@ -36,29 +36,38 @@ class ExtendError(Exception):
     """A refusal the client should read — never a surprise at the wallet."""
 
 
-def quote(daily_ngn: float, days: int, markup: float) -> dict:
+def quote(
+    daily_ngn: float, days: int, markup: float,
+    *, floor: float = C.META_MIN_DAILY_NGN, platform_name: str = "Meta",
+) -> dict:
     """What extending will cost, before anything changes.
 
     `markup` is the rate this campaign was SOLD under, carried on its own record, so a
     later change to Uri's fee never re-bases a campaign onto maths its owner never
     agreed to — the same rule billing.py follows.
+
+    `floor`/`platform_name` default to Meta's own values — zero behaviour change for
+    every existing Meta caller — so a TikTok caller (added 2026-09-25, once TikTok
+    campaigns had a real "Keep it running" adapter to call) can pass its own real
+    floor (C.HARD_FLOOR_DAILY_NGN["tiktok"]) instead of Meta's ₦1,610.
     """
     if days < MIN_EXTEND_DAYS or days > MAX_EXTEND_DAYS:
         raise ExtendError(
             f"Choose between {MIN_EXTEND_DAYS} and {MAX_EXTEND_DAYS} more days."
         )
-    # Meta's OWN floor, not the ₦2,000 product minimum.
+    # The platform's OWN floor, not the ₦2,000 product minimum.
     #
     # ₦2,000 governs what a client may SET on a new plan. Applying it here would mean a
     # campaign launched before that rule existed — ₦1,800/day, running happily — could
     # never be continued, which punishes exactly the long-running campaigns this
-    # feature is for. Live-caught against a real ad set. Continuing an ad Meta is
-    # already delivering is not the moment to enforce a rule about new ones; the only
-    # question that matters here is whether Meta will keep serving it.
-    if daily_ngn < C.META_MIN_DAILY_NGN:
+    # feature is for. Live-caught against a real Meta ad set. Continuing an ad the
+    # platform is already delivering is not the moment to enforce a rule about new
+    # ones; the only question that matters here is whether the platform will keep
+    # serving it.
+    if daily_ngn < floor:
         raise ExtendError(
-            f"This campaign spends ₦{daily_ngn:,.0f} a day, under Meta's "
-            f"₦{C.META_MIN_DAILY_NGN:,.0f} floor — Meta will not deliver it. "
+            f"This campaign spends ₦{daily_ngn:,.0f} a day, under {platform_name}'s "
+            f"₦{floor:,.0f} floor — {platform_name} will not deliver it. "
             f"Start a new campaign instead."
         )
     ad_spend = round(daily_ngn * days, 2)

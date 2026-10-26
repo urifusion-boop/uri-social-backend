@@ -27,8 +27,8 @@ import re
 from typing import Any, Optional
 
 from . import constants as C
-from .models import CampaignPlan, CampaignRequest, GeoMode, GeoPin, GeoPlan, PinSource
 from .objectives import CHOICES as OBJECTIVE_CHOICES
+from .models import CampaignPlan, CampaignRequest, GeoMode, GeoPin, GeoPlan, PinSource, Platform, PlatformPlan
 
 # Meta's own bounds. Sending outside these fails the ad set create outright.
 MIN_AGE, MAX_AGE = 18, 65
@@ -59,6 +59,17 @@ _PLACEMENT_LABELS = {
 }
 
 
+def _location_names(geo: Optional[GeoPlan]) -> list[str]:
+    """What the ad set will actually target. A pinless plan targets its whole city
+    (meta_targeting_from_geo_named), and showing "—" for it read as "nowhere"."""
+    if not geo:
+        return []
+    if geo.pins:
+        return [p.name for p in geo.pins]
+    area = geo.city or ("" if geo.fallback_area == "the wider area" else geo.fallback_area)
+    return [area] if area else []
+
+
 def _gender_of(targeting: dict) -> str:
     return _CODES_TO_GENDER.get(tuple(targeting.get("genders") or []), "all")
 
@@ -71,6 +82,30 @@ def _placement_of(targeting: dict) -> str:
         if value and sorted(value) == sorted(current):
             return key
     return "automatic"
+
+
+def _daily_floor_for(platform: Optional[PlatformPlan]) -> float:
+    """The real daily-spend floor for whichever platform this plan is on — was
+    hardcoded to Meta's own floor everywhere in this module (both the help text
+    and, more seriously, the budget/duration/daily-spend validation itself),
+    which is wrong for TikTok's real ₦31,000 floor.
+
+    Mirrors decision_engine.py's own _days_for exactly, so this module and the
+    decision engine can never disagree about what "too thin to run" means for a
+    given platform: Meta uses MIN_DAILY_SPEND_NGN (₦2,000 — Jane's own quality
+    floor, deliberately above Meta's raw ₦1,610 platform floor, since a campaign
+    sitting on the platform minimum delivers too thinly to learn anything); every
+    other platform uses its own real HARD_FLOOR_DAILY_NGN, since Jane has no
+    equivalent quality-floor policy defined for TikTok/Google yet and TikTok's
+    real floor (₦31,000) is already far above any reasonable quality floor
+    anyway. Google's is 0 (CPC-driven, no hard floor) — deliberately preserved
+    as 0 here rather than falling back to Meta's number, so a Google-only plan's
+    budget/days validation stays unconstrained, matching decision_engine.py."""
+    if not platform:
+        return C.MIN_DAILY_SPEND_NGN
+    if platform.platform == Platform.META:
+        return max(C.HARD_FLOOR_DAILY_NGN.get("meta", 0), C.MIN_DAILY_SPEND_NGN)
+    return C.HARD_FLOOR_DAILY_NGN.get(platform.platform.value, C.MIN_DAILY_SPEND_NGN)
 
 
 def _interest_names(targeting: dict) -> list[str]:
@@ -96,13 +131,30 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
     `editable: False` lines are shown but not changeable — they are derived from other
     fields (the daily split) or fixed by the connection (the Page), and pretending
     otherwise would invite an edit we would have to silently ignore.
+
+    Live-caught 2026-09-23, revised 2026-09-25: every targeting-shaped field here
+    used to render unconditionally, Meta-labelled, on a TikTok plan too — but
+    adapters/tiktok.py didn't read plan.geo or plan.audience_targeting at all when
+    it built the ad group, so editing any of them on a TikTok plan changed nothing
+    real ("system says yes and does something else", the exact bug class this
+    module's docstring says it exists to prevent). adapters/tiktok.py now genuinely
+    uses location/gender/age (confirmed against TikTok's own Audience targeting and
+    Enumerations API reference), so locations/gender/age are real again for both
+    platforms. Interests and placement stay Meta-only: interests have no TikTok
+    mapping wired up yet (deferred, not silently dropped — see
+    _resolve_tiktok_locations's own docstring in adapters/tiktok.py for the same
+    honesty pattern), and placement ("Facebook and Instagram" vs "Instagram only"
+    etc.) is a Meta-only concept with no TikTok equivalent at all.
     """
     targeting = plan.audience_targeting or {}
     creative = plan.creative
     platform = plan.platforms[0] if plan.platforms else None
     geo = plan.geo
+    is_tiktok = bool(platform and platform.platform == Platform.TIKTOK)
+    floor = _daily_floor_for(platform)
+    platform_name = "TikTok" if is_tiktok else "Meta"
 
-    return [
+    fields: list[dict[str, Any]] = [
         {
             "key": "objective", "label": "Goal", "type": "select",
             "value": (plan.objective.value if plan.objective else ""),
@@ -124,30 +176,43 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "editable": True, "max_length": 500,
             "help": "The body of the ad — what the reader actually reads.",
         },
+    ]
+
+    fields += [
         {
             "key": "locations", "label": "Locations", "type": "list",
-            "value": [p.name for p in (geo.pins if geo else [])],
+            "value": _location_names(geo),
             "editable": True, "max_items": MAX_LOCATIONS,
-            "help": f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
-                    "we never target raw coordinates.",
+            "help": (f"Up to {MAX_LOCATIONS} areas. Each must be somewhere TikTok can name — "
+                     "we never target raw coordinates."
+                     if is_tiktok else
+                     f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
+                     "we never target raw coordinates."),
         },
+        # Real for both platforms since 2026-09-25 — TikTok resolves these same
+        # interest NAMES against its own /tool/interest_category/ catalogue
+        # (adapters/tiktok.py's _resolve_tiktok_interests) rather than Meta's;
+        # the flexible_spec this reads from is genuinely platform-neutral, only
+        # the resolved ids inside it differ by platform.
         {
             "key": "interests", "label": "Interests and behaviours", "type": "list",
             "value": _interest_names(targeting),
             "editable": True, "max_items": MAX_INTERESTS,
-            # Advantage+ audience is on (as Ads Manager sets it), so the interests
-            # steer delivery rather than fence it.
-            "help": ("Where Meta starts looking — it may also reach similar people it "
+            # Advantage+ audience is on for Meta (as Ads Manager sets it), so there
+            # the interests steer delivery rather than fence it — saying they are the
+            # exact audience would be the card overstating what Meta will do.
+            "help": ("Checked against TikTok's own targeting catalogue when you save."
+                     if is_tiktok else
+                     "Where Meta starts looking — it may also reach similar people it "
                      "expects to respond. Checked against Meta's targeting catalogue "
                      "when you save."),
         },
-        {
-            "key": "gender", "label": "Gender", "type": "select",
-            "value": _gender_of(targeting),
-            "options": ["all", "men", "women"], "editable": True,
-            "help": "Who sees it. 'All' is usually right unless the product is gendered.",
-        },
-        {
+    ]
+    if not is_tiktok:
+        # Placement ("Facebook and Instagram" vs "Instagram only") has no
+        # TikTok equivalent at all — TikTok only ever runs on TikTok's own
+        # placement, so this stays Meta-only.
+        fields.append({
             "key": "placement", "label": "Where it shows", "type": "select",
             "value": _placement_of(targeting),
             "options": list(_PLACEMENTS.keys()),
@@ -155,17 +220,33 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "editable": True,
             "help": "Automatic delivers best but also spends on Audience Network. "
                     "Pick a platform to keep it off everything else.",
-        },
+        })
+    age_min_field: dict[str, Any] = {
+        "key": "age_min", "label": "Minimum age", "type": "number",
+        "value": targeting.get("age_min", MIN_AGE),
+        "min": MIN_AGE, "max": MAX_AGE, "editable": True,
+    }
+    if is_tiktok:
+        age_min_field["help"] = (
+            "TikTok targets in age bands, not this exact number — the range you give "
+            "gets mapped onto whichever of its bands overlap it."
+        )
+    fields += [
         {
-            "key": "age_min", "label": "Minimum age", "type": "number",
-            "value": targeting.get("age_min", MIN_AGE),
-            "min": MIN_AGE, "max": MAX_AGE, "editable": True,
+            "key": "gender", "label": "Gender", "type": "select",
+            "value": _gender_of(targeting),
+            "options": ["all", "men", "women"], "editable": True,
+            "help": "Who sees it. 'All' is usually right unless the product is gendered.",
         },
+        age_min_field,
         {
             "key": "age_max", "label": "Maximum age", "type": "number",
             "value": targeting.get("age_max", MAX_AGE),
             "min": MIN_AGE, "max": MAX_AGE, "editable": True,
         },
+    ]
+
+    fields += [
         {
             "key": "budget_ngn", "label": "Budget", "type": "number",
             "value": req.budget_ngn, "min": 1, "editable": True, "prefix": "₦",
@@ -175,17 +256,18 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "key": "days", "label": "Duration (days)", "type": "number",
             "value": (platform.days if platform else 0),
             "min": 1, "max": 90, "editable": True,
-            "help": f"However long you want — Jane's default is only a starting point. "
+            "help": "However long you want — Jane's default is only a starting point. "
                     f"Shorter means more spend per day, and the daily figure cannot go "
-                    f"below ₦{C.MIN_DAILY_SPEND_NGN:,.0f}.",
+                    f"below ₦{floor:,.0f} on {platform_name}.",
         },
         {
             "key": "daily_spend", "label": "Daily spend", "type": "number",
             "value": round(req.budget_ngn / platform.days, 2) if platform and platform.days else None,
-            "min": C.MIN_DAILY_SPEND_NGN, "editable": True, "prefix": "₦",
-            "help": f"How much goes out each day. At least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} — "
-                    f"below that an ad delivers too thinly to learn anything. Setting this "
-                    f"changes how many days the budget lasts.",
+            "min": floor, "editable": True, "prefix": "₦",
+            "help": f"How much goes out each day. At least ₦{floor:,.0f} on {platform_name} — "
+                    f"below that an ad delivers too thinly to learn anything (or, on TikTok, "
+                    f"is under the platform's own floor). Setting this changes how many days "
+                    f"the budget lasts.",
         },
         {
             "key": "destination", "label": "Where taps go", "type": "derived",
@@ -194,6 +276,7 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "help": "Set by your connection, not by this plan.",
         },
     ]
+    return fields
 
 
 def _name_list(value: Any) -> list[str]:
@@ -321,6 +404,9 @@ async def apply_edits(
     req: CampaignRequest,
     edits: dict[str, Any],
     access_token: str = "",
+    *,
+    tiktok_advertiser_id: str = "",
+    tiktok_access_token: str = "",
 ) -> tuple[CampaignPlan, CampaignRequest, list[str], list[str]]:
     """Fold validated edits into the plan.
 
@@ -335,6 +421,9 @@ async def apply_edits(
     targeting = dict(plan.audience_targeting or {})
     plan_update: dict[str, Any] = {}
     req_update: dict[str, Any] = {}
+    platform = plan.platforms[0] if plan.platforms else None
+    is_tiktok = bool(platform and platform.platform == Platform.TIKTOK)
+    platform_name = "TikTok" if is_tiktok else "Meta"
 
     # ── objective ─────────────────────────────────────────────────────────────
     # Before launch ONLY. Meta refuses to change a campaign's objective once it has an
@@ -377,24 +466,63 @@ async def apply_edits(
                 applied += [k for k in ("headline", "caption") if k in edits]
 
     # ── locations ─────────────────────────────────────────────────────────────
+    # Real for both platforms now (2026-09-25) — TikTok resolves against its own
+    # /tool/region/ (adapters/tiktok.py's _resolve_tiktok_locations) instead of
+    # Meta's Graph API, but both land in the same plan.geo.pins shape, since
+    # that's what each platform's own launch step re-resolves by name from.
     if "locations" in edits:
         names = _name_list(edits.get("locations"))
-        region = (plan.geo.city if plan.geo else "") or req.geo
-        pins, bad = await _validated_locations(names, region, access_token)
-        rejections += bad
-        if pins:
-            base = plan.geo or GeoPlan(mode=GeoMode.OWN_RADIUS, city=region)
-            plan_update["geo"] = base.model_copy(update={"pins": pins})
-            applied.append("locations")
-        elif names:
-            rejections.append("No location was changed — none of those could be named by Meta.")
+        if is_tiktok:
+            if not (tiktok_advertiser_id and tiktok_access_token):
+                rejections.append("TikTok isn't configured, so locations can't be checked right now.")
+            else:
+                from .adapters.tiktok import _resolve_tiktok_locations
+
+                hits, bad = await _resolve_tiktok_locations(
+                    names[:MAX_LOCATIONS], tiktok_advertiser_id, tiktok_access_token)
+                rejections += [f"{n} — TikTok has no targetable area by that name in Nigeria" for n in bad]
+                pins = [GeoPin(name=h["name"], source=PinSource.GEOCODED, reason="chosen by you") for h in hits]
+                if pins:
+                    base = plan.geo or GeoPlan(mode=GeoMode.OWN_RADIUS, city=(plan.geo.city if plan.geo else req.geo))
+                    plan_update["geo"] = base.model_copy(update={"pins": pins})
+                    applied.append("locations")
+                elif names:
+                    rejections.append("No location was changed — none of those could be named by TikTok.")
+        else:
+            region = (plan.geo.city if plan.geo else "") or req.geo
+            pins, bad = await _validated_locations(names, region, access_token)
+            rejections += bad
+            if pins:
+                base = plan.geo or GeoPlan(mode=GeoMode.OWN_RADIUS, city=region)
+                plan_update["geo"] = base.model_copy(update={"pins": pins})
+                applied.append("locations")
+            elif names:
+                rejections.append("No location was changed — none of those could be named by Meta.")
 
     # ── interests ─────────────────────────────────────────────────────────────
+    # Real for both platforms since 2026-09-25 — TikTok resolves the SAME
+    # interest names against its own /tool/interest_category/ catalogue
+    # (adapters/tiktok.py's _resolve_tiktok_interests) rather than Meta's Graph
+    # API. flexible_spec itself is a platform-neutral internal representation;
+    # only the ids stored inside it (and which API validated them) differ.
     if "interests" in edits:
         names = _name_list(edits.get("interests"))
         if not names:
             targeting.pop("flexible_spec", None)
             applied.append("interests")
+        elif is_tiktok:
+            if not (tiktok_advertiser_id and tiktok_access_token):
+                rejections.append("TikTok isn't configured, so interests can't be checked right now.")
+            else:
+                from .adapters.tiktok import _resolve_tiktok_interests
+
+                hits, bad = await _resolve_tiktok_interests(names, tiktok_advertiser_id, tiktok_access_token)
+                rejections += [f"{n} — not something TikTok lets you target" for n in bad]
+                if hits:
+                    entry = {k: v for k, v in _other_flex_fields(plan.audience_targeting or {}).items()}
+                    entry["interests"] = [{"id": h["interest_category_id"], "name": h["name"]} for h in hits]
+                    targeting["flexible_spec"] = [entry]
+                    applied.append("interests")
         else:
             kept, bad = await _validated_interests(
                 names, access_token, _resolved_interests(plan.audience_targeting or {}))
@@ -414,7 +542,25 @@ async def apply_edits(
                 targeting["flexible_spec"] = [entry]
                 applied.append("interests")
 
+    # ── placement (Meta-only: no TikTok equivalent at all) ──────────────────────
+    if is_tiktok and "placement" in edits:
+        rejections.append("TikTok campaigns don't support placement targeting in Jane yet.")
+    if not is_tiktok and "placement" in edits:
+        choice = str(edits.get("placement") or "").strip().lower()
+        if choice not in _PLACEMENTS:
+            rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
+        else:
+            placements = _PLACEMENTS[choice]
+            if placements:
+                targeting["publisher_platforms"] = placements
+            else:
+                targeting.pop("publisher_platforms", None)
+            applied.append("placement")
+
     # ── gender ────────────────────────────────────────────────────────────────
+    # Real for both platforms now — TikTok's own gender enum
+    # (GENDER_MALE/GENDER_FEMALE/GENDER_UNLIMITED) maps directly onto this same
+    # genders encoding (see adapters/tiktok.py's _tiktok_gender_for).
     if "gender" in edits:
         choice = str(edits.get("gender") or "").strip().lower()
         if choice not in _GENDER_TO_CODES:
@@ -427,20 +573,12 @@ async def apply_edits(
                 targeting.pop("genders", None)
             applied.append("gender")
 
-    # ── placement ─────────────────────────────────────────────────────────────
-    if "placement" in edits:
-        choice = str(edits.get("placement") or "").strip().lower()
-        if choice not in _PLACEMENTS:
-            rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
-        else:
-            platforms = _PLACEMENTS[choice]
-            if platforms:
-                targeting["publisher_platforms"] = platforms
-            else:
-                targeting.pop("publisher_platforms", None)
-            applied.append("placement")
-
     # ── age ───────────────────────────────────────────────────────────────────
+    # Real for both platforms now — TikTok maps this same continuous age_min/
+    # age_max range onto whichever of its discrete age bands overlap it (see
+    # adapters/tiktok.py's _tiktok_age_groups_for), so the bounds validated here
+    # stay platform-agnostic rather than needing TikTok's own bucket enum
+    # surfaced in the UI.
     if {"age_min", "age_max"} & edits.keys():
         lo = _as_int(edits.get("age_min", targeting.get("age_min", MIN_AGE)))
         hi = _as_int(edits.get("age_max", targeting.get("age_max", MAX_AGE)))
@@ -454,16 +592,26 @@ async def apply_edits(
             targeting["age_min"], targeting["age_max"] = lo, hi
             applied += [k for k in ("age_min", "age_max") if k in edits]
 
-    # ── budget and duration ───────────────────────────────────────────────────
-    # Judged TOGETHER, because what Meta actually rejects is the daily figure they
-    # produce between them. Halving the duration is a valid way to clear the floor,
-    # so validating either one alone would refuse edits that are in fact fine — and
-    # would let a legal-looking pair through that the launch then fails on
-    # ("Budget is too low", subcode 1885272).
+    # ── budget, duration and daily spend ────────────────────────────────────────
+    # Judged TOGETHER, because what the platform actually rejects is the daily
+    # figure they produce between them. Halving the duration (or raising the daily
+    # spend directly) is a valid way to clear the floor, so validating any one of
+    # the three alone would refuse edits that are in fact fine — and would let a
+    # legal-looking combination through that the launch then fails on ("Budget is
+    # too low", subcode 1885272 on Meta).
+    #
+    # Live-caught 2026-09-23: the floor here was hardcoded to a single constant
+    # regardless of platform (first C.META_MIN_DAILY_NGN, then, when daily_spend
+    # became directly editable in the same window, C.MIN_DAILY_SPEND_NGN) — a
+    # TikTok edit could pass this check well under TikTok's real ₦31,000 floor and
+    # then fail for real at launch. Now looked up per the plan's own platform via
+    # _daily_floor_for, which mirrors decision_engine.py's own logic exactly:
+    # Meta uses the ₦2,000 product-quality floor, TikTok its real ₦31,000 floor.
     if {"budget_ngn", "days", "daily_spend"} & edits.keys():
         current_days = plan.platforms[0].days if plan.platforms else C.DEFAULT_CAMPAIGN_DAYS
         budget = _as_float(edits["budget_ngn"]) if "budget_ngn" in edits else req.budget_ngn
         days = _as_int(edits["days"]) if "days" in edits else current_days
+        floor = _daily_floor_for(platform)
 
         # Setting the daily spend decides the DURATION, not the budget: the budget is
         # what the client agreed to pay and is not ours to move on their behalf. An
@@ -471,10 +619,10 @@ async def apply_edits(
         daily_accepted = False
         if "daily_spend" in edits and "days" not in edits:
             daily = _as_float(edits["daily_spend"])
-            if daily is None or daily < C.MIN_DAILY_SPEND_NGN:
+            if daily is None or daily < floor:
                 rejections.append(
-                    f"Daily spend must be at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} — below that "
-                    f"an ad delivers too thinly to learn anything."
+                    f"Daily spend must be at least ₦{floor:,.0f} on {platform_name} — below "
+                    f"that an ad delivers too thinly to learn anything."
                 )
             elif budget is not None and budget > 0:
                 days = max(1, round(budget / daily))
@@ -490,15 +638,16 @@ async def apply_edits(
             )
         elif budget is None or days is None:
             rejections.append("Budget and duration must both be numbers.")
-        elif budget / days < C.MIN_DAILY_SPEND_NGN:
-            longest = int(budget // C.MIN_DAILY_SPEND_NGN)
+        elif floor > 0 and budget / days < floor:
+            longest = int(budget // floor)
             rejections.append(
-                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under the "
-                f"₦{C.MIN_DAILY_SPEND_NGN:,.0f} minimum — an ad spending less than that "
-                f"delivers too thinly to learn anything. "
+                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under "
+                f"{platform_name}'s ₦{floor:,.0f} minimum — an ad spending less than that "
+                "either delivers too thinly to learn anything or is under the platform's own "
+                "floor. "
                 + (f"Run it over {longest} days or fewer, or raise the budget."
                    if longest >= 1 else
-                   f"You would need at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} for a single day.")
+                   f"You would need at least ₦{floor:,.0f} for a single day.")
             )
         else:
             if "budget_ngn" in edits:
