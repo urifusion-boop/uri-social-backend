@@ -200,11 +200,17 @@ def _fallback_why(sig: dict) -> str:
     return "This is about what you sell, so it's a timely chance to show up where your customers are already talking."
 
 
-def _fallback_action(sig: dict) -> dict:
+def _fallback_action(sig: dict, connected: Optional[list[str]] = None) -> dict:
+    """Deterministic, zero-fabrication-risk — same policy as _fallback_why,
+    so this never calls the AI again. It used to hardcode "instagram"
+    regardless of what was actually connected, the same ungrounded-default
+    bug the main judging path had — `connected` (a plain DB lookup, no
+    fabrication risk) fixes that here too, not just on the AI's own path."""
     name = sig.get("topic_name") or sig.get("topic")
+    platform = (connected or ["instagram"])[0]
     return {
         "type": "post", "title": f"Post about {name}",
-        "platforms": ["instagram"], "format": "Single image post",
+        "platforms": [platform], "format": "Single image post",
         "hook": f"Let's talk about {name}.",
         "outline": [f"Share your take on {name}", "Show how your product or service fits",
                     "Invite a reply or DM"],
@@ -213,19 +219,25 @@ def _fallback_action(sig: dict) -> dict:
     }
 
 
-async def _judge_one_retry(profile: dict, sig: dict, error: str, model: str) -> Optional["_Judged"]:
+async def _judge_one_retry(db, profile: dict, sig: dict, error: str, model: str,
+                           connected: Optional[list[str]] = None) -> Optional["_Judged"]:
     """Re-ask for just this one signal after a validation failure, with the
     error named explicitly — mirrors insight_composer._call_llm's
-    error_context retry, adapted to the batched _Judgement schema."""
+    error_context retry, adapted to the batched _Judgement schema. Gets the
+    same PLATFORM & FORMAT FACTS as the primary judge call — a rewritten
+    action still needs to stay grounded in what's actually connected, not
+    just the primary action."""
     f = profile["facts"]
     facts = "\n".join(f"{k}: {v}" for k, v in f.items() if v)
+    platform_facts = await _platform_format_facts(db, profile, connected)
     samples = " | ".join((x.get("text") or "")[:160].replace("\n", " ") for x in (sig.get("samples") or [])[:3])
     line = (f"[0] topic: {sig.get('topic_name')} · type: {sig['type']} · market: {sig.get('market_label')} · "
             f"customer needs: {', '.join(sig.get('needs') or []) or '—'} · intents: {sig.get('intent_mix')}\n"
             f"    sample posts: {samples}")
     req = AIService.build_ai_model(model=model, temperature=0.2, messages=[
         {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": f"BUSINESS FACTS\n{facts}\n\nSIGNALS\n{line}"},
+        {"role": "user", "content": f"BUSINESS FACTS\n{facts}\n\nPLATFORM & FORMAT FACTS\n{platform_facts}"
+                                    f"\n\nSIGNALS\n{line}"},
         {"role": "user", "content": (
             f"Your previous attempt for this signal failed validation: {error}\n"
             "Rewrite 'why' and 'action' for index 0 using ONLY plain language — no percentages, "
@@ -346,24 +358,31 @@ def score(sig: dict, relevance: float, brand_fit: float, weights: dict) -> dict:
 _CONTENT_PLATFORMS = {"instagram", "tiktok", "facebook", "x", "linkedin", "whatsapp_status"}
 
 
-async def _platform_format_facts(db, profile: dict) -> str:
+async def _connected_platforms(db, profile: dict) -> list[str]:
+    """Real, content-postable connected platforms for this business (ad
+    accounts like facebook_ads excluded — matches router.py's
+    create_from_card CONTENT_PLATFORMS check). Cheap, deterministic, no AI
+    involved — safe to call even from the zero-fabrication-risk fallback
+    path below, not just the main judging prompt."""
+    try:
+        from app.agents.social_media_manager.services.social_account_service import SocialAccountService
+        conn = await SocialAccountService.get_user_connections(db, profile.get("user_id"), profile.get("brand_id"))
+        return [p for p in (conn.get("responseData") or {}).get("connected_platforms") or []
+               if p in _CONTENT_PLATFORMS]
+    except Exception as e:
+        print(f"[MI][listen] connected-platforms lookup failed: {e}")
+        return []
+
+
+async def _platform_format_facts(db, profile: dict, connected: Optional[list[str]] = None) -> str:
     """Grounds the AI's platform/format choice in real data instead of
     letting it guess (live-reported bug: every card defaulted to Instagram
     + carousel regardless of what was actually connected, because the
     prompt was never given connected accounts or real performance history
     to react to — see this function's three real signal sources below, in
     priority order, matching SYSTEM's own instructions)."""
-    user_id, brand_id = profile.get("user_id"), profile.get("brand_id")
-    lines = []
-    try:
-        from app.agents.social_media_manager.services.social_account_service import SocialAccountService
-        conn = await SocialAccountService.get_user_connections(db, user_id, brand_id)
-        connected = [p for p in (conn.get("responseData") or {}).get("connected_platforms") or []
-                    if p in _CONTENT_PLATFORMS]
-    except Exception as e:
-        print(f"[MI][listen] connected-platforms lookup failed: {e}")
-        connected = []
-    lines.append(f"connected_platforms: {', '.join(connected) or 'none connected yet'}")
+    connected = await _connected_platforms(db, profile) if connected is None else connected
+    lines = [f"connected_platforms: {', '.join(connected) or 'none connected yet'}"]
 
     f = profile.get("facts") or {}
     stated_platforms = f.get("target_platforms")
@@ -375,7 +394,8 @@ async def _platform_format_facts(db, profile: dict) -> str:
 
     try:
         from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
-        perf = await PerformanceAnalyticsService.get_user_performance(user_id, db, brand_id=brand_id)
+        perf = await PerformanceAnalyticsService.get_user_performance(
+            profile.get("user_id"), db, brand_id=profile.get("brand_id"))
         if perf.get("has_data"):
             if perf.get("top_platforms"):
                 lines.append(f"best_performing_platforms (from this business's own real post engagement, "
@@ -389,10 +409,11 @@ async def _platform_format_facts(db, profile: dict) -> str:
     return "\n".join(lines)
 
 
-async def _judge(db, profile: dict, sigs: list[dict], model: str) -> dict[int, _Judged]:
+async def _judge(db, profile: dict, sigs: list[dict], model: str,
+                 connected: Optional[list[str]] = None) -> dict[int, _Judged]:
     f = profile["facts"]
     facts = "\n".join(f"{k}: {v}" for k, v in f.items() if v)
-    platform_facts = await _platform_format_facts(db, profile)
+    platform_facts = await _platform_format_facts(db, profile, connected)
     lines = []
     for i, s in enumerate(sigs):
         samples = " | ".join((x.get("text") or "")[:160].replace("\n", " ") for x in (s.get("samples") or [])[:3])
@@ -452,7 +473,8 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
     if not cands:
         return []
 
-    judged = await _judge(db, profile, cands, sc["model"])
+    connected = await _connected_platforms(db, profile)
+    judged = await _judge(db, profile, cands, sc["model"], connected=connected)
     cards = []
     for i, sig in enumerate(cands):
         j = judged.get(i)
@@ -471,7 +493,7 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
             track_event(brand, "card_validation_retry", {
                 "brand_id": brand, "signal_id": sig.get("id"), "topic": sig.get("topic"), "reason": err[:200],
             })
-            retry = await _judge_one_retry(profile, sig, err, sc["model"])
+            retry = await _judge_one_retry(db, profile, sig, err, sc["model"], connected=connected)
             if retry and retry.action:
                 cand_why, cand_action = retry.why, retry.action.dict()
                 err = _validate_card_numbers(cand_why, cand_action, allowed)
@@ -481,7 +503,7 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
                 track_event(brand, "card_validation_fallback", {
                     "brand_id": brand, "signal_id": sig.get("id"), "topic": sig.get("topic"), "reason": err[:200],
                 })
-                why, action = _fallback_why(sig), _fallback_action(sig)
+                why, action = _fallback_why(sig), _fallback_action(sig, connected)
             else:
                 why, action = cand_why, cand_action
 

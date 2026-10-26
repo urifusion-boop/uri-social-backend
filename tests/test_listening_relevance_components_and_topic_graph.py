@@ -248,7 +248,7 @@ def test_a_mismatched_language_can_push_a_card_below_the_relevance_gate(monkeypa
            "z": 5.0, "growth": 1.0, "persistence_days": 3, "scores": {"M": 60, "C": 60}, "confidence": 0.8}
     run(db["mi_listen_signals"].insert_one(dict(sig)))
 
-    async def fake_judge(db, profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model, connected=None):
         return {i: _J(i, rel=CFG["score"]["min_relevance"] + 5) for i in range(len(sigs))}  # just above the gate
     monkeypatch.setattr(personalize, "_judge", fake_judge)
 

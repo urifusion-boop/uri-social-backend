@@ -112,7 +112,7 @@ def test_sustained_dismissal_history_gates_an_otherwise_qualifying_card_out(monk
            "topic_name": "latasha wig", "type": "rising", "scores": {"M": 70, "C": 60}, "confidence": 0.8,
            "needs": [], "samples": [], "expires_at": NOW + timedelta(days=7)}
 
-    async def fake_judge(db, profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model, connected=None):
         return {0: _J(0, CFG["score"]["min_relevance"] + 5, 80)}  # would pass on relevance alone
     monkeypatch.setattr(personalize, "_judge", fake_judge)
 

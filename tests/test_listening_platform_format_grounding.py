@@ -108,6 +108,57 @@ class TestPlatformFormatFacts:
         assert "connected_platforms: none connected yet" in out
 
 
+class TestFallbackActionIsAlsoGrounded:
+    """_fallback_action is the deterministic, zero-fabrication-risk safety
+    net used when the AI's output fails validation twice — it used to
+    hardcode "instagram" here too, the exact same ungrounded-default bug,
+    just on a path that never calls the AI at all (so fixing it needs no
+    AI mocking — a real connected-platforms list is enough)."""
+
+    def test_picks_the_first_real_connected_platform_not_instagram(self):
+        action = personalize._fallback_action(
+            {"topic_name": "latasha wig", "topic": "latasha wig"}, connected=["tiktok", "facebook"]
+        )
+        assert action["platforms"] == ["tiktok"]
+
+    def test_falls_back_to_instagram_only_when_nothing_is_connected(self):
+        action = personalize._fallback_action({"topic_name": "x", "topic": "x"}, connected=[])
+        assert action["platforms"] == ["instagram"]
+
+    def test_omitting_connected_entirely_keeps_the_old_default_behavior(self):
+        """Regression guard for the pre-existing direct-call test in
+        test_listening_engine.py, which calls _fallback_action with no
+        `connected` argument at all."""
+        action = personalize._fallback_action({"topic_name": "x", "topic": "x"})
+        assert action["platforms"] == ["instagram"]
+
+
+class TestRetryPathIsAlsoGrounded:
+    def test_judge_one_retry_includes_platform_facts_in_its_prompt(self):
+        from types import SimpleNamespace
+        from app.services import AIService as ai_module
+
+        captured = {}
+
+        def fake_build(messages, **kw):
+            captured["messages"] = messages
+            return SimpleNamespace(messages=messages)
+
+        async def fake_structured(req, response_model):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=None))])
+
+        db = fresh_db()
+        with _patch_connections(["tiktok"]), patch.object(
+            ai_module.AIService, "build_ai_model", staticmethod(fake_build)
+        ), patch.object(ai_module.AIService, "structured_chat_completion", new=AsyncMock(side_effect=fake_structured)):
+            run(personalize._judge_one_retry(
+                db, PROFILE, {"topic_name": "x", "topic": "x", "type": "rising"}, "fabricated number", "gpt-4o-mini"
+            ))
+        prompt_text = " ".join(m["content"] for m in captured["messages"] if "content" in m)
+        assert "PLATFORM & FORMAT FACTS" in prompt_text
+        assert "connected_platforms: tiktok" in prompt_text
+
+
 class TestPerPlatformPerformance:
     """PerformanceAnalyticsService already fetched `platform` on every draft
     but never aggregated it — the exact same data used for avg_engagement_by_format
