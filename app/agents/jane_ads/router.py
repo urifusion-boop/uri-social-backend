@@ -11,6 +11,7 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Optional
 
@@ -1834,6 +1835,13 @@ class MetaLaunchFromMessageBody(BaseModel):
     reference_image_url: str = ""         # required for creative_source=upload/recomposite (from
                                           # /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
+    # TikTok-only, additive: 2+ extra photos for a TikTok Carousel Ad, alongside (never
+    # instead of) reference_image_url/is_video above — a lone static image isn't a valid
+    # TikTok ad unit at all (TikTok is video OR carousel, never single-image), so this is
+    # how a photo-only business can still reach TikTok without shooting a video. Ignored
+    # entirely for a Meta-bound plan; ignored here too unless there are 2+ URLs (see the
+    # tiktok_needs_video gate in _build_campaign_plan).
+    carousel_image_urls: list[str] = []
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
     reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
                                           # regenerating (a targeting/budget tweak shouldn't burn a
@@ -1892,6 +1900,15 @@ class MetaLaunchFromMessageBody(BaseModel):
     # See CreativeForBrandBody's identical field — Day 1 -> Day 30 (SEED-078)
     # only, a second real photo of the same thing at a later point in time.
     reference_image_url_2: str = ""
+    # Explicit user platform choice — additive on top of Jane's own silent
+    # pick, never touching the existing Meta routing/gating. "" (default)
+    # keeps today's behaviour exactly as-is (Jane picks, TikTok only when
+    # she'd have picked it herself). "tiktok" asks for TikTok specifically —
+    # honoured only if TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN are configured
+    # and the creative is a video or a 2+ photo carousel (TikTok's hard
+    # requirement); otherwise an early_return explains why, same shape as every
+    # other early_return here. Any other value is ignored.
+    preferred_platform: str = ""          # "" | "tiktok"
 
 
 class _PlanBuildResult(BaseModel):
@@ -1996,7 +2013,16 @@ async def _build_campaign_plan(
     from .threads import thread_history
     from .policy import Severity, review_ad_creative
 
-    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+    # TikTok's own ad account is entirely separate from any Meta Page (see
+    # adapters/tiktok.py) — a brand explicitly asking for TikTok must never be blocked
+    # on Meta config/connection at all (live-confirmed 2026-10-19: a client who picked
+    # TikTok but had no Facebook Page connected got "Connect your Facebook Page" before
+    # TikTok was ever considered). Everything below is unchanged for any other request.
+    tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
+    tiktok_preferred = body.preferred_platform == "tiktok"
+    tiktok_only = tiktok_preferred and tiktok_ready
+
+    if not tiktok_only and not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
 
     # 0. Per-brand Meta ads connection — checked FIRST, before Jane says a word, so a
@@ -2007,16 +2033,24 @@ async def _build_campaign_plan(
     # campaign's goal, which Jane hasn't determined yet at this point — a followers/
     # engagement campaign never uses it at all. Re-checked strictly once the goal is
     # known, at step 1.6 below.
-    try:
-        ads_conn = await resolve_ads_page_for_launch(
-            db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
-        )
-    except AdsConnectionRequired as e:
-        return {"early_return": {
-            "stage": f"meta_connection_{e.state.value}",
-            "understood": {},
-            "page_name": e.page_name,
-        }}
+    if tiktok_only:
+        # No Meta Page: TikTok sends people to the brand's own WhatsApp number (a wa.me
+        # link), so that is all the connection there is. Skipped entirely — this check is
+        # Meta-only and has nothing to say about TikTok.
+        from .whatsapp import get_brand_whatsapp
+        ads_conn = {"page_id": "",
+                    "whatsapp_number": await get_brand_whatsapp(db, brand_ctx.get("brand_id")) or ""}
+    else:
+        try:
+            ads_conn = await resolve_ads_page_for_launch(
+                db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
+            )
+        except AdsConnectionRequired as e:
+            return {"early_return": {
+                "stage": f"meta_connection_{e.state.value}",
+                "understood": {},
+                "page_name": e.page_name,
+            }}
     page_id = ads_conn["page_id"]
 
     if body.creative_source in ("upload", "recomposite") and not body.reference_image_url:
@@ -2181,6 +2215,14 @@ async def _build_campaign_plan(
     stated_budget_ngn = req.budget_ngn
     req.budget_ngn = C.ad_spend_from_budget(stated_budget_ngn)
 
+    # TikTok rejects an ad group under its own daily floor (₦31,000), and the fee comes out
+    # of the stated budget — so a stated ₦31,000 is only ₦27,900 of ad spend and would fail
+    # at launch, after the wallet check. Say what's needed now, in the client's terms.
+    if tiktok_preferred:
+        too_low = _tiktok_budget_too_low_message(req.budget_ngn)
+        if too_low:
+            return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": too_low}}
+
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
     # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
     # Every other goal DOES need a destination — but only a WhatsApp one needs the
@@ -2208,7 +2250,14 @@ async def _build_campaign_plan(
         and requested_destination not in ("", "ask")
         and destination_type == DestinationType.WHATSAPP
     )
-    if needs_whatsapp_number and not ads_conn["whatsapp_number"]:
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"] and tiktok_only:
+        return {"early_return": {
+            "stage": "tiktok_connection_no_whatsapp",
+            "understood": parsed.model_dump(),
+            "question": "Add the WhatsApp number your ads should send people to (Connected Accounts), "
+                        "then tell me again and I'll build it.",
+        }}
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"] and not tiktok_only:
         try:
             ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
         except AdsConnectionRequired as e:
@@ -2231,7 +2280,7 @@ async def _build_campaign_plan(
     # unrelated "sporteinstein.com" left over from an earlier campaign.
     if req.goal != Goal.FOLLOWERS and requested_destination not in ("", "ask"):
         from .destination import (
-            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
+            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform, set_brand_destination,
         )
 
         def _early_destination_error(error: str) -> dict:
@@ -2244,7 +2293,7 @@ async def _build_campaign_plan(
                 "question": "Where should people who tap your ad end up?",
                 "destination_options": [
                     {**opt, "current": brand_destination.get(opt["field"], "")}
-                    for opt in DESTINATION_OPTIONS
+                    for opt in options_for_platform(tiktok_preferred)
                 ],
                 "cta_choices": cta_choice_list(),
                 "selected": {
@@ -2401,9 +2450,25 @@ async def _build_campaign_plan(
     # launch path yet. Jane's original recommendation is always surfaced in the
     # response for transparency, regardless of what actually launches.
     jane_platforms = [p.platform.value for p in plan.platforms]
-    tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
+    # tiktok_ready is computed once, at step 0.
     jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
-    if jane_picked_tiktok and tiktok_ready:
+    if tiktok_preferred:
+        # Explicit "give me TikTok" request (MetaLaunchFromMessageBody.preferred_platform) —
+        # purely additive on top of Jane's own silent pick below; does not touch the Meta
+        # routing/gating in the else branch at all. jane_platforms above still reflects what
+        # Jane would have picked on her own, for the same transparency the forced_to_meta
+        # banner already gives.
+        if not tiktok_ready:
+            return {"early_return": {"stage": "tiktok_not_configured", "understood": parsed.model_dump(),
+                    "question": "TikTok Ads isn't connected yet — try again shortly, or drop the TikTok "
+                                 "request and I'll use what's available."}}
+        # The real video-or-not check happens further down, once the ACTUAL creative is
+        # built (creative.is_video) — plan.creative.has_video here is still only the NL
+        # parser's guess from the free-text message, which rejected a real uploaded video
+        # every time (confirmed live 2026-09-17).
+        plan = apply_platform_override(plan, [Platform.TIKTOK])
+        forced_to_meta = False
+    elif jane_picked_tiktok and tiktok_ready:
         plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
         forced_to_meta = False
     else:
@@ -2531,7 +2596,7 @@ async def _build_campaign_plan(
         and await destination_already_answered(db, brand_ctx.get("brand_id"), body.thread_id)
     )
     if req.goal != Goal.FOLLOWERS and not destination_settled:
-        from .destination import DESTINATION_OPTIONS, cta_choice_list
+        from .destination import cta_choice_list, options_for_platform
 
         def _destination_prompt(error: str = "") -> dict:
             return {"early_return": {
@@ -2542,7 +2607,7 @@ async def _build_campaign_plan(
                 # retypes their own number to change only the button.
                 "destination_options": [
                     {**opt, "current": brand_destination.get(opt["field"], "")}
-                    for opt in DESTINATION_OPTIONS
+                    for opt in options_for_platform(tiktok_preferred)
                 ],
                 "cta_choices": cta_choice_list(),
                 "selected": {
@@ -2682,6 +2747,25 @@ async def _build_campaign_plan(
             .replace("you have photos", "you have video")
             .replace("no creative is needed for search", "you have video")
         )
+
+    # TikTok's real video-or-not requirement, checked here (not up at the platform-decision
+    # point) for the same reason the explanation-text patch above exists: creative.is_video
+    # only reflects reality once the ACTUAL creative_source (upload/generate/draft/reuse) has
+    # run — checking any earlier value meant a genuinely uploaded video still got rejected,
+    # because the free-text message parse has no way to know about it. No-op for a Meta-bound
+    # plan.
+    #
+    # A TikTok Carousel Ad (2+ photos) is the other real way in — TikTok has no
+    # single-static-image ad unit at all, so "attach one more photo" is a genuine alternative
+    # to shooting a video, not a downgrade. body.carousel_image_urls carries those, kept
+    # separate from reference_image_url/is_video above.
+    has_carousel = len(body.carousel_image_urls) >= 2
+    if any(p.platform == Platform.TIKTOK for p in plan.platforms) and not creative.is_video and not has_carousel:
+        return {"early_return": {"stage": "tiktok_needs_video", "understood": parsed.model_dump(),
+                "question": "TikTok needs either a video, or at least 2 photos for a carousel ad. "
+                             "Attach one of those for this campaign, then ask for TikTok again."}}
+    if has_carousel:
+        creative.carousel_image_urls = body.carousel_image_urls
 
     # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
     # runs before a plan is ever shown as ready, not just right before launch.
@@ -2844,6 +2928,19 @@ async def _build_campaign_plan(
     )
 
 
+def _tiktok_budget_too_low_message(ad_spend_ngn: float) -> str:
+    """"" when `ad_spend_ngn` clears TikTok's daily floor; otherwise what the client needs
+    to state, in their terms. The fee comes out of the stated budget, so the floor has to
+    be grossed up: ₦31,000 of ad spend needs a stated ₦34,445."""
+    floor = C.HARD_FLOOR_DAILY_NGN["tiktok"]
+    if ad_spend_ngn >= floor:
+        return ""
+    minimum_stated = math.ceil(floor / (1.0 - C.SERVICE_FEE_RATE))
+    return (f"TikTok needs at least ₦{floor:,.0f} of ad spend a day. With URI's "
+            f"{C.SERVICE_FEE_RATE:.0%} fee that means a budget of ₦{minimum_stated:,.0f} or "
+            f"more — what budget would you like to use?")
+
+
 def _total_due_ngn(ad_spend_ngn: float) -> float:
     """What the customer's wallet must cover for a campaign whose AD SPEND is
     `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
@@ -2929,7 +3026,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     credentials are configured (see the forcing logic in _build_campaign_plan)."""
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError, _video_thumbnail_url
     from .wallet import WalletService
     from .store import MongoWalletStore
 
@@ -2954,6 +3051,15 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         raise HTTPException(status_code=400, detail=str(e))
 
     campaign_collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
+    # TikTok-only (see _video_thumbnail_url docstring): for a video ad,
+    # plan.creative.image_url IS the raw .mp4 URL, which the campaign list's
+    # plain <img> tag can't render — swap in a Cloudinary-derived poster frame
+    # for display only, purely additive, leaves Meta's own image_url untouched.
+    display_image_url = (
+        _video_thumbnail_url(plan.creative.image_url)
+        if is_tiktok and plan.creative.is_video
+        else plan.creative.image_url
+    )
     # Enrich the stored campaign record with display fields so the campaign-list
     # view can render name/creative/budget without re-deriving them.
     await db[campaign_collection].update_one(
@@ -2965,7 +3071,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "category": req.category,
             "headline": plan.creative.headline,
             "primary_text": plan.creative.primary_text,
-            "image_url": plan.creative.image_url,
+            "image_url": display_image_url,
             "budget_ngn": req.budget_ngn,
             "goal": plan.goal.value,
             "city": req.geo,
@@ -2983,12 +3089,12 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     )
 
     launch_note = (
-        "Created DISABLE (paused) — zero spend. Review and activate in TikTok Ads Manager to go live."
+        "Created DISABLE (paused) — zero spend. Review and activate from Campaign Manager to go live."
         if is_tiktok else
         "Created PAUSED — zero spend. Review and activate in Ads Manager to go live."
     )
     ads_manager_url = (
-        f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
+        ""
         if is_tiktok else
         f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
         f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
@@ -3006,6 +3112,10 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "status": "DISABLE" if is_tiktok else "PAUSED",
             "note": launch_note,
             "ads_manager_url": ads_manager_url,
+            # Additive — status already implied this (DISABLE vs PAUSED) but a named field is
+            # what the frontend actually needs for a platform badge, not string-sniffing an
+            # unrelated status value.
+            "platform": "tiktok" if is_tiktok else "meta",
         },
     }
 
@@ -3356,6 +3466,22 @@ async def _load_pending_plan(db, plan_id: str, brand_id: str) -> dict:
     return doc
 
 
+def _preferred_platform_for_challenge(plan: CampaignPlan) -> str:
+    """What to pin the rebuild to when a Plan Defence "challenge" corrects a plan.
+
+    Live-caught 2026-09-23: the challenge rebuild used to construct its synthetic
+    MetaLaunchFromMessageBody with no preferred_platform at all, so a TikTok plan
+    (chosen via an explicit override, not Jane's own silent pick) went back through
+    Jane's own platform decision on any follow-up correction — a client correcting
+    their budget on a TikTok plan could get a Meta plan back, with their platform choice
+    quietly overturned by an unrelated question. Re-reads the platform straight off the
+    plan being corrected, matching what the original launch request pinned. "" (Jane
+    picks) for every non-TikTok plan, exactly as before."""
+    if plan.platforms and plan.platforms[0].platform == Platform.TIKTOK:
+        return "tiktok"
+    return ""
+
+
 @router.get("/meta/plan/{plan_id}/fields")
 async def meta_plan_fields(
     plan_id: str,
@@ -3405,8 +3531,13 @@ async def meta_plan_edit_fields(
 
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
+    # TikTok credentials threaded through separately (keyword-only) — locations now resolve
+    # against TikTok's own /tool/region/ for a TikTok plan rather than Meta's Graph API,
+    # which the positional access_token below is for.
     new_plan, new_req, applied, rejections = await apply_edits(
         plan, req, body.edits, settings.META_ADS_ACCESS_TOKEN,
+        tiktok_advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID,
+        tiktok_access_token=settings.TIKTOK_ADS_ACCESS_TOKEN,
     )
 
     rebuilt_summary = None
@@ -3555,6 +3686,10 @@ async def meta_plan_ask(
             category=req.category,
             reuse_image_url=plan.creative.image_url if plan.creative else "",
             thread_id=doc.get("thread_id", ""),
+            preferred_platform=_preferred_platform_for_challenge(plan),
+            # A carousel plan has no video to reuse; without its photos the rebuild would
+            # stop at "TikTok needs a video or 2+ photos".
+            carousel_image_urls=(plan.creative.carousel_image_urls if plan.creative else []),
         )
         rebuilt = await _build_campaign_plan(synthetic_body, brand_ctx, db)
         if isinstance(rebuilt, dict):
@@ -3662,10 +3797,18 @@ async def meta_campaigns(
             # destinations existed carry neither field and were all WhatsApp.
             "destination_type": r.get("destination_type") or "whatsapp",
             "destination_link": r.get("destination_link") or "",
-            "status": "paused",   # everything is created PAUSED (Meta) / DISABLE (TikTok) for now
+            # Real last-known state (the toggle endpoint persists it for TikTok on every
+            # activate/pause) — "paused" for a campaign that's never been toggled, which is
+            # accurate: every campaign is created PAUSED (Meta) / DISABLE (TikTok). This is
+            # the fallback when with_metrics is off or a live delivery read fails below; it
+            # used to be hardcoded to "paused", which kept showing a PAUSED badge and the
+            # wrong play/pause icon on a TikTok campaign that WAS running.
+            "status": r.get("status", "paused"),
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+            # TikTok campaigns run in URI's own advertiser account, which clients must not
+            # be pointed at (or shown the id of). Meta's link is unchanged.
             "ads_manager_url": (
-                f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
+                ""
                 if is_tiktok else
                 f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
                 f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r.get('campaign_id')}"
@@ -3684,6 +3827,10 @@ async def meta_campaigns(
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
                     continue
                 row["status"] = summary["delivery"].lower()
+                if summary.get("delivery_note"):
+                    # TikTok: switched on, but in review / rejected / out of balance. The card
+                    # renders serving_note for any platform.
+                    row["serving_note"] = summary["delivery_note"]
                 # A wa.me link ad reports 0 conversations forever — Meta only fires
                 # the conversation metric for native Click-to-WhatsApp. Rendering that
                 # raw would tell a client their ad produced nothing when the truth is
@@ -3708,6 +3855,9 @@ async def meta_campaigns(
                     "impressions": summary["impressions"],
                     "reach": summary["reach"],
                     "delivery": summary["delivery"],
+                    # What the badge shows when it differs from the on/off state (e.g. "In
+                    # review" while delivery is "Active"). Empty = same as delivery.
+                    "delivery_display": summary.get("delivery_display") or summary["delivery"],
                     "ends_at": summary["ends_at"],
                 }
             except Exception as e:
@@ -4054,6 +4204,37 @@ async def extend_quote(
     from .wallet import WalletService
 
     brand_id = brand_ctx.get("brand_id")
+    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_id)
+    if tiktok_record is not None:
+        record = tiktok_record
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            sched = await adapter.fetch_adgroup_schedule(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        try:
+            q = quote(sched["daily_ngn"], days, markup,
+                      floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
+        except ExtendError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        balance = await WalletService(MongoWalletStore(db)).get_balance(record["business_id"])
+        return {
+            **q,
+            "campaign_id": campaign_id,
+            "current_end_time": sched["end_time"],
+            "new_end_time": new_end_time(sched["end_time"], days).isoformat(),
+            "has_ended": sched["has_ended"],
+            "wallet_balance_ngn": balance,
+            "affordable": balance >= q["total_due_ngn"],
+        }
+
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
     if not record or record.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Campaign not found")
@@ -4111,6 +4292,79 @@ async def extend_campaign(
     from .wallet import InsufficientFundsError, WalletService
 
     brand_id = brand_ctx.get("brand_id")
+    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_id)
+    if tiktok_record is not None and not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Extending restarts spending on this campaign — confirm to go ahead.",
+        )
+    wallet = WalletService(MongoWalletStore(db))
+    if tiktok_record is not None:
+        record = tiktok_record
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            sched = await adapter.fetch_adgroup_schedule(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        try:
+            q = quote(sched["daily_ngn"], body.days, markup,
+                      floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
+        except ExtendError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        balance = await wallet.get_balance(record["business_id"])
+        if balance < q["total_due_ngn"]:
+            raise HTTPException(
+                status_code=402,
+                detail=f"₦{q['total_due_ngn']:,.0f} needed to run {body.days} more day(s) at "
+                       f"₦{q['daily_ngn']:,.0f}/day — your wallet has ₦{balance:,.0f}. Top up first.",
+            )
+
+        ends_at = new_end_time(sched["end_time"], body.days)
+        # Both fields move together — see extend_adgroup's own docstring for why
+        # pushing only the end date would spread the SAME total budget thinner
+        # rather than actually buying more delivery on a BUDGET_MODE_TOTAL ad group.
+        new_budget = round(sched["budget_ngn"] + q["ad_spend_ngn"], 2)
+        try:
+            confirmed = await adapter.extend_adgroup(sched["adgroup_id"], new_budget, ends_at)
+        except TikTokAdsAPIError as e:
+            raise HTTPException(status_code=502, detail=f"TikTok did not accept the new end date: {e}")
+
+        try:
+            await wallet.charge_ad_spend(record["business_id"], q["total_due_ngn"],
+                                         campaign_id=campaign_id)
+        except InsufficientFundsError:
+            raise HTTPException(
+                status_code=402,
+                detail="The campaign was extended but your wallet could not cover it — "
+                       "top up now, or pause the campaign to stop it spending.",
+            )
+
+        await db["jane_ads_tiktok_campaigns"].update_one(
+            {"campaign_id": campaign_id},
+            {"$inc": {"charged_upfront_ngn": q["total_due_ngn"]},
+             "$push": {"extensions": {
+                 "days": body.days, "daily_ngn": q["daily_ngn"],
+                 "charged_ngn": q["total_due_ngn"], "new_end_time": ends_at.isoformat(),
+                 "at": datetime.now(timezone.utc),
+             }}},
+        )
+        return {
+            "campaign_id": campaign_id,
+            "extended_by_days": body.days,
+            "charged_ngn": q["total_due_ngn"],
+            "end_time": confirmed.get("end_time"),
+            "wallet_balance_ngn": await wallet.get_balance(record["business_id"]),
+            "note": "Same campaign, same creative — it keeps everything TikTok has learned. "
+                    "It runs until this date unless you pause it.",
+        }
+
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
     if not record or record.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Campaign not found")
@@ -4205,6 +4459,24 @@ async def _live_campaign(db, campaign_id: str, brand_id: str) -> dict:
     return record
 
 
+async def _tiktok_live_campaign(db, campaign_id: str, brand_id: str) -> Optional[dict]:
+    """The brand's TikTok record for this campaign, or None when it isn't a TikTok campaign.
+
+    A separate lookup rather than a change to _live_campaign above: every Meta endpoint
+    keeps calling that one exactly as before, and the TikTok-aware endpoints below check
+    this FIRST and only fall through to their unchanged Meta code when it returns None."""
+    record = await db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": campaign_id})
+    if record and record.get("brand_id") == brand_id:
+        return record
+    return None
+
+
+_TIKTOK_LEARNING_WARNING = (
+    "Changing who this ad targets while it's already running can affect delivery for "
+    "a while as TikTok's system adjusts to the new audience."
+)
+
+
 @router.get("/meta/campaigns/{campaign_id}/targeting")
 async def get_live_targeting(
     campaign_id: str,
@@ -4220,6 +4492,33 @@ async def get_live_targeting(
 
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .live_edit import LEARNING_WARNING, describe_live, targeting_fingerprint
+
+    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+    if tiktok_record is not None:
+        record = tiktok_record
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+        from .live_edit import describe_live_tiktok
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            live = await adapter.fetch_adgroup_targeting(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        delivering = (live.get("operation_status") or "").upper() == "ENABLE"
+        fields = await describe_live_tiktok(
+            live["targeting"], settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+        return {
+            "campaign_id": campaign_id,
+            "adset_id": live["adgroup_id"],
+            "effective_status": live.get("operation_status"),
+            "fields": fields,
+            "baseline": targeting_fingerprint(live["targeting"]),
+            "delivering": delivering,
+            "learning_warning": _TIKTOK_LEARNING_WARNING if delivering else "",
+        }
 
     await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
@@ -4270,6 +4569,69 @@ async def edit_live_targeting(
     from .live_edit import build_targeting_edit, describe_live, targeting_fingerprint
 
     brand_id = brand_ctx.get("brand_id")
+    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_id)
+    if tiktok_record is not None and not body.edits:
+        raise HTTPException(status_code=400, detail="No edits supplied.")
+    if tiktok_record is not None:
+        record = tiktok_record
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+        from .live_edit import build_tiktok_targeting_edit, describe_live_tiktok
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            live = await adapter.fetch_adgroup_targeting(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        current = live["targeting"]
+        fingerprint = targeting_fingerprint(current)
+        if body.baseline and body.baseline != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="This campaign's targeting was changed somewhere else since you "
+                       "opened it. Reload to see the current settings before editing.",
+            )
+
+        changed, applied, rejections = await build_tiktok_targeting_edit(
+            current, body.edits, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+        if not applied or changed is None:
+            fields = await describe_live_tiktok(
+                current, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+            return {"campaign_id": campaign_id, "applied": [], "rejected": rejections,
+                    "fields": fields, "baseline": fingerprint}
+
+        # No genuine validate_only exists for TikTok's /adgroup/update/ (see
+        # update_adgroup_targeting's own docstring) — straight to the real write,
+        # same "an ack is not an effect" readback discipline as Meta below.
+        try:
+            result = await adapter.update_adgroup_targeting(live["adgroup_id"], changed)
+        except TikTokAdsAPIError as e:
+            fields = await describe_live_tiktok(
+                current, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+            return {"campaign_id": campaign_id, "applied": [], "fields": fields,
+                    "baseline": fingerprint, "rejected": [*rejections, f"TikTok rejected the change: {e}"]}
+
+        confirmed = result.get("targeting") or {}
+        await db["jane_ads_live_targeting_edits"].insert_one({
+            "campaign_id": campaign_id, "brand_id": brand_id, "adset_id": live["adgroup_id"],
+            "fields": applied, "before": current, "after": confirmed,
+            "was_delivering": (live.get("operation_status") or "").upper() == "ENABLE",
+            "edited_at": datetime.now(timezone.utc),
+        })
+        confirmed_fields = await describe_live_tiktok(
+            confirmed, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+        return {
+            "campaign_id": campaign_id,
+            "applied": applied,
+            "rejected": rejections,
+            # Reported from what TikTok HOLDS, not from what we sent.
+            "fields": confirmed_fields,
+            "baseline": targeting_fingerprint(confirmed),
+            "verified": True,
+        }
+
     record = await _live_campaign(db, campaign_id, brand_id)
     if not body.edits:
         raise HTTPException(status_code=400, detail="No edits supplied.")
@@ -4340,16 +4702,20 @@ async def edit_live_targeting(
 
 
 @router.get("/objectives")
-async def list_objectives() -> dict:
+async def list_objectives(platform: str = "") -> dict:
     """Meta's campaign objectives, for the picker Jane opens the conversation with.
 
     Offered in Meta's own words so that what the client chooses here is what Ads
     Manager shows them later — the mismatch that made this necessary was a client
     asking for sales and finding "Objective: Engagement" on their campaign.
-    """
-    from .objectives import CHOICES
 
-    return {"objectives": CHOICES}
+    platform="tiktok" swaps in TikTok-accurate blurbs (see objectives.choices_for_platform)
+    — the five choices and what they're stored as are identical either way, only the
+    explanation underneath each one changes. Any other value returns Meta's, unchanged.
+    """
+    from .objectives import choices_for_platform
+
+    return {"objectives": choices_for_platform(platform == "tiktok")}
 
 
 @router.post("/meta/campaigns/{campaign_id}/status")
@@ -4384,9 +4750,17 @@ async def set_meta_campaign_status(
             raise HTTPException(status_code=400, detail="TikTok ads not configured")
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
         try:
-            return await adapter.set_delivery(campaign_id, body.active)
+            result = await adapter.set_delivery(campaign_id, body.active)
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
+        # Persist the new state — /meta/campaigns' "status" falls back to this stored value
+        # only when a live metrics fetch doesn't return a real delivery status, so it needs
+        # to reflect the last thing WE did (live-confirmed: an activated TikTok campaign kept
+        # showing a PAUSED badge and a play, not pause, button).
+        await db["jane_ads_tiktok_campaigns"].update_one(
+            {"campaign_id": campaign_id}, {"$set": {"status": "active" if body.active else "paused"}}
+        )
+        return result
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured")
