@@ -1691,6 +1691,25 @@ class ApprovalWorkflowService:
                     print(f"✅ LinkedIn carousel publish: post_id={post_id} slides={result.get('slides')}")
                     return {"success": bool(post_id), "post_id": post_id, "raw_response": result}
 
+                # ── LinkedIn video ─────────────────────────────────────────────
+                # video_url (not post_type) is the signal a draft carries video —
+                # same convention Instagram/TikTok use elsewhere in this file.
+                # Without this branch, a video draft fell into the image/text
+                # branch below, which only ever reads image_url, so the video
+                # was never uploaded and the post went out as caption-only text.
+                video_url = draft.get("video_url") or ""
+                if video_url:
+                    print(f"🎬 LinkedIn video publish | urn={urn} video_url={video_url[:80]}")
+                    result = await svc.create_post(
+                        access_token=token,
+                        person_urn=urn,
+                        text=content,
+                        video_url=video_url,
+                    )
+                    post_id = result.get("post_id")
+                    print(f"✅ LinkedIn video publish: post_id={post_id}")
+                    return {"success": bool(post_id), "post_id": post_id, "raw_response": result}
+
                 # ── LinkedIn single image / text ──────────────────────────────
                 image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if image_url and image_url.startswith("data:"):
