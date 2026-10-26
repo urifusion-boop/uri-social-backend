@@ -42,7 +42,9 @@ async def raise_alert(db, kind: str, title: str, detail: str, now: Optional[date
         or (now - last_emailed) >= timedelta(minutes=RE_EMAIL_COOLDOWN_MINUTES)
     )
     if should_email:
-        await _email_admins(title, detail)
+        occurrences = ((existing or {}).get("occurrences") or 0) + 1
+        first_seen = (existing or {}).get("first_seen") or now
+        await _email_admins(title, detail, occurrences, first_seen)
         await db["platform_alerts"].update_one({"kind": kind}, {"$set": {"last_emailed_at": now}})
 
 
@@ -63,19 +65,20 @@ async def list_alerts(db, include_dismissed: bool = False) -> list[dict]:
     return out
 
 
-async def _email_admins(title: str, detail: str) -> None:
+async def _email_admins(title: str, detail: str, occurrences: int, first_seen: datetime) -> None:
     from app.core.config import settings
     from app.services.EmailService import email_service
 
     admins = [e.strip() for e in (settings.PLATFORM_ALERT_EMAILS or "").split(",") if e.strip()]
-    body = (
-        f"<p><strong>{title}</strong></p>"
-        f"<p>{detail}</p>"
-        f"<p style=\"color:#888;font-size:12px\">This is an automated platform alert from URI Social. "
-        f"It also appears on the Admin dashboard.</p>"
-    )
+    template_vars = {
+        "title": title,
+        "detail": detail,
+        "occurrences": occurrences,
+        "first_seen": first_seen.strftime("%b %d, %Y %I:%M %p UTC"),
+        "app_url": (settings.WEB_APP_URL or "").strip("'\"") or "https://www.urisocial.com",
+    }
     for addr in admins:
         try:
-            await email_service.send_raw_email(addr, f"[URI Social] {title}", body)
+            await email_service.send_email(addr, f"[URI Social] {title}", "platform_alert", template_vars)
         except Exception as e:
             print(f"[platform_alerts] failed to email {addr}: {e}")
