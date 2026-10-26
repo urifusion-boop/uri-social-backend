@@ -256,8 +256,17 @@ async def card_action(card_id: str, body: CardAction, ctx: dict = Depends(requir
     return UriResponse.get_single_data_response("card", {"id": card_id, **update})
 
 
+class CreateFromCardOverrides(BaseModel):
+    """The AI's choice of platform/format is a starting point, never the
+    only option — see the card_action docstring below for why this exists.
+    Both are optional; omitted fields fall back to the card's own action."""
+    platforms: Optional[List[str]] = None
+    content_type: Optional[str] = None  # "post" | "carousel" — overrides action.type's post/carousel split
+
+
 @router.post("/cards/{card_id}/create")
-async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_access),
+async def create_from_card(card_id: str, overrides: CreateFromCardOverrides = CreateFromCardOverrides(),
+                           ctx: dict = Depends(require_mi_write_access),
                            db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
     """§9.3's "Create" deep-link: pass a card's evidence-backed brief straight
     into the content generator instead of the owner re-typing it by hand.
@@ -271,7 +280,20 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
     CarouselGenerationService nor any image-generation code path. It defaults
     to no reference image and the brand's own library style rotation (no
     custom guide/override) — exactly what a plain Create Content submission
-    gets when every optional toggle is left untouched."""
+    gets when every optional toggle is left untouched.
+
+    Live-reported bug: every card suggested Instagram only, with no way to
+    pick a different platform before content (and a credit) was spent on
+    one the owner didn't want — confirmed this wasn't a connection limit
+    (the test account had Facebook, Instagram, LinkedIn and TikTok all
+    connected; Jane simply defaults to Instagram when the Playbook states no
+    platform preference, every time). `overrides` lets the owner pick
+    different platforms — validated against what's actually connected, so
+    this can never queue content for a platform with nothing to post
+    through — and/or swap a carousel suggestion for a single post or back,
+    before anything is generated or any credit is spent. A human always has
+    final say over the AI's first guess here, the same principle already
+    applied to ad tests and videos elsewhere in this module."""
     card = await db["mi_listen_cards"].find_one({"id": card_id, "brand_id": ctx["brand_id"]})
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -280,6 +302,12 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
 
     action = card.get("action") or {}
     action_type = action.get("type")
+    if overrides.content_type in ("post", "carousel") and action_type in ("post", "carousel", "faq"):
+        # A format swap never changes which pipeline branch runs below
+        # (video/ad_test stay whatever the card itself is) — it only
+        # decides, for an ordinary content card, whether that branch builds
+        # a carousel or a single post from the same brief.
+        action_type = "carousel" if overrides.content_type == "carousel" else "post"
 
     if action_type == "video":
         # The real video pipeline (VideoStoryboardService.generate_storyboard)
@@ -299,7 +327,7 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
         creative_direction = ". ".join(p for p in brief_parts if p) or card.get("why") or card.get("observation") or ""
         if not creative_direction:
             raise HTTPException(status_code=400, detail="This card has no brief to build a video from")
-        platform = next((p for p in (action.get("platforms") or []) if p), "instagram_reels")
+        platform = next((p for p in (overrides.platforms or action.get("platforms") or []) if p), "instagram_reels")
         now = datetime.utcnow()
         await db["mi_listen_card_actions"].insert_one({
             "card_id": card_id, "brand_id": ctx["brand_id"], "user_id": ctx["user_id"], "action": "created",
@@ -340,9 +368,20 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
             "card_id": card_id, "thread": thread, "seed_message": seed,
         })
 
-    platforms = [p for p in (action.get("platforms") or []) if p]
+    from app.agents.social_media_manager.services.social_account_service import SocialAccountService
+
+    platforms = [p for p in (overrides.platforms or action.get("platforms") or []) if p]
     if not platforms:
         raise HTTPException(status_code=400, detail="This card has no platforms to create content for")
+    if overrides.platforms:
+        conn_result = await SocialAccountService.get_user_connections(db, ctx["user_id"], ctx["brand_id"])
+        connected = set((conn_result.get("responseData") or {}).get("connected_platforms") or [])
+        not_connected = [p for p in platforms if p not in connected]
+        if not_connected:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not connected: {', '.join(not_connected)}. Connect it first, or pick a different platform.",
+            )
 
     seed_parts = [action.get("hook"), *(action.get("outline") or []), action.get("cta")]
     seed_content = ". ".join(p for p in seed_parts if p) or card.get("why") or card.get("observation") or ""
@@ -379,7 +418,7 @@ async def create_from_card(card_id: str, ctx: dict = Depends(require_mi_write_ac
     brand_context["user_id"] = ctx["user_id"]
     brand_context["brand_id"] = ctx["brand_id"]
 
-    post_type = "carousel" if action.get("type") == "carousel" else "feed"
+    post_type = "carousel" if action_type == "carousel" else "feed"
     if post_type == "carousel":
         num_slides = max(2, min(10, len(action.get("outline") or []) or 3))
         result = await CarouselGenerationService.generate_multi_platform(

@@ -21,7 +21,7 @@ mongomock_motor = pytest.importorskip("mongomock_motor")
 
 from fastapi import HTTPException
 
-from app.agents.market_intelligence.listening.router import create_from_card
+from app.agents.market_intelligence.listening.router import create_from_card, CreateFromCardOverrides
 from app.services.CreditService import credit_service
 from app.services.TrialService import trial_service
 
@@ -341,6 +341,114 @@ class TestCreateFromCard:
         assert exc.value.status_code == 502
         card = await db["mi_listen_cards"].find_one({"id": "c1"})
         assert card["status"] == "shown" and card["content_id"] is None
+
+
+def _patch_connections(connected):
+    return patch(
+        "app.agents.social_media_manager.services.social_account_service.SocialAccountService"
+        ".get_user_connections",
+        new=AsyncMock(return_value={"status": True, "responseData": {"connected_platforms": list(connected)}}),
+    )
+
+
+class TestPlatformAndFormatOverrides:
+    """Live-reported bug: every card suggested Instagram only, with no way
+    to pick a different platform or swap carousel<->post before a credit
+    was spent — even when other platforms were genuinely connected. These
+    cover the fix: an explicit override always wins over the AI's first
+    guess, and is validated against what's actually connected."""
+
+    @pytest.mark.asyncio
+    async def test_platform_override_replaces_the_cards_own_platforms(self):
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, platforms=("instagram",))
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, _patch_connections(
+            ["instagram", "facebook", "tiktok"]
+        ), patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(return_value=_ok_generation(draft_ids=("d1",))),
+        ) as mock_gen:
+            await create_from_card(
+                "c1", overrides=CreateFromCardOverrides(platforms=["facebook", "tiktok"]), ctx=CTX, db=db
+            )
+        assert mock_gen.call_args.kwargs["platforms"] == ["facebook", "tiktok"]
+
+    @pytest.mark.asyncio
+    async def test_platform_override_rejects_a_platform_that_isnt_connected(self):
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, platforms=("instagram",))
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _patch_connections(["instagram"]):
+            with pytest.raises(HTTPException) as exc:
+                await create_from_card(
+                    "c1", overrides=CreateFromCardOverrides(platforms=["tiktok"]), ctx=CTX, db=db
+                )
+        assert exc.value.status_code == 400
+        assert "tiktok" in exc.value.detail.lower()
+        card = await db["mi_listen_cards"].find_one({"id": "c1"})
+        assert card["status"] == "shown" and card["content_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_content_type_override_swaps_a_post_card_to_carousel(self):
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, action_type="post")
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
+            "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
+            ".generate_multi_platform",
+            new=AsyncMock(return_value=_ok_carousel()),
+        ) as mock_carousel, patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(),
+        ) as mock_plain:
+            await create_from_card(
+                "c1", overrides=CreateFromCardOverrides(content_type="carousel"), ctx=CTX, db=db
+            )
+        mock_carousel.assert_called_once()
+        mock_plain.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_content_type_override_swaps_a_carousel_card_to_a_plain_post(self):
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, action_type="carousel")
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
+            "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
+            ".generate_multi_platform",
+            new=AsyncMock(),
+        ) as mock_carousel, patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(return_value=_ok_generation(draft_ids=("d1",))),
+        ) as mock_plain:
+            await create_from_card(
+                "c1", overrides=CreateFromCardOverrides(content_type="post"), ctx=CTX, db=db
+            )
+        mock_plain.assert_called_once()
+        mock_carousel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_overrides_behaves_exactly_as_before(self):
+        """Regression guard: omitting overrides entirely (the pre-existing
+        call shape) must still use the card's own platforms/type untouched."""
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, platforms=("instagram", "tiktok"), action_type="post")
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
+            "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
+            ".generate_multi_platform_content",
+            new=AsyncMock(return_value=_ok_generation()),
+        ) as mock_gen:
+            await create_from_card("c1", ctx=CTX, db=db)
+        assert mock_gen.call_args.kwargs["platforms"] == ["instagram", "tiktok"]
 
 
 if __name__ == "__main__":
