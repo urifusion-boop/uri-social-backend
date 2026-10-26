@@ -185,7 +185,13 @@ class ApifyInstagramAdapter(SourceAdapter):
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
                                since: datetime, until: datetime, language: Optional[str] = None,
-                               items_per_query: Optional[int] = None) -> str:
+                               items_per_query: Optional[int] = None, location: Optional[dict] = None) -> str:
+        # Phase F: this actor (apify~instagram-hashtag-scraper) has no
+        # location/geo field at all — verified against its input schema.
+        # Real IG geo-targeting needs a different actor entirely (a
+        # location-scraper taking a numeric IG location id), not a param
+        # on this one — see geo.py's module docstring. `location` is
+        # accepted for interface compatibility only and intentionally unused.
         hashtags = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not hashtags:
             raise ValueError("no hashtags to search for")

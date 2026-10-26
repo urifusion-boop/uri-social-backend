@@ -103,7 +103,8 @@ class MockSourceAdapter(SourceAdapter):
         return concerns + inquiries + noise
 
     async def start_collection(
-        self, keywords: list[str], excluded_keywords: list[str], since: datetime, until: datetime
+        self, keywords: list[str], excluded_keywords: list[str], since: datetime, until: datetime,
+        language: Optional[str] = None, items_per_query: Optional[int] = None, location: Optional[dict] = None,
     ) -> str:
         run_id = f"mockrun_{uuid.uuid4().hex[:8]}"
         self._runs[run_id] = {"status": ScanStatus.COMPLETED, "fetched": False}

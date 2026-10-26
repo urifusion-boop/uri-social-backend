@@ -18,7 +18,8 @@ from app.domain.responses.uri_response import UriResponse
 from app.routers.admin_router import verify_admin as _verify_admin
 
 from ..access import require_mi_write_access
-from . import collector, discovery, golden, metrics, ontology, permissions, profile as profile_mod, replay, review
+from . import collector, discovery, geo, golden, metrics, ontology, permissions, profile as profile_mod, replay, review
+from .geo import LocationScope
 from .config import _merge, get_config, unknown_top_level_keys, update_config
 from .cycle import run_cycle
 
@@ -67,8 +68,8 @@ async def disable_listening(ctx: dict = Depends(require_mi_write_access),
 def _public_profile(p: dict) -> dict:
     p = dict(p)
     p.pop("_id", None)
-    return {k: p.get(k) for k in ("brand_id", "markets", "country", "private_terms", "status", "version",
-                                  "updated_at", "field_origins", "facts")}
+    return {k: p.get(k) for k in ("brand_id", "markets", "country", "location_scope", "location_countries",
+                                  "private_terms", "status", "version", "updated_at", "field_origins", "facts")}
 
 
 @router.get("/status")
@@ -102,6 +103,37 @@ async def listening_status(ctx: dict = Depends(get_active_brand_context),
         "cadence_hours": cfg["cadence_hours"],
         "budget": {"monthly_usd": cfg["monthly_budget_usd"], "spent_usd": round(await collector.spent_this_month(db), 4)},
     })
+
+
+@router.get("/locations")
+async def list_locations(db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """The known-place registry (Phase F) for the frontend's location
+    picker: continents, countries, and seeded cities/regions. Read-only,
+    no brand context needed — this is the same catalog for everyone."""
+    await geo.ensure_seeded(db)
+    places = await geo.list_places(db)
+    return UriResponse.get_single_data_response("locations", {
+        "continents": [{"code": code, "label": v["label"], "countries": v["countries"]}
+                       for code, v in geo.CONTINENTS.items()],
+        "countries": [{"code": code, "name": v["name"], "continent": v["continent"]}
+                      for code, v in geo.COUNTRIES.items() if code != "GLOBAL"],
+        "places": places,
+    })
+
+
+@router.put("/location-scope")
+async def put_location_scope(body: LocationScope, ctx: dict = Depends(require_mi_write_access),
+                             db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """Explicit override of this business's listening location scope —
+    replaces today's fully-automatic, AI-inferred single country. See
+    profile.set_location_scope's docstring for exactly what it changes."""
+    try:
+        updated = await profile_mod.set_location_scope(db, ctx["brand_id"], body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not updated:
+        raise HTTPException(status_code=404, detail="No listening profile for this brand yet — enable listening first.")
+    return UriResponse.get_single_data_response("profile", _public_profile(updated))
 
 
 @router.get("/pulse")

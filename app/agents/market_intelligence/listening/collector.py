@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import enrich, markets, ontology, permissions, topics
+from . import enrich, geo, markets, ontology, permissions, topics
 
 # Bump when collection/counting rules change: markets then re-backfill.
 # v2: measuring vs discovery searches; coverage and counts from measuring only.
@@ -58,7 +58,8 @@ async def _one_query(adapter, q: dict, excluded: list[str], since: datetime, unt
     out = {"query": q["q"], "kind": q["kind"], "role": q.get("role", "sample"), "id": q.get("id"),
            "cap": per, "items": [], "cost": 0.0, "error": None, "capped": False}
     try:
-        run_id_provider = await adapter.start_collection([q["q"]], excluded, since, until, items_per_query=per)
+        run_id_provider = await adapter.start_collection([q["q"]], excluded, since, until,
+                                                         items_per_query=per, location=q.get("location_hint"))
         out["run_id"] = run_id_provider
         cursor = None
         for _ in range(20):
@@ -140,8 +141,10 @@ async def collect_market(db, market: dict, cfg: dict, adapter, source: str, now:
         await db["mi_listen_runs"].update_one({"id": run["id"]}, {"$set": dict(run)}, upsert=True)
         return run
     patterns = await ontology.intent_patterns(db)
+    place_ids = markets.requested_places(market)
+    places = [p for p in (await asyncio.gather(*[geo.get_place(db, pid) for pid in place_ids])) if p]
     plan = markets.compile_queries(category, market["country"], patterns, market.get("learned_terms") or [],
-                                   cfg["max_queries_per_market"], source=source)
+                                   cfg["max_queries_per_market"], source=source, places=places)
 
     # A market collected under older collection rules is backfilled again, so
     # its history is consistent with how it is counted now.
@@ -175,6 +178,8 @@ async def collect_market(db, market: dict, cfg: dict, adapter, source: str, now:
             add = {"markets": market["key"], "found_by_queries": res.get("id")}
             if measured:
                 add["measured"] = market["key"]  # found by a fully-read search: may be counted
+            if str(res.get("kind") or "").startswith("geo:"):
+                add["geo_places"] = res["kind"].split(":", 1)[1]  # Phase F: which requested place this came from
             r = await db["mi_listen_items"].update_one(
                 {"source_id": ev.source_id},
                 {"$setOnInsert": {**doc, "first_run": run["id"]}, "$addToSet": add},

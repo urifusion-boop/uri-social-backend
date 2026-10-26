@@ -348,7 +348,7 @@ class _FakeAdapter:
     def __init__(self, n, fail=False):
         self.n, self.fail = n, fail
 
-    async def start_collection(self, kw, ex, since, until, items_per_query=None):
+    async def start_collection(self, kw, ex, since, until, items_per_query=None, location=None):
         if self.fail:
             raise RuntimeError("apify down")
         return "run1"
@@ -416,7 +416,7 @@ class _SlowAdapter:
     def __init__(self, n, block_event):
         self.n, self.block_event = n, block_event
 
-    async def start_collection(self, kw, ex, since, until, items_per_query=None):
+    async def start_collection(self, kw, ex, since, until, items_per_query=None, location=None):
         await self.block_event.wait()
         return "run1"
 

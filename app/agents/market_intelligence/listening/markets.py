@@ -28,7 +28,7 @@ import hashlib
 from datetime import datetime
 from typing import Any, Optional
 
-from . import ontology
+from . import geo, ontology
 
 MAX_QUERY_CHARS = 380
 
@@ -45,9 +45,11 @@ SOURCE_QUERY_STYLE: dict[str, str] = {
     "facebook": "flat", "facebook_pro": "flat",
 }
 
-COUNTRY_LANGS = {"NG": ["en", "pcm"], "GH": ["en", "pcm"], "KE": ["en", "sw"], "ZA": ["en"], "GB": ["en"], "US": ["en"]}
-COUNTRY_NAMES = {"NG": "Nigeria", "GH": "Ghana", "KE": "Kenya", "ZA": "South Africa", "GB": "United Kingdom",
-                 "US": "United States", "GLOBAL": "Global"}
+# Sourced from geo.py (Phase F) — one registry, not duplicated here. Kept as
+# module-level names since callers already import COUNTRY_LANGS/COUNTRY_NAMES
+# from this module.
+COUNTRY_LANGS = geo.COUNTRY_LANGS
+COUNTRY_NAMES = geo.COUNTRY_NAMES
 
 
 def market_key(category_id: str, country: str) -> str:
@@ -95,8 +97,32 @@ def flat_terms(terms: list[str]) -> list[str]:
     return _clean(terms)
 
 
+CITY_QUERIES_PER_PLACE = 3  # small, fixed — a deliberate add-on per requested place, not scaled by max_queries_per_market
+
+
+def _location_hint(country: str, place: Optional[dict] = None) -> Optional[dict]:
+    """What collector.py hands the adapter as `location` (Phase F). A plain
+    country code is always safe to pass, even for a market's base queries —
+    it only makes a market's OWN already-intended country scoping real
+    upstream (e.g. TikTok's `location` field) instead of a no-op label; it
+    never narrows anything a subscriber wasn't already expecting, since the
+    market itself is already `category:country`. GLOBAL means no filter."""
+    if (country or "GLOBAL").upper() == "GLOBAL":
+        return None
+    code = country.upper()
+    lang = (COUNTRY_LANGS.get(code) or ["en"])[0]
+    # News editions are genuinely country-native (no "known place" needed) —
+    # default from the market's own country so every country-scoped market
+    # gets this lever, not only ones with a requested city.
+    hint: dict = {"country": code, "news_edition": f"{code}:{lang}"}
+    if place:
+        hint.update({k: v for k, v in (place.get("source_hints") or {}).items() if v is not None})
+        hint["place_id"] = place.get("id")
+    return hint
+
+
 def compile_queries(category: dict, country: str, patterns: dict, learned: list[str],
-                    max_queries: int, source: str = "x") -> dict:
+                    max_queries: int, source: str = "x", places: Optional[list[dict]] = None) -> dict:
     """The searches for one market run, in priority order, plus exclusions.
 
     role "measure": intent/problem phrases × products — narrow enough to read
@@ -104,7 +130,15 @@ def compile_queries(category: dict, country: str, patterns: dict, learned: list[
     produced for "or_group"-style sources (see module docstring); a flat
     search has no way to express an intent phrase AND-ed with a product.
     role "sample": broad category and learned terms — far too busy to read
-    completely; used to discover topics and wording, never to count trends."""
+    completely; used to discover topics and wording, never to count trends.
+
+    `places` (Phase F): known-place docs at least one subscriber has asked
+    for inside this market's country (markets.py's `city_requests`). Each
+    gets its own small, ADDITIONAL query set on top of the base ones above —
+    never replacing or narrowing them, so subscribers who only want the
+    whole country see no change. Capped at CITY_QUERIES_PER_PLACE per place,
+    outside `max_queries` (a deliberate per-request add-on, not scaled by
+    the market's own query budget)."""
     style = SOURCE_QUERY_STYLE.get(source, "or_group")
     langs = COUNTRY_LANGS.get((country or "").upper(), ["en"])
     core = _clean(category.get("core_terms") or [])
@@ -142,9 +176,22 @@ def compile_queries(category: dict, country: str, patterns: dict, learned: list[
         for t in flat_terms(learned):
             queries.append({"kind": "learned", "q": t, "role": "sample"})
 
+    base_hint = _location_hint(country)
     for q in queries:
         q["id"] = query_id(q["q"])
-    return {"queries": queries[:max_queries], "dropped": max(0, len(queries) - max_queries),
+        q["location_hint"] = base_hint
+    kept = queries[:max_queries]
+
+    city_queries: list[dict] = []
+    for place in (places or []):
+        place_hint = _location_hint(country, place)
+        terms = core + _clean(local)
+        geo_qs = or_groups(terms[:6]) if style == "or_group" else flat_terms(terms)
+        for g in geo_qs[:CITY_QUERIES_PER_PLACE]:
+            city_queries.append({"kind": f"geo:{place['id']}", "q": g, "role": "sample",
+                                 "id": query_id(f"{place['id']}:{g}"), "location_hint": place_hint})
+
+    return {"queries": kept + city_queries, "dropped": max(0, len(queries) - max_queries),
             "excluded": _clean(category.get("excluded") or [])[:10], "languages": langs}
 
 
@@ -176,6 +223,32 @@ async def subscribe(db, key: str, brand_id: str) -> None:
 async def unsubscribe_others(db, brand_id: str, keep: list[str]) -> None:
     await db["mi_markets"].update_many({"subscribers": brand_id, "key": {"$nin": keep}},
                                        {"$pull": {"subscribers": brand_id}})
+
+
+async def request_place(db, key: str, place_id: str, brand_id: str) -> None:
+    """One subscriber asking this market's collection to also cover a
+    specific city/region inside it (Phase F) — additive, never replaces the
+    market's own country-wide collection for other subscribers. Stored as
+    `city_requests.{place_id}: [brand_id, ...]` so `collect_market` knows
+    which known places to build extra geo-scoped queries for."""
+    await db["mi_markets"].update_one({"key": key}, {"$addToSet": {f"city_requests.{place_id}": brand_id}})
+
+
+async def unrequest_place(db, key: str, place_id: str, brand_id: str) -> None:
+    await db["mi_markets"].update_one({"key": key}, {"$pull": {f"city_requests.{place_id}": brand_id}})
+
+
+async def unrequest_places_elsewhere(db, brand_id: str, keep_place_ids: list[str]) -> None:
+    """Mirrors unsubscribe_others, for place requests: pulls this brand out
+    of every market's city_requests for a place not in `keep_place_ids`."""
+    async for m in db["mi_markets"].find({f"city_requests": {"$exists": True}}):
+        for place_id in list((m.get("city_requests") or {}).keys()):
+            if place_id not in keep_place_ids and brand_id in (m["city_requests"].get(place_id) or []):
+                await unrequest_place(db, m["key"], place_id, brand_id)
+
+
+def requested_places(market: dict) -> list[str]:
+    return [pid for pid, brands in (market.get("city_requests") or {}).items() if brands]
 
 
 async def due_markets(db, cfg: dict, now: Optional[datetime] = None, only: Optional[list[str]] = None) -> list[dict]:

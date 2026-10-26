@@ -208,7 +208,11 @@ class ApifyYouTubeAdapter(SourceAdapter):
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
                                since: datetime, until: datetime, language: Optional[str] = None,
-                               items_per_query: Optional[int] = None) -> str:
+                               items_per_query: Optional[int] = None, location: Optional[dict] = None) -> str:
+        # Phase F: this actor's `country` field is documented as a
+        # localization setting, not a confirmed hard content filter —
+        # left unused here rather than overselling precision we can't
+        # verify. `location` is accepted for interface compatibility only.
         terms = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not terms:
             raise ValueError("no keywords to search for")

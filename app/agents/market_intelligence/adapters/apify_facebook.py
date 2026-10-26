@@ -193,7 +193,11 @@ class ApifyFacebookAdapter(SourceAdapter):
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
                                since: datetime, until: datetime, language: Optional[str] = None,
-                               items_per_query: Optional[int] = None) -> str:
+                               items_per_query: Optional[int] = None, location: Optional[dict] = None) -> str:
+        # Phase F: this actor's input schema couldn't be verified (its
+        # Apify Store page 404s) — no geo lever is built on an unconfirmed
+        # assumption. `location` is accepted for interface compatibility
+        # only and intentionally unused until verified in the Apify console.
         terms = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not terms:
             raise ValueError("no keywords to search for")

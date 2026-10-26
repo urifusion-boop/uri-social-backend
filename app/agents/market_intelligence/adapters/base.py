@@ -64,11 +64,21 @@ class SourceAdapter(ABC):
 
     @abstractmethod
     async def start_collection(
-        self, keywords: list[str], excluded_keywords: list[str], since: datetime, until: datetime
+        self, keywords: list[str], excluded_keywords: list[str], since: datetime, until: datetime,
+        location: Optional[dict] = None,
     ) -> str:
         """Kick off collection for the given window. Returns a provider-run id
         the caller persists before ever fetching results (PRD §17: 'save the
-        provider run ID before fetching results')."""
+        provider run ID before fetching results').
+
+        `location` (Phase F — location-scoped listening): the resolved geo
+        hint for this query, e.g. {"country": "NG"} or a known place's
+        source_hints (e.g. {"country": "NG", "x_near": "Lagos, Nigeria",
+        "x_radius_km": 30, "place_id": "lagos_ng"}). An adapter with no real
+        upstream geo lever for this source MUST accept the parameter (for
+        interface compatibility) but may no-op it — documented honestly in
+        that adapter's own capabilities().notes, never a silent promise of
+        precision it can't deliver."""
         ...
 
     @abstractmethod
