@@ -29,6 +29,9 @@ EVENTS = {
     "Trending topic in your niche": "trending_topic",
     "Content calendar needs refill": "calendar_refill",
     "Engagement spike detected": "engagement_spike",
+    "Customer message needs a reply": "inbox_needs_reply",
+    "Ad performance alerts": "ad_growth_alert",
+    "AI inbox usage": "inbox_quota",
 }
 EVENT_LABELS = {v: k for k, v in EVENTS.items()}
 
@@ -50,6 +53,14 @@ _PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_poste
 # picks its own list of alerts — choosing only a channel (the normal state
 # after onboarding) must not silence them.
 _DEFAULT_EVENTS = {"post_ready", "post_published"}
+
+# Never optional: an owner must hear that a customer is waiting on a person,
+# whatever alerts they picked.
+_ALWAYS_EVENTS = {"inbox_needs_reply", "ad_growth_alert", "inbox_quota"}
+
+# Sent here whatever channel the brand chose, on top of that channel. WhatsApp
+# only goes to owners who linked a number (see notify).
+_DIRECT_TOO = {"inbox_needs_reply": ["email", "whatsapp"]}
 
 
 def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -83,15 +94,16 @@ def is_customised(prefs: Dict[str, Any]) -> bool:
 
 def channels_for(event: str, prefs: Dict[str, Any]) -> List[str]:
     """Which external channels an event goes to (in-app is always added)."""
-    if event not in prefs["enabled"]:
+    if event not in prefs["enabled"] and event not in _ALWAYS_EVENTS:
         return []
     out: List[str] = []
     if prefs["channel"]:
         out.append(prefs["channel"])
-    elif event in _DEFAULT_EVENTS:
+    elif event in _DEFAULT_EVENTS or event in _ALWAYS_EVENTS:
         out.append("email")  # no channel chosen: these two have always gone by email
     if event == "post_ready":
         out += prefs["approval_channels"]
+    out += _DIRECT_TOO.get(event, [])
     seen: List[str] = []
     for c in out:
         if c not in seen and c != "dashboard":
@@ -180,7 +192,7 @@ async def notify(
     prefs = preferences(profile)
     if only_if_configured and event not in prefs["events"]:
         return {"skipped": "not enabled"}   # the newer alerts are opt-in: only if explicitly ticked
-    if event not in prefs["enabled"]:
+    if event not in prefs["enabled"] and event not in _ALWAYS_EVENTS:
         return {"skipped": "not enabled"}
     if dedupe_key and dedupe_hours and await _recently_sent(db, user_id, event, dedupe_key, dedupe_hours):
         return {"skipped": "already sent"}
@@ -192,6 +204,8 @@ async def notify(
     meta = {**(metadata or {}), "brand_id": brand_id, "dedupe_key": dedupe_key, "link": link}
     results: Dict[str, Any] = {}
     for channel in channels_for(event, prefs):
+        if channel == "whatsapp" and prefs["channel"] != "whatsapp" and not user.get("whatsapp_phone"):
+            continue
         try:
             ok, error = await _send(db, channel, user, profile, user_id, title, message, link)
         except Exception as exc:  # a channel must never break the caller
