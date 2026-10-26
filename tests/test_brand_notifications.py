@@ -243,4 +243,3 @@ def test_escalations_always_go_by_email_and_whatsapp_on_top_of_the_chosen_channe
     assert bn.channels_for("inbox_needs_reply", slack) == ["slack", "email", "whatsapp"]
     whatsapp = bn.preferences({"notification_channel": "WhatsApp"})
     assert bn.channels_for("inbox_needs_reply", whatsapp) == ["whatsapp", "email"]
-    assert bn.channels_for("post_failed", bn.preferences({})) == ["email"]

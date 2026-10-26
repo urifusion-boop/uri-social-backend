@@ -3135,12 +3135,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         if is_tiktok else
         "Created PAUSED — zero spend. Review and activate in Ads Manager to go live."
     )
-    ads_manager_url = (
-        ""
-        if is_tiktok else
-        f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-        f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
-    )
+    ads_manager_url = ""
     return {
         "stage": "launched",
         "understood": built.understood,
@@ -3871,12 +3866,7 @@ async def meta_campaigns(
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
             # TikTok campaigns run in URI's own advertiser account, which clients must not
             # be pointed at (or shown the id of). Meta's link is unchanged.
-            "ads_manager_url": (
-                ""
-                if is_tiktok else
-                f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-                f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r.get('campaign_id')}"
-            ),
+            "ads_manager_url": "",
             "metrics": None,
         }
         if adapter and r.get("campaign_id"):
