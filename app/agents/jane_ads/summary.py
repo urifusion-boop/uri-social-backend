@@ -69,6 +69,11 @@ def _naira(n: float) -> str:
     return f"₦{n:,.0f}"
 
 
+def _days_label(days: int) -> str:
+    """"1 day", "7 days" — a one-day TikTok run read "1 days" on the plan card."""
+    return f"{days} day" if days == 1 else f"{days} days"
+
+
 def _reach_bounds(delivery_estimate: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
     """Pull the audience-size bounds out of Meta's delivery_estimate response, tolerant
     of both the estimate_mau_* and estimate_dau_* shapes Meta returns."""
@@ -148,7 +153,7 @@ def build_campaign_summary(
     if len(plan.platforms) == 1:
         p = plan.platforms[0]
         budget_allocation = ReasonedValue(
-            value=f"{_naira(p.budget_ngn)} over {p.days} days on {_PLATFORM_LABELS.get(p.platform, p.platform.value)}",
+            value=f"{_naira(p.budget_ngn)} over {_days_label(p.days)} on {_PLATFORM_LABELS.get(p.platform, p.platform.value)}",
             reason=f"Your full {_naira(total_budget)} goes to the one platform that fits, for the strongest signal.",
         )
     else:
@@ -182,7 +187,7 @@ def build_campaign_summary(
         duration_reason = (f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear "
                            f"{plat_label}'s minimum daily budget so the ad actually delivers, without "
                            f"stretching too thin.")
-    duration = ReasonedValue(value=f"{days} days", reason=duration_reason)
+    duration = ReasonedValue(value=_days_label(days), reason=duration_reason)
 
     # Optimization — what the platform is told to get you, named after where the tap
     # actually lands. Was hard-coded to WhatsApp, which read "WhatsApp link clicks / most
