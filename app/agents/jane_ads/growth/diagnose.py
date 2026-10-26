@@ -16,7 +16,7 @@ from typing import Optional
 from .stats import confidence_label
 
 EXECUTABLE = ("pause_ad", "resume_ad", "pause_campaign", "resume_campaign", "set_daily_budget")
-ADVISORY = ("observe", "refresh_creative", "review_offer", "fix_tracking",
+ADVISORY = ("observe", "refresh_creative", "review_offer", "fix_tracking", "fix_ad_details",
             "fix_landing_page", "follow_up_leads", "review_targeting")
 
 ISSUE_LABELS = {
@@ -33,10 +33,11 @@ ISSUE_LABELS = {
     "strong_variant": "One ad is clearly outperforming the others",
     "scale_opportunity": "Results are cheap and the budget is the limit",
     "daily_incomplete": "Meta's day-by-day figures don't add up",
+    "creative_issues": "An ad has gaps that hurt delivery",
 }
 
 # Evaluation windows: long enough for results and attribution to land.
-EVAL_DAYS = {"pause_ad": 3, "pause_campaign": 1, "resume_campaign": 3, "set_daily_budget": 4,
+EVAL_DAYS = {"fix_ad_details": 3, "pause_ad": 3, "pause_campaign": 1, "resume_campaign": 3, "set_daily_budget": 4,
              "refresh_creative": 5, "review_offer": 7, "fix_tracking": 2, "fix_landing_page": 3,
              "follow_up_leads": 3, "review_targeting": 5, "observe": 2}
 
@@ -72,6 +73,18 @@ def diagnose(finding: dict, ctx: dict) -> dict:
         recs = [_rec("fix_tracking", "Check the ad account connection; no changes run until data is fresh.",
                      "Fresh data before any decision", "None — nothing is changed.",
                      "A successful data pull")]
+
+    elif issue == "creative_issues":
+        ads = ev.get("ads") or []
+        listed = "; ".join(f"{a.get('name') or a.get('ad_id')}: {', '.join(a['problems'][:4])}" for a in ads[:3])
+        hypotheses = [_h("These gaps make the ad less likely to be shown, or shown in fewer places", "high",
+                         f"Meta reports — {listed}.")]
+        alternatives = ["Some placement warnings only matter for placements you don't want anyway."]
+        recs = [_rec("fix_ad_details", "Add the missing headline and description, and fix what Meta lists "
+                     "(for example a video that misses a placement's size requirements), then check "
+                     "the ad again.", "More placements deliver and the ad reads as finished",
+                     "Low — a new version of the ad restarts Meta's learning.",
+                     "No problems listed on the ad")]
 
     elif issue == "daily_incomplete":
         hypotheses = [_h("Meta's daily breakdown for this campaign is incomplete", "high",

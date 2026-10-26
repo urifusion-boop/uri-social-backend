@@ -113,6 +113,10 @@ def _plans(brand: str) -> list[dict]:
         {"campaign_id": promo, "display_name": "Weekend Promo — Lagos (demo)", "daily_ngn": 2000,
          "budget_ngn": 30000,
          "ads": {f"{promo}-ad": "ACTIVE"},
+         "ad_review": [{"ad_id": f"{promo}-ad", "name": "Weekend promo ad", "status": "ACTIVE",
+                        "headline": False, "description": False,
+                        "problems": ["No headline", "No description",
+                                     "Ad undeliverable to Instagram Feed — edit your video to meet the requirements"]}],
          "rows": _rows(promo, brand, f"{promo}-ad",
                        {n: ((2000, 4000, 50, 4) if n > 3 else (2000, 3500, 45, 0)) for n in days})},
         {"campaign_id": abuja, "display_name": "Abuja Consultations — Leads (demo)", "daily_ngn": 2500,
@@ -150,7 +154,7 @@ async def seed(db, brand_id: str, user_id: str) -> list[dict]:
         ad_ids = list(p["ads"])
         record = {"campaign_id": cid, "brand_id": brand_id, "user_id": user_id, "demo": True,
                   "display_name": p["display_name"], "adset_id": f"{cid}-adset", "ad_id": ad_ids[0],
-                  "ads": p["ads"], "status": "ACTIVE", "daily_ngn": p["daily_ngn"],
+                  "ads": p["ads"], "ad_review": p.get("ad_review") or [], "status": "ACTIVE", "daily_ngn": p["daily_ngn"],
                   "launch_daily_ngn": p["daily_ngn"], "budget_ngn": p["budget_ngn"],
                   "ad_spend_markup": 1.111111, "created_at": _now() - timedelta(days=12),
                   "ends_at": _now() + timedelta(days=6)}

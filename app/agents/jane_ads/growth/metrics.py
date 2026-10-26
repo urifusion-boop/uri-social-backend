@@ -187,3 +187,54 @@ async def destination_url(adapter, ad_id: str) -> str:
         return link or ""
     except Exception:
         return ""
+
+
+def _first(*vals) -> str:
+    for v in vals:
+        if isinstance(v, list):
+            v = next((x.get("text") if isinstance(x, dict) else x for x in v if x), "")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def parse_ad_review(ad: dict) -> dict:
+    """What's wrong with one ad, from Meta's own read of it: no headline, no
+    description, and every issue Meta lists (undeliverable placements, creative that
+    misses a requirement, a rejected review)."""
+    cr = ad.get("creative") or {}
+    spec = cr.get("object_story_spec") or {}
+    link, video = spec.get("link_data") or {}, spec.get("video_data") or {}
+    feed = cr.get("asset_feed_spec") or {}
+    headline = _first(cr.get("title"), link.get("name"), video.get("title"), feed.get("titles"))
+    description = _first(link.get("description"), video.get("link_description"), feed.get("descriptions"))
+    problems: list[str] = []
+    if not headline:
+        problems.append("No headline")
+    if not description:
+        problems.append("No description")
+    for i in ad.get("issues_info") or []:
+        text = i.get("error_summary") or i.get("error_message") or ""
+        if text and text not in problems:
+            problems.append(text)
+    status = (ad.get("effective_status") or "").upper()
+    if status in ("DISAPPROVED", "WITH_ISSUES") and not any(i.get("error_summary") for i in ad.get("issues_info") or []):
+        problems.append("Meta rejected this ad" if status == "DISAPPROVED" else "Meta reports issues with this ad")
+    return {"ad_id": ad.get("id"), "name": ad.get("name") or ad.get("id"), "status": status,
+            "headline": bool(headline), "description": bool(description), "problems": problems}
+
+
+async def review_ads(adapter, campaign_id: str) -> list[dict]:
+    """Every ad in the campaign, reviewed. Best-effort: a failed read is no news, not a finding."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(f"{adapter._graph_base}/{campaign_id}/ads", params={
+                "access_token": adapter._access_token, "limit": 25,
+                "fields": ("id,name,effective_status,issues_info,"
+                           "creative{title,body,object_story_spec,asset_feed_spec}")})
+        data = resp.json()
+        if "error" in data:
+            return []
+        return [parse_ad_review(a) for a in data.get("data") or []]
+    except Exception:
+        return []
