@@ -127,6 +127,22 @@ def _tiktok_objective_type(objective: CampaignObjective) -> str:
     return _TIKTOK_OBJECTIVE.get(objective, "TRAFFIC")
 
 
+def _report_campaign_filter(campaign_id: str) -> str:
+    """The `filtering` param for /report/integrated/get/, scoped to one campaign.
+
+    Two live-caught rules: the field is "campaign_ids" (plural; 2026-10-20 "Invalid
+    value for filter field: campaign_id is not supported"), and filter_value is a
+    JSON-encoded ARRAY string, not a bare id (2026-10-26 "when filter_type = IN,
+    filter_value needs to be a valid JSON array character string"). A plain id made
+    every campaign summary, spend and click report fail, so TikTok campaigns showed no
+    numbers and spend tracking for billing never ran."""
+    return json.dumps([{
+        "field_name": "campaign_ids",
+        "filter_type": "IN",
+        "filter_value": json.dumps([str(campaign_id)]),
+    }])
+
+
 def _tiktok_objective_for_creative(objective: CampaignObjective, is_carousel: bool) -> str:
     """The TikTok objective to create the campaign with, given the creative.
 
@@ -830,6 +846,19 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     location_names, self._advertiser_id, self._access_token)
                 if unresolved_locations:
                     print(f"[TikTokAdsAdapter] locations not resolved, dropped: {unresolved_locations}", flush=True)
+                # Jane plans on neighbourhoods (Ikeja, Lekki, Surulere), but TikTok's
+                # location tree stops at province/city, so none of them resolve and the
+                # ad group used to go Nigeria-wide — a ₦31,000 Lagos campaign spread across
+                # the whole country (live 2026-10-26). Fall back to the plan's own city.
+                city_name = (plan.geo.city or "").strip() if plan.geo else ""
+                if not resolved_locations and city_name and city_name.lower() not in {n.lower() for n in location_names}:
+                    resolved_locations, city_unresolved = await _resolve_tiktok_locations(
+                        [city_name], self._advertiser_id, self._access_token)
+                    if resolved_locations:
+                        print(f"[TikTokAdsAdapter] no area resolved — targeting the plan's city "
+                              f"{[r['name'] for r in resolved_locations]} instead of all of Nigeria", flush=True)
+                    elif city_unresolved:
+                        print(f"[TikTokAdsAdapter] city {city_name!r} did not resolve either — Nigeria-wide", flush=True)
                 # Nigeria-wide is the honest fallback whenever nothing named
                 # resolved (no pins on the plan at all, or every lookup failed) —
                 # never an empty location_ids, which the launch would reject.
@@ -1116,6 +1145,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                               f"— falling back to CONTACT_US", flush=True)
                         ad_data = await _create_ad("CONTACT_US")
                 ad_id = str(ad_data["data"]["ad_ids"][0]) if ad_data["data"].get("ad_ids") else str(ad_data["data"].get("ad_id", ""))
+                await self._ensure_ad_disabled(client, adgroup_id, ad_id)
         except Exception:
             await self._rollback_partial_launch(campaign_id)
             raise
@@ -1211,13 +1241,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "data_level": "AUCTION_AD",
                     "dimensions": json.dumps(["ad_id"]),
                     "metrics": json.dumps(["spend"]),
-                    # Live-caught 2026-10-20: "Invalid value for filter field: campaign_id
-                    # is not supported" — this endpoint's filter field is "campaign_ids"
-                    # (plural, confirmed against TikTok's own filtering examples), not
-                    # "campaign_id", and filter_value is a plain comma-separated string
-                    # ("123,456"), not a JSON-encoded array — unlike campaign/get/'s own
-                    # filtering param elsewhere in this file, which really is a JSON object.
-                    "filtering": json.dumps([{"field_name": "campaign_ids", "filter_type": "IN", "filter_value": campaign_id}]),
+                    # See _report_campaign_filter: field name and filter_value format.
+                    "filtering": _report_campaign_filter(campaign_id),
                     "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
                     "end_date": now.strftime("%Y-%m-%d"),
                     "page": 1,
@@ -1274,13 +1299,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "data_level": "AUCTION_CAMPAIGN",
                     "dimensions": json.dumps(["campaign_id"]),
                     "metrics": json.dumps(["clicks", "spend"]),
-                    # Live-caught 2026-10-20: "Invalid value for filter field: campaign_id
-                    # is not supported" — this endpoint's filter field is "campaign_ids"
-                    # (plural, confirmed against TikTok's own filtering examples), not
-                    # "campaign_id", and filter_value is a plain comma-separated string
-                    # ("123,456"), not a JSON-encoded array — unlike campaign/get/'s own
-                    # filtering param elsewhere in this file, which really is a JSON object.
-                    "filtering": json.dumps([{"field_name": "campaign_ids", "filter_type": "IN", "filter_value": campaign_id}]),
+                    # See _report_campaign_filter: field name and filter_value format.
+                    "filtering": _report_campaign_filter(campaign_id),
                     "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
                     "end_date": now.strftime("%Y-%m-%d"),
                     "page": 1,
@@ -1318,6 +1338,32 @@ class TikTokAdsAdapter(AdPlatformAdapter):
             )
             for _ in range(new_count)
         ]
+
+    async def _ensure_ad_disabled(self, client: httpx.AsyncClient, adgroup_id: str, ad_id: str) -> None:
+        """ad/create's top-level operation_status="DISABLE" is not honoured: the new ad
+        came up ENABLED under a paused campaign and ad group (live 2026-10-26). Switch it
+        off explicitly with the same status endpoint pause_ad uses.
+
+        Best-effort on purpose: the campaign and ad group are already DISABLE, so an ad
+        left on cannot deliver — failing a launch that otherwise worked, after the
+        wallet has been checked, would be worse than the cosmetic mismatch."""
+        if not ad_id:
+            return
+        try:
+            resp = await client.post(
+                f"{self._api_base}/ad/status/update/",
+                headers=self._headers(),
+                json={
+                    "advertiser_id": self._advertiser_id,
+                    "adgroup_id": adgroup_id,
+                    "ad_ids": [ad_id],
+                    "operation_status": "DISABLE",
+                },
+            )
+            _raise_for_error(resp.json(), "disable new ad")
+        except Exception as e:
+            print(f"[TikTokAdsAdapter] could not disable new ad {ad_id} ({e}) — campaign and ad group "
+                  f"are still DISABLE, so nothing delivers", flush=True)
 
     async def pause_ad(self, campaign_id: str, ad_id: str) -> bool:
         record = await self._get_campaign_record(campaign_id)
@@ -1379,13 +1425,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "data_level": "AUCTION_CAMPAIGN",
                     "dimensions": json.dumps(["campaign_id"]),
                     "metrics": json.dumps(["impressions", "reach", "clicks", "spend"]),
-                    # Live-caught 2026-10-20: "Invalid value for filter field: campaign_id
-                    # is not supported" — this endpoint's filter field is "campaign_ids"
-                    # (plural, confirmed against TikTok's own filtering examples), not
-                    # "campaign_id", and filter_value is a plain comma-separated string
-                    # ("123,456"), not a JSON-encoded array — unlike campaign/get/'s own
-                    # filtering param elsewhere in this file, which really is a JSON object.
-                    "filtering": json.dumps([{"field_name": "campaign_ids", "filter_type": "IN", "filter_value": campaign_id}]),
+                    # See _report_campaign_filter: field name and filter_value format.
+                    "filtering": _report_campaign_filter(campaign_id),
                     "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
                     "end_date": now.strftime("%Y-%m-%d"),
                     "page": 1,

@@ -87,6 +87,16 @@ def test_duration_matches_plan_days():
     assert s.duration.value == "7 days"
 
 
+def test_a_one_day_run_reads_one_day_not_one_days():
+    plan = _plan(platforms=[PlatformPlan(platform=Platform.TIKTOK, budget_ngn=31_000, days=1,
+                                         variants=1, test_scope=ABTestScope.NONE,
+                                         objective=CampaignObjective.CONVERSATIONS)])
+    s = build_campaign_summary(plan, _req(budget_ngn=31_000))
+    assert s.duration.value == "1 day"
+    assert "over 1 day on TikTok" in s.budget_allocation.value
+    assert "1 days" not in s.duration.value + s.budget_allocation.value
+
+
 def test_audience_size_from_meta_pool_but_leads_from_budget():
     # Meta's pool is huge (8M) — leads must NOT scale off it; they come from the budget
     # (plan.estimated_conversations = 40), so a ₦20k campaign never claims millions of leads.
