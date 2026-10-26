@@ -305,6 +305,13 @@ class Settings(BaseSettings):
     # never had this env var either — same default-seed convention as
     # JANE_ADS_ADMIN_EMAILS above, so the panel works without server config.
     ADMIN_EMAILS: str = "urisocialingsight@gmail.com,ujahnaomi104@gmail.com"
+    # Comma-separated emails that receive platform-wide operational alerts
+    # (app/services/platform_alerts.py) — infrastructure/account failures
+    # like the OpenAI account running out of credit, not per-user issues.
+    # Deliberately separate from ADMIN_EMAILS: that list also grants
+    # admin-panel API access, which is a different, bigger decision than
+    # "should this address get notified when something breaks."
+    PLATFORM_ALERT_EMAILS: str = "hello@urisocial.com,urisocialingsight@gmail.com,urifusion@gmail.com"
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None

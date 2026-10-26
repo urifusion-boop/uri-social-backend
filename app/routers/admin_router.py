@@ -634,6 +634,37 @@ async def get_admin_stats(
     }
 
 
+@router.get("/alerts")
+async def list_platform_alerts(
+    include_dismissed: bool = False,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Platform-wide operational alerts (app/services/platform_alerts.py) —
+    infrastructure/account failures like the OpenAI account running out of
+    credit, not per-user issues. Shown on the Admin dashboard so this is
+    found by looking at a page an admin already opens, not by waiting for a
+    user to complain or by someone remembering to check a separate tool."""
+    from app.services import platform_alerts
+    alerts = await platform_alerts.list_alerts(db, include_dismissed=include_dismissed)
+    return {"alerts": alerts}
+
+
+@router.post("/alerts/{kind}/dismiss")
+async def dismiss_platform_alert(
+    kind: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Marks it fixed. If the same failure happens again later, raise_alert
+    clears this and emails again — dismissing isn't a permanent mute."""
+    from app.services import platform_alerts
+    result = await platform_alerts.dismiss_alert(db, kind)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No alert of that kind found")
+    return {"alert": result}
+
+
 @router.get("/users/export/emails")
 async def export_user_emails(
     admin_user: dict = Depends(verify_admin),
