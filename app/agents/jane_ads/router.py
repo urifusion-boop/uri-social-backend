@@ -2475,7 +2475,7 @@ class MetaLaunchFromMessageBody(BaseModel):
     # honoured only if TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN are configured
     # and the creative is video (TikTok's hard requirement); otherwise an
     # early_return explains why, same shape as every other early_return here.
-    preferred_platform: str = ""          # "" | "tiktok" | "google"
+    preferred_platform: str = ""          # "" | "meta" | "tiktok" | "google"
     # Where on Google: search | display | demand_gen (YouTube & Discover) | pmax (everywhere).
     google_placement: str = ""
 
@@ -3115,7 +3115,10 @@ async def _build_campaign_plan(
         plan = apply_platform_override(plan, [Platform.TIKTOK])
         forced_to_meta = False
     else:
-        jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
+        # "meta" is the client choosing Instagram & Facebook by name: Jane's own
+        # leaning towards TikTok no longer overrides it.
+        jane_picked_tiktok = (any(p.platform == Platform.TIKTOK for p in plan.platforms)
+                              and body.preferred_platform != "meta")
         if jane_picked_tiktok and tiktok_ready:
             plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
             forced_to_meta = False
