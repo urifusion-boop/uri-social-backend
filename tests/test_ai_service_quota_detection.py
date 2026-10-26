@@ -94,6 +94,41 @@ def test_insufficient_quota_raises_the_platform_alert(monkeypatch):
     assert "Content Calendar" in captured["detail"] and "Social Listening" in captured["detail"]
 
 
+def test_the_alert_detail_shows_openai_s_plain_sentence_not_the_raw_dict(monkeypatch):
+    """Live-found: the admin dashboard/email used to show the raw Python
+    dict repr of the error inline — technical, ugly, not user-friendly.
+    The detail text must carry OpenAI's own human sentence instead."""
+    captured = {}
+
+    async def fake_raise_alert(db, kind, title, detail, now=None):
+        captured.update(detail=detail)
+
+    from app.services import platform_alerts
+    import app.database as database_module
+    monkeypatch.setattr(platform_alerts, "raise_alert", fake_raise_alert)
+    monkeypatch.setattr(database_module, "get_db", lambda: object())
+
+    real_shaped_error = (
+        "Error code: 429 - {'error': {'message': 'You have no credits remaining. Add credits to "
+        "continue using the API at https://platform.openai.com/settings/organization/billing/.', "
+        "'type': 'insufficient_quota', 'param': None, 'code': 'credit_balance_exhausted'}}"
+    )
+    exc = _FakeRateLimitError(real_shaped_error)
+    monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
+
+    run(AIService.chat_completion(_request()))
+
+    assert "You have no credits remaining" in captured["detail"]
+    assert "{'error'" not in captured["detail"]  # the raw dict repr is gone
+    assert "credit_balance_exhausted" not in captured["detail"]
+
+
+def test_friendly_message_falls_back_to_the_raw_text_when_unparseable():
+    assert ai_service_module._friendly_openai_message("totally unexpected error shape") == (
+        "totally unexpected error shape"
+    )
+
+
 def test_a_plain_rate_limit_never_raises_the_platform_alert(monkeypatch):
     called = {"n": 0}
 
