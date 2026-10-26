@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div style="display:inline-flex; align-items:center; gap:8px; padding:6px 14px; border-radius:20px; font-size:12px; font-weight:700; background:rgba(220,38,38,.08); color:#DC2626; margin-bottom:16px;">
+  &#9888; Platform Alert
+</div>
+<h1>{{ title }}</h1>
+<p style="text-align:left;">{{ detail }}</p>
+<div style="background:rgba(220,38,38,.05); border:1px solid rgba(220,38,38,.15); border-radius:10px; padding:16px 20px; margin:20px 0; text-align:left;">
+  <p style="font-size:13px; color:#991B1B; font-weight:700; margin:0 0 6px;">Seen {{ occurrences }} time{{ 's' if occurrences != 1 else '' }}, since {{ first_seen }}</p>
+  <p style="font-size:13px; color:#6B7280; margin:0;">This alert will keep emailing at most once an hour while it's ongoing, and again if it recurs after being marked fixed.</p>
+</div>
+<a href="{{ app_url | default('https://www.urisocial.com') }}/workspace?tab=admin" class="cta">Open Admin Dashboard →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">This also appears as a dismissible banner on every Admin tab.</p>
+{% endblock %}
