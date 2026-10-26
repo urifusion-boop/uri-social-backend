@@ -248,7 +248,7 @@ def choose_platform(
                      f"not a reason to switch platforms.")
 
     per_platform_budget = budget / len(platforms)
-    days = _days_for(budget)
+    days = _days_for(budget, platforms)
     platform_plans: list[PlatformPlan] = []
     for p in platforms:
         variants, scope = _variant_plan(per_platform_budget, C.USEFUL_MIN_NGN[p.value])
@@ -290,7 +290,7 @@ def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> Campa
 
     total_budget = plan.per_business_cap_ngn
     per_platform_budget = total_budget / len(chosen)
-    days = _days_for(total_budget)
+    days = _days_for(total_budget, chosen)
 
     platform_plans: list[PlatformPlan] = []
     for p in chosen:
@@ -300,7 +300,29 @@ def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> Campa
             variants=variants, test_scope=scope,
             objective=default_objective_for(plan.goal),
         ))
-    return plan.model_copy(update={"platforms": platform_plans})
+    # plan.explanation was written for the platform Jane picked on her own ("I chose
+    # Instagram + Facebook because ..."), so a TikTok request still read as a Meta
+    # recommendation. Swap in the platform(s) the plan now actually runs on; every
+    # other sentence (how they buy, budget, creative, geography) stays true.
+    explanation = plan.explanation
+    previous = _platform_names(plan.platforms) if plan.platforms else ""
+    if previous and previous != _platform_names(platform_plans):
+        explanation = explanation.replace(
+            f"I chose {previous} because", f"I chose {_platform_names(platform_plans)} because"
+        )
+    return plan.model_copy(update={"platforms": platform_plans, "explanation": explanation})
+
+
+_PLATFORM_DISPLAY_NAMES = {Platform.META: "Instagram + Facebook", Platform.GOOGLE: "Google Search",
+                           Platform.TIKTOK: "TikTok"}
+
+
+def _platform_names(plans: list[PlatformPlan]) -> str:
+    """The plain-language platform list the explanation names ("TikTok",
+    "Instagram + Facebook and Google Search")."""
+    return " and ".join(_PLATFORM_DISPLAY_NAMES[p.platform] for p in plans)
+
+
 
 
 def _explain(
@@ -310,9 +332,7 @@ def _explain(
 ) -> str:
     """The required explanation (PRD §6 template): platform + how they buy + budget +
     creative + geography, in plain language like a marketer."""
-    names = {Platform.META: "Instagram + Facebook", Platform.GOOGLE: "Google Search",
-             Platform.TIKTOK: "TikTok"}
-    where = " and ".join(names[p.platform] for p in plans)
+    where = _platform_names(plans)
     buy = {
         PurchaseBehaviour.SEARCH: "your customers search for this rather than stumble on it",
         PurchaseBehaviour.DISCOVER: "your customers discover this by scrolling, not by searching",
