@@ -393,6 +393,23 @@ class TestPlatformAndFormatOverrides:
         assert card["status"] == "shown" and card["content_id"] is None
 
     @pytest.mark.asyncio
+    async def test_platform_override_rejects_an_ad_account_as_a_postable_platform(self):
+        """An ad account (facebook_ads) is a real connection but not
+        something content can be posted to — rejected before even checking
+        connections, so this never fails confusingly two steps later."""
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, platforms=("instagram",))
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _patch_connections(["instagram", "facebook_ads"]):
+            with pytest.raises(HTTPException) as exc:
+                await create_from_card(
+                    "c1", overrides=CreateFromCardOverrides(platforms=["facebook_ads"]), ctx=CTX, db=db
+                )
+        assert exc.value.status_code == 400
+        assert "facebook_ads" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
     async def test_content_type_override_swaps_a_post_card_to_carousel(self):
         db = fresh_db()
         credit_service._db = db

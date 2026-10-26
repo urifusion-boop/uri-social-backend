@@ -25,6 +25,11 @@ from .cycle import run_cycle
 
 router = APIRouter(prefix="/listening", tags=["Market Intelligence · Listening"])
 
+# Matches _Action.platforms' own documented list in personalize.py — a
+# connected account isn't necessarily one of these (facebook_ads/google_ads
+# are real connections, not postable platforms).
+CONTENT_PLATFORMS = {"instagram", "tiktok", "facebook", "x", "linkedin", "whatsapp_status"}
+
 MANUAL_RUN_MIN_MINUTES = 30
 CARD_ACTIONS = {"saved", "dismissed", "snoozed", "acted", "created", "shown"}
 
@@ -374,6 +379,14 @@ async def create_from_card(card_id: str, overrides: CreateFromCardOverrides = Cr
     if not platforms:
         raise HTTPException(status_code=400, detail="This card has no platforms to create content for")
     if overrides.platforms:
+        # Content-postable platforms only — a connected account can also be
+        # an ad account (facebook_ads, google_ads), which is a real
+        # connection but not something content generation accepts, so it's
+        # rejected here the same way an unconnected platform is rather than
+        # failing confusingly two steps later.
+        not_postable = [p for p in platforms if p not in CONTENT_PLATFORMS]
+        if not_postable:
+            raise HTTPException(status_code=400, detail=f"Not a postable platform: {', '.join(not_postable)}.")
         conn_result = await SocialAccountService.get_user_connections(db, ctx["user_id"], ctx["brand_id"])
         connected = set((conn_result.get("responseData") or {}).get("connected_platforms") or [])
         not_connected = [p for p in platforms if p not in connected]
