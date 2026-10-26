@@ -183,6 +183,9 @@ DESTINATION_OPTIONS: list[dict] = [
 VALUE_FIELD_FOR_TYPE = {o["value"]: o["field"] for o in DESTINATION_OPTIONS}
 
 
+TIKTOK_WHATSAPP_INPUT_NOTE = "People who tap your TikTok ad will message this number on WhatsApp."
+
+
 def options_for_platform(tiktok: bool = False) -> list[dict]:
     """DESTINATION_OPTIONS, minus Instagram DMs when the campaign is running on
     TikTok — ig.me is a Meta/Instagram deep link, meaningless on a TikTok ad.
@@ -190,7 +193,13 @@ def options_for_platform(tiktok: bool = False) -> list[dict]:
     through this rather than using the raw list directly."""
     if not tiktok:
         return list(DESTINATION_OPTIONS)
-    return [o for o in DESTINATION_OPTIONS if o["value"] != DestinationType.INSTAGRAM_DM.value]
+    options = [o for o in DESTINATION_OPTIONS if o["value"] != DestinationType.INSTAGRAM_DM.value]
+    # The WhatsApp number note ("linked to your Facebook Page in Meta") is a Meta
+    # requirement; a TikTok ad opens a plain wa.me link, so there is no Page to match.
+    return [
+        {**o, "input_note": TIKTOK_WHATSAPP_INPUT_NOTE} if o["value"] == DestinationType.WHATSAPP.value else o
+        for o in options
+    ]
 
 
 def cta_choice_list() -> list[dict]:

@@ -20,6 +20,7 @@ from app.agents.jane_ads.destination import (
     meta_cta,
     normalize_instagram_username,
     normalize_website_url,
+    options_for_platform,
 )
 
 
@@ -408,3 +409,27 @@ async def test_legacy_brand_with_only_a_number_still_reads_as_whatsapp():
     assert d["chosen"] is False
     assert d["whatsapp_number"] == "2348000000000"
     assert d["destination_type"] == "whatsapp"
+
+
+# ── Picker options per platform ───────────────────────────────────────────────
+
+def _whatsapp_note(options):
+    return next(o for o in options if o["value"] == "whatsapp")["input_note"]
+
+
+def test_meta_picker_keeps_the_facebook_page_note():
+    assert "Facebook Page" in _whatsapp_note(options_for_platform(False))
+
+
+def test_tiktok_picker_has_no_meta_wording_and_no_instagram_dms():
+    options = options_for_platform(True)
+    assert "instagram_dm" not in [o["value"] for o in options]
+    note = _whatsapp_note(options)
+    assert "TikTok" in note
+    for meta_word in ("Facebook", "Meta", "Instagram"):
+        assert meta_word not in note
+
+
+def test_tiktok_picker_does_not_mutate_the_shared_options():
+    options_for_platform(True)
+    assert "Facebook Page" in _whatsapp_note(options_for_platform(False))
