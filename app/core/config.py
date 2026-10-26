@@ -299,6 +299,13 @@ class Settings(BaseSettings):
     # (all-users ad spend / margin). Overridable by the env var of the same name;
     # the default seeds the current admins so the report works without server config.
     JANE_ADS_ADMIN_EMAILS: str = "shorekoya@gmail.com,urisocialingsight@gmail.com"
+    # Comma-separated emails that receive platform-wide operational alerts
+    # (app/services/platform_alerts.py) — infrastructure/account failures
+    # like the OpenAI account running out of credit, not per-user issues.
+    # Deliberately separate from ADMIN_EMAILS (above): that list also grants
+    # admin-panel API access, which is a different, bigger decision than
+    # "should this address get notified when something breaks."
+    PLATFORM_ALERT_EMAILS: str = "hello@urisocial.com,urisocialingsight@gmail.com,urifusion@gmail.com"
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
