@@ -86,6 +86,7 @@ class PerformanceAnalyticsService:
             format_eng: Dict[str, List[float]] = defaultdict(list)
             topic_eng: Dict[str, List[float]] = defaultdict(list)
             hour_eng: Dict[int, List[float]] = defaultdict(list)
+            platform_eng: Dict[str, List[float]] = defaultdict(list)
 
             for draft in drafts:
                 draft_id = draft.get("id", "")
@@ -100,6 +101,10 @@ class PerformanceAnalyticsService:
 
                 fmt = PerformanceAnalyticsService._classify_format(draft)
                 format_eng[fmt].append(eng_rate)
+
+                platform = draft.get("platform")
+                if platform:
+                    platform_eng[platform].append(eng_rate)
 
                 for topic in PerformanceAnalyticsService._extract_topics(draft.get("content", ""), brand_pillars):
                     topic_eng[topic].append(eng_rate)
@@ -125,6 +130,10 @@ class PerformanceAnalyticsService:
                 topic: round(sum(v) / len(v), 2)
                 for topic, v in topic_eng.items() if v
             }
+            avg_by_platform = {
+                platform: round(sum(v) / len(v), 2)
+                for platform, v in platform_eng.items() if v
+            }
             best_hour = (
                 max(hour_eng.items(), key=lambda x: sum(x[1]) / len(x[1]))[0]
                 if hour_eng else 18
@@ -132,16 +141,19 @@ class PerformanceAnalyticsService:
 
             top_formats = [f for f, _ in sorted(avg_by_format.items(), key=lambda x: x[1], reverse=True)][:3]
             top_topics  = [t for t, _ in sorted(avg_by_topic.items(),  key=lambda x: x[1], reverse=True)][:5]
+            top_platforms = [p for p, _ in sorted(avg_by_platform.items(), key=lambda x: x[1], reverse=True)]
 
             return {
                 "avg_engagement_by_format": avg_by_format,
                 "avg_engagement_by_topic":  avg_by_topic,
+                "avg_engagement_by_platform": avg_by_platform,
                 "best_posting_hour": best_hour,
                 "top_formats": top_formats,
                 "top_topics":  top_topics,
+                "top_platforms": top_platforms,
                 "post_count": len(drafts),
                 "analytics_count": len(analytics_list),
-                "has_data": bool(avg_by_format or avg_by_topic),
+                "has_data": bool(avg_by_format or avg_by_topic or avg_by_platform),
             }
 
         except Exception as exc:
@@ -176,9 +188,11 @@ class PerformanceAnalyticsService:
         return {
             "avg_engagement_by_format": {},
             "avg_engagement_by_topic":  {},
+            "avg_engagement_by_platform": {},
             "best_posting_hour": 18,
             "top_formats": [],
             "top_topics":  [],
+            "top_platforms": [],
             "post_count": 0,
             "analytics_count": 0,
             "has_data": False,
