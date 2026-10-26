@@ -1927,7 +1927,7 @@ class MetaLaunchFromMessageBody(BaseModel):
     # and the creative is a video or a 2+ photo carousel (TikTok's hard
     # requirement); otherwise an early_return explains why, same shape as every
     # other early_return here. Any other value is ignored.
-    preferred_platform: str = ""          # "" | "tiktok"
+    preferred_platform: str = ""          # "" | "meta" | "tiktok"
 
 
 class _PlanBuildResult(BaseModel):
@@ -2479,7 +2479,8 @@ async def _build_campaign_plan(
     # response for transparency, regardless of what actually launches.
     jane_platforms = [p.platform.value for p in plan.platforms]
     # tiktok_ready is computed once, at step 0.
-    jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
+    jane_picked_tiktok = (any(p.platform == Platform.TIKTOK for p in plan.platforms)
+                          and body.preferred_platform != "meta")
     if tiktok_preferred:
         # Explicit "give me TikTok" request (MetaLaunchFromMessageBody.preferred_platform) —
         # purely additive on top of Jane's own silent pick below; does not touch the Meta
