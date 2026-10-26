@@ -745,7 +745,13 @@ class CreditService:
         current_bonus = getattr(wallet, 'bonus_credits', 0)
         new_bonus = max(0, current_bonus + amount)
         new_total = new_bonus + getattr(wallet, 'subscription_credits', 0)
-        new_remaining = new_total - wallet.credits_used
+        # bonus_credits/subscription_credits are already net of usage (see
+        # get_user_wallet()'s own recompute, which never subtracts
+        # credits_used again) — subtracting it here double-counted every
+        # credit the user had ever used, so a grant meant to bring someone
+        # back to e.g. 20 credits could write a negative credits_remaining
+        # once their lifetime credits_used passed the grant amount.
+        new_remaining = new_total
         applied_amount = new_bonus - current_bonus  # what actually changed, after flooring
 
         await self.user_credits_collection.update_one(
