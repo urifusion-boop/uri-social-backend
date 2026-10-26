@@ -203,6 +203,37 @@ def test_set_location_scope_free_text_city_rejects_unknown_country():
     run(go())
 
 
+def test_resolve_or_create_place_is_free_of_duplicates_under_concurrency():
+    """Two businesses typing the same brand-new city at nearly the same
+    moment must never create two separate place documents — the atomic
+    upsert in resolve_or_create_place is what guarantees this, not luck."""
+    async def go():
+        db = fresh_db()
+        results = await asyncio.gather(*[geo.resolve_or_create_place(db, "Berlin", "DE") for _ in range(10)])
+        assert {r["id"] for r in results} == {"berlin_de"}
+        assert await db["mi_known_places"].count_documents({"id": "berlin_de"}) == 1
+    run(go())
+
+
+def test_resolve_or_create_place_dedupes_case_and_whitespace_variants():
+    async def go():
+        db = fresh_db()
+        a = await geo.resolve_or_create_place(db, "Tokyo", "JP")
+        b = await geo.resolve_or_create_place(db, "  TOKYO  ", "JP")
+        c = await geo.resolve_or_create_place(db, "tokyo", "jp")
+        assert a["id"] == b["id"] == c["id"] == "tokyo_jp"
+        assert await db["mi_known_places"].count_documents({"id": "tokyo_jp"}) == 1
+    run(go())
+
+
+def test_resolve_or_create_place_rejects_blank_city_name():
+    async def go():
+        db = fresh_db()
+        assert await geo.resolve_or_create_place(db, "   ", "JP") is None
+        assert await geo.resolve_or_create_place(db, "", "JP") is None
+    run(go())
+
+
 def test_set_location_scope_switching_city_to_country_drops_the_place_request():
     async def go():
         db = fresh_db()
