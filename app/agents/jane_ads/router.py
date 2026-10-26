@@ -2809,6 +2809,13 @@ async def _build_campaign_plan(
     fee_bypassed = (body.preferred_platform == "tiktok")
     req.budget_ngn = stated_budget_ngn if fee_bypassed else C.ad_spend_from_budget(stated_budget_ngn)
 
+    # TikTok rejects an ad group under its own daily floor (₦31,000) — at launch, after the
+    # wallet check. With no fee taken, the stated budget IS the ad spend, so say so now.
+    if fee_bypassed:
+        too_low = _tiktok_budget_too_low_message(req.budget_ngn)
+        if too_low:
+            return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": too_low}}
+
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
     # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
     # Every other goal DOES need a destination — but only a WhatsApp one needs the
@@ -3616,6 +3623,16 @@ async def _build_campaign_plan(
         selected_plan_variant=selected_variant.model_dump() if selected_variant else None,
         fee_bypassed=fee_bypassed,
     )
+
+
+def _tiktok_budget_too_low_message(budget_ngn: float) -> str:
+    """"" when `budget_ngn` clears TikTok's own daily floor; otherwise what the client needs
+    to state. TikTok pays no URI fee, so the floor applies to the stated budget as it is."""
+    floor = C.HARD_FLOOR_DAILY_NGN["tiktok"]
+    if budget_ngn >= floor:
+        return ""
+    return (f"TikTok needs a budget of at least ₦{floor:,.0f} to run. "
+            f"What budget would you like to use?")
 
 
 def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False, fee_only: bool = False) -> float:
@@ -5029,7 +5046,7 @@ async def extend_quote(
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
 
-        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        markup = 1.0  # TikTok pays no URI fee, so an extension costs exactly its ad spend
         try:
             q = quote(sched["daily_ngn"], days, markup,
                       floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
@@ -5122,7 +5139,7 @@ async def extend_campaign(
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
 
-        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        markup = 1.0  # TikTok pays no URI fee, so an extension costs exactly its ad spend
         try:
             q = quote(sched["daily_ngn"], body.days, markup,
                       floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
