@@ -9,6 +9,7 @@ Flow:
   5. create_post(access_token, author_urn, text)  → publish to LinkedIn (person or org)
 """
 
+import asyncio
 import urllib.parse
 from typing import Any, Dict, List
 
@@ -21,6 +22,7 @@ TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 UGC_POSTS_URL = "https://api.linkedin.com/v2/ugcPosts"
 REGISTER_UPLOAD_URL = "https://api.linkedin.com/v2/assets?action=registerUpload"
+ASSETS_URL = "https://api.linkedin.com/v2/assets"
 ORG_ACLS_URL = "https://api.linkedin.com/v2/organizationAcls"
 
 SCOPES = "openid profile email w_member_social"
@@ -158,6 +160,84 @@ class LinkedInDirectService:
 
         return asset
 
+    async def _register_video(self, access_token: str, author_urn: str) -> Dict[str, Any]:
+        """Register a video upload with LinkedIn. Returns upload URL and asset URN."""
+        payload = {
+            "registerUploadRequest": {
+                "recipes": ["urn:li:digitalmediaRecipe:feedshare-video"],
+                "owner": author_urn,
+                "serviceRelationships": [
+                    {"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}
+                ],
+            }
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                REGISTER_UPLOAD_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                    "Content-Type": "application/json",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            upload_url = data["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"]
+            asset = data["value"]["asset"]
+            return {"upload_url": upload_url, "asset": asset}
+
+    async def _wait_for_video_ready(self, access_token: str, asset: str, timeout_seconds: int = 120) -> None:
+        """
+        Poll until LinkedIn finishes transcoding the uploaded video.
+
+        Posting a UGC share that references the asset before LinkedIn marks it
+        AVAILABLE fails (or silently drops the video) — unlike the image path,
+        video has real server-side processing between upload and "ready to post".
+        """
+        asset_id = asset.rsplit(":", 1)[-1]
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                r = await client.get(
+                    f"{ASSETS_URL}/{asset_id}",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "X-Restli-Protocol-Version": "2.0.0",
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+                recipes = data.get("recipes", [])
+                status = recipes[0].get("status") if recipes else None
+                if status == "AVAILABLE":
+                    return
+                if status == "ERROR":
+                    raise RuntimeError(f"LinkedIn failed to process uploaded video (asset={asset})")
+                if asyncio.get_event_loop().time() >= deadline:
+                    raise RuntimeError(f"Timed out waiting for LinkedIn to process uploaded video (asset={asset})")
+                await asyncio.sleep(3)
+
+    async def _upload_video(self, access_token: str, author_urn: str, video_url: str) -> str:
+        """Register + upload one video, wait for processing, and return its LinkedIn asset URN."""
+        reg = await self._register_video(access_token, author_urn)
+        upload_url = reg["upload_url"]
+        asset = reg["asset"]
+
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+            video_resp.raise_for_status()
+            content_type = video_resp.headers.get("content-type", "video/mp4").split(";")[0]
+            put_r = await client.put(
+                upload_url,
+                content=video_resp.content,
+                headers={"Content-Type": content_type},
+            )
+            put_r.raise_for_status()
+
+        await self._wait_for_video_ready(access_token, asset)
+        return asset
+
     async def create_carousel_post(
         self,
         access_token: str,
@@ -234,17 +314,28 @@ class LinkedInDirectService:
         person_urn: str,
         text: str,
         image_url: str = None,
+        video_url: str = None,
     ) -> Dict[str, Any]:
         """
-        Publish a text (or image+text) post to LinkedIn.
+        Publish a text (or image+text, or video+text) post to LinkedIn.
         person_urn: e.g. "urn:li:person:abc123"
         image_url: optional public URL of image to attach
+        video_url: optional public URL of video to attach (takes priority over image_url)
         Returns {"post_id": ...}.
         """
         media_category = "NONE"
         media = []
 
-        if image_url:
+        if video_url:
+            asset = await self._upload_video(access_token, person_urn, video_url)
+            media_category = "VIDEO"
+            media = [{
+                "status": "READY",
+                "description": {"text": ""},
+                "media": asset,
+                "title": {"text": ""},
+            }]
+        elif image_url:
             try:
                 reg = await self._register_image(access_token, person_urn)
                 upload_url = reg["upload_url"]
