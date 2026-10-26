@@ -8,8 +8,21 @@ from app.domain.models.chat_model import (
 )
 from typing import Any, List
 import asyncio
+import re
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def _friendly_openai_message(error_message: str) -> str:
+    """OpenAI's SDK renders a failed call's error as "Error code: 429 -
+    {python dict repr}" — fine in a log line, not in an admin's inbox or
+    dashboard. Pulls out just the human sentence OpenAI actually sent
+    ('message': '...'), falling back to the raw text (trimmed) if the
+    shape doesn't match what's expected."""
+    match = re.search(r"'message':\s*'((?:[^'\\]|\\.)*)'", error_message)
+    if match:
+        return match.group(1).replace("\\'", "'")
+    return error_message[:300]
 
 
 async def _alert_openai_out_of_credit(error_message: str) -> None:
@@ -28,6 +41,7 @@ async def _alert_openai_out_of_credit(error_message: str) -> None:
     try:
         from app.database import get_db
         from app.services import platform_alerts
+        friendly = _friendly_openai_message(error_message)
         await platform_alerts.raise_alert(
             get_db(),
             kind="openai_insufficient_quota",
@@ -35,7 +49,7 @@ async def _alert_openai_out_of_credit(error_message: str) -> None:
             detail=(
                 "Every AI feature on the platform (Content Calendar, Social Listening, and anything "
                 "else that calls OpenAI) is down until the balance is topped up or auto-reload is "
-                f"enabled on the OpenAI account. Raw error: {error_message[:300]}"
+                f"enabled on the OpenAI account. OpenAI says: “{friendly}”"
             ),
         )
     except Exception as e:
