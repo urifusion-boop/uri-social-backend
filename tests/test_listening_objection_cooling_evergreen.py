@@ -197,7 +197,7 @@ def test_recurring_need_is_not_crowded_out_of_judging(monkeypatch):
 
     captured = {}
 
-    async def fake_judge(db, profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model, connected=None):
         captured["sigs"] = sigs
         return {}
     monkeypatch.setattr(personalize, "_judge", fake_judge)
@@ -225,7 +225,7 @@ def test_recurring_need_card_is_not_crowded_out_of_the_final_cut(monkeypatch):
         run(_signal_doc(db, f"topic{i}", "rising", m_score=95))
     run(_signal_doc(db, "frontal install", "recurring_need", m_score=30, confidence=0.6))
 
-    async def fake_judge(db, profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model, connected=None):
         return {i: _J(i) for i in range(len(sigs))}
     monkeypatch.setattr(personalize, "_judge", fake_judge)
 
