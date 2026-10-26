@@ -134,6 +134,29 @@ class TestFlow:
         assert path.endswith("/apidojo~tweet-scraper/runs")
         assert body["maxItems"] == 100 and body["sort"] == "Latest"
 
+    def test_location_near_and_radius_are_passed_through_on_the_test_actor(self, monkeypatch):
+        factory, calls = _fake_apify(n_items=0, statuses=("SUCCEEDED",))
+        adapter = ax.ApifyXAdapter(ax.TEST_PROFILE, token="apify_api_test", client_factory=factory)
+        _run(adapter.start_collection(["wig"], [], datetime(2026, 10, 9), datetime(2026, 10, 16),
+                                      location={"country": "NG", "x_near": "Lagos, Nigeria", "x_radius_km": 30}))
+        _, _, body = calls["start"][0]
+        assert body["near"] == "Lagos, Nigeria" and body["within"] == "30km"
+
+    def test_location_uses_geotaggedNear_on_the_pro_actor(self, monkeypatch):
+        factory, calls = _fake_apify(n_items=0, statuses=("SUCCEEDED",))
+        adapter = ax.ApifyXAdapter(ax.PRO_PROFILE, token="apify_api_test", client_factory=factory)
+        _run(adapter.start_collection(["wig"], [], datetime(2026, 10, 9), datetime(2026, 10, 16),
+                                      location={"country": "NG", "x_near": "Lagos, Nigeria", "x_radius_km": 30}))
+        _, _, body = calls["start"][0]
+        assert body["geotaggedNear"] == "Lagos, Nigeria" and body["withinRadius"] == "30km"
+
+    def test_no_location_means_no_geo_fields_sent(self, monkeypatch):
+        factory, calls = _fake_apify(n_items=0, statuses=("SUCCEEDED",))
+        adapter = ax.ApifyXAdapter(ax.TEST_PROFILE, token="apify_api_test", client_factory=factory)
+        _run(adapter.start_collection(["wig"], [], datetime(2026, 10, 9), datetime(2026, 10, 16)))
+        _, _, body = calls["start"][0]
+        assert "near" not in body and "within" not in body
+
     def test_failed_run_is_reported_not_hidden(self, monkeypatch):
         monkeypatch.setattr(ax, "POLL_SECONDS", 0)
         factory, _ = _fake_apify(n_items=3, statuses=("FAILED",))

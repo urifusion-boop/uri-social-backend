@@ -186,12 +186,18 @@ class ApifyNewsAdapter(SourceAdapter):
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
                                since: datetime, until: datetime, language: Optional[str] = None,
-                               items_per_query: Optional[int] = None) -> str:
+                               items_per_query: Optional[int] = None, location: Optional[dict] = None) -> str:
         terms = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not terms:
             raise ValueError("no keywords to search for")
         per, total = self._cap(terms, items_per_query)
         body = {"searchQueries": terms, "maxItems": per, "language": language or "en"}
+        # Phase F: cleanscrape~google-news-scraper's real locale lever is a
+        # combined gl:hl "edition" string (verified against the actor's own
+        # input schema) — the strongest, cleanest geo lever of any source here.
+        edition = (location or {}).get("news_edition")
+        if edition:
+            body["edition"] = edition
         max_charge = round(total * self.profile.usd_per_1000 / 1000 * 1.5 + 0.05, 2)
         params = {"maxItems": total, "maxTotalChargeUsd": max_charge}
         r = await self._request("POST", f"{API}/acts/{self.profile.actor}/runs", params=params, json=body)

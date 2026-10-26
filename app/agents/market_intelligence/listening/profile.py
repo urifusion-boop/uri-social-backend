@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
 
-from . import embeddings, markets, ontology
+from . import embeddings, geo, markets, ontology
+from .geo import LocationScope
 
 PROMPT_VERSION = "mi-listen-profile-v1"
 
@@ -132,6 +133,68 @@ async def _map(db, facts: dict) -> tuple[list[str], Optional[str]]:
     return ids, country or (code if len(code) == 2 or code == "GLOBAL" else None)
 
 
+async def set_location_scope(db, brand_id: str, scope: LocationScope) -> Optional[dict]:
+    """Explicit user override of listening location (Phase F) — unlike
+    `build()`, this does NOT re-run the AI playbook mapping; it just resolves
+    `scope` to the right country-market set and re-subscribes, the same
+    ensure_market/subscribe/unsubscribe_others dance build() already does for
+    its own AI-inferred single country. Continent scope explodes into every
+    member country's own market (real per-country precision, not one shared
+    loosely-filtered query — PRD decision). Region/city scope stays on that
+    one country's market and additionally registers the place via
+    markets.request_place, so collect_market builds extra geo-scoped queries
+    for it without narrowing the shared country-wide collection for anyone
+    else subscribed to that same market."""
+    existing = await db["mi_listening_profiles"].find_one({"brand_id": brand_id})
+    if not existing:
+        return None
+    await geo.ensure_seeded(db)
+    category_ids = sorted({key.rsplit(":", 1)[0] for key in (existing.get("markets") or [])})
+    if not category_ids:
+        return None
+
+    place: Optional[dict] = None
+    if scope.level in ("region", "city"):
+        place = await geo.get_place(db, scope.place_id) if scope.place_id else None
+        if not place:
+            raise ValueError(f"unknown place_id {scope.place_id!r}")
+        countries = [place["country"]]
+    else:
+        countries = geo.resolve_countries(scope)
+    if not countries:
+        raise ValueError(f"location scope resolved to no countries: {scope}")
+
+    market_keys = []
+    for country in countries:
+        for cid in category_ids:
+            m = await markets.ensure_market(db, cid, country)
+            await markets.subscribe(db, m["key"], brand_id)
+            market_keys.append(m["key"])
+    await markets.unsubscribe_others(db, brand_id, market_keys)
+
+    keep_place_ids = [place["id"]] if place else []
+    await markets.unrequest_places_elsewhere(db, brand_id, keep_place_ids)
+    if place:
+        for key in market_keys:
+            await markets.request_place(db, key, place["id"], brand_id)
+
+    now = datetime.utcnow()
+    update = {
+        "location_scope": scope.dict(), "markets": market_keys,
+        "country": countries[0] if len(countries) == 1 else "GLOBAL",
+        "location_countries": countries, "updated_at": now,
+    }
+    update.setdefault("field_origins", existing.get("field_origins") or {})
+    update["field_origins"]["location_scope"] = "user_override"
+    await db["mi_listening_profiles"].update_one({"brand_id": brand_id}, {"$set": update})
+    await db["mi_listening_profile_history"].insert_one({
+        "brand_id": brand_id, "version": existing.get("version", 0), "markets": market_keys,
+        "location_scope": scope.dict(), "at": now, "reason": "location_scope_override",
+    })
+    existing.update(update)
+    return existing
+
+
 PLAN_TIER_FALLBACK = "default"
 
 
@@ -174,6 +237,7 @@ async def build(db, user_id: str, brand_id: str, playbook: dict, force: bool = F
         return existing
 
     await ontology.ensure_seeded(db)
+    await geo.ensure_seeded(db)
     category_ids, country = await _map(db, facts)
     country = country or "GLOBAL"
     market_keys = []

@@ -212,7 +212,8 @@ class ApifyXAdapter(SourceAdapter):
             accessible_languages=["en", "pcm", "yo", "ig", "ha", "fr"],
             refresh_cadence_hours=24,  # paid per post: once a day is plenty for keep-updating
             notes=(f"{self.profile.label}. Public posts only; up to {ITEMS_PER_KEYWORD} tweets per keyword per scan. "
-                   "X search reliably reaches about the last 30 days."),
+                   "X search reliably reaches about the last 30 days. Supports real city-level geo "
+                   "targeting (near + radius) when a known place is requested."),
         )
 
     async def estimate_cost(self, keywords: list[str], days: int) -> float:
@@ -221,7 +222,7 @@ class ApifyXAdapter(SourceAdapter):
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
                                since: datetime, until: datetime, language: Optional[str] = None,
-                               items_per_query: Optional[int] = None) -> str:
+                               items_per_query: Optional[int] = None, location: Optional[dict] = None) -> str:
         terms = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not terms:
             raise ValueError("no keywords to search for")
@@ -230,6 +231,21 @@ class ApifyXAdapter(SourceAdapter):
             body = {"searchTerms": terms, "maxItems": total, "sort": "Latest"}
         else:
             body = {"searchTerms": terms, "maxItems": per, "queryType": "Latest"}
+        # Phase F: real city-precise geo targeting — both actors expose a
+        # place-name "near" + radius field (apidojo calls them
+        # geotaggedNear/withinRadius; kaitoeasyapi calls them near/within),
+        # verified against each actor's own input schema.
+        near = (location or {}).get("x_near")
+        if near:
+            radius = (location or {}).get("x_radius_km")
+            if self.profile.key == "x_pro":
+                body["geotaggedNear"] = near
+                if radius:
+                    body["withinRadius"] = f"{radius}km"
+            else:
+                body["near"] = near
+                if radius:
+                    body["within"] = f"{radius}km"
         max_charge = round(total * self.profile.usd_per_1000 / 1000 * 1.5 + 0.05, 2)
         params = {"maxItems": total, "maxTotalChargeUsd": max_charge}
         r = await self._request("POST", f"{API}/acts/{self.profile.actor}/runs", params=params, json=body)

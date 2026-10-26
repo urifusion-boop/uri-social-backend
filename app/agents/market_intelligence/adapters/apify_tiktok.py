@@ -185,7 +185,9 @@ class ApifyTikTokAdapter(SourceAdapter):
             accessible_languages=["en", "pcm", "yo", "ig", "ha", "fr"],
             refresh_cadence_hours=24,
             notes=(f"{self.profile.label}. Public videos only; up to {ITEMS_PER_KEYWORD} per keyword per scan. "
-                   "Field mapping unverified against a live run — see module docstring."),
+                   "Field mapping unverified against a live run — see module docstring. "
+                   + ("Supports a real, native country filter." if self.profile.key == "tiktok"
+                      else "Country targeting here is only an approximate proxy-origin setting, not a confirmed content filter.")),
         )
 
     async def estimate_cost(self, keywords: list[str], days: int) -> float:
@@ -194,13 +196,27 @@ class ApifyTikTokAdapter(SourceAdapter):
 
     async def start_collection(self, keywords: list[str], excluded_keywords: list[str],
                                since: datetime, until: datetime, language: Optional[str] = None,
-                               items_per_query: Optional[int] = None) -> str:
+                               items_per_query: Optional[int] = None, location: Optional[dict] = None) -> str:
         terms = build_search_terms(keywords, excluded_keywords, since, until, language)
         if not terms:
             raise ValueError("no keywords to search for")
         per, total = self._cap(terms, items_per_query)
         body = {"searchQueries": terms, "resultsPerPage": per, "shouldDownloadVideos": False,
                 "shouldDownloadCovers": False, "shouldDownloadSubtitles": False}
+        country = (location or {}).get("country")
+        if country:
+            if self.profile.key == "tiktok":
+                # apidojo~tiktok-scraper: `location` is a real, native ISO-2
+                # country filter (verified against the actor's own input schema).
+                body["location"] = country
+                place_url = (location or {}).get("tiktok_place_url")
+                if place_url:
+                    body["startUrls"] = [place_url]
+            else:
+                # clockworks~tiktok-scraper (tiktok_pro): only a proxy-origin
+                # knob exists, not a declared content filter — approximate,
+                # reported as such rather than oversold.
+                body["proxyCountryCode"] = country
         max_charge = round(total * self.profile.usd_per_1000 / 1000 * 1.5 + 0.05, 2)
         params = {"maxItems": total, "maxTotalChargeUsd": max_charge}
         r = await self._request("POST", f"{API}/acts/{self.profile.actor}/runs", params=params, json=body)

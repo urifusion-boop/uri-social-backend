@@ -78,7 +78,7 @@ class _FakeAdapter:
         self.default_n = default_n
         self.queries_seen = []
 
-    async def start_collection(self, kw, ex, since, until, items_per_query=None):
+    async def start_collection(self, kw, ex, since, until, items_per_query=None, location=None):
         self.queries_seen.append(kw[0])
         return f"run:{kw[0]}"
 
