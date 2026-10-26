@@ -155,9 +155,19 @@ async def set_location_scope(db, brand_id: str, scope: LocationScope) -> Optiona
 
     place: Optional[dict] = None
     if scope.level in ("region", "city"):
-        place = await geo.get_place(db, scope.place_id) if scope.place_id else None
-        if not place:
-            raise ValueError(f"unknown place_id {scope.place_id!r}")
+        if scope.place_id:
+            place = await geo.get_place(db, scope.place_id)
+            if not place:
+                raise ValueError(f"unknown place_id {scope.place_id!r}")
+        elif scope.city and scope.country:
+            # Any real city in any real country works immediately — it
+            # doesn't need to already be on the curated list (geo.py's
+            # resolve_or_create_place docstring explains why).
+            place = await geo.resolve_or_create_place(db, scope.city, scope.country)
+            if not place:
+                raise ValueError(f"unknown country {scope.country!r}")
+        else:
+            raise ValueError("city-level scope needs either place_id or both city and country")
         countries = [place["country"]]
     else:
         countries = geo.resolve_countries(scope)

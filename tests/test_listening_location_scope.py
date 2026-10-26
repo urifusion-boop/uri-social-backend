@@ -31,9 +31,19 @@ def fresh_db():
 # ── geo.py registry ─────────────────────────────────────────────────────────
 
 def test_continent_resolves_to_real_per_country_list_not_one_blob():
-    scope = LocationScope(level="continent", continent="AF")
+    scope = LocationScope(level="continent", continent="AFRICA")
     countries = geo.resolve_countries(scope)
-    assert set(countries) == {"NG", "GH", "KE", "ZA"}
+    # Every real African country is covered (not a hand-picked handful) —
+    # the whole point of making this flexible instead of a fixed pilot list.
+    assert len(countries) >= 50
+    assert {"NG", "GH", "KE", "ZA", "EG", "MA", "RW"}.issubset(set(countries))
+
+
+def test_every_real_country_is_selectable_not_just_a_pilot_handful():
+    assert len(geo.COUNTRIES) - 1 >= 190  # -1 for the GLOBAL pseudo-entry
+    for code in ("BR", "JP", "DE", "IN", "AU", "MX", "EG"):
+        assert code in geo.COUNTRIES
+        assert geo.resolve_countries(LocationScope(level="country", country=code)) == [code]
 
 
 def test_country_level_resolves_to_itself():
@@ -134,8 +144,13 @@ def test_set_location_scope_continent_subscribes_to_every_member_country():
     async def go():
         db = fresh_db()
         await _seed_profile(db)
-        updated = await profile.set_location_scope(db, "brandA", LocationScope(level="continent", continent="AF"))
-        assert set(updated["markets"]) == {"hair_wigs:NG", "hair_wigs:GH", "hair_wigs:KE", "hair_wigs:ZA"}
+        # Real, full continent coverage — not a hand-picked pilot handful —
+        # straight from the canonical dataset (data/countries.json), so this
+        # count is whatever that dataset actually says, not a number we pick.
+        updated = await profile.set_location_scope(db, "brandA", LocationScope(level="continent", continent="AMERICAS"))
+        expected = {f"hair_wigs:{c}" for c in geo.CONTINENTS["AMERICAS"]["countries"]}
+        assert len(expected) >= 30
+        assert set(updated["markets"]) == expected
         assert updated["location_scope"]["level"] == "continent"
         for key in updated["markets"]:
             m = await db["mi_markets"].find_one({"key": key})
@@ -157,6 +172,34 @@ def test_set_location_scope_city_subscribes_country_market_and_requests_place():
         m = await db["mi_markets"].find_one({"key": "hair_wigs:NG"})
         assert "brandA" in m["subscribers"]
         assert markets.requested_places(m) == ["lagos_ng"]
+    run(go())
+
+
+def test_set_location_scope_free_text_city_works_for_any_country_not_just_curated_ones():
+    async def go():
+        db = fresh_db()
+        await _seed_profile(db)
+        # Nairobi isn't on the curated KNOWN_PLACES list — it must still work.
+        updated = await profile.set_location_scope(
+            db, "brandA", LocationScope(level="city", city="Nairobi", country="KE"))
+        assert updated["markets"] == ["hair_wigs:KE"]
+        assert updated["country"] == "KE"
+        m = await db["mi_markets"].find_one({"key": "hair_wigs:KE"})
+        assert "brandA" in m["subscribers"]
+        assert markets.requested_places(m) == ["nairobi_ke"]
+        place = await geo.get_place(db, "nairobi_ke")
+        assert place["source"] == "generated"
+        assert place["source_hints"]["x_near"] == "Nairobi, Kenya"
+    run(go())
+
+
+def test_set_location_scope_free_text_city_rejects_unknown_country():
+    async def go():
+        db = fresh_db()
+        await _seed_profile(db)
+        with pytest.raises(ValueError):
+            await profile.set_location_scope(
+                db, "brandA", LocationScope(level="city", city="Nowhereville", country="ZZ"))
     run(go())
 
 

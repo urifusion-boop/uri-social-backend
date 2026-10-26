@@ -19,35 +19,75 @@ that many countries individually. Region/city scope stays on the country
 market (so country-level subscribers of the same shared market are never
 narrowed) and adds its own geo-scoped queries on top — see markets.py's
 `city_queries`.
+
+Every real country on Earth is selectable (COUNTRIES below, loaded from
+`data/countries.json` — a canonical ISO-3166/region dataset, the same one
+the frontend's own country picker is built from, not a hand-typed list —
+see `data/fetch_countries.py`), and so is any city — typing a new one
+resolves it on the spot (`resolve_or_create_place`) instead of requiring it
+to appear on a pre-built list first. The first version of this feature
+(23-26 Oct 2026) shipped with only Nigeria's five largest cities
+pre-curated — a deliberate, narrow pilot to validate the mechanism on real
+data before widening it, the same "test first, then open up" pattern X's
+two connectors went through before every other source was added (see
+Phase A). It was never meant to stay that narrow: Uri's businesses are not
+only in Nigeria, and a city list that only covered one country would have
+been a real product gap, not a design choice — this module now covers
+every country, and any named city, on purpose.
 """
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-# Real-world continent membership, trimmed to countries this product can
-# actually serve today (COUNTRIES below) — not every country on Earth.
-# Extend both together when a new country is added.
-CONTINENTS: dict[str, dict[str, Any]] = {
-    "AF": {"label": "Africa", "countries": ["NG", "GH", "KE", "ZA"]},
-    "EU": {"label": "Europe", "countries": ["GB"]},
-    "NA": {"label": "North America", "countries": ["US"]},
+_DATA_FILE = Path(__file__).parent / "data" / "countries.json"
+_RAW = json.loads(_DATA_FILE.read_text())
+
+# Continent groupings use the dataset's own `region` field directly
+# (Africa, Americas, Asia, Europe, Oceania) rather than a hand-split
+# North/South America — one less hand-authored judgment call, and "Americas"
+# is itself a standard grouping (the same one the UN geoscheme and the
+# source dataset both use).
+CONTINENTS: dict[str, dict[str, Any]] = {}
+for _row in _RAW["countries"]:
+    _key = _row["region"].upper().replace(" ", "_")
+    CONTINENTS.setdefault(_key, {"label": _row["region"], "countries": []})
+    CONTINENTS[_key]["countries"].append(_row["code"])
+
+# Extra local-language terms (beyond English) are only worth adding where
+# the ontology actually has local_terms seeded for that language (today:
+# Nigerian Pidgin, Swahili) — every other country defaults to English-only
+# search, same safe, honest default as GLOBAL used before this module
+# existed. Extending this list is additive, data-only work (no code
+# changes) once a market's local terms are written for a new language.
+_EXTRA_LANGS: dict[str, list[str]] = {"NG": ["pcm"], "GH": ["pcm"], "KE": ["sw"]}
+
+# Google News' real editions are a curated ~87-combination list, not every
+# country × every language — guessing a country's spoken language and
+# assuming "<country>:<that language>" is a valid edition risks sending a
+# combination that doesn't exist. Only set where independently confirmed
+# (so far: Nigeria, Ghana, Kenya, South Africa, UK, US, matching this
+# phase's own verified research) — everywhere else, News collection simply
+# runs without a country-specific edition until confirmed, the same
+# "report what's not yet available" pattern used everywhere else in this
+# product, rather than a silent guess.
+_NEWS_EDITIONS: dict[str, str] = {
+    "NG": "NG:en", "GH": "GH:en", "KE": "KE:en", "ZA": "ZA:en", "GB": "GB:en", "US": "US:en",
 }
 
-# Supersedes markets.py's old hardcoded COUNTRY_LANGS/COUNTRY_NAMES — one
-# source of truth. `langs` keeps the existing local-language-term selection
-# behavior; nothing changes for these 6 countries, just where it's defined.
+_CONTINENT_OF: dict[str, str] = {row["code"]: row["region"].upper().replace(" ", "_") for row in _RAW["countries"]}
+
 COUNTRIES: dict[str, dict[str, Any]] = {
-    "NG": {"name": "Nigeria", "continent": "AF", "langs": ["en", "pcm"]},
-    "GH": {"name": "Ghana", "continent": "AF", "langs": ["en", "pcm"]},
-    "KE": {"name": "Kenya", "continent": "AF", "langs": ["en", "sw"]},
-    "ZA": {"name": "South Africa", "continent": "AF", "langs": ["en"]},
-    "GB": {"name": "United Kingdom", "continent": "EU", "langs": ["en"]},
-    "US": {"name": "United States", "continent": "NA", "langs": ["en"]},
-    "GLOBAL": {"name": "Global", "continent": None, "langs": ["en"]},
+    row["code"]: {"name": row["name"], "continent": _CONTINENT_OF.get(row["code"]),
+                  "langs": ["en"] + _EXTRA_LANGS.get(row["code"], [])}
+    for row in _RAW["countries"]
 }
+COUNTRIES["GLOBAL"] = {"name": "Global", "continent": None, "langs": ["en"]}
 
 COUNTRY_LANGS: dict[str, list[str]] = {c: v["langs"] for c, v in COUNTRIES.items()}
 COUNTRY_NAMES: dict[str, str] = {c: v["name"] for c, v in COUNTRIES.items()}
@@ -55,44 +95,53 @@ COUNTRY_NAMES: dict[str, str] = {c: v["name"] for c, v in COUNTRIES.items()}
 
 class LocationScope(BaseModel):
     """What a business has explicitly asked listening to be scoped to.
-    `level="global"` is today's default (unchanged behavior). `place_id`
-    (a `mi_known_places` id) is required for region/city level; `country`
-    is required for country level; `continent` for continent level."""
+    `level="global"` is today's default (unchanged behavior). For
+    region/city level, either `place_id` (an existing known place) or
+    `city` + `country` (any free-text city — resolved, and cached for
+    reuse, on the spot) must be given; `country` alone is required for
+    country level; `continent` for continent level."""
     level: str = Field(description='"global" | "continent" | "country" | "region" | "city"')
     continent: Optional[str] = None
     country: Optional[str] = None
     place_id: Optional[str] = None
+    city: Optional[str] = None
 
 
-# First known places: Nigeria's major cities only (PRD decision — every
-# other existing country stays at country-level selection until a city is
-# explicitly asked for; don't pre-build speculative coverage). `source_hints`
-# fields left None mean that source has no real geo lever for this place yet
-# (verified per-actor in Phase F's research) — reported honestly via each
-# adapter's own capabilities().notes, never a silent no-op.
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")
+
+
+# Curated upgrades: places where someone has looked up the two fields no
+# city gets automatically (a real TikTok place-URL id, a real Instagram
+# numeric location id — see module docstring). Starting with Nigeria's
+# five largest cities is a pilot, not a ceiling — `resolve_or_create_place`
+# below means a business in any other city is never blocked from city-level
+# scoping while waiting for this list to catch up; it just starts without
+# those two sources' extra precision until someone curates it, same as
+# every city not yet on this list.
 KNOWN_PLACES: list[dict[str, Any]] = [
-    {"id": "lagos_ng", "level": "city", "name": "Lagos", "country": "NG", "continent": "AF",
-     "aliases": ["lagos", "eko"], "coordinates": {"lat": 6.5244, "lon": 3.3792},
+    {"id": "lagos_ng", "level": "city", "name": "Lagos", "country": "NG", "continent": "AFRICA",
+     "aliases": ["lagos", "eko"], "coordinates": {"lat": 6.5244, "lon": 3.3792}, "source": "curated",
      "source_hints": {"x_near": "Lagos, Nigeria", "x_radius_km": 30,
                        "tiktok_place_url": None, "instagram_location_id": None,
                        "reddit_subreddits": ["lagos", "Nigeria"], "news_edition": "NG:en"}},
-    {"id": "abuja_ng", "level": "city", "name": "Abuja", "country": "NG", "continent": "AF",
-     "aliases": ["abuja", "fct"], "coordinates": {"lat": 9.0765, "lon": 7.3986},
+    {"id": "abuja_ng", "level": "city", "name": "Abuja", "country": "NG", "continent": "AFRICA",
+     "aliases": ["abuja", "fct"], "coordinates": {"lat": 9.0765, "lon": 7.3986}, "source": "curated",
      "source_hints": {"x_near": "Abuja, Nigeria", "x_radius_km": 25,
                        "tiktok_place_url": None, "instagram_location_id": None,
                        "reddit_subreddits": ["abuja", "Nigeria"], "news_edition": "NG:en"}},
-    {"id": "port_harcourt_ng", "level": "city", "name": "Port Harcourt", "country": "NG", "continent": "AF",
-     "aliases": ["port harcourt", "ph city"], "coordinates": {"lat": 4.8156, "lon": 7.0498},
+    {"id": "port_harcourt_ng", "level": "city", "name": "Port Harcourt", "country": "NG", "continent": "AFRICA",
+     "aliases": ["port harcourt", "ph city"], "coordinates": {"lat": 4.8156, "lon": 7.0498}, "source": "curated",
      "source_hints": {"x_near": "Port Harcourt, Nigeria", "x_radius_km": 25,
                        "tiktok_place_url": None, "instagram_location_id": None,
                        "reddit_subreddits": ["Nigeria"], "news_edition": "NG:en"}},
-    {"id": "kano_ng", "level": "city", "name": "Kano", "country": "NG", "continent": "AF",
-     "aliases": ["kano"], "coordinates": {"lat": 12.0022, "lon": 8.5920},
+    {"id": "kano_ng", "level": "city", "name": "Kano", "country": "NG", "continent": "AFRICA",
+     "aliases": ["kano"], "coordinates": {"lat": 12.0022, "lon": 8.5920}, "source": "curated",
      "source_hints": {"x_near": "Kano, Nigeria", "x_radius_km": 25,
                        "tiktok_place_url": None, "instagram_location_id": None,
                        "reddit_subreddits": ["Nigeria"], "news_edition": "NG:en"}},
-    {"id": "ibadan_ng", "level": "city", "name": "Ibadan", "country": "NG", "continent": "AF",
-     "aliases": ["ibadan"], "coordinates": {"lat": 7.3775, "lon": 3.9470},
+    {"id": "ibadan_ng", "level": "city", "name": "Ibadan", "country": "NG", "continent": "AFRICA",
+     "aliases": ["ibadan"], "coordinates": {"lat": 7.3775, "lon": 3.9470}, "source": "curated",
      "source_hints": {"x_near": "Ibadan, Nigeria", "x_radius_km": 25,
                        "tiktok_place_url": None, "instagram_location_id": None,
                        "reddit_subreddits": ["Nigeria"], "news_edition": "NG:en"}},
@@ -126,6 +175,45 @@ async def get_place(db, place_id: str) -> Optional[dict]:
     return p
 
 
+async def resolve_or_create_place(db, city: str, country: str) -> Optional[dict]:
+    """Any named city in any real country can be used for city-level
+    scoping immediately — it doesn't need to already be on KNOWN_PLACES.
+    Generates reasonable default hints for the sources that need only a
+    plain place name (X's near/radius, Reddit's subreddit guess); the two
+    sources that need a real looked-up id (a TikTok place URL, an
+    Instagram numeric location id) start unset, same as any city not yet
+    curated — upgradeable later without the business having to redo
+    anything. The generated place is cached in `mi_known_places` (tagged
+    `source: "generated"`) so the next business asking for the same city
+    reuses it instead of regenerating it, and so it shows up for curation."""
+    code = (country or "").upper()
+    if code not in COUNTRIES or code == "GLOBAL":
+        return None
+    city = (city or "").strip()
+    if not city:
+        return None
+    place_id = f"{_slugify(city)}_{code.lower()}"
+    existing = await get_place(db, place_id)
+    if existing:
+        return existing
+    country_name = COUNTRY_NAMES.get(code, code)
+    doc = {
+        "id": place_id, "level": "city", "name": city, "country": code,
+        "continent": _CONTINENT_OF.get(code), "aliases": [city.lower()],
+        "coordinates": None, "source": "generated",
+        "source_hints": {
+            "x_near": f"{city}, {country_name}", "x_radius_km": 25,
+            "tiktok_place_url": None, "instagram_location_id": None,
+            "reddit_subreddits": [_slugify(city), country_name],
+            "news_edition": _NEWS_EDITIONS.get(code),
+        },
+        "created_at": datetime.utcnow(),
+    }
+    await db["mi_known_places"].insert_one(dict(doc))
+    doc.pop("_id", None)
+    return doc
+
+
 def resolve_countries(scope: LocationScope) -> list[str]:
     """Which country codes this scope resolves to, for market
     ensure/subscribe. Continent explodes to every member country (real
@@ -134,10 +222,10 @@ def resolve_countries(scope: LocationScope) -> list[str]:
     if scope.level == "global":
         return ["GLOBAL"]
     if scope.level == "continent":
-        c = CONTINENTS.get((scope.continent or "").upper())
+        c = CONTINENTS.get((scope.continent or "").upper().replace(" ", "_"))
         return list(c["countries"]) if c else []
     if scope.level == "country":
         code = (scope.country or "").upper()
-        return [code] if code in COUNTRIES else []
-    # region/city: resolved by the caller via get_place(scope.place_id)["country"]
+        return [code] if code in COUNTRIES and code != "GLOBAL" else []
+    # region/city: resolved by the caller via get_place/resolve_or_create_place
     return []
