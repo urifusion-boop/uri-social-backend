@@ -1,0 +1,25 @@
+"""A budget the client types is a budget they stated — including the same amount as
+last time, written with a comma, in an opening message that ends with a full stop."""
+from app.agents.jane_ads.jane_consultant import (
+    _budget_grounded, _build_budget_confirmation_note, _latest_user_reply,
+)
+
+BRIEF = "Run an ad for Uri Social in Lagos, ₦10,000 total over 5 days. Send people to our website urisocial.com."
+
+
+def test_the_latest_reply_ignores_a_trailing_full_stop_and_dots_in_links():
+    assert _latest_user_reply(BRIEF) == "send people to our website urisocial.com"
+    assert _latest_user_reply("Fashion brand. 10000, ikeja") == "10000, ikeja"
+
+
+def test_an_opening_message_naming_last_times_budget_is_not_asked_again():
+    note = _build_budget_confirmation_note(10000, BRIEF, [])
+    assert "Set budget_ngn to 10000" in note
+
+
+def test_a_comma_formatted_budget_counts_as_said():
+    assert _budget_grounded(10000, 10000, BRIEF, [])
+
+
+def test_the_remembered_budget_alone_still_does_not_count():
+    assert not _budget_grounded(10000, 10000, "Run an ad for Uri Social in Lagos.", [])
