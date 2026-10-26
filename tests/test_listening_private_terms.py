@@ -273,7 +273,7 @@ def test_competitor_move_signal_is_a_real_candidate_for_cards_for(monkeypatch):
 
     run(go())
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         from app.agents.market_intelligence.listening.personalize import _Judged, _Action
         out = {}
         for i, s in enumerate(sigs):

@@ -89,6 +89,19 @@ Optionally, also propose ONE alternative action for the same signal — a genuin
 worth considering instead (e.g. a carousel FAQ next to a video, or a proposed ad test when buying intent is
 strong) — only when something else really does fit as well as or differently from the primary action; omit it
 rather than padding the card with a weaker, smaller version of the same idea.
+
+PLATFORM AND FORMAT CHOICE — read PLATFORM & FORMAT FACTS before deciding, never guess or default:
+1. `platforms` in your action must be chosen ONLY from `connected_platforms` listed there — never propose a
+   platform this business hasn't connected.
+2. If `stated_platform_preference` and/or `stated_format_preference` is given (the owner said so directly in
+   their Playbook), follow it.
+3. Otherwise, if `best_performing_platforms`/`best_performing_formats` is given (computed from this business's
+   own real published-post engagement), prefer those — real history beats a guess.
+4. Otherwise (no stated preference and no history yet — a genuinely new business), choose whichever connected
+   platform and format actually fit this specific signal and action type best, and vary your choice across
+   different cards rather than defaulting to the same one every time — nothing here means "always Instagram" or
+   "always carousel."
+
 For a competitor_move signal, the action must be a differentiation idea — never copy or imitate the competitor;
 show this business's own, genuinely different answer to the same thing customers are reacting to.
 For an upcoming_development signal, the action must be content planned to publish BEFORE the date shown in the
@@ -326,9 +339,60 @@ def score(sig: dict, relevance: float, brand_fit: float, weights: dict) -> dict:
     return s
 
 
-async def _judge(profile: dict, sigs: list[dict], model: str) -> dict[int, _Judged]:
+# Matches router.py's create_from_card CONTENT_PLATFORMS — a connected
+# account can also be an ad account (facebook_ads, google_ads), which is a
+# real connection but not something content can be posted to, so it's never
+# offered to the AI as a platform choice either.
+_CONTENT_PLATFORMS = {"instagram", "tiktok", "facebook", "x", "linkedin", "whatsapp_status"}
+
+
+async def _platform_format_facts(db, profile: dict) -> str:
+    """Grounds the AI's platform/format choice in real data instead of
+    letting it guess (live-reported bug: every card defaulted to Instagram
+    + carousel regardless of what was actually connected, because the
+    prompt was never given connected accounts or real performance history
+    to react to — see this function's three real signal sources below, in
+    priority order, matching SYSTEM's own instructions)."""
+    user_id, brand_id = profile.get("user_id"), profile.get("brand_id")
+    lines = []
+    try:
+        from app.agents.social_media_manager.services.social_account_service import SocialAccountService
+        conn = await SocialAccountService.get_user_connections(db, user_id, brand_id)
+        connected = [p for p in (conn.get("responseData") or {}).get("connected_platforms") or []
+                    if p in _CONTENT_PLATFORMS]
+    except Exception as e:
+        print(f"[MI][listen] connected-platforms lookup failed: {e}")
+        connected = []
+    lines.append(f"connected_platforms: {', '.join(connected) or 'none connected yet'}")
+
+    f = profile.get("facts") or {}
+    stated_platforms = f.get("target_platforms")
+    if stated_platforms:
+        lines.append(f"stated_platform_preference (from the owner's own Playbook): {', '.join(stated_platforms)}")
+    stated_formats = f.get("preferred_formats")
+    if stated_formats:
+        lines.append(f"stated_format_preference (from the owner's own Playbook): {', '.join(stated_formats)}")
+
+    try:
+        from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
+        perf = await PerformanceAnalyticsService.get_user_performance(user_id, db, brand_id=brand_id)
+        if perf.get("has_data"):
+            if perf.get("top_platforms"):
+                lines.append(f"best_performing_platforms (from this business's own real post engagement, "
+                             f"best first): {', '.join(perf['top_platforms'])}")
+            if perf.get("top_formats"):
+                lines.append(f"best_performing_formats (from this business's own real post engagement, "
+                             f"best first): {', '.join(perf['top_formats'])}")
+    except Exception as e:
+        print(f"[MI][listen] performance-history lookup failed: {e}")
+
+    return "\n".join(lines)
+
+
+async def _judge(db, profile: dict, sigs: list[dict], model: str) -> dict[int, _Judged]:
     f = profile["facts"]
     facts = "\n".join(f"{k}: {v}" for k, v in f.items() if v)
+    platform_facts = await _platform_format_facts(db, profile)
     lines = []
     for i, s in enumerate(sigs):
         samples = " | ".join((x.get("text") or "")[:160].replace("\n", " ") for x in (s.get("samples") or [])[:3])
@@ -337,7 +401,8 @@ async def _judge(profile: dict, sigs: list[dict], model: str) -> dict[int, _Judg
                      f"    sample posts: {samples}")
     req = AIService.build_ai_model(model=model, temperature=0.4, messages=[
         {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": f"BUSINESS FACTS\n{facts}\n\nSIGNALS\n" + "\n".join(lines)},
+        {"role": "user", "content": f"BUSINESS FACTS\n{facts}\n\nPLATFORM & FORMAT FACTS\n{platform_facts}"
+                                    f"\n\nSIGNALS\n" + "\n".join(lines)},
     ])
     try:
         completion = await AIService.structured_chat_completion(req, response_model=_Judgement)
@@ -387,7 +452,7 @@ async def cards_for(db, profile: dict, cfg: dict, now: Optional[datetime] = None
     if not cands:
         return []
 
-    judged = await _judge(profile, cands, sc["model"])
+    judged = await _judge(db, profile, cands, sc["model"])
     cards = []
     for i, sig in enumerate(cands):
         j = judged.get(i)

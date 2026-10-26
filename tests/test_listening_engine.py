@@ -212,7 +212,7 @@ def test_cards_are_gated_scored_and_stored(monkeypatch):
     db = fresh_db()
     _seed_and_detect(db)
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         return {i: _J(i, 90 if s["topic"] == "latasha wig" else 20, 80) for i, s in enumerate(sigs)}
     monkeypatch.setattr(personalize, "_judge", fake_judge)
     prof = {"brand_id": "b1", "user_id": "u1", "markets": [MARKET["key"]], "facts": {"brand_name": "Glow Hair"}}
@@ -232,7 +232,7 @@ def test_fabricated_number_triggers_retry_and_uses_clean_retry_content(monkeypat
     db = fresh_db()
     _seed_and_detect(db)
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         return {i: _J(i, 90 if s["topic"] == "latasha wig" else 20, 80, why="Demand is up 300% this week.")
                 for i, s in enumerate(sigs)}
     clean = _J(0, 90, 80, why="Your customers are already talking about this.")
@@ -251,7 +251,7 @@ def test_fabricated_number_falls_back_when_retry_also_fails(monkeypatch):
     db = fresh_db()
     _seed_and_detect(db)
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         return {i: _J(i, 90 if s["topic"] == "latasha wig" else 20, 80, why="Demand is up 300% this week.")
                 for i, s in enumerate(sigs)}
 
@@ -278,7 +278,7 @@ def test_a_clean_alternative_is_kept_on_the_card(monkeypatch):
     db = fresh_db()
     _seed_and_detect(db)
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         out = {}
         for i, s in enumerate(sigs):
             j = _J(i, 90 if s["topic"] == "latasha wig" else 20, 80)
@@ -297,7 +297,7 @@ def test_an_alternative_with_a_fabricated_number_is_dropped_not_retried(monkeypa
     _seed_and_detect(db)
     retried = []
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         out = {}
         for i, s in enumerate(sigs):
             j = _J(i, 90 if s["topic"] == "latasha wig" else 20, 80)
@@ -323,7 +323,7 @@ def test_an_alternative_identical_to_the_primary_action_is_dropped(monkeypatch):
     db = fresh_db()
     _seed_and_detect(db)
 
-    async def fake_judge(profile, sigs, model):
+    async def fake_judge(db, profile, sigs, model):
         out = {}
         for i, s in enumerate(sigs):
             j = _J(i, 90 if s["topic"] == "latasha wig" else 20, 80)
