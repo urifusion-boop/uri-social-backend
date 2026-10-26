@@ -27,6 +27,7 @@ from app.agents.jane_ads.adapters.tiktok import (
     _tiktok_gender_choice,
     _tiktok_gender_for,
     _tiktok_interest_names,
+    _tiktok_objective_for_creative,
     _tiktok_location_names,
     _tiktok_schedule_days,
     _tiktok_schedule_has_ended,
@@ -1254,3 +1255,25 @@ def test_extend_adgroup_writes_new_budget_and_end_date_then_reads_back():
     assert write_json["adgroup_id"] == "222"
     assert write_json["budget"] == 248000.0
     assert write_json["schedule_end_time"] == "2026-10-04 10:00:00"
+
+
+# ── Objective vs creative ─────────────────────────────────────────────────────
+
+def test_carousel_never_runs_under_video_views():
+    # Engagement -> VIDEO_VIEWS, and TikTok rejects a Carousel Ad under it at ad/create
+    # ("Objective type not supported") after the campaign and ad group already exist.
+    assert _tiktok_objective_for_creative(CampaignObjective.ENGAGEMENT, is_carousel=True) == "TRAFFIC"
+
+
+def test_video_keeps_video_views_for_engagement():
+    assert _tiktok_objective_for_creative(CampaignObjective.ENGAGEMENT, is_carousel=False) == "VIDEO_VIEWS"
+
+
+@pytest.mark.parametrize("objective,expected", [
+    (CampaignObjective.AWARENESS, "REACH"),
+    (CampaignObjective.TRAFFIC, "TRAFFIC"),
+    (CampaignObjective.LEADS, "LEAD_GENERATION"),
+    (CampaignObjective.SALES, "TRAFFIC"),
+])
+def test_carousel_keeps_the_objectives_tiktok_supports_for_it(objective, expected):
+    assert _tiktok_objective_for_creative(objective, is_carousel=True) == expected
