@@ -31,12 +31,12 @@ def fresh_db():
 def _email_spy(monkeypatch):
     calls = []
 
-    async def fake_send(to_email, subject, html_body):
-        calls.append({"to": to_email, "subject": subject, "body": html_body})
+    async def fake_send(to_email, subject, template_name, template_vars):
+        calls.append({"to": to_email, "subject": subject, "template": template_name, "vars": template_vars})
         return True
 
     from app.services.EmailService import email_service
-    monkeypatch.setattr(email_service, "send_raw_email", fake_send)
+    monkeypatch.setattr(email_service, "send_email", fake_send)
     return calls
 
 
@@ -55,6 +55,9 @@ def test_first_occurrence_creates_the_alert_and_emails_every_recipient(monkeypat
     expected = [e.strip() for e in settings.PLATFORM_ALERT_EMAILS.split(",") if e.strip()]
     assert {c["to"] for c in calls} == set(expected)
     assert "hello@urisocial.com" in expected and "urifusion@gmail.com" in expected
+    assert all(c["template"] == "platform_alert" for c in calls)
+    assert calls[0]["vars"]["occurrences"] == 1
+    assert calls[0]["vars"]["title"] == "OpenAI is out of credit"
 
 
 def test_repeated_occurrences_within_the_cooldown_do_not_re_email(monkeypatch):
@@ -132,10 +135,10 @@ def test_list_alerts_excludes_dismissed_by_default(monkeypatch):
 def test_a_broken_email_send_does_not_block_recording_the_alert(monkeypatch):
     db = fresh_db()
 
-    async def boom(to_email, subject, html_body):
+    async def boom(to_email, subject, template_name, template_vars):
         raise RuntimeError("smtp down")
     from app.services.EmailService import email_service
-    monkeypatch.setattr(email_service, "send_raw_email", boom)
+    monkeypatch.setattr(email_service, "send_email", boom)
 
     run(platform_alerts.raise_alert(db, "openai_insufficient_quota", "t", "d"))  # must not raise
     doc = run(db["platform_alerts"].find_one({"kind": "openai_insufficient_quota"}))
