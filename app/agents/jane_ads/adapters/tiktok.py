@@ -43,6 +43,7 @@ missing/present "error" key. _raise_for_error below checks that, not "error".
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
@@ -587,6 +588,46 @@ _DELIVERY_LABELS = {
     "DISABLE": "Paused",
     "DELETE": "Deleted",
 }
+
+# What TikTok's own secondary_status (the "why" behind operation_status) means to the
+# client. operation_status only says ENABLE/DISABLE, so a campaign switched on but
+# waiting in ad review, rejected, or out of balance still read "Active" in URI while
+# TikTok Ads Manager said "Not delivered" (live 2026-10-26). Matched by substring, in
+# priority order, because the exact enum names (AD_STATUS_AUDIT, ADGROUP_STATUS_NOT_START,
+# ...) were not confirmed against TikTok's reference — an unrecognised value still
+# surfaces, as "Needs attention", with TikTok's own wording.
+_TIKTOK_DELIVERY_RULES: list[tuple[str, str, str]] = [
+    ("AUDIT_DENY", "Needs changes",
+     "TikTok rejected this ad, so it can't deliver. Open it in TikTok Ads Manager to see why."),
+    ("AUDIT", "In review",
+     "TikTok is reviewing this ad. It starts delivering once it's approved."),
+    ("BALANCE", "Needs billing info",
+     "TikTok can't deliver because the advertiser account's balance or payment method needs attention."),
+    ("BUDGET_EXCEED", "Budget used",
+     "This campaign's whole budget has been spent."),
+    ("TIME_DONE", "Ended",
+     "This campaign's schedule has ended. Use Keep it running to extend it."),
+    ("NOT_START", "Scheduled",
+     "Waiting for its scheduled start time."),
+    ("DISABLE", "Ad paused",
+     "The ad or its ad group is switched off inside TikTok, so nothing is delivering."),
+]
+
+
+def _tiktok_delivery_display(ad_status: str, adgroup_status: str) -> tuple[str, str]:
+    """(label, note) for a campaign that is switched ON but may not be delivering, from
+    its ad and ad group secondary_status. ("", "") means nothing to add: delivering, or
+    TikTok gave no status. Only meaningful when the campaign's own operation_status is
+    ENABLE — a paused campaign is simply Paused."""
+    statuses = [str(s or "").upper() for s in (ad_status, adgroup_status) if s]
+    if not statuses or all("DELIVERY_OK" in s for s in statuses):
+        return "", ""
+    for needle, label, note in _TIKTOK_DELIVERY_RULES:
+        if any(needle in s for s in statuses):
+            return label, note
+    raw = next((s for s in statuses if "DELIVERY_OK" not in s), statuses[0])
+    pretty = re.sub(r"^(ADGROUP|AD|CAMPAIGN)_STATUS_", "", raw).replace("_", " ").lower()
+    return "Needs attention", f"TikTok reports this ad as \u201c{pretty}\u201d and it isn't delivering yet."
 
 
 class TikTokAdsAPIError(Exception):
@@ -1396,7 +1437,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         TikTok's Marketing API has no single combined field-expansion read the way
         Meta's does. Not yet verified against a live account, same honesty as the
         rest of this file."""
-        await self._get_campaign_record(campaign_id)  # 404s cleanly if unknown to us
+        record = await self._get_campaign_record(campaign_id)  # 404s cleanly if unknown to us
         now = datetime.now(timezone.utc)
         async with httpx.AsyncClient(timeout=30) as client:
             status_resp = await client.get(
@@ -1415,6 +1456,22 @@ class TikTokAdsAdapter(AdPlatformAdapter):
             # instead of an explicit value.
             raw_status = status_rows[0].get("operation_status", "") if status_rows else "DELETE"
             delivery = _DELIVERY_LABELS.get(raw_status, raw_status.replace("_", " ").title() or "Paused")
+
+            # `delivery` stays the plain ENABLE/DISABLE label: billing.py and monitoring.py
+            # treat "Active" as "running". What the client SEES is delivery_display plus
+            # delivery_note, from TikTok's own secondary_status. Only worth two extra
+            # calls when the campaign is on — a paused one is just Paused. Best-effort:
+            # a failed lookup must never cost the client their numbers.
+            delivery_display, delivery_note = "", ""
+            if raw_status == "ENABLE":
+                ad_status = await self._secondary_status(
+                    client, "/ad/get/", "ad_ids", record.get("ad_id", ""), "ad_id")
+                adgroup_status = await self._secondary_status(
+                    client, "/adgroup/get/", "adgroup_ids", record.get("adgroup_id", ""), "adgroup_id")
+                delivery_display, delivery_note = _tiktok_delivery_display(ad_status, adgroup_status)
+                if delivery_display:
+                    print(f"[TikTokAdsAdapter] campaign {campaign_id} is on but {delivery_display!r}: "
+                          f"ad={ad_status!r} adgroup={adgroup_status!r}", flush=True)
 
             report_resp = await client.get(
                 f"{self._api_base}/report/integrated/get/",
@@ -1448,6 +1505,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
 
         return {
             "delivery": delivery,
+            "delivery_display": delivery_display,
+            "delivery_note": delivery_note,
             "spend_ngn": spend_ngn,
             "impressions": int(float(metrics.get("impressions", 0))),
             "reach": int(float(metrics.get("reach", 0))),
@@ -1458,6 +1517,30 @@ class TikTokAdsAdapter(AdPlatformAdapter):
             "cost_per_conversation_ngn": cost_per_click,
             "ends_at": None,   # not stored on the campaign record today
         }
+
+    async def _secondary_status(
+        self, client: httpx.AsyncClient, endpoint: str, filter_key: str, object_id: str, id_field: str,
+    ) -> str:
+        """TikTok's secondary_status for one ad or ad group, or "" if it can't be read."""
+        if not object_id:
+            return ""
+        try:
+            resp = await client.get(
+                f"{self._api_base}{endpoint}",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "filtering": json.dumps({filter_key: [object_id]}),
+                    "fields": json.dumps([id_field, "operation_status", "secondary_status"]),
+                },
+            )
+            data = resp.json()
+            _raise_for_error(data, "delivery status read")
+            rows = (data.get("data") or {}).get("list") or []
+            return str(rows[0].get("secondary_status") or "") if rows else ""
+        except Exception as e:
+            print(f"[TikTokAdsAdapter] could not read {endpoint} secondary_status for {object_id}: {e}", flush=True)
+            return ""
 
     async def set_delivery(self, campaign_id: str, active: bool) -> dict:
         """Turn a campaign on or off from the caller's own campaign-management

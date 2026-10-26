@@ -12,7 +12,9 @@ import json
 import re
 from unittest.mock import AsyncMock, patch
 
-from app.agents.jane_ads.adapters.tiktok import _report_campaign_filter
+import pytest
+
+from app.agents.jane_ads.adapters.tiktok import _report_campaign_filter, _tiktok_delivery_display
 from app.agents.jane_ads.models import CampaignObjective, GeoMode, GeoPin, GeoPlan
 from tests.test_jane_ads_tiktok_adapter import (
     FakeDb,
@@ -225,3 +227,110 @@ def test_engagement_video_still_launches_under_video_views():
     client, _ = _launch(_plan(objective=CampaignObjective.ENGAGEMENT))
 
     assert client.sent("/campaign/create/")[0]["objective_type"] == "VIDEO_VIEWS"
+
+
+# ── What the client sees while a switched-on campaign is not delivering ────────
+# Live 2026-10-26: TikTok Ads Manager said "Not delivered" while URI said "Active",
+# because URI only read operation_status (ENABLE/DISABLE).
+
+@pytest.mark.parametrize("ad_status,adgroup_status,label", [
+    ("AD_STATUS_AUDIT", "ADGROUP_STATUS_DELIVERY_OK", "In review"),
+    ("AD_STATUS_REAUDIT", "", "In review"),
+    ("AD_STATUS_AUDIT_DENY", "ADGROUP_STATUS_DELIVERY_OK", "Needs changes"),
+    ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_NOT_START", "Scheduled"),
+    ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_TIME_DONE", "Ended"),
+    ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_BALANCE_EXCEED", "Needs billing info"),
+    ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_BUDGET_EXCEED", "Budget used"),
+    ("AD_STATUS_DISABLE", "ADGROUP_STATUS_DELIVERY_OK", "Ad paused"),
+    ("AD_STATUS_SOMETHING_NEW", "ADGROUP_STATUS_DELIVERY_OK", "Needs attention"),
+])
+def test_delivery_status_is_explained_in_the_clients_words(ad_status, adgroup_status, label):
+    shown, note = _tiktok_delivery_display(ad_status, adgroup_status)
+
+    assert shown == label
+    assert note
+
+
+def test_a_rejection_outranks_a_review_and_everything_else():
+    # Several levels can disagree; the client needs the one that needs them to act.
+    assert _tiktok_delivery_display("AD_STATUS_AUDIT_DENY", "ADGROUP_STATUS_AUDIT")[0] == "Needs changes"
+    assert _tiktok_delivery_display("AD_STATUS_AUDIT", "ADGROUP_STATUS_NOT_START")[0] == "In review"
+
+
+@pytest.mark.parametrize("ad_status,adgroup_status", [
+    ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_DELIVERY_OK"),
+    ("", ""),
+    ("AD_STATUS_DELIVERY_OK", ""),
+])
+def test_a_delivering_or_unknown_campaign_gets_no_override(ad_status, adgroup_status):
+    assert _tiktok_delivery_display(ad_status, adgroup_status) == ("", "")
+
+
+def test_an_unrecognised_status_is_shown_in_tiktoks_own_words():
+    label, note = _tiktok_delivery_display("AD_STATUS_FROZEN_BY_ADMIN", "ADGROUP_STATUS_DELIVERY_OK")
+
+    assert label == "Needs attention"
+    assert "frozen by admin" in note
+
+
+def _summary(campaign_status, ad_status="", adgroup_status=""):
+    adapter = _adapter(FakeDb())
+    _seed_campaign(adapter)
+    client = _RoutedClient({
+        "/campaign/get/": {"code": 0, "message": "OK", "data": {"list": [
+            {"campaign_id": "111", "operation_status": campaign_status}]}},
+        "/ad/get/": {"code": 0, "message": "OK", "data": {"list": [
+            {"ad_id": "333", "secondary_status": ad_status}]}},
+        "/adgroup/get/": {"code": 0, "message": "OK", "data": {"list": [
+            {"adgroup_id": "222", "secondary_status": adgroup_status}]}},
+    })
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = client
+        return client, _run(adapter.fetch_campaign_summary("111"))
+
+
+def test_a_switched_on_campaign_in_review_stays_active_for_billing_but_shows_in_review():
+    client, summary = _summary("ENABLE", "AD_STATUS_AUDIT", "ADGROUP_STATUS_DELIVERY_OK")
+
+    # billing.py and monitoring.py treat "Active" as running — that must not change.
+    assert summary["delivery"] == "Active"
+    assert summary["delivery_display"] == "In review"
+    assert "reviewing" in summary["delivery_note"]
+    assert len(client.sent("/ad/get/")) == 1 and len(client.sent("/adgroup/get/")) == 1
+
+
+def test_a_delivering_campaign_has_no_note():
+    _, summary = _summary("ENABLE", "AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_DELIVERY_OK")
+
+    assert summary["delivery"] == "Active"
+    assert summary["delivery_display"] == ""
+    assert summary["delivery_note"] == ""
+
+
+def test_a_paused_campaign_costs_no_extra_calls():
+    client, summary = _summary("DISABLE")
+
+    assert summary["delivery"] == "Paused"
+    assert summary["delivery_display"] == ""
+    assert client.sent("/ad/get/") == [] and client.sent("/adgroup/get/") == []
+
+
+def test_a_failed_status_lookup_never_costs_the_client_their_numbers():
+    adapter = _adapter(FakeDb())
+    _seed_campaign(adapter)
+    client = _RoutedClient({
+        "/campaign/get/": {"code": 0, "message": "OK", "data": {"list": [
+            {"campaign_id": "111", "operation_status": "ENABLE"}]}},
+        "/ad/get/": {"code": 40100, "message": "temporary failure", "data": {}},
+        "/adgroup/get/": {"code": 40100, "message": "temporary failure", "data": {}},
+        "/report/integrated/get/": {"code": 0, "message": "OK", "data": {"list": [
+            {"metrics": {"spend": "6000.0", "clicks": "9", "impressions": "15304", "reach": "9000"}}]}},
+    })
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = client
+        summary = _run(adapter.fetch_campaign_summary("111"))
+
+    assert summary["delivery"] == "Active"
+    assert summary["delivery_display"] == ""
+    assert summary["spend_ngn"] == 6000.0
+    assert summary["impressions"] == 15304
