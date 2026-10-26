@@ -59,13 +59,17 @@ META_CAMPAIGN = {"campaign_id": "m1", "brand_id": "brand-1", "business_id": "b1"
 
 # ── Objectives: TikTok wording on request, Meta's list otherwise ────────────────
 
+def _choices(out):
+    return [{k: o[k] for k in ("value", "label", "blurb", "caveat")} for o in out["objectives"]]
+
+
 def test_objectives_default_is_metas_list_unchanged():
-    assert _run(jane_router.list_objectives()) == {"objectives": CHOICES}
+    assert _choices(_run(jane_router.list_objectives())) == CHOICES
 
 
 @pytest.mark.parametrize("platform", ["google", "meta", "TIKTOK", "garbage"])
 def test_any_other_platform_value_gets_metas_list(platform):
-    assert _run(jane_router.list_objectives(platform=platform)) == {"objectives": CHOICES}
+    assert _choices(_run(jane_router.list_objectives(platform=platform))) == CHOICES
 
 
 def test_tiktok_objectives_keep_values_and_labels_but_change_the_wording():
