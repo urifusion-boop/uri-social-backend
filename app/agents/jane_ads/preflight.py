@@ -12,9 +12,8 @@ import asyncio
 import re
 from typing import Optional
 
-import httpx
-
 from app.core.config import settings
+from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
 
 _RATIO_OK = ((9 / 16, 0.03), (4 / 5, 0.03), (1.0, 0.03))
 _MAX_STORY_SECONDS = 60
@@ -31,31 +30,25 @@ def whatsapp_link_steps(number: str) -> str:
     )
 
 
-async def page_has_whatsapp(page_id: str) -> Optional[bool]:
-    """Whether Meta shows a WhatsApp number on this Page; None when it can't be told."""
-    if not (page_id and settings.META_ADS_ACCESS_TOKEN):
-        return None
-    url = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}"
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            data = (await client.get(url, params={"fields": "whatsapp_number",
-                                                  "access_token": settings.META_ADS_ACCESS_TOKEN})).json()
-    except (httpx.HTTPError, ValueError):
-        return None
-    if "error" in data:
-        return None
-    return bool(data.get("whatsapp_number"))
-
-
 async def whatsapp_warning(plan) -> list[str]:
+    """Meta only shows a WhatsApp number to a token holding whatsapp_business_management,
+    so an absent field means "can't see", never "not linked". The only certain answer is
+    the dry-run at launch; here the client is told what must be true and how to check."""
     if (plan.destination_type or "") != "whatsapp":
         return []
-    if await page_has_whatsapp(plan.page_id) is not False:
+    linked = await page_has_whatsapp_linked(plan.page_id, settings.META_ADS_ACCESS_TOKEN)
+    if linked:
         return []
+    if linked is False:
+        return [
+            "Meta says no WhatsApp number is linked to your Facebook Page, so an ad that opens a "
+            "WhatsApp chat can look set up but never deliver. To link it:\n"
+            + whatsapp_link_steps(plan.whatsapp_number)
+        ]
     return [
-        "Your Facebook Page doesn't show a WhatsApp number linked, so Meta may not run an ad "
-        "that opens a WhatsApp chat — the ad would look set up but never deliver. To link it:\n"
-        + whatsapp_link_steps(plan.whatsapp_number)
+        "This ad opens a WhatsApp chat, which only works if your WhatsApp number is linked to your "
+        "Facebook Page — we can't see that link from here. If you've already linked it, ignore this. "
+        "To check or link it:\n" + whatsapp_link_steps(plan.whatsapp_number)
     ]
 
 
