@@ -1899,6 +1899,7 @@ async def _generate_final_copy(
     platforms: List[str],
     existing_assets_summary: str,
     force: bool = False,
+    avoid_context: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """PRD Step8 (final copy) and Step9 (creative direction) share ONE
     chunked network call here rather than two — a deliberate simplification
@@ -1909,7 +1910,17 @@ async def _generate_final_copy(
     to fix (see generate_plan_v2's concurrency comments). The PRD's real
     requirement — copy generation must not reinterpret the approved concept
     — is satisfied by fixing territory/subject/angle/device/format as given
-    inputs the model is told not to touch, not by forcing a second round-trip."""
+    inputs the model is told not to touch, not by forcing a second round-trip.
+
+    avoid_context: other, already-finalized items from the SAME plan that
+    concepts_chunk must not duplicate — used by _regenerate_flagged_items.
+    Without this, regenerating a flagged item in isolation only guarantees
+    it differs from the OTHER items being regenerated alongside it in this
+    same call; it has no idea what the plan's other ~29 untouched items
+    already say, so the "fixed" item can easily land right back on a title/
+    hook/visual idea that duplicates one of those — confirmed live: a plan
+    still showed items flagged similar after its one auto-regeneration pass
+    supposedly fixed them, for exactly this reason."""
     n = len(concepts_chunk)
     brand_name = brand.get("brand_name") or "the brand"
     industry = brand.get("industry") or "business"
@@ -1997,6 +2008,24 @@ async def _generate_final_copy(
     ]
     carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
 
+    avoid_context_block = ""
+    if avoid_context:
+        avoid_lines = [
+            f"- {(c.get('exact_copy') or {}).get('headline') or c.get('title', '')} "
+            f"/ hook: {c.get('hook', '')} "
+            f"/ visual idea: {(c.get('creative_direction') or {}).get('central_visual_idea') or c.get('central_visual_idea', '')}"
+            for c in avoid_context
+            if c.get("title") or c.get("hook")
+        ]
+        if avoid_lines:
+            avoid_context_block = (
+                "\n\n=== ALREADY USED ELSEWHERE IN THIS SAME 30-DAY PLAN — DO NOT DUPLICATE ===\n"
+                "These items are staying as-is. Your new item(s) below must not be a reworded "
+                "version of any of these — different headline, different hook, different visual "
+                "idea, and not leaning on the same underlying angle just phrased differently:\n"
+                + "\n".join(avoid_lines)
+            )
+
     # Substitute the real brand name into {brand}-templated entries for display
     # — truncating at the placeholder (the old approach) left phrases like
     # "at {brand}, we" showing as the near-meaningless "at..." to the model.
@@ -2027,6 +2056,7 @@ then the CTA. Do not start from "what text goes on the graphic."
 
 {concepts_block}
 {carousel_spec}
+{avoid_context_block}
 
 HEADLINE STANDARD — every title/headline must create curiosity, tension,
 recognition, surprise, contrarian thinking, or real specificity. It should
@@ -2203,10 +2233,13 @@ async def _regenerate_flagged_items(
     concepts_chunk = [items_by_index[i] for i in flagged_day_indices if i in items_by_index]
     if not concepts_chunk:
         return {}
+    flagged_set = set(flagged_day_indices)
+    avoid_context = [item for i, item in items_by_index.items() if i not in flagged_set]
     try:
         regenerated = await _generate_final_copy(
             brand=brand, concepts_chunk=concepts_chunk, platforms=platforms,
             existing_assets_summary=existing_assets_summary, force=True,
+            avoid_context=avoid_context,
         )
     except Exception as exc:
         print(f"[CalendarV2] auto-regeneration of {len(concepts_chunk)} flagged item(s) failed: {exc}", flush=True)
