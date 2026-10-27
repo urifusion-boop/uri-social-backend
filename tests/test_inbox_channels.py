@@ -337,3 +337,14 @@ def test_every_token_for_a_page_is_tried_until_meta_accepts_one():
     assert tried == ["weak", "tok"]
     assert out["subscriptions"][0]["subscribed"] is True
     assert all(d["access_token"] == "tok" for d in db[CHANNEL_ACCOUNTS].docs)
+
+
+def test_a_refused_subscription_is_explained_by_its_cause():
+    from app.agents.inbox.channels import subscription_issue
+
+    admin = subscription_issue("(#200) User does not have sufficient administrative permission for this action on this page.", "uri.social")
+    assert admin["code"] == "not_page_admin" and "Full control" in admin["message"] and "uri.social" in admin["message"]
+    perm = subscription_issue("(#200) one of these permissions is needed: pages_messaging.")
+    assert perm["code"] == "missing_permission" and "connect Instagram again" in perm["message"]
+    assert subscription_issue("") == {}
+    assert subscription_issue("boom")["code"] == "subscription_failed"
