@@ -13,20 +13,29 @@ def _plan(dest="whatsapp", is_video=False, url="https://res.cloudinary.com/x/vid
                            creative=SimpleNamespace(is_video=is_video, image_url=url))
 
 
-def test_whatsapp_ad_without_a_linked_number_warns_with_the_steps(monkeypatch):
-    async def none_linked(page_id):
-        return False
-    monkeypatch.setattr(preflight, "page_has_whatsapp", none_linked)
+def _linked_as(monkeypatch, answer):
+    async def fake(page_id, token):
+        return answer
+    monkeypatch.setattr(preflight, "page_has_whatsapp_linked", fake)
+
+
+def test_meta_saying_not_linked_warns_firmly_with_the_steps(monkeypatch):
+    _linked_as(monkeypatch, False)
     out = _run(preflight.whatsapp_warning(_plan()))
-    assert len(out) == 1 and "Linked accounts → WhatsApp" in out[0] and "+2348012345678" in out[0]
+    assert len(out) == 1 and out[0].startswith("Meta says no WhatsApp number")
+    assert "Linked accounts → WhatsApp" in out[0] and "+2348012345678" in out[0]
 
 
-def test_linked_unknown_or_non_whatsapp_gives_no_warning(monkeypatch):
-    for answer in (True, None):
-        async def fake(page_id, a=answer):
-            return a
-        monkeypatch.setattr(preflight, "page_has_whatsapp", fake)
-        assert _run(preflight.whatsapp_warning(_plan())) == []
+def test_unverifiable_link_is_a_soft_check_not_a_claim(monkeypatch):
+    _linked_as(monkeypatch, None)
+    out = _run(preflight.whatsapp_warning(_plan()))
+    assert len(out) == 1 and "can't see that link" in out[0] and "ignore this" in out[0]
+    assert "doesn't show" not in out[0] and "Meta says no" not in out[0]
+
+
+def test_linked_or_non_whatsapp_gives_no_warning(monkeypatch):
+    _linked_as(monkeypatch, True)
+    assert _run(preflight.whatsapp_warning(_plan())) == []
     assert _run(preflight.whatsapp_warning(_plan(dest="website"))) == []
 
 
