@@ -616,6 +616,48 @@ def _concept_pool_avoid_block(concepts: List[Dict[str, Any]]) -> str:
     )
 
 
+def _allocate_territories(territories: Dict[str, Dict[str, Any]], total: int) -> List[str]:
+    """Returns a list of `total` territory keys, round-robin across every
+    territory in `territories` (interleaved, not grouped, so slicing this
+    into chunks gives each chunk a representative mix rather than one
+    territory per chunk), honoring each territory's own `max_share` cap
+    (e.g. L_COMMERCIAL's PRD §8 "must not dominate the calendar" ceiling)
+    where one is declared.
+
+    This exists because leaving territory choice to the model's own
+    judgment ("draw from these freely") let it default to whichever 2-3
+    territories felt safest for the brand every time, regardless of how
+    many other territories were available — confirmed live: URI's
+    calendar stayed ~25/30 "similar"-flagged even after candidate chunks
+    were made aware of each other's output (today's wave-splitting fix),
+    because awareness alone doesn't force actually using the other 8-9
+    unused territories. This is purely which STRATEGIC LENS each concept
+    is framed through (problem/desire/proof/process/etc.) — every concept
+    generated from any territory is still fully grounded in this specific
+    brand's name, audience, voice and rules, which are injected into every
+    chunk's prompt unconditionally and untouched by this function."""
+    keys = list(territories.keys())
+    if not keys or total <= 0:
+        return []
+    caps = {
+        k: max(1, round(total * t["max_share"])) if "max_share" in t else total
+        for k, t in territories.items()
+    }
+    counts = {k: 0 for k in keys}
+    out: List[str] = []
+    idx = 0
+    guard_limit = total * len(keys) + len(keys) * 2  # safety bound, not expected to be hit
+    guard = 0
+    while len(out) < total and guard < guard_limit:
+        k = keys[idx % len(keys)]
+        if counts[k] < caps[k]:
+            out.append(k)
+            counts[k] += 1
+        idx += 1
+        guard += 1
+    return out
+
+
 async def _generate_candidate_concepts(
     brand: Dict[str, Any],
     framework: Dict[str, Any],
@@ -720,7 +762,27 @@ async def _generate_candidate_concepts(
         chunk_sizes.append(size)
         remaining -= size
 
-    async def _one_chunk(chunk_idx: int, n: int, extra_avoid_block: str = "") -> List[Dict[str, Any]]:
+    # Assign each chunk a required territory mix instead of leaving territory
+    # choice to the model's own judgment — see _allocate_territories' own
+    # docstring for why. Slicing one interleaved allocation sequentially
+    # gives each chunk a representative sub-mix of the whole run's spread.
+    territory_assignment = _allocate_territories(framework["territories"], target_count)
+    chunk_territories: List[List[str]] = []
+    _offset = 0
+    for _size in chunk_sizes:
+        chunk_territories.append(territory_assignment[_offset:_offset + _size])
+        _offset += _size
+
+    async def _one_chunk(
+        chunk_idx: int, n: int, assigned_territories: List[str], extra_avoid_block: str = ""
+    ) -> List[Dict[str, Any]]:
+        territory_counts: Dict[str, int] = {}
+        for _t in assigned_territories:
+            territory_counts[_t] = territory_counts.get(_t, 0) + 1
+        territory_requirement_block = "\n".join(
+            f"- {count} concept(s) from {key} ({framework['territories'][key]['label']})"
+            for key, count in territory_counts.items()
+        ) or f"- {n} concept(s), any territory below"
         prompt = f"""You are a senior creative strategist generating CANDIDATE content
 CONCEPTS for {brand_name}, a {industry} business. Target audience: {audience}.
 Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
@@ -728,8 +790,15 @@ Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
 {stage_note}{context_block}{assets_block}{avoid_block}{extra_avoid_block}{psychology_block}
 Platforms: {', '.join(platforms) if platforms else 'social media'}.
 
-Available Content Territories (draw from these freely — you don't need every one):
+Content Territories (full list, for context on what each means):
 {territories_block}
+
+THIS BATCH'S REQUIRED TERRITORY MIX — produce exactly this many concepts from
+each territory listed, no substitutions and nothing from a territory not
+listed here. Every concept, regardless of territory, must still be entirely
+about {brand_name} specifically — the territory only changes the framing
+(e.g. a problem to solve vs. proof of results), never what business it's about:
+{territory_requirement_block}
 
 Available Angles: {angles_block}
 
@@ -839,7 +908,9 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
     half = max(1, len(chunk_sizes) // 2)
     wave1_sizes, wave2_sizes = chunk_sizes[:half], chunk_sizes[half:]
 
-    wave1_results = await asyncio.gather(*[_one_chunk(i, size) for i, size in enumerate(wave1_sizes)])
+    wave1_results = await asyncio.gather(*[
+        _one_chunk(i, size, chunk_territories[i]) for i, size in enumerate(wave1_sizes)
+    ])
     wave1_concepts = [c for chunk in wave1_results for c in chunk]
 
     if not wave2_sizes:
@@ -847,7 +918,7 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
 
     wave1_avoid_block = _concept_pool_avoid_block(wave1_concepts)
     wave2_results = await asyncio.gather(*[
-        _one_chunk(half + i, size, extra_avoid_block=wave1_avoid_block)
+        _one_chunk(half + i, size, chunk_territories[half + i], extra_avoid_block=wave1_avoid_block)
         for i, size in enumerate(wave2_sizes)
     ])
     wave2_concepts = [c for chunk in wave2_results for c in chunk]
