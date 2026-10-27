@@ -450,3 +450,19 @@ def test_a_budget_below_the_minimum_is_refused_even_by_hand():
     rec = {"action_type": "set_daily_budget", "executable": True, "parameters": {"from_ngn": 2250, "to_ngn": 1500}}
     ok, why = pol.check(pol.normalize({}), rec, STATE, by_user=True, manual=True)
     assert not ok and "₦2,000" in why
+
+
+def test_missing_headline_description_and_meta_issues_are_flagged():
+    ad = {"id": "a1", "name": "Ad one", "effective_status": "ACTIVE",
+          "creative": {"object_story_spec": {"link_data": {"message": "hi"}}},
+          "issues_info": [{"error_summary": "Ad undeliverable to Instagram Feed"}]}
+    rev = metrics.parse_ad_review(ad)
+    assert rev["problems"] == ["No headline", "No description", "Ad undeliverable to Instagram Feed"]
+    found = detect.detect(rows({1: (300, 500, 10, 3)}), ctx(ad_review=[rev]))
+    f = [f for f in found if f["issue_type"] == "creative_issues"][0]
+    d = diagnose.diagnose(f, {})
+    assert "No headline" in d["hypotheses"][0]["why"] and d["recommendations"][0]["action_type"] == "fix_ad_details"
+    complete = metrics.parse_ad_review({"id": "a2", "effective_status": "ACTIVE", "creative": {
+        "object_story_spec": {"link_data": {"name": "Hi", "description": "There"}}}})
+    assert complete["problems"] == []
+    assert "creative_issues" not in issues(detect.detect(rows({1: (300, 500, 10, 3)}), ctx(ad_review=[complete])))
