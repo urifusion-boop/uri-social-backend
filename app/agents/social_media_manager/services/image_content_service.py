@@ -909,6 +909,16 @@ class ImageContentService:
                     f"This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
+            _safe_margins = ImageContentService._safe_zone_margins_pct(specs["width"], specs["height"])
+            _tb_pct = _safe_margins["top_bottom"]
+            _lr_pct = _safe_margins["left_right"]
+            _crop_note = (
+                "\nThis image will be generated at a different aspect ratio than its final "
+                "size, then center-cropped to fit — the margins below already include a "
+                "buffer for that crop, so treat them as the true usable canvas, not a style "
+                "preference."
+                if (_tb_pct > 12 or _lr_pct > 12) else ""
+            )
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
 You must follow every instruction below precisely.
@@ -918,10 +928,11 @@ Do NOT draw from your training data to add elements not described in this prompt
 Every element in the image must come from the instructions below. Nothing else.
 
 CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
-Every letter of every word must be 100% inside the image canvas with no clipping.
-Maintain a minimum 12% safe-zone margin from every edge (top, bottom, left, right).
-Headlines must begin at least 12% from the top edge. CTA text must end at least 12%
-from the bottom edge. If text is too large to fit within these margins, reduce the
+Every letter of every word must be 100% inside the image canvas with no clipping.{_crop_note}
+Maintain a minimum {_tb_pct}% safe-zone margin from the top and bottom edges, and a
+minimum {_lr_pct}% safe-zone margin from the left and right edges.
+Headlines must begin at least {_tb_pct}% from the top edge. CTA text must end at least
+{_tb_pct}% from the bottom edge. If text is too large to fit within these margins, reduce the
 font size — do NOT let any character touch or cross any edge. This rule overrides
 any visual style, typography, or layout instruction that follows.{logo_space_note}"""
 
@@ -2991,6 +3002,52 @@ Answer with exactly one word: "yes" or "no"."""
         buf = io.BytesIO()
         cropped.save(buf, format="WEBP", quality=97, method=6)
         return _b64.b64encode(buf.getvalue()).decode()
+
+    @staticmethod
+    def _safe_zone_margins_pct(target_w: int, target_h: int, base_pct: int = 12) -> Dict[str, int]:
+        """
+        How much top/bottom and left/right margin the generation prompt must ask
+        for so that headline/CTA text survives _crop_to_ratio's post-generation
+        center-crop, not just the raw canvas the model draws on.
+
+        GPT-Image-2 only ever generates one of 3 fixed buckets (landscape
+        1536x1024, portrait 1024x1536, square 1024x1024 — see the size selection
+        in _call_dalle_api) and _crop_to_ratio then center-crops that bucket down
+        to the platform's real target ratio. For a close match (square targets,
+        roughly-4:3/3:4 targets) the crop is negligible and base_pct is enough,
+        same as before this existed. For a mismatched target — LinkedIn's 1200x628
+        (1.91:1) against the 1.5:1 landscape bucket is the worst case in this app,
+        per _call_dalle_api's own comment — the crop alone removes ~11% off the
+        top AND ~11% off the bottom before the image is even resized, which eats
+        almost the entire flat 12% margin the model was told to respect and
+        reliably clips headline text. Returns the margin the model must be told
+        to leave on the axis that actually gets cropped, so "safe" in the prompt
+        means safe after the crop too, not just on the model's own canvas.
+        """
+        if target_w > target_h:
+            gen_w, gen_h = 1536, 1024
+        elif target_h > target_w:
+            gen_w, gen_h = 1024, 1536
+        else:
+            gen_w, gen_h = 1024, 1024
+
+        gen_ratio = gen_w / gen_h
+        target_ratio = target_w / target_h
+
+        top_bottom_pct = base_pct
+        left_right_pct = base_pct
+
+        if abs(gen_ratio - target_ratio) / target_ratio >= 0.02:
+            if target_ratio > gen_ratio:
+                new_h = gen_w / target_ratio
+                cropped_frac_each_side = ((gen_h - new_h) / gen_h) / 2
+                top_bottom_pct = min(40, base_pct + round(cropped_frac_each_side * 100))
+            else:
+                new_w = gen_h * target_ratio
+                cropped_frac_each_side = ((gen_w - new_w) / gen_w) / 2
+                left_right_pct = min(40, base_pct + round(cropped_frac_each_side * 100))
+
+        return {"top_bottom": top_bottom_pct, "left_right": left_right_pct}
 
     @staticmethod
     async def crop_and_reupload_for_tiktok(image_url: str, user_id: str) -> str:
