@@ -6,6 +6,7 @@ separating a real customer message from anything a stranger POSTs at the URL.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Optional
 
@@ -355,7 +356,14 @@ async def list_channels(
     workspace_id = brand_ctx.get("brand_id")
     # Kept in step with Connected Accounts: connecting or disconnecting there is all
     # it takes for the inbox to follow.
-    if not await in_sync_with_connections(db, workspace_id):
+    # Never checked, or refused earlier and due another try — a reconnect in Connected
+    # Accounts keeps the same account ids, so nothing else would notice it was fixed.
+    unchecked = await db[CHANNEL_ACCOUNTS].count_documents(
+        {"workspace_id": workspace_id, "platform": {"$in": ["instagram", "facebook"]},
+         "$or": [{"subscription": {"$exists": False}},
+                 {"subscription.ok": False,
+                  "subscription.checked_at": {"$lt": datetime.now(timezone.utc) - timedelta(minutes=2)}}]})
+    if unchecked or not await in_sync_with_connections(db, workspace_id):
         try:
             await link_workspace_channels(db, brand_ctx.get("user_id", ""), workspace_id)
         except Exception as e:
@@ -390,6 +398,7 @@ async def list_channels(
             "has_token": bool(r.get("access_token")),
             "last_event_at": (last_conv[0].get("last_activity_at") if last_conv else None),
             "needs_reconnect": not live,
+            "subscription_ok": (r.get("subscription") or {}).get("ok"),
         })
     return {"channels": out}
 
