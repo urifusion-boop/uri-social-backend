@@ -750,56 +750,80 @@ async def generate_content(
             # overlapping it. Fire each draft's (or slide's) generation as its own
             # asyncio task so they actually run concurrently. Keep references so
             # nothing gets garbage-collected mid-flight.
+            # Structural fix, not a one-off: everything between the optimistic
+            # has_image=True write above and the asyncio.create_task calls
+            # below can throw (carousel style resolution, a missing dict key,
+            # anything) — when it does, the outer except below turns it into
+            # a 500 for the whole request, but the has_image=True write
+            # already happened and nothing is left to ever flip image_failed,
+            # since the one background task that would do that never got
+            # created. The draft sits there "generating" forever with no
+            # path to resolve. Wrap the setup itself so any failure here
+            # marks every draft this batch touched as image_failed instead
+            # of leaving it stuck — confirmed live on the content-calendar
+            # version of this exact same pattern (content_calendar_v2_router.py).
             _bg_image_tasks: List[asyncio.Task] = []
-            for draft in drafts:
-                if post_type == "carousel":
-                    slides = draft.get("slides") or []
-                    # Pass total_slides and carousel_id for visual continuity
-                    total_slides = len(slides)
-                    carousel_id = draft["id"]  # All slides share same carousel_id
-                    carousel_brand_context = await _resolve_carousel_shared_context(
-                        db=db,
-                        brand_context=brand_context_dict,
-                        style_override=request.style_override,
-                        carousel_id=carousel_id,
-                        platform=draft["platform"],
-                    )
-                    for slide_index, slide in enumerate(slides):
-                        # Combine slide-specific content with original seed for richer context
-                        slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
-                        # Preserve original seed content for elegant, contextual image generation
-                        # Format: "Original context: {seed}. This slide focuses on: {slide headline and body}"
-                        enriched_seed = f"{request.seed_content}. This slide: {slide_content}"
+            try:
+                for draft in drafts:
+                    if post_type == "carousel":
+                        slides = draft.get("slides") or []
+                        # Pass total_slides and carousel_id for visual continuity
+                        total_slides = len(slides)
+                        carousel_id = draft["id"]  # All slides share same carousel_id
+                        carousel_brand_context = await _resolve_carousel_shared_context(
+                            db=db,
+                            brand_context=brand_context_dict,
+                            style_override=request.style_override,
+                            carousel_id=carousel_id,
+                            platform=draft["platform"],
+                        )
+                        for slide_index, slide in enumerate(slides):
+                            # Combine slide-specific content with original seed for richer context
+                            slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+                            # Preserve original seed content for elegant, contextual image generation
+                            # Format: "Original context: {seed}. This slide focuses on: {slide headline and body}"
+                            enriched_seed = f"{request.seed_content}. This slide: {slide_content}"
+                            _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
+                                draft_id=draft["id"],
+                                platform=draft["platform"],
+                                content=slide_content or draft["content"],
+                                seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
+                                brand_context=carousel_brand_context,
+                                db=db,
+                                reference_image=_slide_reference_image(slide_index),
+                                post_type=post_type,
+                                slide_index=slide_index,
+                                image_model=request.image_model,
+                                total_slides=total_slides,
+                                carousel_id=carousel_id,
+                                style_override=request.style_override,
+                                use_true_compositing=request.use_true_compositing,
+                            )))
+                    else:
                         _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
                             draft_id=draft["id"],
                             platform=draft["platform"],
-                            content=slide_content or draft["content"],
-                            seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
-                            brand_context=carousel_brand_context,
+                            content=draft["content"],
+                            seed_content=request.seed_content,
+                            brand_context=brand_context_dict,
                             db=db,
-                            reference_image=_slide_reference_image(slide_index),
+                            reference_image=ref_images[0] if ref_images else None,
                             post_type=post_type,
-                            slide_index=slide_index,
                             image_model=request.image_model,
-                            total_slides=total_slides,
-                            carousel_id=carousel_id,
                             style_override=request.style_override,
                             use_true_compositing=request.use_true_compositing,
                         )))
-                else:
-                    _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
-                        draft_id=draft["id"],
-                        platform=draft["platform"],
-                        content=draft["content"],
-                        seed_content=request.seed_content,
-                        brand_context=brand_context_dict,
-                        db=db,
-                        reference_image=ref_images[0] if ref_images else None,
-                        post_type=post_type,
-                        image_model=request.image_model,
-                        style_override=request.style_override,
-                        use_true_compositing=request.use_true_compositing,
-                    )))
+            except Exception as image_setup_error:
+                print(
+                    f"❌ [generate_content] image task setup failed before any background "
+                    f"task started for user={user_id}: {image_setup_error}\n{traceback.format_exc()}"
+                )
+                if draft_ids:
+                    await db["content_drafts"].update_many(
+                        {"id": {"$in": draft_ids}},
+                        {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                    )
+                _bg_image_tasks = []
             _BG_IMAGE_TASKS.update(_bg_image_tasks)
             for t in _bg_image_tasks:
                 t.add_done_callback(_BG_IMAGE_TASKS.discard)
