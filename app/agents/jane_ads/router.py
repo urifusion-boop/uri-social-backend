@@ -2696,6 +2696,13 @@ async def _build_campaign_plan(
     # functions at all, so the leakage check had no way to catch them.
     variant_geo_pockets = selected_variant.geo_pockets if selected_variant else None
 
+    # Tell the creative step which platform the campaign actually launches on, so a TikTok
+    # campaign's ad copy and image brief are written for TikTok, not Meta/Instagram. Meta
+    # (and anything else) keeps "meta" and is untouched.
+    copy_platform = (Platform.TIKTOK.value
+                     if plan.platforms and plan.platforms[0].platform == Platform.TIKTOK
+                     else Platform.META.value)
+
     if body.creative_source == "upload":
         creative = await creative_from_upload(
             business_name, category, body.reference_image_url, req.goal.value, req.description,
@@ -2705,6 +2712,7 @@ async def _build_campaign_plan(
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
             vsg01_format_id=body.vsg01_format_id, day30_photo_url=body.reference_image_url_2 or None,
+            platform=copy_platform,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -2714,7 +2722,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
-            vsg01_format_id=body.vsg01_format_id,
+            vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
@@ -2723,7 +2731,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
+            destination_cta=destination_cta, platform=copy_platform,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -2737,7 +2745,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
+            destination_cta=destination_cta, platform=copy_platform,
         )
     else:
         # AI generation is the one creative path that costs a content credit — an
@@ -2759,7 +2767,7 @@ async def _build_campaign_plan(
             # Drives creative-stage retrieval; without it budget is 0, retrieval
             # bails early, and the ad ships with corpus_coverage="none".
             budget_ngn=float(parsed.budget_ngn or 0),
-            vsg01_format_id=body.vsg01_format_id,
+            vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -2830,6 +2838,7 @@ async def _build_campaign_plan(
             pushback_script = await write_shoot_script(
                 business_name, category, req.goal.value, creative.video_recommendation,
                 req.description, await get_brand_context(user_id, db, brand_id) if user_id else {},
+                platform=copy_platform,
             )
         except Exception as e:
             print(f"[oneshot] pushback shoot script skipped: {e}", flush=True)
@@ -2861,6 +2870,7 @@ async def _build_campaign_plan(
             plan.shoot_script = await write_shoot_script(
                 business_name, category, req.goal.value, creative.video_recommendation,
                 req.description, await get_brand_context(user_id, db, brand_id) if user_id else {},
+                platform=copy_platform,
             )
         except Exception as e:
             print(f"[oneshot] shoot script skipped: {e}", flush=True)
