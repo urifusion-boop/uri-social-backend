@@ -616,6 +616,41 @@ def _concept_pool_avoid_block(concepts: List[Dict[str, Any]]) -> str:
     )
 
 
+# Confirmed live: 6+ items on a single 30-day URI plan independently landed
+# on the same "chaos -> simple/smooth/effortless" payoff language, each
+# written by a different one of the 5 concurrent final-copy batches with no
+# visibility into the others — flagged by _llm_diversity_check's crutch-word
+# criterion. These words are legitimately part of some brands' own voice
+# (URI's own tagline uses "streamlined"), so an outright ban would fight
+# brand authenticity. Instead only a deterministic ~1-in-N items (by
+# day_index — the same pre-assignment trick that already fixed territory
+# clustering, see _allocate_territories) may use this language; every other
+# item must express the same benefit more specifically. This reuses the
+# words_to_avoid hard-validation + correction-retry mechanism
+# _generate_final_copy already has for brand.words_to_avoid — no new
+# mechanism, and critically no added sequential round-trip/latency, since
+# it's enforced within the existing per-chunk retry budget.
+_CRUTCH_WORDS = [
+    "simplify", "simplicity", "effortless", "seamless", "hassle-free",
+    "streamline", "smooth", "chaos",
+]
+_CRUTCH_WORD_ALLOWED_EVERY = 5  # ~1 in 5 items may use this language
+
+# Deterministically assigned per item (by day_index) instead of left to the
+# model's own judgment, so the 5 concurrent final-copy batches don't all
+# independently converge on the same safe CTA template — confirmed live: 6
+# items on one plan all used "[Verb] how URI can [benefit] your business
+# today." Same zero-added-latency pre-assignment principle as the crutch-
+# word allowance above and _allocate_territories.
+_CTA_STYLE_VARIANTS = [
+    "Direct action — say exactly what to do next (e.g. \"Book a free demo\", \"Start your free trial\")",
+    "Curiosity-driven — invite them to find out more without stating the outcome up front (e.g. \"See what changes\", \"Find out how\")",
+    "Social proof — point at other real users or results, not a generic claim (e.g. \"See why other businesses switched\")",
+    "Low-commitment first step — small and easy (e.g. \"Send a quick message\", \"Ask a question\")",
+    "Specific next step — name the exact feature, page, or action, never a generic verb",
+]
+
+
 def _allocate_territories(territories: Dict[str, Dict[str, Any]], total: int) -> List[str]:
     """Returns a list of `total` territory keys, round-robin across every
     territory in `territories` (interleaved, not grouped, so slicing this
@@ -2125,7 +2160,8 @@ async def _generate_final_copy(
   Creative device: {(c.get('creative_device') or {}).get('device')} ({(c.get('creative_device') or {}).get('category')})
   Concept: {c.get('concept_name') or c.get('creative_concept_name', '')}
   Objective: {c.get('objective')} | Audience segment: {c.get('audience_segment', '')}
-  Format: {_fmt_line(c)}"""
+  Format: {_fmt_line(c)}
+  CTA style (use this, not a generic template): {_CTA_STYLE_VARIANTS[c.get('day_index', i) % len(_CTA_STYLE_VARIANTS)]}"""
         + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
            f"make it the subject of the post, by name." if c.get("key_date")
            else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
@@ -2306,9 +2342,12 @@ business's actual customers, not a generic reader?
             expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
             if is_carousel:
                 _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-3 hard rule
+            item_words_to_avoid = _all_banned_words(brand)
+            if concepts_chunk[i].get("day_index", i) % _CRUTCH_WORD_ALLOWED_EVERY != 0:
+                item_words_to_avoid = item_words_to_avoid + _CRUTCH_WORDS
             issues = _validate_item_v2(
                 idea, is_carousel=is_carousel, expected_slides=expected_slides,
-                words_to_avoid=_all_banned_words(brand),
+                words_to_avoid=item_words_to_avoid,
             )
             if issues:
                 failures[i] = issues
