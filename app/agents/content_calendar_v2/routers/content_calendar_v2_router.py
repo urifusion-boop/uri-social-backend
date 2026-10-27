@@ -214,6 +214,16 @@ async def create_draft_from_item_v2(
         item = next((it for it in plan["items"] if it["day_index"] == item_index), None)
         if not item:
             raise HTTPException(status_code=404, detail=f"Item {item_index} not found")
+        # Used later for the single-image branch's headline overlay
+        # (_single_image_seed_with_headline) — kept at this scope since
+        # that's a plain NameError otherwise: exact_copy only exists as a
+        # local inside _build_draft_seed_content, a separate function this
+        # one calls, not a closure it shares. Confirmed live: checking
+        # "Include AI-generated image" on any non-carousel item crashed
+        # with a 500 after the draft (and its credit charge) already went
+        # through — "Failed to create draft" in the UI, but the draft and
+        # the deduction were both real.
+        exact_copy = item.get("exact_copy") or {}
 
         # No auto-draft path for video ideas — there's no video render pipeline
         # wired to the calendar (that's the separate Video tab / storyboard job
