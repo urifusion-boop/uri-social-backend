@@ -21,7 +21,7 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
-    in_sync_with_connections, link_workspace_channels, release_channels,
+    in_sync_with_connections, link_workspace_channels, release_channels, subscription_issue,
 )
 from . import agent
 from .meta_transport import meta_transport
@@ -399,6 +399,8 @@ async def list_channels(
             "last_event_at": (last_conv[0].get("last_activity_at") if last_conv else None),
             "needs_reconnect": not live,
             "subscription_ok": (r.get("subscription") or {}).get("ok"),
+            "subscription_issue": (subscription_issue((r.get("subscription") or {}).get("error", ""), r.get("name", ""))
+                                   if (r.get("subscription") or {}).get("ok") is False else None),
         })
     return {"channels": out}
 
@@ -414,7 +416,11 @@ async def resubscribe_channels(
     missing a permission) and nothing retries it, so a Page can look connected and
     receive nothing. This re-runs it and returns Meta's reply per Page."""
     result = await link_workspace_channels(db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"))
-    return {"subscriptions": result["subscriptions"]}
+    names = {c.get("page_id"): c.get("name", "") for c in
+             await db[CHANNEL_ACCOUNTS].find({"workspace_id": brand_ctx.get("brand_id")}).to_list(50)}
+    subs = [{**x, "issue": None if x["subscribed"] else subscription_issue(x["error"], names.get(x["page_id"], ""))}
+            for x in result["subscriptions"]]
+    return {"subscriptions": subs}
 
 
 @router.delete("/channels")
