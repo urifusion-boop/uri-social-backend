@@ -196,6 +196,8 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
             page_token = candidate
             if ok:
                 break
+            scopes = await granted_scopes(candidate)
+            err = f"{err} [token carries: {', '.join(scopes) or 'unknown'}]"
         # Store the Page's own token: replies are Page-scoped too, so a user token
         # here fails every send with the same (#210).
         await db[CHANNEL_ACCOUNTS].update_many(
@@ -275,6 +277,22 @@ async def resolve_page_token(page_id: str, token: str) -> str:
     except Exception as e:
         print(f"[Inbox] could not resolve a page token for {page_id}: {e}", flush=True)
     return token
+
+
+async def granted_scopes(token: str) -> list[str]:
+    """The permissions Meta says this token actually carries; [] when it can't be read."""
+    import httpx
+
+    from app.core.config import settings
+
+    app_token = f"{settings.META_APP_ID}|{settings.META_APP_SECRET}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get("https://graph.facebook.com/debug_token",
+                                 params={"input_token": token, "access_token": app_token})
+        return sorted((r.json().get("data") or {}).get("scopes") or [])
+    except Exception:
+        return []
 
 
 async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:
