@@ -1963,6 +1963,7 @@ class _PlanBuildResult(BaseModel):
     # through so the wallet gate and the upfront charge at launch agree with what the plan
     # was actually built (and shown to the client) against.
     fee_bypassed: bool = False
+    warnings: list[str] = Field(default_factory=list)  # plain-language heads-ups the plan card shows
 
 
 def _last_known_understood(saved: list[dict]) -> dict:
@@ -2953,14 +2954,23 @@ async def _build_campaign_plan(
     except Exception as e:
         print(f"[oneshot] summary skipped: {e}", flush=True)
 
+    warnings: list[str] = []
+    if _runs_on_meta(plan):
+        from .preflight import meta_warnings
+        warnings = await meta_warnings(plan)
+
     return _PlanBuildResult(
-        business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
+        business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms, warnings=warnings,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
         budget_estimate=budget_estimate, summary=summary_dump, thread_id=body.thread_id,
         audience_text=audience_text, variant_group_id=body.variant_group_id,
         selected_plan_variant=selected_variant.model_dump() if selected_variant else None,
         fee_bypassed=fee_bypassed,
     )
+
+
+def _runs_on_meta(plan: CampaignPlan) -> bool:
+    return bool(plan.platforms) and plan.platforms[0].platform == Platform.META
 
 
 def _tiktok_budget_too_low_message(budget_ngn: float) -> str:
@@ -3057,6 +3067,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "selected_plan_variant": built.selected_plan_variant,
         # Carried through to the launch step below, which reloads this doc rather than built.
         "fee_bypassed": built.fee_bypassed,
+        "warnings": built.warnings,
     }
 
 
