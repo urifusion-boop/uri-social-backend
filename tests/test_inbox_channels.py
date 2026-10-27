@@ -286,3 +286,65 @@ def test_whatsapp_is_not_touched_by_the_sync():
                                       "external_account_id": "PN1", "access_token": "t"})
     _run(link_workspace_channels(db, "u1", "ws_1"))
     assert any(d["platform"] == "whatsapp" for d in db[CHANNEL_ACCOUNTS].docs)
+
+
+def test_a_failed_page_subscription_is_recorded_on_the_channel():
+    import app.agents.inbox.channels as ch
+
+    db = _seeded_db([IG_CONN])
+
+    async def fake_resolve(page_id, token):
+        return token
+
+    async def fake_subscribe(page_id, token):
+        return False, "(#200) pages_messaging needed"
+
+    original = (ch.resolve_page_token, ch.subscribe_page_to_app)
+    ch.resolve_page_token, ch.subscribe_page_to_app = fake_resolve, fake_subscribe
+    try:
+        _run(ch.link_workspace_channels(db, "u1", "ws_1"))
+    finally:
+        ch.resolve_page_token, ch.subscribe_page_to_app = original
+
+    subs = [d.get("subscription") for d in db[CHANNEL_ACCOUNTS].docs]
+    assert subs and all(x and x["ok"] is False and "pages_messaging" in x["error"] for x in subs)
+
+
+def test_every_token_for_a_page_is_tried_until_meta_accepts_one():
+    """Facebook can connect through a provider whose token lacks the messaging
+    permissions while Instagram's direct connect has them — the first token alone
+    must not decide whether the Page is subscribed."""
+    import app.agents.inbox.channels as ch
+
+    fb_conn = {**IG_CONN, "platform": "facebook", "page_access_token": "weak", "ig_user_id": ""}
+    db = _seeded_db([fb_conn, IG_CONN])
+    tried = []
+
+    async def fake_resolve(page_id, token):
+        return token
+
+    async def fake_subscribe(page_id, token):
+        tried.append(token)
+        return (token == "tok"), ("" if token == "tok" else "(#200) pages_messaging")
+
+    original = (ch.resolve_page_token, ch.subscribe_page_to_app)
+    ch.resolve_page_token, ch.subscribe_page_to_app = fake_resolve, fake_subscribe
+    try:
+        out = _run(ch.link_workspace_channels(db, "u1", "ws_1"))
+    finally:
+        ch.resolve_page_token, ch.subscribe_page_to_app = original
+
+    assert tried == ["weak", "tok"]
+    assert out["subscriptions"][0]["subscribed"] is True
+    assert all(d["access_token"] == "tok" for d in db[CHANNEL_ACCOUNTS].docs)
+
+
+def test_a_refused_subscription_is_explained_by_its_cause():
+    from app.agents.inbox.channels import subscription_issue
+
+    admin = subscription_issue("(#200) User does not have sufficient administrative permission for this action on this page.", "uri.social")
+    assert admin["code"] == "not_page_admin" and "Full control" in admin["message"] and "uri.social" in admin["message"]
+    perm = subscription_issue("(#200) one of these permissions is needed: pages_messaging.")
+    assert perm["code"] == "missing_permission" and "connect Instagram again" in perm["message"]
+    assert subscription_issue("") == {}
+    assert subscription_issue("boom")["code"] == "subscription_failed"

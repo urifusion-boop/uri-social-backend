@@ -130,6 +130,14 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
         landing.setdefault("checked_at", _now().isoformat())
         await db[metrics.HEALTH].update_one({"campaign_id": cid}, {"$set": {"landing": landing}})
 
+    ad_review: list[dict] = []
+    if not record.get("demo") and pull:
+        ad_review = await metrics.review_ads(adapter, cid)
+        await db[metrics.HEALTH].update_one({"campaign_id": cid}, {"$set": {"ad_review": ad_review}})
+    elif record.get("demo"):
+        ad_review = record.get("ad_review") or []
+    else:
+        ad_review = health.get("ad_review") or []
     fresh = _aware(health.get("last_success_at"))
     return {
         "record": record, "rows": rows, "ad_rows": ad_rows, "health": health, "schedule": sched, "goal": goal,
@@ -142,6 +150,7 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
             "target_cpl_ngn": goal.get("target_cpl_ngn"),
             "leads": lead_stats, "landing": landing, "followups": followups,
             "ad_rows": ad_rows,
+            "ad_review": ad_review,
             "daily_complete": health.get("daily_complete"),
             "lifetime_spend_ngn": (health.get("lifetime") or {}).get("spend_ngn"),
             "daily_spend_ngn": health.get("daily_spend_ngn"),

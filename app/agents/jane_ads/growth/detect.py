@@ -177,6 +177,11 @@ def _non_trend_findings(ctx: dict, recent_clicks: float = 0) -> list[dict]:
     if leads.get("with_outcome", 0) >= MIN_LEADS_WITH_OUTCOME and \
             (leads.get("qualified_rate") or 0) < LOW_QUALIFIED_RATE:
         out.append(_finding("low_lead_quality", "medium", {"leads": leads}))
+    flawed = [a for a in (ctx.get("ad_review") or []) if a.get("problems")]
+    if flawed:
+        out.append(_finding("creative_issues", "high" if any(
+            a.get("status") in ("DISAPPROVED", "WITH_ISSUES") for a in flawed) else "medium",
+            {"ads": flawed[:6], "count": len(flawed)}))
     followups = ctx.get("followups") or {}
     if followups.get("waiting", 0) >= 1:
         out.append(_finding("follow_up_gap", "high" if followups["waiting"] >= 3 else "medium",

@@ -334,3 +334,36 @@ def test_a_failed_status_lookup_never_costs_the_client_their_numbers():
     assert summary["delivery_display"] == ""
     assert summary["spend_ngn"] == 6000.0
     assert summary["impressions"] == 15304
+
+
+# ── Real TikTok numbers on the campaign card ────────────────────────────────────
+
+def _summary_with_report(metrics):
+    adapter = _adapter(FakeDb())
+    _seed_campaign(adapter)
+    client = _RoutedClient({
+        "/campaign/get/": {"code": 0, "message": "OK", "data": {"list": [
+            {"campaign_id": "111", "operation_status": "DISABLE"}]}},
+        "/report/integrated/get/": {"code": 0, "message": "OK", "data": {"list": [{"metrics": metrics}]}},
+    })
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = client
+        return _run(adapter.fetch_campaign_summary("111"))
+
+
+def test_the_summary_carries_tiktoks_real_clicks_and_cost_per_click():
+    # The numbers TikTok Ads Manager showed for the live prod campaign (2026-10-27).
+    summary = _summary_with_report(
+        {"spend": "656.88", "clicks": "103", "impressions": "2122", "reach": "0"})
+
+    assert summary["clicks"] == 103
+    assert summary["cost_per_click_ngn"] == pytest.approx(6.38, abs=0.01)
+    assert summary["spend_ngn"] == 656.88
+    assert summary["impressions"] == 2122
+
+
+def test_no_clicks_means_no_cost_per_click_not_a_division_by_zero():
+    summary = _summary_with_report({"spend": "0", "clicks": "0", "impressions": "0", "reach": "0"})
+
+    assert summary["clicks"] == 0
+    assert summary["cost_per_click_ngn"] is None

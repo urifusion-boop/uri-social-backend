@@ -2475,7 +2475,7 @@ class MetaLaunchFromMessageBody(BaseModel):
     # honoured only if TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN are configured
     # and the creative is video (TikTok's hard requirement); otherwise an
     # early_return explains why, same shape as every other early_return here.
-    preferred_platform: str = ""          # "" | "tiktok" | "google"
+    preferred_platform: str = ""          # "" | "meta" | "tiktok" | "google"
     # Where on Google: search | display | demand_gen (YouTube & Discover) | pmax (everywhere).
     google_placement: str = ""
 
@@ -2514,6 +2514,7 @@ class _PlanBuildResult(BaseModel):
     # plan. Threaded through so the wallet gate and the upfront charge at launch
     # agree with what the plan was actually built (and shown to the client) against.
     fee_bypassed: bool = False
+    warnings: list[str] = Field(default_factory=list)  # plain-language heads-ups the plan card shows
 
 
 def _last_known_understood(saved: list[dict]) -> dict:
@@ -2808,6 +2809,13 @@ async def _build_campaign_plan(
     # would have picked, so this can never silently apply to a Meta plan.
     fee_bypassed = (body.preferred_platform == "tiktok")
     req.budget_ngn = stated_budget_ngn if fee_bypassed else C.ad_spend_from_budget(stated_budget_ngn)
+
+    # TikTok rejects an ad group under its own daily floor (₦31,000) — at launch, after the
+    # wallet check. With no fee taken, the stated budget IS the ad spend, so say so now.
+    if fee_bypassed:
+        too_low = _tiktok_budget_too_low_message(req.budget_ngn)
+        if too_low:
+            return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": too_low}}
 
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
     # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
@@ -3108,7 +3116,10 @@ async def _build_campaign_plan(
         plan = apply_platform_override(plan, [Platform.TIKTOK])
         forced_to_meta = False
     else:
-        jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
+        # "meta" is the client choosing Instagram & Facebook by name: Jane's own
+        # leaning towards TikTok no longer overrides it.
+        jane_picked_tiktok = (any(p.platform == Platform.TIKTOK for p in plan.platforms)
+                              and body.preferred_platform != "meta")
         if jane_picked_tiktok and tiktok_ready:
             plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
             forced_to_meta = False
@@ -3608,14 +3619,33 @@ async def _build_campaign_plan(
     except Exception as e:
         print(f"[oneshot] summary skipped: {e}", flush=True)
 
+    warnings: list[str] = []
+    if _runs_on_meta(plan):
+        from .preflight import meta_warnings
+        warnings = await meta_warnings(plan)
+
     return _PlanBuildResult(
-        business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
+        business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms, warnings=warnings,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
         budget_estimate=budget_estimate, summary=summary_dump, thread_id=body.thread_id,
         audience_text=audience_text, variant_group_id=body.variant_group_id,
         selected_plan_variant=selected_variant.model_dump() if selected_variant else None,
         fee_bypassed=fee_bypassed,
     )
+
+
+def _runs_on_meta(plan: CampaignPlan) -> bool:
+    return bool(plan.platforms) and plan.platforms[0].platform == Platform.META
+
+
+def _tiktok_budget_too_low_message(budget_ngn: float) -> str:
+    """"" when `budget_ngn` clears TikTok's own daily floor; otherwise what the client needs
+    to state. TikTok pays no URI fee, so the floor applies to the stated budget as it is."""
+    floor = C.HARD_FLOOR_DAILY_NGN["tiktok"]
+    if budget_ngn >= floor:
+        return ""
+    return (f"TikTok needs a budget of at least ₦{floor:,.0f} to run. "
+            f"What budget would you like to use?")
 
 
 def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False, fee_only: bool = False) -> float:
@@ -3722,6 +3752,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "variant_group_id": built.variant_group_id,
         "audience_text": built.audience_text,
         "selected_plan_variant": built.selected_plan_variant,
+        "warnings": built.warnings,
     }
 
 
@@ -4659,6 +4690,13 @@ async def meta_campaigns(
                     ),
                     "impressions": summary["impressions"],
                     "reach": summary["reach"],
+                    # TikTok only (other adapters don't report them): real clicks and what each
+                    # cost, shown instead of the WhatsApp-conversation boxes a link ad can't fill.
+                    "clicks": summary.get("clicks"),
+                    "cost_per_click_ngn": (
+                        round(summary["cost_per_click_ngn"], 2)
+                        if summary.get("cost_per_click_ngn") is not None else None
+                    ),
                     "delivery": summary["delivery"],
                     # What the badge shows when it differs from the on/off state (e.g.
                     # "In review" while delivery is "Active"). Empty = same as delivery.
@@ -5029,7 +5067,7 @@ async def extend_quote(
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
 
-        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        markup = 1.0  # TikTok pays no URI fee, so an extension costs exactly its ad spend
         try:
             q = quote(sched["daily_ngn"], days, markup,
                       floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
@@ -5122,7 +5160,7 @@ async def extend_campaign(
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
 
-        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        markup = 1.0  # TikTok pays no URI fee, so an extension costs exactly its ad spend
         try:
             q = quote(sched["daily_ngn"], body.days, markup,
                       floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")

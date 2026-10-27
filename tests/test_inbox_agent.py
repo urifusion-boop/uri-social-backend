@@ -176,7 +176,7 @@ def test_legal_threats_are_caught_by_words():
 def test_unknown_model_output_falls_back_to_safe_labels():
     cls = agent.coerce_classification(
         {"intent": "buy_now", "urgency": "extreme", "confidence": "lots",
-         "exclusions": ["made_up"]}, "hi")
+         "exclusions": ["made_up"]}, "what is this about")
     assert cls["intent"] == "other" and cls["urgency"] == "normal"
     assert cls["confidence"] == 0 and cls["exclusions"] == []
 
@@ -372,7 +372,7 @@ def test_a_held_message_gets_one_holding_line_until_a_person_replies():
 
     again = ObjectId()
     db[MESSAGES].docs.append({"_id": again, "workspace_id": WS, "conversation_id": conv_id,
-                              "direction": "inbound", "text": "hello??", "provider_message_id": "mid_in_2",
+                              "direction": "inbound", "text": "any update on this?", "provider_message_id": "mid_in_2",
                               "received_at": now()})
     out = _run(agent.process_inbound(db, WS, conv_id, str(again), llm, _sent_transport(sent)))
     assert out["status"] == "drafted" and len(sent) == 1
@@ -491,3 +491,29 @@ def test_alert_emails_are_cleaned_and_survive_a_save_that_omits_them():
     saved = _run(agent.save_settings(db, WS, {"auto_reply_enabled": True}, "u"))
     assert saved["alert_emails"] == ["a@b.co"]
     assert _run(agent.load_settings(db, WS))["alert_emails"] == ["a@b.co"]
+
+
+@pytest.mark.parametrize("text", ["hello", "Hi", "hey there", "good morning", "thanks", "Thank you!", "hello??"])
+def test_a_bare_greeting_is_engagement_whatever_came_before(text):
+    assert agent.is_greeting(text)
+    cls = agent.coerce_classification({"intent": "booking", "confidence": 60, "exclusions": ["stock_or_price"]}, text)
+    assert cls["intent"] == "engagement" and cls["exclusions"] == [] and cls["confidence"] >= 90
+
+
+@pytest.mark.parametrize("text", ["hello, do you deliver to Ikeja", "can i book a demo?", "hi what is the price"])
+def test_a_greeting_followed_by_a_question_is_not_a_bare_greeting(text):
+    assert not agent.is_greeting(text)
+
+
+def test_a_hello_after_an_unanswered_question_is_answered_not_held():
+    db = Db()
+    conv_id, msg_id = _seed(db, text="hello")
+    db[MESSAGES].docs.insert(0, {
+        "_id": ObjectId(), "workspace_id": WS, "conversation_id": conv_id, "direction": "inbound",
+        "text": "can i book a demo?", "provider_message_id": "mid_old", "received_at": now() - timedelta(days=5)})
+    # The model drifts to the old question: booking, "unanswered". The greeting rule overrides both.
+    llm = fake_llm({**CLS_FAQ, "intent": "booking", "confidence": 70},
+                   {"reply": "Hello! How can I help?", "cited": [FAQ_ID], "confidence": 95, "unanswered": ["can i book a demo?"]})
+    sent: list = []
+    out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
+    assert out["status"] == "auto_sent" and sent == ["Hello! How can I help?"]
