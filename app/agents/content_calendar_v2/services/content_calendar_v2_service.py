@@ -596,6 +596,26 @@ async def _repurposing_candidate_concepts(
 
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
+def _concept_pool_avoid_block(concepts: List[Dict[str, Any]]) -> str:
+    """Formats an earlier wave's candidate concepts as a prompt block telling
+    a later wave not to duplicate them — the within-this-generation-run
+    counterpart to creative_memory's avoid_block (which only covers a PRIOR
+    plan's concepts). See _generate_candidate_concepts's wave-splitting
+    comment for why this exists."""
+    if not concepts:
+        return ""
+    lines = [
+        f"- territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}"
+        f" ({c.get('concept_name', '')})"
+        for c in concepts
+    ]
+    return (
+        "\nAlready proposed earlier in this SAME batch — do not repeat these "
+        "territory+subject+angle combinations or their underlying idea:\n"
+        + "\n".join(lines)
+    )
+
+
 async def _generate_candidate_concepts(
     brand: Dict[str, Any],
     framework: Dict[str, Any],
@@ -700,12 +720,12 @@ async def _generate_candidate_concepts(
         chunk_sizes.append(size)
         remaining -= size
 
-    async def _one_chunk(chunk_idx: int, n: int) -> List[Dict[str, Any]]:
+    async def _one_chunk(chunk_idx: int, n: int, extra_avoid_block: str = "") -> List[Dict[str, Any]]:
         prompt = f"""You are a senior creative strategist generating CANDIDATE content
 CONCEPTS for {brand_name}, a {industry} business. Target audience: {audience}.
 Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
 {f'USP: {usp}.' if usp else ''}
-{stage_note}{context_block}{assets_block}{avoid_block}{psychology_block}
+{stage_note}{context_block}{assets_block}{avoid_block}{extra_avoid_block}{psychology_block}
 Platforms: {', '.join(platforms) if platforms else 'social media'}.
 
 Available Content Territories (draw from these freely — you don't need every one):
@@ -797,8 +817,41 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
         print(f"[CalendarV2] candidate chunk {chunk_idx} failed after retry: {last_exc}", flush=True)
         return []
 
-    results = await asyncio.gather(*[_one_chunk(i, size) for i, size in enumerate(chunk_sizes)])
-    return [c for chunk in results for c in chunk]
+    # Chunks run concurrently for latency (this pipeline is already tight
+    # against the gateway timeout — see this function's own docstring and
+    # _generate_final_copy's), but that means every chunk is independently
+    # blind to what every OTHER chunk is proposing. Confirmed live: for a
+    # business with a genuinely narrow content space, 4 parallel 20-concept
+    # calls converge on the same territory/subject combinations often enough
+    # to produce real, substantial duplication downstream (a 30-item plan
+    # landing at 25/30 flagged "similar" even after the diversity-check's own
+    # bugs were fixed) — the later diversity check was correctly catching
+    # genuine repetition that originated HERE, not a false positive.
+    #
+    # Split into two sequential waves instead of one fully-blind round: wave 1
+    # runs exactly as before (concurrent, blind), then wave 2 gets wave 1's
+    # full output as an explicit "already proposed in this batch, don't
+    # duplicate" list, same mechanism creative_memory's avoid_block already
+    # uses for a PRIOR plan's concepts. This halves the number of chunks that
+    # are ever fully blind to one another (today: 4; now: at most 2 within a
+    # wave), at the cost of one extra sequential round-trip rather than
+    # zero — a bounded, deliberate latency tradeoff for a real diversity gain.
+    half = max(1, len(chunk_sizes) // 2)
+    wave1_sizes, wave2_sizes = chunk_sizes[:half], chunk_sizes[half:]
+
+    wave1_results = await asyncio.gather(*[_one_chunk(i, size) for i, size in enumerate(wave1_sizes)])
+    wave1_concepts = [c for chunk in wave1_results for c in chunk]
+
+    if not wave2_sizes:
+        return wave1_concepts
+
+    wave1_avoid_block = _concept_pool_avoid_block(wave1_concepts)
+    wave2_results = await asyncio.gather(*[
+        _one_chunk(half + i, size, extra_avoid_block=wave1_avoid_block)
+        for i, size in enumerate(wave2_sizes)
+    ])
+    wave2_concepts = [c for chunk in wave2_results for c in chunk]
+    return wave1_concepts + wave2_concepts
 
 
 # ── Step 4 — Score candidates (PRD §11-12, §37) ─────────────────────────────
