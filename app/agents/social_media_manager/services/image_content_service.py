@@ -3288,10 +3288,26 @@ Answer with exactly one word: "yes" or "no"."""
 
                     _gpt2_b64 = _gpt2_resp.data[0].b64_json
 
+                    # GPT-Image-2 only generates 3 fixed buckets (1536x1024,
+                    # 1024x1536, 1024x1024) — none of which match most
+                    # platforms' real target ratio (LinkedIn's 1200x628 is
+                    # 1.91:1 vs the landscape bucket's 1.5:1, the worst
+                    # mismatch of any platform this app targets). Center-crop
+                    # to the target RATIO first, exactly like every other
+                    # branch in this function already does (gpt-image-1 edit,
+                    # fal.ai, Gemini, gpt-image-1 fallback) — this branch was
+                    # the one missing it. Without this, the resize below
+                    # scales width and height by different factors and
+                    # visibly squashes/stretches the whole image (confirmed
+                    # live: a LinkedIn post's subject and logo both looked
+                    # warped — up to a 27% width/height scale mismatch).
+                    _gpt2_b64 = ImageContentService._crop_to_ratio(_gpt2_b64, target_w, target_h)
+
                     _gpt2_img = _PILImage.open(_io.BytesIO(_b64.b64decode(_gpt2_b64))).convert("RGB")
 
                     # Resize to exact target dimensions (e.g., 1080×1350 for Instagram)
-                    # OpenAI generates at 1024×1536, we resize to match platform specs exactly
+                    # — the ratio already matches post-crop, so this is now a uniform
+                    # scale, not a stretch.
                     gen_w, gen_h = _gpt2_img.size
                     if (gen_w, gen_h) != (target_w, target_h):
                         print(f"🔄 Resizing from {gen_w}×{gen_h} to {target_w}×{target_h} (exact platform dimensions)")
