@@ -291,6 +291,41 @@ class TestCreateFromCard:
         assert result["responseData"]["draft_ids"] == ["d1"]
 
     @pytest.mark.asyncio
+    async def test_image_task_setup_failure_marks_drafts_failed_instead_of_stuck_forever(self):
+        # Regression: anything that throws between the optimistic
+        # has_image=True write and the asyncio.create_task calls (carousel
+        # style resolution here; an undefined variable on the
+        # content-calendar-v2 version of this same pattern) used to leave
+        # the draft at has_image=True/image_failed=False forever — the one
+        # background task that would ever flip image_failed never got
+        # created, so the UI spun indefinitely. The request must still
+        # succeed (the draft itself is real) and the draft must come back
+        # image_failed instead of stuck.
+        db = fresh_db()
+        credit_service._db = db
+        trial_service._db = db
+        await _card(db, action_type="carousel")
+        # CarouselGenerationService.generate_multi_platform is mocked below
+        # (this test is about the image-task setup, not real carousel
+        # generation), so it won't insert the draft doc it normally would —
+        # pre-insert it the same shape a real call would have left behind,
+        # so the image-task setup has a real document to mark image_failed.
+        await db["content_drafts"].insert_one({"id": "d1", "platform": "instagram", "content": "caption"})
+        with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, patch(
+            "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
+            ".generate_multi_platform",
+            new=AsyncMock(return_value=_ok_carousel()),
+        ), patch(
+            "app.agents.social_media_manager.routers.complete_social_manager._resolve_carousel_shared_context",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            result = await create_from_card("c1", ctx=CTX, db=db)
+
+        assert result["responseData"]["draft_ids"] == ["d1"]
+        draft = await db["content_drafts"].find_one({"id": "d1"})
+        assert draft["image_failed"] is True
+
+    @pytest.mark.asyncio
     async def test_insufficient_credits_blocks_generation_with_a_clear_402(self):
         db = fresh_db()
         credit_service._db = db

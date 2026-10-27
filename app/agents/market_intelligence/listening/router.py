@@ -477,28 +477,48 @@ async def create_from_card(card_id: str, overrides: CreateFromCardOverrides = Cr
             {"id": {"$in": draft_ids}}, {"$set": {"has_image": True, "image_failed": False}})
         for d in drafts:
             d["has_image"] = True
+    # Structural fix, not a one-off: see the identical comment on this same
+    # pattern in content_calendar_v2_router.py and complete_social_manager.py
+    # — anything that throws between the optimistic has_image=True write
+    # above and the asyncio.create_task calls below leaves the draft stuck
+    # "generating" forever, since the one task that would ever flip
+    # image_failed never got created. Wrap setup so a failure here marks the
+    # batch failed instead of leaving it stuck.
     bg_tasks: list[asyncio.Task] = []
-    for draft in drafts:
-        if post_type == "carousel":
-            slides = draft.get("slides") or []
-            carousel_id = draft["id"]
-            carousel_brand_context = await _resolve_carousel_shared_context(
-                db=db, brand_context=brand_context, style_override=None,
-                carousel_id=carousel_id, platform=draft["platform"],
-            )
-            for slide_index, slide in enumerate(slides):
-                slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
-                enriched_seed = f"{seed_content}. This slide: {slide_content}"
+    try:
+        for draft in drafts:
+            if post_type == "carousel":
+                slides = draft.get("slides") or []
+                carousel_id = draft["id"]
+                carousel_brand_context = await _resolve_carousel_shared_context(
+                    db=db, brand_context=brand_context, style_override=None,
+                    carousel_id=carousel_id, platform=draft["platform"],
+                )
+                for slide_index, slide in enumerate(slides):
+                    slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+                    enriched_seed = f"{seed_content}. This slide: {slide_content}"
+                    bg_tasks.append(asyncio.create_task(_generate_image_bg(
+                        draft_id=draft["id"], platform=draft["platform"], content=slide_content or draft["content"],
+                        seed_content=enriched_seed, brand_context=carousel_brand_context, db=db,
+                        post_type=post_type, slide_index=slide_index, total_slides=len(slides), carousel_id=carousel_id,
+                    )))
+            else:
                 bg_tasks.append(asyncio.create_task(_generate_image_bg(
-                    draft_id=draft["id"], platform=draft["platform"], content=slide_content or draft["content"],
-                    seed_content=enriched_seed, brand_context=carousel_brand_context, db=db,
-                    post_type=post_type, slide_index=slide_index, total_slides=len(slides), carousel_id=carousel_id,
+                    draft_id=draft["id"], platform=draft["platform"], content=draft["content"],
+                    seed_content=seed_content, brand_context=brand_context, db=db, post_type=post_type,
                 )))
-        else:
-            bg_tasks.append(asyncio.create_task(_generate_image_bg(
-                draft_id=draft["id"], platform=draft["platform"], content=draft["content"],
-                seed_content=seed_content, brand_context=brand_context, db=db, post_type=post_type,
-            )))
+    except Exception as image_setup_error:
+        print(f"❌ [Listening] image task setup failed before any background task started "
+              f"for card {card_id}: {image_setup_error}")
+        import traceback as _tb
+        print(_tb.format_exc())
+        if draft_ids:
+            await db["content_drafts"].update_many(
+                {"id": {"$in": draft_ids}},
+                {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+            )
+        bg_tasks = []
+
     _BG_IMAGE_TASKS.update(bg_tasks)
     for t in bg_tasks:
         t.add_done_callback(_BG_IMAGE_TASKS.discard)
