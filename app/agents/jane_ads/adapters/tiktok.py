@@ -1515,6 +1515,10 @@ class TikTokAdsAdapter(AdPlatformAdapter):
             # conversation-start webhook exists yet for TikTok.
             "conversations": clicks,
             "cost_per_conversation_ngn": cost_per_click,
+            # TikTok's own, real numbers. A WhatsApp-link ad has no countable conversations
+            # (the card shows N/A for those), so the card shows these for TikTok instead.
+            "clicks": clicks,
+            "cost_per_click_ngn": cost_per_click,
             "ends_at": None,   # not stored on the campaign record today
         }
 
