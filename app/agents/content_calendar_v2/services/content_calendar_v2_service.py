@@ -1561,9 +1561,17 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
             seen_openings[opening] = i
         if i > 0:
             prev = items[i - 1]
+            # Persisted plan items store this as "creative_angle", not
+            # "angle" ("angle" is only the field name on the earlier
+            # pre-copy CONCEPT shape, e.g. in _similarity_overlap). Reading
+            # "angle" here always returned None for both sides, so this
+            # clause silently reduced to a territory+subject-only check —
+            # confirmed live: two adjacent items sharing a territory+subject
+            # but with deliberately DIFFERENT angles were flagged as
+            # duplicates anyway, since angle was never actually compared.
             if (item.get("territory") == prev.get("territory")
                     and item.get("subject") == prev.get("subject")
-                    and item.get("angle") == prev.get("angle")):
+                    and item.get("creative_angle") == prev.get("creative_angle")):
                 issues[i] = issues.get(i, "") + "; repeats prior day's territory+subject+angle"
         visual_idea = str((item.get("creative_direction") or {}).get("central_visual_idea") or "").strip().lower()
         visual_opening = " ".join(visual_idea.split()[:6])
@@ -2871,9 +2879,15 @@ async def regenerate_item_v2(
         "carousel_slide_count": slide_count,
     }
 
+    # Same blindness bug the auto-regeneration pass had (see
+    # _regenerate_flagged_items): without this, a manual regenerate has no
+    # idea what the plan's OTHER items already say, so it can easily land
+    # right back on a title/hook/visual idea that duplicates one of them.
+    other_items = [it for it in plan["items"] if it["day_index"] != item_index]
     chunk_items = await _generate_final_copy(
         brand=brand, concepts_chunk=[concept], platforms=plan.get("platforms") or [],
         existing_assets_summary=existing_assets_summary, force=True,
+        avoid_context=other_items,
     )
     if not chunk_items:
         raise RuntimeError("Regeneration produced no result")
@@ -2950,6 +2964,30 @@ async def regenerate_item_v2(
         new_idea.get("creative_concept_name") or item.get("creative_concept_name", ""))
     update_fields["items.$[it].regenerated_count"] = item.get("regenerated_count", 0) + 1
     update_fields["items.$[it].last_regenerated_reason"] = f"manual:{regen_scope}"
+
+    # Recompute the diversity/quality flags against the rest of the plan —
+    # before this fix, a manual regenerate never touched diversity_check or
+    # creative_quality_review_note at all, so the frontend's "flagged as
+    # similar to another idea in this plan" warning triangle kept showing
+    # on the card forever, regardless of how different the new content
+    # actually was, because nothing ever recomputed it. Cheap/deterministic
+    # (the same check the initial plan generation already uses), not a
+    # second LLM round-trip for a single-item action.
+    merged_item = {**item, **fields_to_apply, "format": effective_format}
+    full_items = sorted(
+        (merged_item if it["day_index"] == item_index else it for it in plan["items"]),
+        key=lambda it: it["day_index"],
+    )
+    position = next(i for i, it in enumerate(full_items) if it["day_index"] == item_index)
+    still_flagged = position in _rule_based_diversity_issues(full_items)
+    update_fields["items.$[it].diversity_check"] = {
+        "passed": not still_flagged,
+        "similarity_score": 1.0 if still_flagged else 0.0,
+        "flagged_against_item_id": None,
+    }
+    update_fields["items.$[it].creative_quality_review_note"] = (
+        _anti_boring_check([merged_item], brand_name=brand.get("brand_name", "")).get(0)
+    )
     update_fields["updated_at"] = datetime.utcnow().isoformat()
 
     await db[COLLECTION].update_one(

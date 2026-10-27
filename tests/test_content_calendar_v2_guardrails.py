@@ -20,6 +20,16 @@ runs:
 4. series_name was carried straight from the model's candidate output with no
    check that it actually recurred — a real plan carried 6 distinct series
    names, each used exactly once, which the prompt itself says not to do.
+5. _rule_based_diversity_issues's adjacent-day repeat check compared
+   item.get("angle") on persisted plan items, which only ever store this
+   field as "creative_angle" ("angle" is the field name on the earlier,
+   pre-copy CONCEPT shape instead) — so the angle side of the comparison
+   silently evaluated to None == None (always true) for every pair, real
+   or not. Two adjacent items sharing a territory+subject but a
+   deliberately DIFFERENT angle were flagged as duplicates anyway, since
+   angle was never actually being compared — a real, structural
+   contributor to plans showing far more items flagged "similar" than
+   were actually similar.
 """
 from app.agents.content_calendar_v2.services.content_calendar_v2_service import (
     MAX_CAPTION_WORDS,
@@ -30,6 +40,7 @@ from app.agents.content_calendar_v2.services.content_calendar_v2_service import 
     _find_banned_words,
     _recurring_series_names,
     _resolve_series_name,
+    _rule_based_diversity_issues,
     _validate_item_v2,
 )
 
@@ -302,6 +313,35 @@ def test_ordinary_copy_with_no_numbers_or_citations_is_clean():
     item = _item()
     brand = {"brand_name": "Docerity", "industry": "solar financing"}
     assert _fabricated_claims_used(item, brand) == []
+
+
+# ── _rule_based_diversity_issues — the real persisted field is creative_angle ──
+
+def _diversity_item(day_index, territory, subject, creative_angle, title):
+    return {
+        "day_index": day_index, "territory": territory, "subject": subject,
+        "creative_angle": creative_angle, "title": title, "cta": "",
+        "creative_direction": {"central_visual_idea": f"visual {day_index}"},
+    }
+
+
+def test_same_territory_and_subject_but_different_angle_is_not_flagged():
+    items = [
+        _diversity_item(0, "A_PROBLEM", "shipping delays", "mythbusting", "Title Zero Here Today Now"),
+        _diversity_item(1, "A_PROBLEM", "shipping delays", "customer story", "Something Else Entirely Different"),
+    ]
+    issues = _rule_based_diversity_issues(items)
+    assert 1 not in issues
+
+
+def test_same_territory_subject_and_angle_is_flagged():
+    items = [
+        _diversity_item(0, "A_PROBLEM", "shipping delays", "mythbusting", "Title Zero Here Today Now"),
+        _diversity_item(1, "A_PROBLEM", "shipping delays", "mythbusting", "Something Else Entirely Different"),
+    ]
+    issues = _rule_based_diversity_issues(items)
+    assert 1 in issues
+    assert "repeats prior day" in issues[1]
 
 
 if __name__ == "__main__":
