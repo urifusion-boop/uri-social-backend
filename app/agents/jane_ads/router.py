@@ -3253,6 +3253,9 @@ async def meta_plan_from_message(
         "thread_id": built.thread_id,
         "variant_group_id": built.variant_group_id,
         "selected_plan_variant": built.selected_plan_variant,
+        # Launch rebuilds from this document, not from `built`: without it a TikTok plan
+        # quoted fee-free would be charged the fee at launch.
+        "fee_bypassed": built.fee_bypassed,
         "status": "pending",
         "created_at": now,
         "expires_at": now + timedelta(days=7),
