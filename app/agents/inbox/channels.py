@@ -197,6 +197,10 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
 
         ok, err = await subscribe_page_to_app(page_id, page_token)
         subscriptions.append({"page_id": page_id, "subscribed": ok, "error": err})
+        await db[CHANNEL_ACCOUNTS].update_many(
+            {"workspace_id": workspace_id, "page_id": page_id},
+            {"$set": {"subscription": {"ok": ok, "error": err[:300], "checked_at": now()}}},
+        )
         if not ok:
             print(f"[Inbox] could not subscribe page {page_id}: {err}", flush=True)
 
