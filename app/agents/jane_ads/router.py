@@ -3932,6 +3932,13 @@ async def meta_campaigns(
                     ),
                     "impressions": summary["impressions"],
                     "reach": summary["reach"],
+                    # TikTok only (other adapters don't report them): real clicks and what each
+                    # cost, shown instead of the WhatsApp-conversation boxes a link ad can't fill.
+                    "clicks": summary.get("clicks"),
+                    "cost_per_click_ngn": (
+                        round(summary["cost_per_click_ngn"], 2)
+                        if summary.get("cost_per_click_ngn") is not None else None
+                    ),
                     "delivery": summary["delivery"],
                     # What the badge shows when it differs from the on/off state (e.g. "In
                     # review" while delivery is "Active"). Empty = same as delivery.
