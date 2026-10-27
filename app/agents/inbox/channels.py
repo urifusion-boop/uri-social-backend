@@ -174,28 +174,34 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
             )
             linked.append(key)
 
-    # Subscribe each distinct Page once, after the rows are stored.
-    subscriptions: list[dict] = []
-    seen_pages: set[str] = set()
+    # Subscribe each distinct Page once, after the rows are stored. A Page can be backed
+    # by several connections (Facebook through one provider, Instagram through another)
+    # and only some of their tokens carry the messaging permissions, so every token is
+    # tried and the first one Meta accepts is the one the channel keeps.
+    tokens_by_page: dict[str, list[str]] = {}
     for conn in conns:
         if _workspace_of(conn) != workspace_id:
             continue
         page_id = str(conn.get("page_id") or "")
         token = conn.get("page_access_token") or ""
-        if not page_id or not token or page_id in seen_pages:
-            continue
-        seen_pages.add(page_id)
+        if page_id and token and token not in tokens_by_page.setdefault(page_id, []):
+            tokens_by_page[page_id].append(token)
 
-        page_token = await resolve_page_token(page_id, token)
-        if page_token != token:
-            # Store the Page's own token: replies are Page-scoped too, so a user
-            # token here fails every send with the same (#210).
-            await db[CHANNEL_ACCOUNTS].update_many(
-                {"workspace_id": workspace_id, "page_id": page_id},
-                {"$set": {"access_token": page_token, "updated_at": now()}},
-            )
-
-        ok, err = await subscribe_page_to_app(page_id, page_token)
+    subscriptions: list[dict] = []
+    for page_id, tokens in tokens_by_page.items():
+        ok, err, page_token = False, "", ""
+        for token in tokens:
+            candidate = await resolve_page_token(page_id, token)
+            ok, err = await subscribe_page_to_app(page_id, candidate)
+            page_token = candidate
+            if ok:
+                break
+        # Store the Page's own token: replies are Page-scoped too, so a user token
+        # here fails every send with the same (#210).
+        await db[CHANNEL_ACCOUNTS].update_many(
+            {"workspace_id": workspace_id, "page_id": page_id},
+            {"$set": {"access_token": page_token, "updated_at": now()}},
+        )
         subscriptions.append({"page_id": page_id, "subscribed": ok, "error": err})
         await db[CHANNEL_ACCOUNTS].update_many(
             {"workspace_id": workspace_id, "page_id": page_id},
