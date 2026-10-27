@@ -80,6 +80,17 @@ def test_tiktok_objectives_keep_values_and_labels_but_change_the_wording():
     assert not any("WhatsApp orders" in o["blurb"] for o in out)
 
 
+def test_a_tiktok_client_is_told_nothing_about_other_platforms_in_the_objective_list():
+    # Jane also echoes the picked blurb into the chat ("Engagement it is — …"), so any
+    # Meta/WhatsApp comparison here reaches the client twice.
+    out = _run(jane_router.list_objectives(platform="tiktok"))["objectives"]
+    for o in out:
+        text = f'{o["label"]} {o["blurb"]} {o["caveat"]}'.lower()
+        for word in ("meta", "instagram", "facebook", "whatsapp", "pixel"):
+            assert word not in text, (o["value"], word)
+        assert len(o["blurb"]) <= 70, o["blurb"]
+
+
 # ── Which campaigns count as TikTok ─────────────────────────────────────────────
 
 def test_only_this_brands_tiktok_campaign_is_routed_to_tiktok():
