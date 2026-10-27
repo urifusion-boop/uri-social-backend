@@ -286,3 +286,25 @@ def test_whatsapp_is_not_touched_by_the_sync():
                                       "external_account_id": "PN1", "access_token": "t"})
     _run(link_workspace_channels(db, "u1", "ws_1"))
     assert any(d["platform"] == "whatsapp" for d in db[CHANNEL_ACCOUNTS].docs)
+
+
+def test_a_failed_page_subscription_is_recorded_on_the_channel():
+    import app.agents.inbox.channels as ch
+
+    db = _seeded_db([IG_CONN])
+
+    async def fake_resolve(page_id, token):
+        return token
+
+    async def fake_subscribe(page_id, token):
+        return False, "(#200) pages_messaging needed"
+
+    original = (ch.resolve_page_token, ch.subscribe_page_to_app)
+    ch.resolve_page_token, ch.subscribe_page_to_app = fake_resolve, fake_subscribe
+    try:
+        _run(ch.link_workspace_channels(db, "u1", "ws_1"))
+    finally:
+        ch.resolve_page_token, ch.subscribe_page_to_app = original
+
+    subs = [d.get("subscription") for d in db[CHANNEL_ACCOUNTS].docs]
+    assert subs and all(x and x["ok"] is False and "pages_messaging" in x["error"] for x in subs)
