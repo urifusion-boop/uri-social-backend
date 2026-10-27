@@ -394,6 +394,20 @@ async def list_channels(
     return {"channels": out}
 
 
+@router.post("/channels/resubscribe")
+async def resubscribe_channels(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Ask Meta again to deliver this workspace's Pages' messages, and say what it answered.
+
+    The one-time subscription made when an account is linked can fail quietly (a token
+    missing a permission) and nothing retries it, so a Page can look connected and
+    receive nothing. This re-runs it and returns Meta's reply per Page."""
+    result = await link_workspace_channels(db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"))
+    return {"subscriptions": result["subscriptions"]}
+
+
 @router.delete("/channels")
 async def unlink_channels(
     platform: str = Query(""),
