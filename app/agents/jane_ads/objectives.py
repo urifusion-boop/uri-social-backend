@@ -94,17 +94,15 @@ CHOICES = [
 # objective the client picks doesn't change), only the explanation underneath.
 _TIKTOK_BLURBS = {
     CampaignObjective.AWARENESS.value:
-        "Get your video or photo seen by as many people as possible.",
+        "Get your video or photos seen by as many people as possible.",
     CampaignObjective.TRAFFIC.value:
-        "Send people to your link — TikTok charges per click.",
+        "Send people to your link.",
     CampaignObjective.ENGAGEMENT.value:
-        "Get more views on your video. TikTok has no native WhatsApp ad type the way "
-        "Meta does, so this optimises for video views, not messages.",
+        "Get more people watching your ad.",
     CampaignObjective.LEADS.value:
-        "Collect enquiries from interested people — TikTok's own lead generation objective.",
+        "Collect enquiries from interested people.",
     CampaignObjective.SALES.value:
-        "Find people likely to buy. Runs as Traffic on TikTok today — a dedicated "
-        "sales/conversions objective needs a TikTok Pixel, not set up yet.",
+        "Find people likely to buy. Runs as link clicks for now.",
 }
 
 
