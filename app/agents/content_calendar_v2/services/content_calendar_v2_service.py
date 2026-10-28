@@ -99,6 +99,32 @@ CANDIDATE_CHUNK_SIZE = 20    # concurrent chunks, mirrors the proven content-chu
 CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item cap is
                               # evidence larger single structured-JSON calls degrade
 
+# ── Rate-limit resilience (confirmed live, Oct 2026) ────────────────────────
+# Candidate generation, scoring, and final-copy generation each fire several
+# GPT-4o calls concurrently via asyncio.gather (4, 4, and ~5 respectively).
+# A real OpenAI 429 doesn't reject just one of them — a burst this size can
+# trip the account's own rate limit on its own, especially stacked on other
+# same-account traffic, and it then rejects every concurrent call in the
+# same burst at once. An instant retry just re-fires into the same limit
+# and failed identically both times when this actually happened. Two fixes,
+# applied at every chunked call site below: stagger each chunk's own start
+# slightly so a burst isn't literally simultaneous, and back off briefly
+# before retrying specifically when the failure was rate-limit-shaped (a
+# different error, e.g. a JSON parse glitch, still retries immediately —
+# no reason to slow that down).
+_RATE_LIMIT_MARKER = "temporarily unavailable"   # both AIService 429/quota messages contain this
+_RATE_LIMIT_BACKOFF_SECONDS = 5
+_CHUNK_STAGGER_SECONDS = 0.5
+
+
+def _is_rate_limited(error: Any) -> bool:
+    return _RATE_LIMIT_MARKER in str(error)
+
+
+async def _backoff_if_rate_limited(error: Any) -> None:
+    if _is_rate_limited(error):
+        await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
+
 MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
 MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN = 3   # the brand picked Reels/video in its Playbook
 MIN_CAROUSEL_FORMATS_PER_WEEK = 1   # business requirement (Oct 2026): 1-2 carousels per week
@@ -351,8 +377,29 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
     words_to_avoid = [str(w) for w in (brand.get("words_to_avoid") or []) if w]
     if words_to_avoid:
         parts.append("Words/phrases to avoid: " + ", ".join(words_to_avoid))
+    proof_points = [str(p) for p in (brand.get("proof_points") or []) if p]
+    # Confirmed live: "Proof"-territory posts for a brand with no real proof
+    # data on file came back as vague, unverifiable "customer success"
+    # claims — correctly flagged by the diversity checker's GENERIC
+    # criterion, since the model had nothing true to cite and invented
+    # filler instead. Giving it real proof_points when they exist fixes
+    # that directly; the explicit "do not invent" instruction below is what
+    # stops it from fabricating a testimonial when the list is still empty.
+    # Always computed (even when `parts` is otherwise empty) so a brand with
+    # a near-blank Playbook still gets the anti-fabrication instruction, not
+    # silence.
+    proof_block = (
+        "\n\nREAL PROOF AVAILABLE (quote/cite these close to verbatim in \"Proof\"-style posts):\n"
+        + "\n".join(f"- {p}" for p in proof_points)
+        if proof_points else
+        "\n\nNO REAL PROOF POINTS ARE ON FILE for this business yet. Do NOT invent a testimonial, "
+        "case study, customer quote, or specific result — that's fabrication. Any \"Proof\"-territory "
+        "idea must instead use something genuinely verifiable without invented evidence (the process "
+        "itself, a guarantee, a founder's direct accountability, a demonstrable feature) — or, better, "
+        "treat this as a signal to lean on a different territory instead."
+    )
     if not parts:
-        return ""
+        return "\n\nCUSTOMER PSYCHOLOGY (from this brand's Playbook):" + proof_block
     return (
         "\n\nCUSTOMER PSYCHOLOGY (from this brand's Playbook — real customer reality, not a generic assumption):\n"
         + "\n".join(f"- {p}" for p in parts)
@@ -363,7 +410,91 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
           "close to verbatim rather than paraphrasing it into generic marketing language — see the "
           "addendum's own example: \"I don't have time to cook\" becomes \"You don't hate cooking. "
           "You hate deciding what to cook at 7:30pm,\" not \"5 Benefits of Meal Delivery.\""
+        + proof_block
     )
+
+
+def _flatten_psychology_facts(brand: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Every individual real customer-psychology fact on this brand's
+    Playbook, as its own (label, fact) entry — not joined into one summary
+    string the way _customer_psychology_block's block is. Used to
+    deterministically assign each calendar item ONE specific real fact it
+    must be grounded in (see _generate_final_copy's grounding instruction +
+    _fact_grounding_issue), instead of leaving "use something real" as an
+    unenforced prompt suggestion every item was free to ignore. Confirmed
+    live: even once URI's Playbook had real pain points/objections/proof
+    points on file, most of a 30-item plan still read as generic filler
+    disconnected from any of them — the instruction existed, nothing
+    checked whether an item actually followed it."""
+    facts: List[Tuple[str, str]] = []
+    for label, key in [
+        ("Pain point", "customer_pain_points"),
+        ("Need", "customer_needs"),
+        ("Desire", "customer_desires"),
+        ("Fear", "customer_fears"),
+        ("Frustration", "customer_frustrations"),
+        ("Aspiration", "customer_aspirations"),
+        ("Objection", "customer_objections"),
+        ("Reason they hesitate", "customer_hesitations"),
+        ("Common question", "common_questions"),
+        ("Buying trigger", "buying_triggers"),
+        ("Proof point", "proof_points"),
+    ]:
+        for v in (brand.get(key) or []):
+            v = str(v).strip()
+            if v:
+                facts.append((label, v))
+    why = str(brand.get("why_customers_choose_us") or "").strip()
+    if why:
+        facts.append(("Why customers choose this business", why))
+    return facts
+
+
+_GROUNDING_STOPWORDS = {
+    "the", "and", "your", "that", "with", "have", "this", "from", "their",
+    "about", "into", "over", "just", "when", "where", "what", "will",
+    "would", "could", "should", "they", "them", "more", "than", "then",
+    "also", "very", "much", "some", "each", "which", "while", "before",
+    "after", "because", "these", "those", "there", "here", "being", "both",
+    "through", "during", "without", "between", "under", "again", "further",
+    "once", "other", "same", "such", "only", "own", "cant", "dont", "isnt",
+    "wont", "really", "actually", "customers", "business", "businesses",
+}
+
+
+def _significant_words(text: str) -> List[str]:
+    """Meaningful content words from a real customer-psychology fact — what
+    an item actually needs to engage with to count as grounded in it,
+    filtering out connective/generic words that would make the check
+    trivially easy to pass with unrelated text."""
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    return list(dict.fromkeys(
+        w for w in words if len(w) >= 4 and w not in _GROUNDING_STOPWORDS
+    ))
+
+
+def _fact_grounding_issue(idea: Dict[str, Any], fact_label: str, fact_text: str) -> Optional[str]:
+    """None if `idea`'s reader-facing text genuinely engages with its
+    assigned real fact's actual substance; otherwise a correction message
+    naming exactly what's missing. Deliberately not a verbatim-quote
+    requirement (the addendum already prefers near-verbatim phrasing where
+    natural, but forcing it on every item would make 30 days sound
+    robotic) — this only requires the item's own words to overlap with the
+    fact's real vocabulary, which a genuinely-grounded paraphrase will
+    naturally do and pure generic filler ("URI makes it possible") won't."""
+    sig_words = _significant_words(fact_text)
+    if not sig_words:
+        return None
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    hits = find_banned(_reader_text(idea), sig_words)
+    required = 1 if len(sig_words) <= 2 else 2
+    if len(hits) < required:
+        return (
+            f'does not actually engage with its assigned real fact — [{fact_label}] "{fact_text}" — '
+            f'reference its real substance (e.g. "{", ".join(sig_words[:3])}"), not generic language '
+            f'that could apply to any business'
+        )
+    return None
 
 
 def _brand_rules_block(brand: Dict[str, Any]) -> str:
@@ -444,6 +575,103 @@ def _resolve_series_name(name: Optional[str], brand_name: str, industry: str) ->
 
 
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
+
+def _concept_pool_avoid_block(concepts: List[Dict[str, Any]]) -> str:
+    """Formats an earlier wave's candidate concepts as a prompt block telling
+    a later wave not to duplicate them — the within-this-generation-run
+    counterpart to creative_memory's avoid_block (which only covers a PRIOR
+    plan's concepts). See _generate_candidate_concepts's wave-splitting
+    comment for why this exists."""
+    if not concepts:
+        return ""
+    lines = [
+        f"- territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}"
+        f" ({c.get('concept_name', '')})"
+        for c in concepts
+    ]
+    return (
+        "\nAlready proposed earlier in this SAME batch — do not repeat these "
+        "territory+subject+angle combinations or their underlying idea:\n"
+        + "\n".join(lines)
+    )
+
+
+# Confirmed live: 6+ items on a single 30-day URI plan independently landed
+# on the same "chaos -> simple/smooth/effortless" payoff language, each
+# written by a different one of the 5 concurrent final-copy batches with no
+# visibility into the others — flagged by _llm_diversity_check's crutch-word
+# criterion. These words are legitimately part of some brands' own voice
+# (URI's own tagline uses "streamlined"), so an outright ban would fight
+# brand authenticity. Instead only a deterministic ~1-in-N items (by
+# day_index — the same pre-assignment trick that already fixed territory
+# clustering, see _allocate_territories) may use this language; every other
+# item must express the same benefit more specifically. This reuses the
+# words_to_avoid hard-validation + correction-retry mechanism
+# _generate_final_copy already has for brand.words_to_avoid — no new
+# mechanism, and critically no added sequential round-trip/latency, since
+# it's enforced within the existing per-chunk retry budget.
+_CRUTCH_WORDS = [
+    "simplify", "simplicity", "effortless", "seamless", "hassle-free",
+    "streamline", "smooth", "chaos",
+]
+_CRUTCH_WORD_ALLOWED_EVERY = 5  # ~1 in 5 items may use this language
+
+# Deterministically assigned per item (by day_index) instead of left to the
+# model's own judgment, so the 5 concurrent final-copy batches don't all
+# independently converge on the same safe CTA template — confirmed live: 6
+# items on one plan all used "[Verb] how URI can [benefit] your business
+# today." Same zero-added-latency pre-assignment principle as the crutch-
+# word allowance above and _allocate_territories.
+_CTA_STYLE_VARIANTS = [
+    "Direct action — say exactly what to do next (e.g. \"Book a free demo\", \"Start your free trial\")",
+    "Curiosity-driven — invite them to find out more without stating the outcome up front (e.g. \"See what changes\", \"Find out how\")",
+    "Social proof — point at other real users or results, not a generic claim (e.g. \"See why other businesses switched\")",
+    "Low-commitment first step — small and easy (e.g. \"Send a quick message\", \"Ask a question\")",
+    "Specific next step — name the exact feature, page, or action, never a generic verb",
+]
+
+
+def _allocate_territories(territories: Dict[str, Dict[str, Any]], total: int) -> List[str]:
+    """Returns a list of `total` territory keys, round-robin across every
+    territory in `territories` (interleaved, not grouped, so slicing this
+    into chunks gives each chunk a representative mix rather than one
+    territory per chunk), honoring each territory's own `max_share` cap
+    (e.g. L_COMMERCIAL's PRD §8 "must not dominate the calendar" ceiling)
+    where one is declared.
+
+    This exists because leaving territory choice to the model's own
+    judgment ("draw from these freely") let it default to whichever 2-3
+    territories felt safest for the brand every time, regardless of how
+    many other territories were available — confirmed live: URI's
+    calendar stayed ~25/30 "similar"-flagged even after candidate chunks
+    were made aware of each other's output (today's wave-splitting fix),
+    because awareness alone doesn't force actually using the other 8-9
+    unused territories. This is purely which STRATEGIC LENS each concept
+    is framed through (problem/desire/proof/process/etc.) — every concept
+    generated from any territory is still fully grounded in this specific
+    brand's name, audience, voice and rules, which are injected into every
+    chunk's prompt unconditionally and untouched by this function."""
+    keys = list(territories.keys())
+    if not keys or total <= 0:
+        return []
+    caps = {
+        k: max(1, round(total * t["max_share"])) if "max_share" in t else total
+        for k, t in territories.items()
+    }
+    counts = {k: 0 for k in keys}
+    out: List[str] = []
+    idx = 0
+    guard_limit = total * len(keys) + len(keys) * 2  # safety bound, not expected to be hit
+    guard = 0
+    while len(out) < total and guard < guard_limit:
+        k = keys[idx % len(keys)]
+        if counts[k] < caps[k]:
+            out.append(k)
+            counts[k] += 1
+        idx += 1
+        guard += 1
+    return out
+
 
 async def _generate_candidate_concepts(
     brand: Dict[str, Any],
@@ -549,16 +777,43 @@ async def _generate_candidate_concepts(
         chunk_sizes.append(size)
         remaining -= size
 
-    async def _one_chunk(chunk_idx: int, n: int) -> List[Dict[str, Any]]:
+    # Assign each chunk a required territory mix instead of leaving territory
+    # choice to the model's own judgment — see _allocate_territories' own
+    # docstring for why. Slicing one interleaved allocation sequentially
+    # gives each chunk a representative sub-mix of the whole run's spread.
+    territory_assignment = _allocate_territories(framework["territories"], target_count)
+    chunk_territories: List[List[str]] = []
+    _offset = 0
+    for _size in chunk_sizes:
+        chunk_territories.append(territory_assignment[_offset:_offset + _size])
+        _offset += _size
+
+    async def _one_chunk(
+        chunk_idx: int, n: int, assigned_territories: List[str], extra_avoid_block: str = ""
+    ) -> List[Dict[str, Any]]:
+        territory_counts: Dict[str, int] = {}
+        for _t in assigned_territories:
+            territory_counts[_t] = territory_counts.get(_t, 0) + 1
+        territory_requirement_block = "\n".join(
+            f"- {count} concept(s) from {key} ({framework['territories'][key]['label']})"
+            for key, count in territory_counts.items()
+        ) or f"- {n} concept(s), any territory below"
         prompt = f"""You are a senior creative strategist generating CANDIDATE content
 CONCEPTS for {brand_name}, a {industry} business. Target audience: {audience}.
 Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
 {f'USP: {usp}.' if usp else ''}
-{stage_note}{context_block}{assets_block}{avoid_block}{psychology_block}
+{stage_note}{context_block}{assets_block}{avoid_block}{extra_avoid_block}{psychology_block}
 Platforms: {', '.join(platforms) if platforms else 'social media'}.
 
-Available Content Territories (draw from these freely — you don't need every one):
+Content Territories (full list, for context on what each means):
 {territories_block}
+
+THIS BATCH'S REQUIRED TERRITORY MIX — produce exactly this many concepts from
+each territory listed, no substitutions and nothing from a territory not
+listed here. Every concept, regardless of territory, must still be entirely
+about {brand_name} specifically — the territory only changes the framing
+(e.g. a problem to solve vs. proof of results), never what business it's about:
+{territory_requirement_block}
 
 Available Angles: {angles_block}
 
@@ -599,6 +854,9 @@ concepts must come purely from business/audience/brand/creative-framework
 reasoning (nothing else exists in this task).
 
 Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys, nothing else."""
+        # Stagger concurrent chunks slightly rather than firing all of them
+        # in the same instant (see _CHUNK_STAGGER_SECONDS's module comment).
+        await asyncio.sleep(chunk_idx * _CHUNK_STAGGER_SECONDS)
         # One retry on parse failure — was a bare try/except with no retry at
         # all, so a single malformed response silently dropped the whole
         # chunk (confirmed live: a framework-config bug made this fail
@@ -612,6 +870,15 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
                     messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=1.0,
                 )
                 response = await AIService.chat_completion(ai_request)
+                # Confirmed live (Oct 2026): AIService.chat_completion returns a
+                # plain {"error": "..."} dict on failure (auth/rate-limit/quota),
+                # not an exception or a normal response object — without this
+                # check, the real error gets masked behind a useless
+                # "'dict' object has no attribute 'choices'", which was the
+                # actual cause of "no candidate concepts produced" shipping
+                # with zero diagnostic value for a real, live failure.
+                if isinstance(response, dict) and response.get("error"):
+                    raise ValueError(response["error"])
                 raw = response.choices[0].message.content.strip()
                 if raw.startswith("```"):
                     raw = raw.split("```")[1]
@@ -629,11 +896,48 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys,
                 return [c for c in parsed if isinstance(c, dict)]
             except Exception as exc:
                 last_exc = exc
+                if attempt == 0:
+                    await _backoff_if_rate_limited(exc)
         print(f"[CalendarV2] candidate chunk {chunk_idx} failed after retry: {last_exc}", flush=True)
         return []
 
-    results = await asyncio.gather(*[_one_chunk(i, size) for i, size in enumerate(chunk_sizes)])
-    return [c for chunk in results for c in chunk]
+    # Chunks run concurrently for latency (this pipeline is already tight
+    # against the gateway timeout — see this function's own docstring and
+    # _generate_final_copy's), but that means every chunk is independently
+    # blind to what every OTHER chunk is proposing. Confirmed live: for a
+    # business with a genuinely narrow content space, 4 parallel 20-concept
+    # calls converge on the same territory/subject combinations often enough
+    # to produce real, substantial duplication downstream (a 30-item plan
+    # landing at 25/30 flagged "similar" even after the diversity-check's own
+    # bugs were fixed) — the later diversity check was correctly catching
+    # genuine repetition that originated HERE, not a false positive.
+    #
+    # Split into two sequential waves instead of one fully-blind round: wave 1
+    # runs exactly as before (concurrent, blind), then wave 2 gets wave 1's
+    # full output as an explicit "already proposed in this batch, don't
+    # duplicate" list, same mechanism creative_memory's avoid_block already
+    # uses for a PRIOR plan's concepts. This halves the number of chunks that
+    # are ever fully blind to one another (today: 4; now: at most 2 within a
+    # wave), at the cost of one extra sequential round-trip rather than
+    # zero — a bounded, deliberate latency tradeoff for a real diversity gain.
+    half = max(1, len(chunk_sizes) // 2)
+    wave1_sizes, wave2_sizes = chunk_sizes[:half], chunk_sizes[half:]
+
+    wave1_results = await asyncio.gather(*[
+        _one_chunk(i, size, chunk_territories[i]) for i, size in enumerate(wave1_sizes)
+    ])
+    wave1_concepts = [c for chunk in wave1_results for c in chunk]
+
+    if not wave2_sizes:
+        return wave1_concepts
+
+    wave1_avoid_block = _concept_pool_avoid_block(wave1_concepts)
+    wave2_results = await asyncio.gather(*[
+        _one_chunk(half + i, size, chunk_territories[half + i], extra_avoid_block=wave1_avoid_block)
+        for i, size in enumerate(wave2_sizes)
+    ])
+    wave2_concepts = [c for chunk in wave2_results for c in chunk]
+    return wave1_concepts + wave2_concepts
 
 
 # ── Step 4 — Score candidates (PRD §11-12, §37) ─────────────────────────────
@@ -1365,9 +1669,17 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
             seen_openings[opening] = i
         if i > 0:
             prev = items[i - 1]
+            # Persisted plan items store this as "creative_angle", not
+            # "angle" ("angle" is only the field name on the earlier
+            # pre-copy CONCEPT shape, e.g. in _similarity_overlap). Reading
+            # "angle" here always returned None for both sides, so this
+            # clause silently reduced to a territory+subject-only check —
+            # confirmed live: two adjacent items sharing a territory+subject
+            # but with deliberately DIFFERENT angles were flagged as
+            # duplicates anyway, since angle was never actually compared.
             if (item.get("territory") == prev.get("territory")
                     and item.get("subject") == prev.get("subject")
-                    and item.get("angle") == prev.get("angle")):
+                    and item.get("creative_angle") == prev.get("creative_angle")):
                 issues[i] = issues.get(i, "") + "; repeats prior day's territory+subject+angle"
         visual_idea = str((item.get("creative_direction") or {}).get("central_visual_idea") or "").strip().lower()
         visual_opening = " ".join(visual_idea.split()[:6])
@@ -1670,6 +1982,7 @@ async def _generate_final_copy(
     platforms: List[str],
     existing_assets_summary: str,
     force: bool = False,
+    avoid_context: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """PRD Step8 (final copy) and Step9 (creative direction) share ONE
     chunked network call here rather than two — a deliberate simplification
@@ -1680,7 +1993,17 @@ async def _generate_final_copy(
     to fix (see generate_plan_v2's concurrency comments). The PRD's real
     requirement — copy generation must not reinterpret the approved concept
     — is satisfied by fixing territory/subject/angle/device/format as given
-    inputs the model is told not to touch, not by forcing a second round-trip."""
+    inputs the model is told not to touch, not by forcing a second round-trip.
+
+    avoid_context: other, already-finalized items from the SAME plan that
+    concepts_chunk must not duplicate — used by _regenerate_flagged_items.
+    Without this, regenerating a flagged item in isolation only guarantees
+    it differs from the OTHER items being regenerated alongside it in this
+    same call; it has no idea what the plan's other ~29 untouched items
+    already say, so the "fixed" item can easily land right back on a title/
+    hook/visual idea that duplicates one of those — confirmed live: a plan
+    still showed items flagged similar after its one auto-regeneration pass
+    supposedly fixed them, for exactly this reason."""
     n = len(concepts_chunk)
     brand_name = brand.get("brand_name") or "the brand"
     industry = brand.get("industry") or "business"
@@ -1696,6 +2019,13 @@ async def _generate_final_copy(
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
     psychology_block = _customer_psychology_block(brand) + _brand_rules_block(brand)
     visual_guide_block = _visual_guide_block(brand)
+    # Deterministic per-item grounding assignment (by day_index) — see
+    # _flatten_psychology_facts/_fact_grounding_issue's own docstrings for
+    # why this exists instead of leaving "use something real" as a soft,
+    # unenforced prompt suggestion. Empty when the Playbook has no real
+    # customer-psychology data at all, in which case nothing changes from
+    # before this existed.
+    psychology_facts = _flatten_psychology_facts(brand)
 
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
     bp_lines = [v for v in [
@@ -1721,13 +2051,31 @@ async def _generate_final_copy(
             return f"CAROUSEL — ~{c.get('carousel_slide_count', 3)} slides (2-3 allowed)"
         return str(c.get("format", "image"))
 
+    def _assigned_fact(day_index: int) -> Optional[Tuple[str, str]]:
+        if not psychology_facts:
+            return None
+        return psychology_facts[day_index % len(psychology_facts)]
+
+    def _grounding_line(c: Dict[str, Any], i: int) -> str:
+        fact = _assigned_fact(c.get("day_index", i))
+        if not fact:
+            return ""
+        label, text = fact
+        return (
+            f"\n  MUST GROUND IN THIS REAL FACT — [{label}] \"{text}\" — build the idea around it "
+            f"(your own words, not a verbatim quote unless it's a Proof point), not generic language "
+            f"that could apply to any business."
+        )
+
     concepts_block = "\n\n".join(
         f"""Item {i} — {c['date']}:
   Territory: {c.get('territory')} | Subject: {c.get('subject')} | Angle: {c.get('angle')}
   Creative device: {(c.get('creative_device') or {}).get('device')} ({(c.get('creative_device') or {}).get('category')})
   Concept: {c.get('concept_name') or c.get('creative_concept_name', '')}
   Objective: {c.get('objective')} | Audience segment: {c.get('audience_segment', '')}
-  Format: {_fmt_line(c)}"""
+  Format: {_fmt_line(c)}
+  CTA style (use this, not a generic template): {_CTA_STYLE_VARIANTS[c.get('day_index', i) % len(_CTA_STYLE_VARIANTS)]}"""
+        + _grounding_line(c, i)
         + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
            f"make it the subject of the post, by name." if c.get("key_date")
            else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
@@ -1740,6 +2088,24 @@ async def _generate_final_copy(
         for i, c in enumerate(concepts_chunk) if c.get("format") == "carousel"
     ]
     carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
+
+    avoid_context_block = ""
+    if avoid_context:
+        avoid_lines = [
+            f"- {(c.get('exact_copy') or {}).get('headline') or c.get('title', '')} "
+            f"/ hook: {c.get('hook', '')} "
+            f"/ visual idea: {(c.get('creative_direction') or {}).get('central_visual_idea') or c.get('central_visual_idea', '')}"
+            for c in avoid_context
+            if c.get("title") or c.get("hook")
+        ]
+        if avoid_lines:
+            avoid_context_block = (
+                "\n\n=== ALREADY USED ELSEWHERE IN THIS SAME 30-DAY PLAN — DO NOT DUPLICATE ===\n"
+                "These items are staying as-is. Your new item(s) below must not be a reworded "
+                "version of any of these — different headline, different hook, different visual "
+                "idea, and not leaning on the same underlying angle just phrased differently:\n"
+                + "\n".join(avoid_lines)
+            )
 
     # Substitute the real brand name into {brand}-templated entries for display
     # — truncating at the placeholder (the old approach) left phrases like
@@ -1771,6 +2137,7 @@ then the CTA. Do not start from "what text goes on the graphic."
 
 {concepts_block}
 {carousel_spec}
+{avoid_context_block}
 
 HEADLINE STANDARD — every title/headline must create curiosity, tension,
 recognition, surprise, contrarian thinking, or real specificity. It should
@@ -1878,6 +2245,7 @@ business's actual customers, not a generic reader?
             # validation-failure retry path below already did.
             print(f"[CalendarV2] final-copy chunk parse failed on attempt {attempt + 1}/2 ({exc})", flush=True)
             if attempt == 0:
+                await _backoff_if_rate_limited(exc)
                 continue
             raise
 
@@ -1887,10 +2255,18 @@ business's actual customers, not a generic reader?
             expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
             if is_carousel:
                 _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-3 hard rule
+            item_words_to_avoid = _all_banned_words(brand)
+            if concepts_chunk[i].get("day_index", i) % _CRUTCH_WORD_ALLOWED_EVERY != 0:
+                item_words_to_avoid = item_words_to_avoid + _CRUTCH_WORDS
             issues = _validate_item_v2(
                 idea, is_carousel=is_carousel, expected_slides=expected_slides,
-                words_to_avoid=_all_banned_words(brand),
+                words_to_avoid=item_words_to_avoid,
             )
+            fact = _assigned_fact(concepts_chunk[i].get("day_index", i))
+            if fact and isinstance(idea, dict):
+                grounding_issue = _fact_grounding_issue(idea, fact[0], fact[1])
+                if grounding_issue:
+                    issues.append(grounding_issue)
             if issues:
                 failures[i] = issues
         if not failures:
@@ -1946,10 +2322,13 @@ async def _regenerate_flagged_items(
     concepts_chunk = [items_by_index[i] for i in flagged_day_indices if i in items_by_index]
     if not concepts_chunk:
         return {}
+    flagged_set = set(flagged_day_indices)
+    avoid_context = [item for i, item in items_by_index.items() if i not in flagged_set]
     try:
         regenerated = await _generate_final_copy(
             brand=brand, concepts_chunk=concepts_chunk, platforms=platforms,
             existing_assets_summary=existing_assets_summary, force=True,
+            avoid_context=avoid_context,
         )
     except Exception as exc:
         print(f"[CalendarV2] auto-regeneration of {len(concepts_chunk)} flagged item(s) failed: {exc}", flush=True)
@@ -2524,9 +2903,15 @@ async def regenerate_item_v2(
         "carousel_slide_count": slide_count,
     }
 
+    # Same blindness bug the auto-regeneration pass had (see
+    # _regenerate_flagged_items): without this, a manual regenerate has no
+    # idea what the plan's OTHER items already say, so it can easily land
+    # right back on a title/hook/visual idea that duplicates one of them.
+    other_items = [it for it in plan["items"] if it["day_index"] != item_index]
     chunk_items = await _generate_final_copy(
         brand=brand, concepts_chunk=[concept], platforms=plan.get("platforms") or [],
         existing_assets_summary=existing_assets_summary, force=True,
+        avoid_context=other_items,
     )
     if not chunk_items:
         raise RuntimeError("Regeneration produced no result")
@@ -2576,6 +2961,31 @@ async def regenerate_item_v2(
         "items.$[it].last_regenerated_reason": "manual",
         "updated_at": datetime.utcnow().isoformat(),
     }
+
+    # Recompute the diversity/quality flags against the rest of the plan —
+    # before this fix, a manual regenerate never touched diversity_check or
+    # creative_quality_review_note at all, so the frontend's "flagged as
+    # similar to another idea in this plan" warning triangle kept showing
+    # on the card forever, regardless of how different the new content
+    # actually was, because nothing ever recomputed it. Cheap/deterministic
+    # (the same check the initial plan generation already uses), not a
+    # second LLM round-trip for a single-item action.
+    merged_item = {**item, **{k: v for k, v in new_idea.items() if k not in ("day_index", "date")}, "format": concept["format"]}
+    full_items = sorted(
+        (merged_item if it["day_index"] == item_index else it for it in plan["items"]),
+        key=lambda it: it["day_index"],
+    )
+    position = next(i for i, it in enumerate(full_items) if it["day_index"] == item_index)
+    still_flagged = position in _rule_based_diversity_issues(full_items)
+    update_fields["items.$[it].diversity_check"] = {
+        "passed": not still_flagged,
+        "similarity_score": 1.0 if still_flagged else 0.0,
+        "flagged_against_item_id": None,
+    }
+    update_fields["items.$[it].creative_quality_review_note"] = (
+        _anti_boring_check([merged_item], brand_name=brand.get("brand_name", "")).get(0)
+    )
+
     await db[COLLECTION].update_one(
         {**scope, "plan_id": plan_id},
         {"$set": update_fields, "$push": {"items.$[it].version_history": version_entry}},
