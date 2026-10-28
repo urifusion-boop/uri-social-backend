@@ -7,8 +7,12 @@ import asyncio
 
 import pytest
 
-from app.agents.market_intelligence.models import ActionReadiness, ComponentScore, ScoreBreakdown
-from app.agents.market_intelligence.scan_runner import _action_readiness_from, _fetch_business_context
+from app.agents.market_intelligence.models import ActionReadiness, ComponentScore, ScoreBreakdown, UrgencyAssessment
+from app.agents.market_intelligence.scan_runner import (
+    _action_readiness_from,
+    _fetch_business_context,
+    _urgency_gated_by_relevance,
+)
 
 
 def _run(coro):
@@ -41,6 +45,51 @@ def test_check_suitability_when_component_missing_entirely():
     components = [ComponentScore(name="product_fit", points=2, reason="x")]
     relevance = ScoreBreakdown(components=components, total=2, band=ScoreBreakdown.band_for(2))
     assert _action_readiness_from(relevance) == ActionReadiness.CHECK_SUITABILITY
+
+
+def _relevance(total: int, feasibility: int) -> ScoreBreakdown:
+    components = [ComponentScore(name="fulfilment_feasibility", points=feasibility, reason="x")]
+    return ScoreBreakdown(components=components, total=total, band=ScoreBreakdown.band_for(total))
+
+
+def test_the_literal_live_bug_low_relevance_is_never_ready_to_act_even_with_fulfilment_known():
+    """Real live example: relevance 3/10 "low," feasibility known (stock/
+    delivery on record) — used to be labelled "Ready to act" anyway, a
+    direct contradiction with the relevance score shown right next to it."""
+    relevance = _relevance(total=3, feasibility=1)
+    assert relevance.band == "low"
+    assert _action_readiness_from(relevance) == ActionReadiness.CHECK_SUITABILITY
+
+
+def test_medium_relevance_with_fulfilment_known_is_ready_to_act():
+    relevance = _relevance(total=5, feasibility=1)
+    assert _action_readiness_from(relevance) == ActionReadiness.READY_TO_ACT
+
+
+class TestUrgencyGatedByRelevance:
+    def test_low_relevance_downgrades_an_urgent_flag(self):
+        """The other half of the same live bug: a fresh but barely-related
+        post was flagged "Urgent" exactly as confidently as a genuinely
+        on-target one, since urgency only ever looked at freshness."""
+        urgency = UrgencyAssessment(is_urgent=True, reason="within 12h urgent cutoff")
+        relevance = _relevance(total=2, feasibility=0)
+        gated = _urgency_gated_by_relevance(urgency, relevance)
+        assert gated.is_urgent is False
+        assert "relevance too low" in gated.reason
+
+    def test_medium_or_higher_relevance_leaves_urgency_untouched(self):
+        urgency = UrgencyAssessment(is_urgent=True, reason="within 12h urgent cutoff")
+        relevance = _relevance(total=6, feasibility=0)
+        gated = _urgency_gated_by_relevance(urgency, relevance)
+        assert gated.is_urgent is True
+        assert gated.reason == "within 12h urgent cutoff"
+
+    def test_an_already_not_urgent_assessment_is_left_alone(self):
+        urgency = UrgencyAssessment(is_urgent=False, reason="not urgent for some other reason")
+        relevance = _relevance(total=2, feasibility=0)
+        gated = _urgency_gated_by_relevance(urgency, relevance)
+        assert gated.is_urgent is False
+        assert gated.reason == "not urgent for some other reason"
 
 
 # ── _fetch_business_context reads the real new fields ────────────────────────

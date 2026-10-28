@@ -77,14 +77,14 @@ def _evidence(evidence_id, hours_ago):
     }
 
 
-def _inquiry_insight(insight_id, evidence_id, is_urgent, reason):
+def _inquiry_insight(insight_id, evidence_id, is_urgent, reason, relevance_band="medium"):
     return {
         "id": insight_id, "brand_id": "b1", "topic_id": "t1", "type": "purchase_inquiry",
         "status": "active", "evidence_ids": [evidence_id],
         "urgency": {"is_urgent": is_urgent, "reason": reason, "deadline": None},
         "headline": "h", "observed_change": "oc", "business_implication": "bi", "suggested_next_step": "sns",
         "confidence": {"components": [], "total": 0, "band": "low"},
-        "relevance": {"components": [], "total": 0, "band": "low"},
+        "relevance": {"components": [], "total": 5, "band": relevance_band},
         "first_seen": NOW, "last_updated": NOW,
     }
 
@@ -114,6 +114,32 @@ def test_the_literal_live_bug_a_stale_urgent_flag_gets_rescored_to_not_urgent():
     updated = db["mi_insights"].docs[0]
     assert updated["status"] == "active"
     assert updated["urgency"]["is_urgent"] is False
+
+
+def test_a_fresh_but_low_relevance_inquiry_is_rescored_to_not_urgent():
+    """Real live bug: a fresh-but-barely-related post was flagged "Urgent"
+    exactly as confidently as a genuinely on-target one, since urgency
+    only ever looked at freshness. A re-score must not leave a low-
+    relevance match "Urgent" just because it's still within the window."""
+    db = FakeDb({
+        "mi_insights": [_inquiry_insight("i1", "e1", True, "within 12h urgent cutoff", relevance_band="low")],
+        "mi_evidence": [_evidence("e1", 2)],
+    })
+    result = _run(expire_stale_inquiries(db, now=NOW))
+    assert result == {"rescored": 1, "expired": 0, "unchanged": 0}
+    updated = db["mi_insights"].docs[0]
+    assert updated["status"] == "active"
+    assert updated["urgency"]["is_urgent"] is False
+    assert "relevance too low" in updated["urgency"]["reason"]
+
+
+def test_an_already_downgraded_low_relevance_inquiry_stays_unchanged():
+    db = FakeDb({
+        "mi_insights": [_inquiry_insight("i1", "e1", False, "relevance too low to flag as urgent (within 12h urgent cutoff)", relevance_band="low")],
+        "mi_evidence": [_evidence("e1", 2)],
+    })
+    result = _run(expire_stale_inquiries(db, now=NOW))
+    assert result == {"rescored": 0, "expired": 0, "unchanged": 1}
 
 
 def test_an_inquiry_past_the_freshness_window_is_expired():
