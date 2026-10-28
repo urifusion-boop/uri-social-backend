@@ -34,9 +34,23 @@ def test_create_topic_tracks_topic_created():
     from app.agents.market_intelligence import router
     from app.agents.market_intelligence.models import TopicCreateRequest
 
+    class FakeCursor:
+        def __init__(self, docs):
+            self._docs = docs
+
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            for d in list(self._docs):
+                yield d
+
     class FakeCollection:
         def __init__(self):
             self.docs = []
+
+        def find(self, query=None, projection=None):
+            return FakeCursor([])
 
         async def insert_one(self, doc):
             self.docs.append(doc)

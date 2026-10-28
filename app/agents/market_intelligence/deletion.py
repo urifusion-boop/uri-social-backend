@@ -18,6 +18,51 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from .models import InsightStatus
 
 
+async def delete_topic_cascade(topic_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> Optional[dict]:
+    """Removing a topic (owner-initiated, e.g. a duplicate created by
+    double-submitting "New topic" or re-running topic suggestion) must
+    actually remove it everywhere it was ever written to, not just from
+    mi_topics — otherwise its evidence, clusters and insights keep
+    existing, keep getting shown, and keep consuming budget on the next
+    scheduled scan despite looking "deleted" from GET /topics. Confirmed
+    live: no DELETE endpoint for a topic existed anywhere in this product
+    before this function, and two real exact-duplicate topics (same
+    question, created minutes apart) were sitting in mi_topics with no
+    way to remove either one.
+
+    Returns None if the topic doesn't exist or isn't owned by this brand
+    — same "404, not a distinguishing error" posture as
+    delete_evidence_cascade above."""
+    topic_doc = await db["mi_topics"].find_one({"id": topic_id})
+    if not topic_doc or topic_doc.get("brand_id") != brand_id:
+        return None
+
+    evidence_ids = [e["id"] async for e in db["mi_evidence"].find({"topic_id": topic_id}, {"id": 1})]
+    insight_ids = [i["id"] async for i in db["mi_insights"].find({"topic_id": topic_id}, {"id": 1})]
+
+    if evidence_ids:
+        await db["mi_classifications"].delete_many({"evidence_id": {"$in": evidence_ids}})
+    if insight_ids:
+        await db["mi_briefs"].delete_many({"insight_id": {"$in": insight_ids}})
+
+    evidence_deleted = (await db["mi_evidence"].delete_many({"topic_id": topic_id})).deleted_count
+    clusters_deleted = (await db["mi_clusters"].delete_many({"topic_id": topic_id})).deleted_count
+    insights_deleted = (await db["mi_insights"].delete_many({"topic_id": topic_id})).deleted_count
+    developments_deleted = (await db["mi_developments"].delete_many({"topic_id": topic_id})).deleted_count
+    await db["mi_scans"].delete_many({"topic_id": topic_id})
+    await db["mi_term_stats"].delete_many({"topic_id": topic_id})
+    await db["mi_outbox"].delete_many({"topic_id": topic_id})
+    await db["mi_topics"].delete_one({"id": topic_id})
+
+    return {
+        "topic_id": topic_id,
+        "evidence_deleted": evidence_deleted,
+        "clusters_deleted": clusters_deleted,
+        "insights_deleted": insights_deleted,
+        "developments_deleted": developments_deleted,
+    }
+
+
 async def delete_evidence_cascade(evidence_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> Optional[dict]:
     """Returns None if the evidence doesn't exist or isn't owned by this
     brand — same "404, not a distinguishing error" posture as the rest of

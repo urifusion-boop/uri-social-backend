@@ -6,6 +6,7 @@ scan_runner.py or a direct Mongo read. No business logic lives here.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timedelta
 
@@ -42,7 +43,7 @@ from .models import (
 )
 from .access import can_manage_mi_access, require_mi_write_access
 from .budget import get_or_create_budget
-from .deletion import delete_evidence_cascade
+from .deletion import delete_evidence_cascade, delete_topic_cascade
 from .notification_delivery import get_or_create_preferences
 from .keyword_suggestion import suggest_keywords
 from .scan_runner import ADAPTER_REGISTRY, create_scan_run, execute_scan, preview_topic_coverage
@@ -178,12 +179,32 @@ async def suggest_topic_from_brand(
     return UriResponse.get_single_data_response("suggestion", suggestion)
 
 
+def _normalize_topic_question(question: str) -> str:
+    """Collapse whitespace, case and trailing punctuation so "...online?"
+    and "...online" (confirmed live as two separate real topics) are
+    recognized as the same standing question."""
+    return re.sub(r"[\s?.!]+$", "", (question or "").strip().lower())
+
+
 @router.post("/topics")
 async def create_topic(
     body: TopicCreateRequest,
     ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
+    # No dedup check ever existed here — confirmed live, this account had
+    # the exact same question submitted twice (11 minutes apart) sitting
+    # as two separate topics, each independently collecting and spending
+    # its own budget. Creation is idempotent on the normalized question
+    # now: a near-identical re-submission returns the existing topic
+    # instead of spawning a duplicate (PRD never asked for two standing
+    # questions that are really the same one).
+    normalized = _normalize_topic_question(body.question)
+    async for existing in db["mi_topics"].find({"brand_id": ctx["brand_id"], "active": True}):
+        if _normalize_topic_question(existing.get("question", "")) == normalized:
+            existing.pop("_id", None)
+            return UriResponse.get_single_data_response("topic", existing, message="A topic with this question already exists.")
+
     # PRD §9: "Uri suggests keywords... the owner reviews them before
     # starting collection" — real suggestion now happens via
     # POST /topics/suggest-keywords, reviewed client-side before this call;
@@ -222,6 +243,23 @@ async def list_topics(
     for t in topics:
         t.pop("_id", None)
     return UriResponse.get_list_data_response("topic", topics)
+
+
+@router.delete("/topics/{topic_id}")
+async def delete_topic(
+    topic_id: str,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """No way to remove a topic existed anywhere in this product before
+    this endpoint — confirmed live, real exact-duplicate topics (the same
+    standing question, created minutes apart) had no way to be cleaned up.
+    Cascades into evidence, classifications, clusters, insights,
+    developments, scans, term stats and outbox entries — see deletion.py."""
+    result = await delete_topic_cascade(topic_id, ctx["brand_id"], db)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return UriResponse.get_single_data_response("deletion", result)
 
 
 @router.get("/budget")
