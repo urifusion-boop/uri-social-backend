@@ -378,8 +378,29 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
     words_to_avoid = [str(w) for w in (brand.get("words_to_avoid") or []) if w]
     if words_to_avoid:
         parts.append("Words/phrases to avoid: " + ", ".join(words_to_avoid))
+    proof_points = [str(p) for p in (brand.get("proof_points") or []) if p]
+    # Confirmed live: "Proof"-territory posts for a brand with no real proof
+    # data on file came back as vague, unverifiable "customer success"
+    # claims — correctly flagged by the diversity checker's GENERIC
+    # criterion, since the model had nothing true to cite and invented
+    # filler instead. Giving it real proof_points when they exist fixes
+    # that directly; the explicit "do not invent" instruction below is what
+    # stops it from fabricating a testimonial when the list is still empty.
+    # Always computed (even when `parts` is otherwise empty) so a brand with
+    # a near-blank Playbook still gets the anti-fabrication instruction, not
+    # silence.
+    proof_block = (
+        "\n\nREAL PROOF AVAILABLE (quote/cite these close to verbatim in \"Proof\"-style posts):\n"
+        + "\n".join(f"- {p}" for p in proof_points)
+        if proof_points else
+        "\n\nNO REAL PROOF POINTS ARE ON FILE for this business yet. Do NOT invent a testimonial, "
+        "case study, customer quote, or specific result — that's fabrication. Any \"Proof\"-territory "
+        "idea must instead use something genuinely verifiable without invented evidence (the process "
+        "itself, a guarantee, a founder's direct accountability, a demonstrable feature) — or, better, "
+        "treat this as a signal to lean on a different territory instead."
+    )
     if not parts:
-        return ""
+        return "\n\nCUSTOMER PSYCHOLOGY (from this brand's Playbook):" + proof_block
     return (
         "\n\nCUSTOMER PSYCHOLOGY (from this brand's Playbook — real customer reality, not a generic assumption):\n"
         + "\n".join(f"- {p}" for p in parts)
@@ -390,6 +411,7 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
           "close to verbatim rather than paraphrasing it into generic marketing language — see the "
           "addendum's own example: \"I don't have time to cook\" becomes \"You don't hate cooking. "
           "You hate deciding what to cook at 7:30pm,\" not \"5 Benefits of Meal Delivery.\""
+        + proof_block
     )
 
 
