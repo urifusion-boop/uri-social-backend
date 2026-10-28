@@ -162,6 +162,16 @@ async def suggest_topic_from_brand(
     if suggestion is None:
         return UriResponse.error_response(
             "Your Brand Playbook doesn't say what you sell yet — add your brand and products there first.")
+    # Prefer what the business actually configured in Settings -> Listening
+    # location over the Playbook's own loose "customer_location" text (often
+    # a whole continent, e.g. "Africa", even once Settings has been set to a
+    # specific country) — confirmed live: this mismatch is why a Nigeria-
+    # scoped account kept getting new topics defaulted to "Africa."
+    from .listening.geo import location_scope_display_name
+    listening_profile = await db["mi_listening_profiles"].find_one({"brand_id": ctx.get("brand_id")})
+    real_location = location_scope_display_name((listening_profile or {}).get("location_scope") or {})
+    if real_location:
+        suggestion["geographic_scope"] = real_location
     # Default to the cheapest real source that's set up on this server.
     from app.core.config import settings
     suggestion["sources"] = ["x"] if (settings.APIFY_API_TOKEN or "").strip() else ["mock"]
@@ -546,6 +556,20 @@ async def list_developments(
     developments = [doc async for doc in cursor]
     for d in developments:
         d.pop("_id", None)
+
+    # Backstop location filter — see development_location_conflicts' own
+    # docstring for why this exists alongside the collection-time fix in
+    # scan_runner.py (catches whatever was already collected before that
+    # fix, or whatever a source with no real geo lever let through).
+    from .listening.geo import development_location_conflicts, resolve_topic_location_hint
+    location_hint = await resolve_topic_location_hint(db, ctx["brand_id"])
+    expected_country = (location_hint or {}).get("country")
+    if expected_country:
+        developments = [
+            d for d in developments
+            if not development_location_conflicts(d.get("location"), expected_country)
+        ]
+
     return UriResponse.get_list_data_response("development", developments)
 
 

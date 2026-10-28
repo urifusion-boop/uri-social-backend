@@ -234,3 +234,104 @@ def resolve_countries(scope: LocationScope) -> list[str]:
         return [code] if code in COUNTRIES and code != "GLOBAL" else []
     # region/city: resolved by the caller via get_place/resolve_or_create_place
     return []
+
+
+def location_scope_display_name(scope: dict) -> Optional[str]:
+    """A plain, human-readable name for a saved location_scope dict (e.g.
+    "Nigeria", "Lagos, Nigeria", "Africa") — or None for global/unset.
+    Used to default a new topic's geographic_scope to what the business
+    actually configured in Settings, instead of the Brand Playbook's own
+    loose "customer_location" free text (often a whole continent, e.g.
+    "Africa", even when Settings has since been set to a specific
+    country) — see resolve_topic_location_hint's docstring for the live
+    bug this mismatch caused."""
+    scope = scope or {}
+    level = scope.get("level")
+    if level == "city":
+        country_name = COUNTRY_NAMES.get((scope.get("country") or "").upper())
+        city = scope.get("city")
+        if city and country_name:
+            return f"{city}, {country_name}"
+        return city or country_name
+    if level == "country":
+        return COUNTRY_NAMES.get((scope.get("country") or "").upper())
+    if level == "continent":
+        c = CONTINENTS.get((scope.get("continent") or "").upper().replace(" ", "_"))
+        return c["label"] if c else None
+    return None
+
+
+def development_location_conflicts(location_text: Optional[str], expected_country: str) -> bool:
+    """True only when `location_text` (a Development's own free-text
+    location, extracted by an LLM from whatever the source announcement
+    said — see development_extractor.py) clearly names a DIFFERENT country
+    than `expected_country`. Never true for ambiguous/unknown text (no
+    location given, or a bare city/venue name with no recognizable country
+    in it) — a missed match is far less harmful than hiding something that
+    might genuinely be relevant, so this only acts on a confident mismatch.
+
+    This is the backstop for what collection-time geo targeting
+    (resolve_topic_location_hint, wired into scan_runner.py) doesn't catch
+    — either because it was collected before that fix existed, or because
+    a source has no real upstream geo lever at all (honestly documented per
+    adapter in capabilities().notes). Confirmed live: a Nigeria-scoped
+    account's Upcoming Items showed a real New Delhi conference and a Las
+    Vegas expo with nothing anywhere checking whether they had anything to
+    do with the account's actual market."""
+    if not location_text or not expected_country:
+        return False
+    text = location_text.lower()
+    expected_name = (COUNTRY_NAMES.get(expected_country.upper()) or "").lower()
+    if expected_name and expected_name in text:
+        return False
+    for code, name in COUNTRY_NAMES.items():
+        if code == expected_country.upper() or code == "GLOBAL":
+            continue
+        name_l = (name or "").lower()
+        # Minimum length guards against short names (e.g. a 2-3 letter code
+        # or a very short country name) matching inside an unrelated word.
+        if len(name_l) >= 4 and name_l in text:
+            return True
+    return False
+
+
+async def resolve_topic_location_hint(db, brand_id: str) -> Optional[dict]:
+    """The real, canonical location hint for a business's OWN topic-based
+    scans (scan_runner.py) — reads the same mi_listening_profiles'
+    location_scope Settings' Listening location card actually writes to,
+    instead of Topic.geographic_scope (a free-text guess made once, at
+    topic-creation time, from the Brand Playbook — see brand_topic.py).
+
+    Confirmed live: an account with location_scope correctly set to Nigeria
+    still had Upcoming Items showing a New Delhi conference and a Las Vegas
+    expo, because nothing in the topic-scan collection path ever consulted
+    location_scope at all — Topic.geographic_scope stayed stuck at whatever
+    the Playbook's loose "customer_location" text said (often a whole
+    continent, e.g. "Africa") and was never enforced as a real filter
+    downstream, only used as a soft keyword-prompt hint. This is the same
+    `location` shape and mechanism listening/collector.py already uses
+    successfully for the shared-market subsystem (see markets.py's
+    `_location_hint`) — reused here, not reinvented, for a business's own
+    topic scans too.
+
+    Returns None for "global"/"continent" scope or no saved profile at all
+    — unchanged, unfiltered collection, same as before this existed.
+    Continent-level has no single country to hand an adapter (that's the
+    shared-market subsystem's own per-country-explosion job via
+    resolve_countries, not a single business's one topic scan)."""
+    profile = await db["mi_listening_profiles"].find_one({"brand_id": brand_id})
+    if not profile:
+        return None
+    scope = profile.get("location_scope") or {}
+    level = scope.get("level")
+    country = (scope.get("country") or "").upper()
+    if level not in ("country", "city") or not country or country == "GLOBAL":
+        return None
+    lang = (COUNTRY_LANGS.get(country) or ["en"])[0]
+    hint: dict = {"country": country, "news_edition": _NEWS_EDITIONS.get(country, f"{country}:{lang}")}
+    if level == "city" and scope.get("place_id"):
+        place = await get_place(db, scope["place_id"])
+        if place:
+            hint.update({k: v for k, v in (place.get("source_hints") or {}).items() if v is not None})
+            hint["place_id"] = place["id"]
+    return hint

@@ -57,6 +57,7 @@ from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
 from . import query_planner, term_learning
+from .listening.geo import resolve_topic_location_hint
 from .notifications import queue_notification
 from app.services.PostHogService import track_event
 from .models import (
@@ -455,6 +456,15 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     provider_run_ids: dict[str, str] = {}
     actual_costs: dict[str, float] = {}
 
+    # The account's real, currently-saved Listening location (Settings ->
+    # Listening location), not topic.geographic_scope — see
+    # resolve_topic_location_hint's own docstring for why these two were
+    # never the same thing and why that caused real, live-confirmed wrong
+    # results (e.g. an India conference surfacing for a Nigeria-scoped
+    # account). None for global/continent scope — collection stays
+    # unfiltered, same as before this existed.
+    location_hint = await resolve_topic_location_hint(db, topic.brand_id)
+
     for source in topic.sources:
         adapter = ADAPTER_REGISTRY.get(source.provider)
         if adapter is None:
@@ -479,9 +489,10 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
                 provider_run_id = await adapter.start_collection(
                     plan["expressions"] if plan else search_keywords,
                     plan["excluded"] if plan else topic.excluded_keywords,
-                    since, until, language=search_language)
+                    since, until, language=search_language, location=location_hint)
             else:
-                provider_run_id = await adapter.start_collection(search_keywords, topic.excluded_keywords, since, until)
+                provider_run_id = await adapter.start_collection(
+                    search_keywords, topic.excluded_keywords, since, until, location=location_hint)
         except Exception as e:
             gaps.append(f"source '{source.provider}' collection failed: {e}")
             await _mark_source(source.provider, status="failed", error=str(e)[:300])
