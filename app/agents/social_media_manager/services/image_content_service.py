@@ -924,6 +924,18 @@ class ImageContentService:
             bottom_margin_rule = ImageContentService.build_bottom_margin_rule(bc)
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
+            # Base kept at 20 (this codebase's own existing baseline, not the
+            # 12 some other callers default to) — dynamically raised on
+            # whichever axis _crop_to_ratio will actually crop, so a platform
+            # like LinkedIn (1200x628, the worst ratio mismatch this app
+            # targets) asks for a margin that survives the crop instead of
+            # just being safe on the model's own pre-crop canvas. Confirmed
+            # live: a LinkedIn headline got clipped at the top edge because
+            # the flat margin here didn't account for how much _crop_to_ratio
+            # removes from that same edge afterward.
+            _safe_margins = ImageContentService._safe_zone_margins_pct(specs["width"], specs["height"], base_pct=20)
+            _tb_pct = _safe_margins["top_bottom"]
+            _lr_pct = _safe_margins["left_right"]
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
 You must follow every instruction below precisely.
@@ -934,8 +946,9 @@ Every element in the image must come from the instructions below. Nothing else.
 
 CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
 Every letter of every word must be 100% inside the image canvas with no clipping.
-Maintain a minimum 20% safe-zone margin from the top, left, and right edges.
-Headlines must begin at least 20% from the top edge.
+Maintain a minimum {_tb_pct}% safe-zone margin from the top edge, and a minimum {_lr_pct}%
+safe-zone margin from the left and right edges.
+Headlines must begin at least {_tb_pct}% from the top edge.
 {bottom_margin_rule}
 If text is too large to fit within these margins, reduce the font size — do NOT let any
 character touch or cross any edge.
@@ -2948,6 +2961,52 @@ Answer with exactly one word: "yes" or "no"."""
         return _b64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
+    def _safe_zone_margins_pct(target_w: int, target_h: int, base_pct: int = 12) -> Dict[str, int]:
+        """
+        How much top/bottom and left/right margin the generation prompt must ask
+        for so that headline/CTA text survives _crop_to_ratio's post-generation
+        center-crop, not just the raw canvas the model draws on.
+
+        GPT-Image-2 only ever generates one of 3 fixed buckets (landscape
+        1536x1024, portrait 1024x1536, square 1024x1024 — see the size selection
+        in _call_dalle_api) and _crop_to_ratio then center-crops that bucket down
+        to the platform's real target ratio. For a close match (square targets,
+        roughly-4:3/3:4 targets) the crop is negligible and base_pct is enough,
+        same as before this existed. For a mismatched target — LinkedIn's 1200x628
+        (1.91:1) against the 1.5:1 landscape bucket is the worst case in this app,
+        per _call_dalle_api's own comment — the crop alone removes ~11% off the
+        top AND ~11% off the bottom before the image is even resized, which eats
+        almost the entire flat margin the model was told to respect and
+        reliably clips headline text. Returns the margin the model must be told
+        to leave on the axis that actually gets cropped, so "safe" in the prompt
+        means safe after the crop too, not just on the model's own canvas.
+        """
+        if target_w > target_h:
+            gen_w, gen_h = 1536, 1024
+        elif target_h > target_w:
+            gen_w, gen_h = 1024, 1536
+        else:
+            gen_w, gen_h = 1024, 1024
+
+        gen_ratio = gen_w / gen_h
+        target_ratio = target_w / target_h
+
+        top_bottom_pct = base_pct
+        left_right_pct = base_pct
+
+        if abs(gen_ratio - target_ratio) / target_ratio >= 0.02:
+            if target_ratio > gen_ratio:
+                new_h = gen_w / target_ratio
+                cropped_frac_each_side = ((gen_h - new_h) / gen_h) / 2
+                top_bottom_pct = min(45, base_pct + round(cropped_frac_each_side * 100))
+            else:
+                new_w = gen_h * target_ratio
+                cropped_frac_each_side = ((gen_w - new_w) / gen_w) / 2
+                left_right_pct = min(45, base_pct + round(cropped_frac_each_side * 100))
+
+        return {"top_bottom": top_bottom_pct, "left_right": left_right_pct}
+
+    @staticmethod
     async def _call_dalle_api(
         prompt: str,
         size: str = "1024x1024",
@@ -3132,10 +3191,26 @@ Answer with exactly one word: "yes" or "no"."""
 
                     _gpt2_b64 = _gpt2_resp.data[0].b64_json
 
+                    # GPT-Image-2 only generates 3 fixed buckets (1536x1024,
+                    # 1024x1536, 1024x1024) — none of which match most
+                    # platforms' real target ratio (LinkedIn's 1200x628 is
+                    # 1.91:1 vs the landscape bucket's 1.5:1, the worst
+                    # mismatch of any platform this app targets). Center-crop
+                    # to the target RATIO first, exactly like every other
+                    # branch in this function already does (gpt-image-1 edit,
+                    # fal.ai, Gemini, gpt-image-1 fallback) — this branch was
+                    # the one missing it. Without this, the resize below
+                    # scales width and height by different factors and
+                    # visibly squashes/stretches the whole image (confirmed
+                    # live: a LinkedIn post's subject and logo both looked
+                    # warped — up to a 27% width/height scale mismatch).
+                    _gpt2_b64 = ImageContentService._crop_to_ratio(_gpt2_b64, target_w, target_h)
+
                     _gpt2_img = _PILImage.open(_io.BytesIO(_b64.b64decode(_gpt2_b64))).convert("RGB")
 
                     # Resize to exact target dimensions (e.g., 1080×1350 for Instagram)
-                    # OpenAI generates at 1024×1536, we resize to match platform specs exactly
+                    # — the ratio already matches post-crop, so this is now a uniform
+                    # scale, not a stretch.
                     gen_w, gen_h = _gpt2_img.size
                     if (gen_w, gen_h) != (target_w, target_h):
                         print(f"🔄 Resizing from {gen_w}×{gen_h} to {target_w}×{target_h} (exact platform dimensions)")
