@@ -136,9 +136,22 @@ class TestDevelopmentLocationConflicts:
         assert development_location_conflicts("", "NG") is False
 
     def test_bare_city_with_no_country_name_is_not_a_conflict(self):
-        """Honest limitation: without a recognizable country name in the
-        text, this can't tell — stays visible rather than guessing."""
+        """Honest limitation: a city not in either lookup can't be placed
+        — stays visible rather than guessing."""
         assert development_location_conflicts("Some Convention Center", "NG") is False
 
     def test_no_expected_country_is_not_a_conflict(self):
         assert development_location_conflicts("New Delhi, India", "") is False
+
+    def test_bare_city_new_delhi_with_no_country_word_is_a_conflict(self):
+        """The actual live bug: a Development's extracted location is a
+        bare city name with no country word at all — "New Delhi", not
+        "New Delhi, India". MAJOR_CITY_COUNTRY is what makes this catchable."""
+        assert development_location_conflicts("New Delhi", "NG") is True
+
+    def test_bare_venue_and_city_las_vegas_with_no_country_word_is_a_conflict(self):
+        assert development_location_conflicts("Mandalay Bay, Las Vegas", "NG") is True
+
+    def test_major_city_matching_expected_country_is_not_a_conflict(self):
+        assert development_location_conflicts("New Delhi", "IN") is False
+        assert development_location_conflicts("Johannesburg", "ZA") is False
