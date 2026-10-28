@@ -320,6 +320,26 @@ def _job_listening_weekly_digest():
     _run_async("listening_weekly_digest", _run)
 
 
+def _job_market_intelligence_inquiry_expiry():
+    """Uri Market Intelligence purchase-inquiry expiry/re-scoring (PRD
+    §12) — hourly. An inquiry insight is written once at compose time and
+    never revised afterward the way a cluster-backed insight is, so
+    nothing else in this codebase keeps an active inquiry's urgency flag
+    (or its active status at all, once its 48h window closes) correct as
+    wall-clock time moves on. Same import-guard rationale as the other
+    Market Intelligence jobs above."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.insight_expiry import expire_stale_inquiries
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await expire_stale_inquiries(db)
+        print(f"⏳ Market Intelligence inquiry expiry: {result}")
+    _run_async("market_intelligence_inquiry_expiry", _run)
+
+
 def _job_listening_retention():
     """Listening Intelligence retention (PRD §12, §15) — daily. Deletes
     items and readings past the configured retention window; everything
@@ -536,6 +556,17 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Uri Market Intelligence purchase-inquiry expiry/re-scoring (PRD §12) —
+    # hourly, so the urgent badge and the active list stay correct as
+    # inquiries age past their freshness window instead of only being
+    # right at the moment they were first composed. Dev-only; import-guarded.
+    _scheduler.add_job(
+        _job_market_intelligence_inquiry_expiry,
+        CronTrigger(minute=55),
+        id="market_intelligence_inquiry_expiry",
+        **_JOB_DEFAULTS,
+    )
+
     # Listening Intelligence retention: daily, off-peak.
     _scheduler.add_job(
         _job_listening_retention,
@@ -570,7 +601,7 @@ def start_notification_scheduler():
     )
 
     _scheduler.start()
-    print("📅 Notification scheduler started with 15 jobs")
+    print("📅 Notification scheduler started with 24 jobs")
 
 
 def stop_notification_scheduler():
