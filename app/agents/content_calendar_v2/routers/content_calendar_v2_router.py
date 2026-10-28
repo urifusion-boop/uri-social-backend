@@ -207,6 +207,16 @@ async def create_draft_from_item_v2(
         item = next((it for it in plan["items"] if it["day_index"] == item_index), None)
         if not item:
             raise HTTPException(status_code=404, detail=f"Item {item_index} not found")
+        # Used later for the single-image branch's headline overlay
+        # (_single_image_seed_with_headline) — kept at this scope since
+        # that's a plain NameError otherwise: exact_copy only exists as a
+        # local inside _build_draft_seed_content, a separate function this
+        # one calls, not a closure it shares. Confirmed live: checking
+        # "Include AI-generated image" on any non-carousel item crashed
+        # with a 500 after the draft (and its credit charge) already went
+        # through — "Failed to create draft" in the UI, but the draft and
+        # the deduction were both real.
+        exact_copy = item.get("exact_copy") or {}
 
         # No auto-draft path for video ideas — there's no video render pipeline
         # wired to the calendar (that's the separate Video tab / storyboard job
@@ -369,49 +379,77 @@ async def create_draft_from_item_v2(
                 # style drift (confirmed live via a client-reported 3-slide
                 # carousel with 3 different visual styles). Resolve once per
                 # carousel draft here too, before any slide's task is created.
+                # Structural fix, not a one-off: everything from the optimistic
+                # has_image=True write above through to the asyncio.create_task
+                # calls below has, on separate occasions, thrown for different
+                # reasons (an undefined variable; carousel style resolution)
+                # and every time the symptom was identical — the draft is
+                # stuck at has_image=True/image_failed=False forever, because
+                # the one background task that would ever flip image_failed
+                # never got created. Rather than keep patching root causes one
+                # at a time, whatever throws in this block now marks every
+                # draft this batch touched as image_failed instead of leaving
+                # it stuck — the UI can show "image failed" and let the user
+                # retry, instead of spinning forever with nothing left to ever
+                # resolve it.
                 _bg_image_tasks: list = []
-                if item.get("format") == "carousel":
-                    for d in drafts:
-                        draft_id = d.get("draft_id") or d.get("id")
-                        slides = d.get("slides") or []
-                        total_slides = len(slides)
-                        carousel_brand_context = await _resolve_carousel_shared_context(
-                            db=db,
-                            brand_context=brand_context,
-                            style_override=None,
-                            carousel_id=draft_id,
-                            platform=d.get("platform", "facebook"),
-                        )
-                        for slide_index, slide in enumerate(slides):
-                            slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
-                            enriched_seed = f"{image_seed_content}. This slide: {slide_content}"
-                            _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
-                                draft_id=draft_id,
+                try:
+                    if item.get("format") == "carousel":
+                        for d in drafts:
+                            draft_id = d.get("draft_id") or d.get("id")
+                            slides = d.get("slides") or []
+                            total_slides = len(slides)
+                            carousel_brand_context = await _resolve_carousel_shared_context(
+                                db=db,
+                                brand_context=brand_context,
+                                style_override=None,
+                                carousel_id=draft_id,
                                 platform=d.get("platform", "facebook"),
-                                content=slide_content or d.get("content", image_seed_content),
+                            )
+                            for slide_index, slide in enumerate(slides):
+                                slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+                                enriched_seed = f"{image_seed_content}. This slide: {slide_content}"
+                                _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
+                                    draft_id=draft_id,
+                                    platform=d.get("platform", "facebook"),
+                                    content=slide_content or d.get("content", image_seed_content),
+                                    seed_content=enriched_seed,
+                                    brand_context=carousel_brand_context,
+                                    db=db,
+                                    reference_image=None,
+                                    post_type="carousel",
+                                    slide_index=slide_index,
+                                    total_slides=total_slides,
+                                    carousel_id=draft_id,
+                                )))
+                    else:
+                        enriched_seed = _single_image_seed_with_headline(image_seed_content, exact_copy)
+                        _bg_image_tasks = [
+                            asyncio.create_task(_generate_image_bg(
+                                draft_id=d.get("draft_id") or d.get("id"),
+                                platform=d.get("platform", "facebook"),
+                                content=d.get("content", image_seed_content),
                                 seed_content=enriched_seed,
-                                brand_context=carousel_brand_context,
+                                brand_context=brand_context,
                                 db=db,
                                 reference_image=None,
-                                post_type="carousel",
-                                slide_index=slide_index,
-                                total_slides=total_slides,
-                                carousel_id=draft_id,
-                            )))
-                else:
-                    enriched_seed = _single_image_seed_with_headline(image_seed_content, exact_copy)
-                    _bg_image_tasks = [
-                        asyncio.create_task(_generate_image_bg(
-                            draft_id=d.get("draft_id") or d.get("id"),
-                            platform=d.get("platform", "facebook"),
-                            content=d.get("content", image_seed_content),
-                            seed_content=enriched_seed,
-                            brand_context=brand_context,
-                            db=db,
-                            reference_image=None,
-                        ))
-                        for d in drafts
-                    ]
+                            ))
+                            for d in drafts
+                        ]
+                except Exception as image_setup_error:
+                    print(
+                        f"❌ [CalendarV2] image task setup failed before any background task "
+                        f"started for plan {plan_id} item {item_index}: {image_setup_error}"
+                    )
+                    import traceback as _tb
+                    print(_tb.format_exc())
+                    if draft_ids:
+                        await db["content_drafts"].update_many(
+                            {"id": {"$in": draft_ids}},
+                            {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                        )
+                    _bg_image_tasks = []
+
                 _BG_IMAGE_TASKS.update(_bg_image_tasks)
                 for t in _bg_image_tasks:
                     t.add_done_callback(_BG_IMAGE_TASKS.discard)
