@@ -145,6 +145,13 @@ class BrandProfileService:
             "customer_needs": [],
             "customer_objections": [],
             "why_customers_choose_us": "",
+            # Real, verifiable evidence only — an actual customer quote, a named
+            # case study, a specific measurable result. Distinct from every field
+            # above (those are the business's belief about its customers; this is
+            # proof it can show them). Written content_calendar_v2 asks for this
+            # by name when writing "Proof" territory posts, and is told to avoid
+            # fabricated-sounding claims when this is empty rather than invent one.
+            "proof_points": [],
             # URI Content Calendar Generation addendum §1-4 — see to_brand_context()
             # for why these are distinct from pain_points/needs/objections above
             "customer_desires": [],
@@ -479,7 +486,7 @@ class BrandProfileService:
                 # Target Customer Detail — evergreen persona, same reasoning as ideal_customer_profile
                 "customer_gender", "customer_location", "customer_occupation", "customer_income_level",
                 "customer_interests", "customer_pain_points", "customer_needs", "customer_objections",
-                "why_customers_choose_us",
+                "why_customers_choose_us", "proof_points",
                 "onboarding_completed",
                 # URI Content Calendar Generation addendum §1-4 — same evergreen-persona
                 # reasoning as the customer_* fields directly above
@@ -595,6 +602,7 @@ class BrandProfileService:
             "customer_needs":        profile.get("customer_needs") or [],
             "customer_objections":   profile.get("customer_objections") or [],
             "why_customers_choose_us": profile.get("why_customers_choose_us", ""),
+            "proof_points":          profile.get("proof_points") or [],
             # URI Content Calendar Generation addendum §1-4: customer psychology
             # fields the addendum asks for that had no dedicated field yet, distinct
             # from pain_points/needs/objections above. All optional/defensive —

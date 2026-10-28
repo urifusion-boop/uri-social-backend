@@ -80,6 +80,9 @@ FIELDS: List[Dict[str, Any]] = [
      "used_in": [POSTS, CALENDAR, VIDEO], "why": "Lets Jane answer doubts before they're raised."},
     {"key": "why_customers_choose_us", "label": "Why customers choose you", "section": "Audience", "weight": 2,
      "used_in": _WRITING, "why": "Your strongest selling line, in your customers' own reasoning."},
+    {"key": "proof_points", "label": "Proof points / testimonials", "section": "Audience", "weight": 2,
+     "used_in": [POSTS, CALENDAR, ADS], "why": "Real quotes or results Jane can cite — without them, "
+     "'proof' posts stay vague instead of specific."},
     {"key": "common_questions", "label": "Common questions customers ask", "section": "Audience", "weight": 2,
      "used_in": [POSTS, CALENDAR, INBOX], "why": "Feeds post ideas and helps Jane answer in the inbox."},
     {"key": "words_to_avoid", "label": "Words/phrases to avoid", "section": "Audience", "weight": 1,
