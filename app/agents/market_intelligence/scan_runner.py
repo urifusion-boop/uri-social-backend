@@ -686,7 +686,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             if not eligible:
                 gaps.append(f"cluster '{cluster.theme}' not surfaced: {reason}")
                 continue
-            urgency = urgency_for_concern(cluster.original_thread_count)
+            urgency = urgency_for_concern(member_evidence)
 
             confidence = confidence_breakdown(member_evidence, cluster.original_thread_count)
             relevance = relevance_breakdown(member_evidence, business_context)

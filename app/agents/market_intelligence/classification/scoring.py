@@ -37,6 +37,12 @@ CONCERN_MIN_ACCOUNTS = 5
 CONCERN_MIN_THREADS = 3
 CONCERN_WINDOW_DAYS = 7
 INQUIRY_FRESHNESS_HOURS = 48
+INQUIRY_URGENT_HOURS = 12  # pilot default — see urgency_for_inquiry's docstring
+
+# Pilot default for urgency_for_concern — see its docstring for why this is
+# a real (if heuristic) signal rather than the hardcoded constant it used to be.
+CONCERN_URGENT_RECENT_HOURS = 48
+CONCERN_URGENT_RECENT_SHARE = 0.5
 
 # PRD §12 trend eligibility bar (pilot defaults).
 TREND_MIN_LATEST_ACCOUNTS = 10
@@ -133,6 +139,13 @@ def _naive_utc(dt: datetime) -> datetime:
 
 
 def urgency_for_inquiry(evidence: Evidence, now: Optional[datetime] = None) -> UrgencyAssessment:
+    """Confirmed live bug: is_inquiry_eligible requires urgency.is_urgent to
+    be True, so when is_urgent used the same INQUIRY_FRESHNESS_HOURS window
+    as eligibility, every single eligible inquiry was, by construction,
+    always urgent — the "urgent" flag carried no information beyond
+    "eligible." A narrower INQUIRY_URGENT_HOURS sub-window breaks that
+    identity: a 40-hour-old inquiry can still be eligible to act on (worth
+    surfacing) without being flagged as needing action RIGHT NOW."""
     now = _naive_utc(now or datetime.utcnow())
     if evidence.published_at is None:
         return UrgencyAssessment(is_urgent=False, reason="undated — cannot assess freshness")
@@ -141,14 +154,44 @@ def urgency_for_inquiry(evidence: Evidence, now: Optional[datetime] = None) -> U
     deadline = published_at + timedelta(hours=INQUIRY_FRESHNESS_HOURS)
     if age > timedelta(hours=INQUIRY_FRESHNESS_HOURS):
         return UrgencyAssessment(is_urgent=False, deadline=deadline, reason=f"older than {INQUIRY_FRESHNESS_HOURS}h freshness window")
-    return UrgencyAssessment(is_urgent=True, deadline=deadline, reason=f"within {INQUIRY_FRESHNESS_HOURS}h freshness window")
+    if age > timedelta(hours=INQUIRY_URGENT_HOURS):
+        return UrgencyAssessment(is_urgent=False, deadline=deadline, reason=f"within the {INQUIRY_FRESHNESS_HOURS}h window but past the {INQUIRY_URGENT_HOURS}h urgent cutoff")
+    return UrgencyAssessment(is_urgent=True, deadline=deadline, reason=f"within {INQUIRY_URGENT_HOURS}h urgent cutoff")
 
 
-def urgency_for_concern(original_thread_count: int) -> UrgencyAssessment:
-    # Concerns don't have a hard deadline the way inquiries do — PRD treats
-    # urgency for a cluster as "how quickly a useful action window closes,"
-    # which for a concern is a judgment call this pilot doesn't automate.
-    return UrgencyAssessment(is_urgent=False, reason="concern clusters are not deadline-driven in this pilot")
+def urgency_for_concern(cluster_evidence: list[Evidence], now: Optional[datetime] = None) -> UrgencyAssessment:
+    """Confirmed live bug: this used to unconditionally return is_urgent=False
+    for every concern (and every other non-trend, non-inquiry type that
+    reuses this function — praise, reputation risk, unmet need, competitor
+    movement) — a hardcoded constant presented as a scoring decision.
+    Concerns genuinely have no hard deadline the way an inquiry does, but
+    PRD's own framing of urgency as "how quickly a useful action window
+    closes" has a real proxy here: a cluster still actively accelerating
+    RIGHT NOW closes its action window faster than one that has already
+    gone quiet, even though both remain eligible. Urgent when at least
+    CONCERN_URGENT_RECENT_SHARE of the cluster's own independent accounts
+    posted within the last CONCERN_URGENT_RECENT_HOURS — i.e. most of what's
+    driving this cluster is still happening, not just old evidence that
+    crossed the eligibility bar a while ago and never cooled off the page."""
+    now = _naive_utc(now or datetime.utcnow())
+    recent_start = now - timedelta(hours=CONCERN_URGENT_RECENT_HOURS)
+    all_accounts = {e.author_handle for e in cluster_evidence if e.author_handle}
+    recent_accounts = {
+        e.author_handle for e in cluster_evidence
+        if e.author_handle and e.published_at and _naive_utc(e.published_at) >= recent_start
+    }
+    if not all_accounts:
+        return UrgencyAssessment(is_urgent=False, reason="no independent accounts to assess recency from")
+    recent_share = len(recent_accounts) / len(all_accounts)
+    if recent_share >= CONCERN_URGENT_RECENT_SHARE:
+        return UrgencyAssessment(
+            is_urgent=True,
+            reason=f"{len(recent_accounts)}/{len(all_accounts)} independent accounts posted in the last {CONCERN_URGENT_RECENT_HOURS}h — still actively growing",
+        )
+    return UrgencyAssessment(
+        is_urgent=False,
+        reason=f"only {len(recent_accounts)}/{len(all_accounts)} independent accounts posted in the last {CONCERN_URGENT_RECENT_HOURS}h — not accelerating",
+    )
 
 
 def is_concern_eligible(evidence_list: list[Evidence], original_thread_count: int, now: Optional[datetime] = None) -> tuple[bool, str]:
@@ -166,12 +209,18 @@ def is_concern_eligible(evidence_list: list[Evidence], original_thread_count: in
 
 
 def is_inquiry_eligible(evidence: Evidence, now: Optional[datetime] = None) -> tuple[bool, str]:
-    """PRD §12: one clear, unresolved-looking request within the 48h freshness limit."""
-    urgency = urgency_for_inquiry(evidence, now)
+    """PRD §12: one clear, unresolved-looking request within the 48h freshness
+    limit. Checks that 48h window directly — NOT urgency_for_inquiry's
+    is_urgent, which is a narrower, separate sub-window (see its own
+    docstring). Eligibility and urgency used to be the same boolean here;
+    an inquiry between the urgent cutoff and the full freshness window is
+    still worth surfacing, just not flagged as needing action RIGHT NOW."""
+    now = _naive_utc(now or datetime.utcnow())
     if evidence.published_at is None:
         return False, "undated — routes to review, not the active inquiry queue"
-    if not urgency.is_urgent:
-        return False, f"expired — {urgency.reason}"
+    age = now - _naive_utc(evidence.published_at)
+    if age > timedelta(hours=INQUIRY_FRESHNESS_HOURS):
+        return False, f"expired — older than {INQUIRY_FRESHNESS_HOURS}h freshness window"
     return True, "eligible"
 
 
