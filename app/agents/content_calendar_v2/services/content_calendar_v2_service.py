@@ -415,6 +415,89 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
     )
 
 
+def _flatten_psychology_facts(brand: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Every individual real customer-psychology fact on this brand's
+    Playbook, as its own (label, fact) entry — not joined into one summary
+    string the way _customer_psychology_block's block is. Used to
+    deterministically assign each calendar item ONE specific real fact it
+    must be grounded in (see _generate_final_copy's grounding instruction +
+    _fact_grounding_issue), instead of leaving "use something real" as an
+    unenforced prompt suggestion every item was free to ignore. Confirmed
+    live: even once URI's Playbook had real pain points/objections/proof
+    points on file, most of a 30-item plan still read as generic filler
+    disconnected from any of them — the instruction existed, nothing
+    checked whether an item actually followed it."""
+    facts: List[Tuple[str, str]] = []
+    for label, key in [
+        ("Pain point", "customer_pain_points"),
+        ("Need", "customer_needs"),
+        ("Desire", "customer_desires"),
+        ("Fear", "customer_fears"),
+        ("Frustration", "customer_frustrations"),
+        ("Aspiration", "customer_aspirations"),
+        ("Objection", "customer_objections"),
+        ("Reason they hesitate", "customer_hesitations"),
+        ("Common question", "common_questions"),
+        ("Buying trigger", "buying_triggers"),
+        ("Proof point", "proof_points"),
+    ]:
+        for v in (brand.get(key) or []):
+            v = str(v).strip()
+            if v:
+                facts.append((label, v))
+    why = str(brand.get("why_customers_choose_us") or "").strip()
+    if why:
+        facts.append(("Why customers choose this business", why))
+    return facts
+
+
+_GROUNDING_STOPWORDS = {
+    "the", "and", "your", "that", "with", "have", "this", "from", "their",
+    "about", "into", "over", "just", "when", "where", "what", "will",
+    "would", "could", "should", "they", "them", "more", "than", "then",
+    "also", "very", "much", "some", "each", "which", "while", "before",
+    "after", "because", "these", "those", "there", "here", "being", "both",
+    "through", "during", "without", "between", "under", "again", "further",
+    "once", "other", "same", "such", "only", "own", "cant", "dont", "isnt",
+    "wont", "really", "actually", "customers", "business", "businesses",
+}
+
+
+def _significant_words(text: str) -> List[str]:
+    """Meaningful content words from a real customer-psychology fact — what
+    an item actually needs to engage with to count as grounded in it,
+    filtering out connective/generic words that would make the check
+    trivially easy to pass with unrelated text."""
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    return list(dict.fromkeys(
+        w for w in words if len(w) >= 4 and w not in _GROUNDING_STOPWORDS
+    ))
+
+
+def _fact_grounding_issue(idea: Dict[str, Any], fact_label: str, fact_text: str) -> Optional[str]:
+    """None if `idea`'s reader-facing text genuinely engages with its
+    assigned real fact's actual substance; otherwise a correction message
+    naming exactly what's missing. Deliberately not a verbatim-quote
+    requirement (the addendum already prefers near-verbatim phrasing where
+    natural, but forcing it on every item would make 30 days sound
+    robotic) — this only requires the item's own words to overlap with the
+    fact's real vocabulary, which a genuinely-grounded paraphrase will
+    naturally do and pure generic filler ("URI makes it possible") won't."""
+    sig_words = _significant_words(fact_text)
+    if not sig_words:
+        return None
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    hits = find_banned(_reader_text(idea), sig_words)
+    required = 1 if len(sig_words) <= 2 else 2
+    if len(hits) < required:
+        return (
+            f'does not actually engage with its assigned real fact — [{fact_label}] "{fact_text}" — '
+            f'reference its real substance (e.g. "{", ".join(sig_words[:3])}"), not generic language '
+            f'that could apply to any business'
+        )
+    return None
+
+
 def _brand_rules_block(brand: Dict[str, Any]) -> str:
     """The Playbook's hard rules, content pillars and important dates for the
     PLAN itself. Drafts made from an idea always applied these, but the ideas
@@ -2125,6 +2208,13 @@ async def _generate_final_copy(
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
     psychology_block = _customer_psychology_block(brand) + _brand_rules_block(brand)
     visual_guide_block = _visual_guide_block(brand)
+    # Deterministic per-item grounding assignment (by day_index) — see
+    # _flatten_psychology_facts/_fact_grounding_issue's own docstrings for
+    # why this exists instead of leaving "use something real" as a soft,
+    # unenforced prompt suggestion. Empty when the Playbook has no real
+    # customer-psychology data at all, in which case nothing changes from
+    # before this existed.
+    psychology_facts = _flatten_psychology_facts(brand)
 
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
     bp_lines = [v for v in [
@@ -2176,6 +2266,22 @@ async def _generate_final_copy(
             parts.append(f"CTA direction already matched to this business's goal: \"{brief['cta']}\"")
         return "\n  " + " ".join(parts)
 
+    def _assigned_fact(day_index: int) -> Optional[Tuple[str, str]]:
+        if not psychology_facts:
+            return None
+        return psychology_facts[day_index % len(psychology_facts)]
+
+    def _grounding_line(c: Dict[str, Any], i: int) -> str:
+        fact = _assigned_fact(c.get("day_index", i))
+        if not fact:
+            return ""
+        label, text = fact
+        return (
+            f"\n  MUST GROUND IN THIS REAL FACT — [{label}] \"{text}\" — build the idea around it "
+            f"(your own words, not a verbatim quote unless it's a Proof point), not generic language "
+            f"that could apply to any business."
+        )
+
     concepts_block = "\n\n".join(
         f"""Item {i} — {c['date']}:
   Territory: {c.get('territory')} | Subject: {c.get('subject')} | Angle: {c.get('angle')}
@@ -2184,6 +2290,7 @@ async def _generate_final_copy(
   Objective: {c.get('objective')} | Audience segment: {c.get('audience_segment', '')}
   Format: {_fmt_line(c)}
   CTA style (use this, not a generic template): {_CTA_STYLE_VARIANTS[c.get('day_index', i) % len(_CTA_STYLE_VARIANTS)]}"""
+        + _grounding_line(c, i)
         + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
            f"make it the subject of the post, by name." if c.get("key_date")
            else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
@@ -2371,6 +2478,11 @@ business's actual customers, not a generic reader?
                 idea, is_carousel=is_carousel, expected_slides=expected_slides,
                 words_to_avoid=item_words_to_avoid,
             )
+            fact = _assigned_fact(concepts_chunk[i].get("day_index", i))
+            if fact and isinstance(idea, dict):
+                grounding_issue = _fact_grounding_issue(idea, fact[0], fact[1])
+                if grounding_issue:
+                    issues.append(grounding_issue)
             if issues:
                 failures[i] = issues
         if not failures:
