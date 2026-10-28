@@ -276,6 +276,7 @@ def test_a_yarngpt_voice_goes_straight_to_lip_sync_with_no_cloning(scene_env, mo
 
 def test_a_failed_yarngpt_call_falls_back_to_the_clone_for_idera(scene_env, monkeypatch):
     calls, _ = scene_env
+    notes = {}
     monkeypatch.setattr(Y, "is_configured", lambda: True)
 
     async def boom(text, speaker, lang="english"):
@@ -283,9 +284,12 @@ def test_a_failed_yarngpt_call_falls_back_to_the_clone_for_idera(scene_env, monk
 
     monkeypatch.setattr(Y, "synthesize", boom)
     with pytest.raises(_Stop):
-        _run(_gen("Idera (Nigerian)"))
+        _run(V.VideoGenerationService._generate_scene_fal(
+            _scene(), V._AVATAR_TALKING, "Idera (Nigerian)", "job1", notes=notes))
     assert [m for m, _ in calls] == ["fal-ai/f5-tts", V._NG_LIPSYNC]
     assert calls[1][1]["audio_url"] == "https://fal/cloned.wav"
+    # Silent before: the customer could not tell the YarnGPT voice from the clone.
+    assert "cloned Idera (Nigerian) voice" in notes["voice_fallback"] and "down" in notes["voice_fallback"]
 
 
 def test_not_configured_keeps_the_clone_path_exactly_as_before(scene_env, monkeypatch):
