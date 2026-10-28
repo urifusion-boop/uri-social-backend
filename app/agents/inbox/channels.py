@@ -370,13 +370,20 @@ async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, 
     if ok:
         return True, ""
 
-    # Only the messaging fields need pages_messaging; comments ride on feed.
-    if "pages_messaging" in err or "(#200)" in err:
-        ok_partial, err_partial = await attempt("feed")
-        if ok_partial:
+    # Each field group needs its own permission: the messaging fields need pages_messaging,
+    # `feed` (comments) needs pages_manage_metadata, which Meta only grants users with a role
+    # on the app until it is approved. DMs are the core of the inbox, so a token lacking
+    # pages_manage_metadata still gets them rather than nothing.
+    if "(#200)" in err or "pages_messaging" in err or "pages_manage_metadata" in err:
+        ok_dm, err_dm = await attempt("messages,messaging_postbacks,message_reactions")
+        if ok_dm:
+            return True, ("DMs only — the token lacks pages_manage_metadata, so comments "
+                          "will not be delivered until that permission is granted")
+        ok_feed, err_feed = await attempt("feed")
+        if ok_feed:
             return True, ("comments only — the token lacks pages_messaging, so DMs "
                           "will not be delivered until that scope is granted")
-        return False, f"{err} | feed-only also failed: {err_partial}"
+        return False, f"{err} | messages-only also failed: {err_dm} | feed-only also failed: {err_feed}"
 
     return False, err
 async def fetch_contact_name(external_user_id: str, access_token: str) -> str:
