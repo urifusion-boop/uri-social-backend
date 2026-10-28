@@ -261,14 +261,61 @@ def location_scope_display_name(scope: dict) -> Optional[str]:
     return None
 
 
+# A development's own extracted location is almost always a bare city or
+# venue name ("New Delhi", "Mandalay Bay, Las Vegas") with no country word
+# in it at all — confirmed live, this is actually the common case, not the
+# exception. A country-name-only check (below) misses it completely. This
+# is a curated, bounded list of major capitals and conference/exhibition
+# hub cities (the kind an "Upcoming Items" announcement actually names),
+# not an exhaustive world-cities gazetteer — the same deliberately-narrow,
+# confirmed-not-guessed philosophy as _NEWS_EDITIONS above. A city missing
+# from this list simply falls through to "ambiguous, stays visible," same
+# as before — this only widens how much of the confident-mismatch case it
+# can actually catch.
+MAJOR_CITY_COUNTRY: dict[str, str] = {
+    "new delhi": "IN", "delhi": "IN", "mumbai": "IN", "bangalore": "IN", "bengaluru": "IN",
+    "chennai": "IN", "kolkata": "IN", "hyderabad": "IN", "pune": "IN",
+    "las vegas": "US", "new york": "US", "los angeles": "US", "san francisco": "US",
+    "chicago": "US", "boston": "US", "miami": "US", "dallas": "US", "houston": "US",
+    "atlanta": "US", "seattle": "US", "washington": "US", "orlando": "US", "austin": "US",
+    "london": "GB", "manchester": "GB", "birmingham": "GB", "edinburgh": "GB",
+    "paris": "FR", "berlin": "DE", "munich": "DE", "frankfurt": "DE", "hamburg": "DE",
+    "madrid": "ES", "barcelona": "ES", "rome": "IT", "milan": "IT", "amsterdam": "NL",
+    "brussels": "BE", "vienna": "AT", "zurich": "CH", "geneva": "CH",
+    "stockholm": "SE", "copenhagen": "DK", "oslo": "NO", "helsinki": "FI",
+    "warsaw": "PL", "prague": "CZ", "budapest": "HU", "athens": "GR", "lisbon": "PT",
+    "dublin": "IE", "moscow": "RU", "istanbul": "TR",
+    "dubai": "AE", "abu dhabi": "AE", "doha": "QA", "riyadh": "SA", "jeddah": "SA",
+    "tel aviv": "IL", "jerusalem": "IL", "beirut": "LB", "amman": "JO",
+    "karachi": "PK", "lahore": "PK", "islamabad": "PK", "dhaka": "BD", "colombo": "LK",
+    "kathmandu": "NP", "hanoi": "VN", "ho chi minh city": "VN", "taipei": "TW",
+    "tokyo": "JP", "osaka": "JP", "kyoto": "JP", "seoul": "KR", "beijing": "CN",
+    "shanghai": "CN", "shenzhen": "CN", "guangzhou": "CN", "hong kong": "HK",
+    "singapore": "SG", "bangkok": "TH", "jakarta": "ID", "manila": "PH",
+    "kuala lumpur": "MY", "sydney": "AU", "melbourne": "AU", "auckland": "NZ",
+    "wellington": "NZ", "toronto": "CA", "vancouver": "CA", "montreal": "CA",
+    "mexico city": "MX", "sao paulo": "BR", "são paulo": "BR", "rio de janeiro": "BR",
+    "buenos aires": "AR", "bogota": "CO", "bogotá": "CO", "lima": "PE", "santiago": "CL",
+    "cairo": "EG", "casablanca": "MA", "tunis": "TN", "algiers": "DZ",
+    "nairobi": "KE", "addis ababa": "ET", "kampala": "UG", "dar es salaam": "TZ",
+    "accra": "GH", "dakar": "SN", "luanda": "AO", "kinshasa": "CD", "harare": "ZW",
+    "lusaka": "ZM", "gaborone": "BW", "windhoek": "NA", "maputo": "MZ", "kigali": "RW",
+    "johannesburg": "ZA", "cape town": "ZA", "durban": "ZA",
+}
+
+
 def development_location_conflicts(location_text: Optional[str], expected_country: str) -> bool:
-    """True only when `location_text` (a Development's own free-text
-    location, extracted by an LLM from whatever the source announcement
-    said — see development_extractor.py) clearly names a DIFFERENT country
-    than `expected_country`. Never true for ambiguous/unknown text (no
-    location given, or a bare city/venue name with no recognizable country
-    in it) — a missed match is far less harmful than hiding something that
-    might genuinely be relevant, so this only acts on a confident mismatch.
+    """True when `location_text` (a Development's own free-text location,
+    extracted by an LLM from whatever the source announcement said — see
+    development_extractor.py) clearly names a DIFFERENT country than
+    `expected_country` — either by naming the country outright, or by
+    naming a major city from MAJOR_CITY_COUNTRY above (confirmed live:
+    "New Delhi" and "Mandalay Bay, Las Vegas" are bare city/venue names
+    with no country word in them at all — the common case, not an edge
+    case, for this kind of announcement). Never true for text this can't
+    place (no location given, or a venue/city not in either list) — a
+    missed match is far less harmful than hiding something that might
+    genuinely be relevant, so this only acts on a confident mismatch.
 
     This is the backstop for what collection-time geo targeting
     (resolve_topic_location_hint, wired into scan_runner.py) doesn't catch
@@ -281,11 +328,15 @@ def development_location_conflicts(location_text: Optional[str], expected_countr
     if not location_text or not expected_country:
         return False
     text = location_text.lower()
-    expected_name = (COUNTRY_NAMES.get(expected_country.upper()) or "").lower()
+    expected = expected_country.upper()
+    expected_name = (COUNTRY_NAMES.get(expected) or "").lower()
     if expected_name and expected_name in text:
         return False
+    for city, code in MAJOR_CITY_COUNTRY.items():
+        if code != expected and city in text:
+            return True
     for code, name in COUNTRY_NAMES.items():
-        if code == expected_country.upper() or code == "GLOBAL":
+        if code == expected or code == "GLOBAL":
             continue
         name_l = (name or "").lower()
         # Minimum length guards against short names (e.g. a 2-3 letter code
