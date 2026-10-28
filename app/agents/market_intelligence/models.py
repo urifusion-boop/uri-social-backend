@@ -91,6 +91,7 @@ class InsightStatus(str, Enum):
     SUPERSEDED = "superseded"   # a newer revision replaced this one
     RETRACTED = "retracted"     # evidence removed / claim invalidated
     DISMISSED = "dismissed"     # user feedback
+    EXPIRED = "expired"         # a purchase inquiry aged past its freshness window unactioned
 
 
 class FeedbackVerdict(str, Enum):
