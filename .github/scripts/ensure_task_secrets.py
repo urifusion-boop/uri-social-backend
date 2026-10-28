@@ -32,6 +32,10 @@ REQUIRED = {
     # Market Intelligence (social listening) collection through Apify actors —
     # the real source adapters (X first) read it; the mock adapter needs none.
     "APIFY_API_TOKEN": f"{SSM_PREFIX}/APIFY_API_TOKEN",
+    # Nigerian voices in talking videos (YarnGPT hosted text-to-speech). Without it those voices
+    # use the older voice-cloning path, exactly as before — so a missing value is safe, but the
+    # SSM parameter must EXIST before this line ships or the task cannot start.
+    "YARNGPT_API_KEY": f"{SSM_PREFIX}/YARNGPT_API_KEY",
 }
 
 
