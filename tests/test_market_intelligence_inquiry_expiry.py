@@ -77,11 +77,12 @@ def _evidence(evidence_id, hours_ago):
     }
 
 
-def _inquiry_insight(insight_id, evidence_id, is_urgent, reason, relevance_band="medium"):
+def _inquiry_insight(insight_id, evidence_id, is_urgent, reason, relevance_band="medium", action_readiness="ready_to_act"):
     return {
         "id": insight_id, "brand_id": "b1", "topic_id": "t1", "type": "purchase_inquiry",
         "status": "active", "evidence_ids": [evidence_id],
         "urgency": {"is_urgent": is_urgent, "reason": reason, "deadline": None},
+        "action_readiness": action_readiness,
         "headline": "h", "observed_change": "oc", "business_implication": "bi", "suggested_next_step": "sns",
         "confidence": {"components": [], "total": 0, "band": "low"},
         "relevance": {"components": [], "total": 5, "band": relevance_band},
@@ -131,15 +132,38 @@ def test_a_fresh_but_low_relevance_inquiry_is_rescored_to_not_urgent():
     assert updated["status"] == "active"
     assert updated["urgency"]["is_urgent"] is False
     assert "relevance too low" in updated["urgency"]["reason"]
+    # The other real gap found live: the first pass of this job only ever
+    # touched urgency, so "Ready to act" (a SEPARATE stored field) kept
+    # showing on a low-relevance match even after "Urgent" was cleared.
+    assert updated["action_readiness"] == "check_suitability"
 
 
 def test_an_already_downgraded_low_relevance_inquiry_stays_unchanged():
     db = FakeDb({
-        "mi_insights": [_inquiry_insight("i1", "e1", False, "relevance too low to flag as urgent (within 12h urgent cutoff)", relevance_band="low")],
+        "mi_insights": [_inquiry_insight(
+            "i1", "e1", False, "relevance too low to flag as urgent (within 12h urgent cutoff)",
+            relevance_band="low", action_readiness="check_suitability",
+        )],
         "mi_evidence": [_evidence("e1", 2)],
     })
     result = _run(expire_stale_inquiries(db, now=NOW))
     assert result == {"rescored": 0, "expired": 0, "unchanged": 1}
+
+
+def test_a_low_relevance_insight_with_only_readiness_wrong_still_gets_fixed():
+    """The exact gap this second pass closes: urgency already correct
+    (cleared by the first pass of this job), but action_readiness was
+    never touched and still said "Ready to act.\""""
+    db = FakeDb({
+        "mi_insights": [_inquiry_insight(
+            "i1", "e1", False, "relevance too low to flag as urgent (within 12h urgent cutoff)",
+            relevance_band="low", action_readiness="ready_to_act",
+        )],
+        "mi_evidence": [_evidence("e1", 2)],
+    })
+    result = _run(expire_stale_inquiries(db, now=NOW))
+    assert result == {"rescored": 1, "expired": 0, "unchanged": 0}
+    assert db["mi_insights"].docs[0]["action_readiness"] == "check_suitability"
 
 
 def test_an_inquiry_past_the_freshness_window_is_expired():

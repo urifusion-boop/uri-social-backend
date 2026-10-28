@@ -30,7 +30,7 @@ from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .classification.scoring import is_inquiry_eligible, urgency_for_inquiry
-from .models import Evidence, EvidenceType, InsightStatus, UrgencyAssessment
+from .models import ActionReadiness, Evidence, EvidenceType, InsightStatus, UrgencyAssessment
 
 
 async def expire_stale_inquiries(db: AsyncIOMotorDatabase, now: datetime = None) -> dict:
@@ -63,22 +63,36 @@ async def expire_stale_inquiries(db: AsyncIOMotorDatabase, now: datetime = None)
             continue
 
         new_urgency = urgency_for_inquiry(evidence, now)
+        relevance_is_low = (doc.get("relevance") or {}).get("band") == "low"
         # Same gate scan_runner.py's compose path applies at creation time
         # (_urgency_gated_by_relevance) — a stale re-score must not
         # resurrect "Urgent" on a match the insight's own stored relevance
         # already rates "low," for the same reason it was never meant to
         # say that in the first place.
-        if new_urgency.is_urgent and (doc.get("relevance") or {}).get("band") == "low":
+        if new_urgency.is_urgent and relevance_is_low:
             new_urgency = UrgencyAssessment(
                 is_urgent=False, deadline=new_urgency.deadline,
                 reason=f"relevance too low to flag as urgent ({new_urgency.reason})",
             )
-        if new_urgency.is_urgent == doc.get("urgency", {}).get("is_urgent") and new_urgency.reason == doc.get("urgency", {}).get("reason"):
+
+        # Confirmed live: the first pass of this job only ever touched
+        # urgency, so a low-relevance insight kept showing "Ready to act"
+        # (the badge driven by action_readiness, a SEPARATE stored field)
+        # even after its "Urgent" tag was correctly cleared. Same gate
+        # _action_readiness_from applies at compose time.
+        new_readiness = ActionReadiness.CHECK_SUITABILITY.value if relevance_is_low else doc.get("action_readiness")
+
+        updates = {}
+        if new_urgency.is_urgent != doc.get("urgency", {}).get("is_urgent") or new_urgency.reason != doc.get("urgency", {}).get("reason"):
+            updates["urgency"] = new_urgency.dict()
+        if new_readiness != doc.get("action_readiness"):
+            updates["action_readiness"] = new_readiness
+
+        if not updates:
             unchanged += 1
             continue
-        await db["mi_insights"].update_one(
-            {"id": doc["id"]}, {"$set": {"urgency": new_urgency.dict(), "last_updated": now}}
-        )
+        updates["last_updated"] = now
+        await db["mi_insights"].update_one({"id": doc["id"]}, {"$set": updates})
         rescored += 1
 
     return {"rescored": rescored, "expired": expired, "unchanged": unchanged}
