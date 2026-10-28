@@ -301,7 +301,77 @@ MAJOR_CITY_COUNTRY: dict[str, str] = {
     "accra": "GH", "dakar": "SN", "luanda": "AO", "kinshasa": "CD", "harare": "ZW",
     "lusaka": "ZM", "gaborone": "BW", "windhoek": "NA", "maputo": "MZ", "kigali": "RW",
     "johannesburg": "ZA", "cape town": "ZA", "durban": "ZA",
+    "lagos": "NG", "abuja": "NG", "port harcourt": "NG", "kano": "NG", "ibadan": "NG",
+    "benin city": "NG", "kaduna": "NG", "enugu": "NG",
 }
+
+# The Brand Playbook's "Region / market" field (select-all-that-apply chips,
+# saved as a comma-joined string — see brand-setup/page.tsx) is a free-text
+# business fact, not this module's own location_scope — confirmed live as
+# the thing relevance_breakdown's geo_fit component actually reads
+# (scan_runner.py's _fetch_business_context). Mapped here, not guessed
+# per-call, exactly like _NEWS_EDITIONS above: a curated set of real chip
+# labels to the countries they mean, nothing invented. "Global /
+# International" and "Other" deliberately map to None — "serves everywhere"
+# and "unspecified" are both real answers, not a country list to resolve.
+REGION_CHIP_COUNTRIES: dict[str, Optional[list[str]]] = {
+    "Nigeria": ["NG"],
+    "West Africa": ["NG", "GH", "SN", "CI", "ML", "BF", "BJ", "TG", "SL", "LR", "GM", "GN", "GW", "NE", "MR", "CV"],
+    "Pan-African": None,  # resolved separately to the full CONTINENTS["AFRICA"] list below
+    "United States": ["US"],
+    "United Kingdom": ["GB"],
+    "Global / International": None,  # serves everywhere — no country list to check against
+    "Other": None,  # unspecified — never guessed
+}
+
+
+def resolve_text_country(text: Optional[str]) -> Optional[str]:
+    """Best-effort: the first country MAJOR_CITY_COUNTRY or COUNTRY_NAMES
+    can confidently place `text` in, or None if it can't be placed.
+    Deliberately returns the SAME kind of honest "can't tell" as
+    development_location_conflicts above, for the same reason — a missed
+    match costs less than a wrong one."""
+    if not text:
+        return None
+    lowered = text.lower()
+    # Word-boundary, not a bare substring check — "Niger" is a literal
+    # substring of "Nigeria" ("...NIGER-ia"), so a plain `in` match would
+    # confidently resolve "somewhere in Nigeria" to the wrong country.
+    for city, code in MAJOR_CITY_COUNTRY.items():
+        if re.search(rf"\b{re.escape(city)}\b", lowered):
+            return code
+    for code, name in COUNTRY_NAMES.items():
+        name_l = (name or "").lower()
+        if code != "GLOBAL" and len(name_l) >= 4 and re.search(rf"\b{re.escape(name_l)}\b", lowered):
+            return code
+    return None
+
+
+def region_chips_cover_country(region_text: Optional[str], country: Optional[str]) -> Optional[bool]:
+    """True when "Global / International" was selected (serves everywhere
+    — any real country is covered) or at least one other selected chip's
+    own country list includes `country`; False once a selected chip
+    resolves to a real country list that does NOT include it; None when
+    nothing selected resolves to any real list at all (only "Other" was
+    picked, or `region_text`/`country` is missing) — callers treat None
+    as "can't tell," not as a mismatch."""
+    if not region_text or not country:
+        return None
+    chips = [c.strip() for c in region_text.split(",") if c.strip()]
+    if "Global / International" in chips:
+        return True  # serves everywhere — any real country is covered
+    saw_a_real_list = False
+    for chip in chips:
+        if chip == "Pan-African":
+            codes = CONTINENTS.get("AFRICA", {}).get("countries")
+        else:
+            codes = REGION_CHIP_COUNTRIES.get(chip)
+        if codes is None:
+            continue
+        saw_a_real_list = True
+        if country in codes:
+            return True
+    return False if saw_a_real_list else None
 
 
 def development_location_conflicts(location_text: Optional[str], expected_country: str) -> bool:
