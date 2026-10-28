@@ -2,22 +2,47 @@
 Make the voice-picker preview clips from YarnGPT's hosted API.
 
 Customers press a play button next to each Nigerian voice before choosing it. Those clips must be
-YarnGPT's own output (what the video will actually use), so they are generated through the same
-client the videos use and saved as static files for the frontend. Each voice costs one short
-synthesis from the YarnGPT account's credits.
+YarnGPT's own output (what the video will actually use), so they are made through the same API the
+videos use and saved as static files for the frontend, together with a manifest.json that tells the
+picker which voices have a preview. The picker shows exactly the voices in that manifest.
 
-    YARNGPT_API_KEY=... python -m scripts.generate_yarngpt_previews \
+Standalone on purpose: it needs only `httpx`, no backend settings, so anyone with a YarnGPT key can
+run it from any checkout. The key is read from the environment and never written anywhere.
+
+    YARNGPT_API_KEY=sk_live_... python scripts/generate_yarngpt_previews.py \
         --out ../uri-social-frontent-next/public/voice-previews
 
-Writes one <voice>.wav per voice (idera.wav, jude.wav, ...). Voices that fail are listed at the end
-and the exit code is 1, so a half-finished set is never mistaken for a full one.
+Each voice costs one short synthesis from the YarnGPT account's credits (about ten in all). Voices
+YarnGPT does not offer, or that fail, are listed at the end and left out of the manifest; the exit
+code is 1 if any were left out, so a half-finished set is never mistaken for a full one.
 """
 import argparse
-import asyncio
+import json
+import os
 import sys
+import time
+import uuid
 from pathlib import Path
+from typing import Dict, Optional
 
-from app.agents.social_media_manager.services import yarngpt_tts_service as Y
+import httpx
+
+DEFAULT_API_URL = "https://api.yarngpt.ai"
+
+# UI voice label -> YarnGPT voice name. MUST match YARNGPT_SPEAKERS in
+# app/agents/social_media_manager/services/yarngpt_tts_service.py (a test compares them).
+LABELS: Dict[str, str] = {
+    "Idera (Nigerian)": "idera",
+    "Jude (Nigerian)": "jude",
+    "Chinenye (Nigerian)": "chinenye",
+    "Emma (Nigerian)": "emma",
+    "Umar (Nigerian)": "umar",
+    "Joke (Nigerian)": "joke",
+    "Zainab (Nigerian)": "zainab",
+    "Osagie (Nigerian)": "osagie",
+    "Remi (Nigerian)": "remi",
+    "Tayo (Nigerian)": "tayo",
+}
 
 
 def preview_line(display_name: str) -> str:
@@ -30,32 +55,100 @@ def filename_for(speaker: str) -> str:
     return f"{speaker}.wav"
 
 
-async def _run(out: Path) -> int:
+def voice_names(payload) -> list:
+    """Voice IDs from GET /voices, tolerant of the response shape (a list, or an object holding one)."""
+    items = payload
+    if isinstance(payload, dict):
+        for key in ("voices", "data", "items", "results"):
+            if isinstance(payload.get(key), list):
+                items = payload[key]
+                break
+    names = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            for key in ("id", "name", "voice", "voice_id"):
+                if isinstance(item.get(key), str):
+                    names.append(item[key])
+                    break
+    return names
+
+
+def synthesize(client: httpx.Client, base: str, key: str, voice: str, text: str,
+               deadline_seconds: int = 240) -> bytes:
+    headers = {"Authorization": f"Bearer {key}"}
+    resp = client.post(
+        f"{base}/api/v1/tts",
+        headers={**headers, "Idempotency-Key": f"uri-preview-{uuid.uuid4().hex}"},
+        json={"text": text, "voice": voice, "output_format": "wav"},
+    )
+    if resp.status_code != 202:
+        raise RuntimeError(f"refused ({resp.status_code}): {resp.text[:200]}")
+    job_id = resp.json()["job_id"]
+
+    deadline, delay = time.monotonic() + deadline_seconds, 1.0
+    while time.monotonic() < deadline:
+        time.sleep(delay)
+        delay = min(4.0, delay * 1.5)
+        status = client.get(f"{base}/api/v1/status/{job_id}", headers=headers)
+        if status.status_code >= 500:
+            continue
+        body = status.json()
+        if body.get("status") == "completed":
+            audio = client.get(body["audio_url"])
+            if audio.status_code != 200 or audio.content[:4] != b"RIFF":
+                raise RuntimeError("the audio file was not a WAV")
+            return audio.content
+        if body.get("status") == "failed":
+            raise RuntimeError(body.get("user_message") or "the job failed")
+    raise RuntimeError("timed out waiting for the job")
+
+
+def run(client: httpx.Client, base: str, key: str, out: Path) -> int:
     out.mkdir(parents=True, exist_ok=True)
-    failed = []
-    for label, speaker in Y.YARNGPT_SPEAKERS.items():
+    listing = client.get(f"{base}/api/v1/voices", headers={"Authorization": f"Bearer {key}"})
+    offered = voice_names(listing.json()) if listing.status_code == 200 else []
+    if offered:
+        print(f"YarnGPT offers {len(offered)} voices: {', '.join(offered)}\n")
+    else:
+        print("Could not read YarnGPT's voice list; trying each voice by name.\n")
+
+    manifest, left_out = [], []
+    for label, speaker in LABELS.items():
+        voice: Optional[str] = next((v for v in offered if v.lower() == speaker), None) if offered else speaker
+        if voice is None:
+            left_out.append(label)
+            print(f"MISSING {label:22s} YarnGPT does not offer a voice called {speaker!r}")
+            continue
         try:
-            audio = await Y.synthesize(preview_line(speaker.capitalize()), speaker)
+            audio = synthesize(client, base, key, voice, preview_line(speaker.capitalize()))
             (out / filename_for(speaker)).write_bytes(audio)
+            manifest.append({"label": label, "speaker": speaker, "file": filename_for(speaker)})
             print(f"ok      {label:22s} -> {filename_for(speaker)} ({len(audio) // 1024} KB)")
         except Exception as e:
-            failed.append(label)
+            left_out.append(label)
             print(f"FAILED  {label:22s} {e}")
-    if failed:
-        print(f"\n{len(failed)} voice(s) failed: {', '.join(failed)}")
+
+    (out / "manifest.json").write_text(json.dumps({"voices": manifest}, indent=2) + "\n")
+    print(f"\nWrote {len(manifest)} preview(s) and manifest.json to {out}")
+    if left_out:
+        print(f"Left out ({len(left_out)}): {', '.join(left_out)}")
         return 1
-    print(f"\nAll {len(Y.YARNGPT_SPEAKERS)} previews written to {out}")
     return 0
 
 
-def main(argv=None) -> int:
+def main(argv=None, client: Optional[httpx.Client] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
-    if not Y.is_configured():
+    key = os.environ.get("YARNGPT_API_KEY", "").strip()
+    if not key:
         print("Set YARNGPT_API_KEY first (the key from the Account page at yarngpt.ai).")
         return 2
-    return asyncio.get_event_loop().run_until_complete(_run(Path(args.out)))
+    base = (os.environ.get("YARNGPT_API_URL") or DEFAULT_API_URL).rstrip("/")
+    with (client or httpx.Client(timeout=60)) as c:
+        return run(c, base, key, Path(args.out))
 
 
 if __name__ == "__main__":

@@ -347,40 +347,80 @@ def test_a_scene_that_keeps_its_voice_adds_no_warning(scene_env, monkeypatch):
     assert notes == {}
 
 
-# ── preview generation ──────────────────────────────────────────────────────────
+# ── preview generation (scripts/generate_yarngpt_previews.py) ───────────────────
 
-def test_the_preview_script_covers_every_voice_and_names_files_by_speaker(tmp_path, monkeypatch):
-    from scripts import generate_yarngpt_previews as G
+import json
 
-    seen = []
-
-    async def fake_synth(text, speaker, lang="english"):
-        seen.append(speaker)
-        return _wav(6.0)
-
-    monkeypatch.setattr(Y, "is_configured", lambda: True)
-    monkeypatch.setattr(Y, "synthesize", fake_synth)
-    assert G.main(["--out", str(tmp_path)]) == 0
-    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(f"{s}.wav" for s in Y.YARNGPT_SPEAKERS.values())
-    assert sorted(seen) == sorted(Y.YARNGPT_SPEAKERS.values())
+from scripts import generate_yarngpt_previews as G
 
 
-def test_a_failed_voice_makes_the_script_exit_nonzero(tmp_path, monkeypatch):
-    from scripts import generate_yarngpt_previews as G
+def _api_transport(offered, fail_voice=None):
+    """A fake YarnGPT: lists `offered` voices; each job completes with a WAV unless it is `fail_voice`."""
+    jobs = {}
 
-    async def fake_synth(text, speaker, lang="english"):
-        if speaker == "tayo":
-            raise Y.YarnGPTError("nope")
-        return _wav(6.0)
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/voices":
+            return httpx.Response(200, json={"voices": [{"id": v} for v in offered]})
+        if path == "/api/v1/tts":
+            voice = json.loads(request.content)["voice"]
+            jobs[f"job-{voice}"] = voice
+            return httpx.Response(202, json={"job_id": f"job-{voice}", "status": "queued"})
+        if path.startswith("/api/v1/status/"):
+            voice = jobs[path.rsplit("/", 1)[1]]
+            if voice == fail_voice:
+                return httpx.Response(200, json={"status": "failed", "user_message": "could not speak"})
+            return httpx.Response(200, json={"status": "completed", "audio_url": "https://signed.test/a.wav"})
+        if request.url.host == "signed.test":
+            return httpx.Response(200, content=_wav(6.0))
+        return httpx.Response(404)
 
-    monkeypatch.setattr(Y, "is_configured", lambda: True)
-    monkeypatch.setattr(Y, "synthesize", fake_synth)
-    assert G.main(["--out", str(tmp_path)]) == 1
+    return httpx.MockTransport(handler)
+
+
+@pytest.fixture
+def preview_env(monkeypatch):
+    monkeypatch.setenv("YARNGPT_API_KEY", "sk_live_test")
+    monkeypatch.setenv("YARNGPT_API_URL", "https://api.yarngpt.test")
+    monkeypatch.setattr(G.time, "sleep", lambda _: None)
+
+
+def _run_script(out, transport):
+    return G.main(["--out", str(out)], client=httpx.Client(transport=transport))
+
+
+def test_the_script_and_the_backend_agree_on_which_voices_exist():
+    assert G.LABELS == Y.YARNGPT_SPEAKERS
+
+
+def test_every_offered_voice_gets_a_preview_and_a_manifest_entry(tmp_path, preview_env):
+    assert _run_script(tmp_path, _api_transport(list(Y.YARNGPT_SPEAKERS.values()))) == 0
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert [v["label"] for v in manifest["voices"]] == list(Y.YARNGPT_SPEAKERS)
+    for v in manifest["voices"]:
+        assert (tmp_path / v["file"]).read_bytes()[:4] == b"RIFF"
+
+
+def test_a_voice_yarngpt_does_not_offer_is_left_out_and_reported(tmp_path, preview_env):
+    offered = [v for v in Y.YARNGPT_SPEAKERS.values() if v != "tayo"]
+    assert _run_script(tmp_path, _api_transport(offered)) == 1
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert "Tayo (Nigerian)" not in [v["label"] for v in manifest["voices"]]
+    assert len(manifest["voices"]) == 9
     assert not (tmp_path / "tayo.wav").exists()
 
 
-def test_the_preview_script_refuses_to_run_without_a_key(tmp_path, monkeypatch):
-    from scripts import generate_yarngpt_previews as G
+def test_a_voice_whose_job_fails_is_left_out_but_the_rest_are_kept(tmp_path, preview_env):
+    assert _run_script(tmp_path, _api_transport(list(Y.YARNGPT_SPEAKERS.values()), fail_voice="emma")) == 1
+    labels = [v["label"] for v in json.loads((tmp_path / "manifest.json").read_text())["voices"]]
+    assert "Emma (Nigerian)" not in labels and len(labels) == 9
 
-    monkeypatch.setattr(Y, "is_configured", lambda: False)
+
+def test_voice_matching_ignores_case(tmp_path, preview_env):
+    assert _run_script(tmp_path, _api_transport([v.capitalize() for v in Y.YARNGPT_SPEAKERS.values()])) == 0
+
+
+def test_without_a_key_the_script_stops_before_spending_anything(tmp_path, monkeypatch):
+    monkeypatch.delenv("YARNGPT_API_KEY", raising=False)
     assert G.main(["--out", str(tmp_path)]) == 2
+    assert list(tmp_path.iterdir()) == []
