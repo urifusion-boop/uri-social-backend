@@ -14,6 +14,7 @@ Unset YARNGPT_API_KEY and `is_configured()` is False: the caller keeps using the
 exactly as before. Every failure raises YarnGPTError so the caller can fall back.
 """
 import asyncio
+import re
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -23,22 +24,12 @@ import httpx
 from app.agents.social_media_manager.services.yarngpt_text import normalize_for_speech
 from app.core.config import settings
 
-# UI voice label -> the YarnGPT voice we want. The labels are what the voice picker sends as
-# `avatar_voice`; keep them in sync with NIGERIAN_VOICES in VideoStoryboardGenerator.tsx.
-# "Idera (Nigerian)" and "Jude (Nigerian)" are the two voices that already existed. YarnGPT says
-# voice IDs can change, so the real ID is looked up from /api/v1/voices (see _resolve_voice).
-YARNGPT_SPEAKERS: Dict[str, str] = {
-    "Idera (Nigerian)": "idera",
-    "Jude (Nigerian)": "jude",
-    "Chinenye (Nigerian)": "chinenye",
-    "Emma (Nigerian)": "emma",
-    "Umar (Nigerian)": "umar",
-    "Joke (Nigerian)": "joke",
-    "Zainab (Nigerian)": "zainab",
-    "Osagie (Nigerian)": "osagie",
-    "Remi (Nigerian)": "remi",
-    "Tayo (Nigerian)": "tayo",
-}
+# The picker offers voices as "<Name> (Nigerian)". The name is the YarnGPT voice; the voices on
+# offer are the ones that have a preview clip (see the frontend's /voice-previews/manifest.json),
+# so adding or renaming a voice needs no change here. YarnGPT says voice IDs can change, so the
+# real ID is always looked up from /api/v1/voices (see _resolve_voice), never assumed.
+NIGERIAN_SUFFIX = " (Nigerian)"
+_NAME = re.compile(r"^[A-Za-z][A-Za-z ]{0,29}$")
 
 _REQUEST_TIMEOUT = 30          # one HTTP call
 _JOB_DEADLINE_SECONDS = 240    # queue + synthesis, start to finish
@@ -58,7 +49,12 @@ def is_configured() -> bool:
 
 
 def speaker_for(voice_label: str) -> Optional[str]:
-    return YARNGPT_SPEAKERS.get(voice_label)
+    """The YarnGPT voice name behind a picker label ("Femi (Nigerian)" -> "femi"), or None if the
+    label is not a Nigerian voice at all (a default voice like "Sarah" is not ours to route)."""
+    if not isinstance(voice_label, str) or not voice_label.endswith(NIGERIAN_SUFFIX):
+        return None
+    name = voice_label[: -len(NIGERIAN_SUFFIX)].strip()
+    return name.lower() if _NAME.match(name) else None
 
 
 def _base_url() -> str:
