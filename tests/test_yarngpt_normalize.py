@@ -1,10 +1,11 @@
 """
-YarnGPT deletes every character that is not a letter (after spelling out digits), so what we
-send it has to be plain spoken words first. See services/yarngpt_tts/normalize.py.
+Text sent to a text-to-speech engine has to be plain spoken words first. See
+services/yarngpt_text.py. The default keeps punctuation (it carries rhythm); strict mode is for
+an engine that deletes every non-letter.
 """
 import pytest
 
-from services.yarngpt_tts.normalize import normalize_for_speech
+from app.agents.social_media_manager.services.yarngpt_text import normalize_for_speech
 
 
 @pytest.mark.parametrize("written,spoken", [
@@ -14,8 +15,8 @@ from services.yarngpt_tts.normalize import normalize_for_speech
     ("Save 50% now", "Save 50 percent now"),
     ("Posts & ads", "Posts and ads"),
     ("Let AI run your socials", "Let A I run your socials"),
-    ("Don't wait, it's free", "Dont wait, its free"),
-    ("Mon-Fri / weekends", "Mon Fri weekends"),
+    ("Don't wait, it's free", "Don't wait, it's free"),
+    ("Mon-Fri / weekends", "Mon-Fri / weekends"),
     ("Dr. Ade and Mr. Bola", "doctor Ade and mister Bola"),
 ])
 def test_written_text_becomes_spoken_words(written, spoken):
@@ -36,3 +37,11 @@ def test_empty_and_whitespace_give_nothing_to_say():
 def test_a_plain_sentence_is_left_alone():
     line = "Abeg, if you are tired of posting every single day, I have good news"
     assert normalize_for_speech(line) == line
+
+
+@pytest.mark.parametrize("written,spoken", [
+    ("Don't wait, it's free", "Dont wait, its free"),
+    ("Mon-Fri / weekends", "Mon Fri weekends"),
+])
+def test_strict_mode_drops_apostrophes_and_dashes_for_engines_that_delete_them(written, spoken):
+    assert normalize_for_speech(written, strip_punctuation=True) == spoken

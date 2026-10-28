@@ -50,12 +50,17 @@ def test_something_that_is_not_a_wav_is_left_alone():
     assert V._pad_wav_bytes(b"not audio") is None
 
 
-# ── the client ──────────────────────────────────────────────────────────────────
+# ── the client (YarnGPT's job-based hosted API) ──────────────────────────────────
 
-class _FakeClient:
-    """Stands in for httpx.AsyncClient; `responses` are consumed one per POST."""
-    def __init__(self, responses):
-        self.responses, self.calls = list(responses), []
+class _Api:
+    """Stands in for httpx.AsyncClient, routing by URL path. `post_replies` and `status_replies` are
+    consumed one per call; a ready-made httpx.Response or an exception."""
+    def __init__(self, voices=None, post_replies=None, status_replies=None, audio=None):
+        self.voices = voices
+        self.post_replies = list(post_replies or [])
+        self.status_replies = list(status_replies or [])
+        self.audio = audio if audio is not None else httpx.Response(200, content=_wav(6.0))
+        self.posts, self.gets = [], []
 
     def __call__(self, *a, **kw):
         return self
@@ -66,58 +71,145 @@ class _FakeClient:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, headers=None, json=None):
-        self.calls.append((url, headers, json))
-        item = self.responses.pop(0)
+    async def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append((url, headers, json))
+        item = self.post_replies.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
 
+    async def get(self, url, headers=None, timeout=None):
+        self.gets.append(url)
+        if url.endswith("/api/v1/voices"):
+            if self.voices is None:
+                return httpx.Response(503, text="down")
+            return httpx.Response(200, json=self.voices)
+        if "/api/v1/status/" in url:
+            item = self.status_replies.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return self.audio          # the signed audio_url
+
+
+def _accepted(job="job1"):
+    return httpx.Response(202, json={"job_id": job, "status": "queued"})
+
+
+def _done(url="https://signed/audio.wav"):
+    return httpx.Response(200, json={"status": "completed", "audio_url": url})
+
 
 @pytest.fixture
-def configured(monkeypatch):
-    monkeypatch.setattr(settings, "YARNGPT_TTS_URL", "http://tts.internal/", raising=False)
-    monkeypatch.setattr(settings, "YARNGPT_TTS_TOKEN", "secret", raising=False)
+def api(monkeypatch):
+    monkeypatch.setattr(settings, "YARNGPT_API_KEY", "key-123", raising=False)
+    monkeypatch.setattr(settings, "YARNGPT_API_URL", "https://api.yarngpt.test/", raising=False)
+    monkeypatch.setitem(Y._voice_cache, "voices", None)
+    monkeypatch.setitem(Y._voice_cache, "at", 0.0)
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(Y.asyncio, "sleep", no_sleep)
+
+    def install(**kw):
+        fake = _Api(**kw)
+        monkeypatch.setattr(httpx, "AsyncClient", fake)
+        return fake
+
+    return install
 
 
 def test_not_configured_means_the_old_path_is_used(monkeypatch):
-    monkeypatch.setattr(settings, "YARNGPT_TTS_URL", None, raising=False)
+    monkeypatch.setattr(settings, "YARNGPT_API_KEY", None, raising=False)
     assert Y.is_configured() is False
     with pytest.raises(Y.YarnGPTError):
         _run(Y.synthesize("hello", "idera"))
 
 
-def test_the_client_sends_the_text_speaker_and_token(configured, monkeypatch):
-    fake = _FakeClient([httpx.Response(200, content=_wav(1))])
-    monkeypatch.setattr(httpx, "AsyncClient", fake)
-    out = _run(Y.synthesize("Hello there", "jude"))
+def test_a_line_is_queued_polled_and_downloaded(api):
+    fake = api(voices=["idera", "jude"], post_replies=[_accepted()],
+               status_replies=[httpx.Response(200, json={"status": "queued"}), _done()])
+    out = _run(Y.synthesize("Pay ₦31,000 today & relax", "idera"))
+
     assert out[:4] == b"RIFF"
-    url, headers, body = fake.calls[0]
-    assert url == "http://tts.internal/synthesize"
-    assert headers == {"Authorization": "Bearer secret"}
-    assert body == {"text": "Hello there", "speaker": "jude", "lang": "english"}
+    url, headers, body = fake.posts[0]
+    assert url == "https://api.yarngpt.test/api/v1/tts"
+    assert headers["Authorization"] == "Bearer key-123"
+    assert headers["Idempotency-Key"].startswith("uri-")
+    assert body == {"text": "Pay 31000 naira today and relax", "voice": "idera", "output_format": "wav"}
+    assert "target_language" not in body        # that would translate the line
 
 
-def test_a_slow_service_is_retried_once_then_raises(configured, monkeypatch):
-    fake = _FakeClient([httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow")])
-    monkeypatch.setattr(httpx, "AsyncClient", fake)
-    with pytest.raises(Y.YarnGPTError):
+def test_the_voice_is_the_exact_id_yarngpt_lists(api):
+    fake = api(voices={"voices": [{"id": "Idera"}, {"id": "Jude"}]}, post_replies=[_accepted()], status_replies=[_done()])
+    _run(Y.synthesize("Hello", "idera"))
+    assert fake.posts[0][2]["voice"] == "Idera"
+
+
+def test_a_voice_yarngpt_no_longer_offers_is_not_requested(api):
+    fake = api(voices=["jude", "umar"], post_replies=[])
+    with pytest.raises(Y.YarnGPTError, match="no voice called"):
         _run(Y.synthesize("Hello", "idera"))
-    assert len(fake.calls) == 2
+    assert fake.posts == []
 
 
-def test_a_server_error_is_retried_and_can_recover(configured, monkeypatch):
-    fake = _FakeClient([httpx.Response(503, text="loading"), httpx.Response(200, content=_wav(1))])
-    monkeypatch.setattr(httpx, "AsyncClient", fake)
+def test_if_the_voice_list_cannot_be_read_the_name_is_sent_as_it_is(api):
+    fake = api(voices=None, post_replies=[_accepted()], status_replies=[_done()])
+    _run(Y.synthesize("Hello", "umar"))
+    assert fake.posts[0][2]["voice"] == "umar"
+
+
+def test_out_of_credits_is_refused_once_and_not_retried(api):
+    refusal = httpx.Response(402, json={"error": {"code": "QUOTA_EXCEEDED", "user_message": "Top up your credits.", "trace_id": "t1"}})
+    fake = api(voices=["idera"], post_replies=[refusal])
+    with pytest.raises(Y.YarnGPTError, match="QUOTA_EXCEEDED"):
+        _run(Y.synthesize("Hello", "idera"))
+    assert len(fake.posts) == 1
+
+
+def test_a_server_error_is_retried_with_the_same_idempotency_key(api):
+    fake = api(voices=["idera"], post_replies=[httpx.Response(503, text="busy"), _accepted()], status_replies=[_done()])
+    assert _run(Y.synthesize("Hello", "idera"))[:4] == b"RIFF"
+    assert len(fake.posts) == 2
+    assert fake.posts[0][1]["Idempotency-Key"] == fake.posts[1][1]["Idempotency-Key"]
+
+
+def test_a_failed_job_raises_with_yarngpts_own_reason(api):
+    api(voices=["idera"], post_replies=[_accepted()],
+        status_replies=[httpx.Response(200, json={"status": "failed", "user_message": "Text could not be spoken."})])
+    with pytest.raises(Y.YarnGPTError, match="could not be spoken"):
+        _run(Y.synthesize("Hello", "idera"))
+
+
+def test_a_job_that_never_finishes_gives_up(api, monkeypatch):
+    monkeypatch.setattr(Y, "_JOB_DEADLINE_SECONDS", 0)
+    api(voices=["idera"], post_replies=[_accepted()], status_replies=[])
+    with pytest.raises(Y.YarnGPTError, match="did not finish"):
+        _run(Y.synthesize("Hello", "idera"))
+
+
+def test_audio_that_is_not_a_wav_is_rejected(api):
+    api(voices=["idera"], post_replies=[_accepted()], status_replies=[_done()],
+        audio=httpx.Response(200, content=b"ID3 not a wav"))
+    with pytest.raises(Y.YarnGPTError, match="not a WAV"):
+        _run(Y.synthesize("Hello", "idera"))
+
+
+def test_a_flaky_poll_is_not_a_failed_job(api):
+    api(voices=["idera"], post_replies=[_accepted()],
+        status_replies=[httpx.ReadTimeout("slow"), httpx.Response(502, text="bad gateway"), _done()])
     assert _run(Y.synthesize("Hello", "idera"))[:4] == b"RIFF"
 
 
-def test_a_rejected_request_is_not_retried(configured, monkeypatch):
-    fake = _FakeClient([httpx.Response(400, text="unknown speaker")])
-    monkeypatch.setattr(httpx, "AsyncClient", fake)
-    with pytest.raises(Y.YarnGPTError):
-        _run(Y.synthesize("Hello", "nobody"))
-    assert len(fake.calls) == 1
+@pytest.mark.parametrize("payload,expected", [
+    (["idera", "jude"], ["idera", "jude"]),
+    ({"voices": [{"id": "Idera"}, {"name": "Jude"}]}, ["Idera", "Jude"]),
+    ({"data": [{"voice": "Umar", "default": True}]}, ["Umar"]),
+    ({"unexpected": 1}, []),
+])
+def test_the_voice_list_is_read_whatever_shape_it_comes_in(payload, expected):
+    assert Y._voice_names(payload) == expected
 
 
 # ── routing inside a talking scene ──────────────────────────────────────────────
@@ -258,26 +350,37 @@ def test_a_scene_that_keeps_its_voice_adds_no_warning(scene_env, monkeypatch):
 # ── preview generation ──────────────────────────────────────────────────────────
 
 def test_the_preview_script_covers_every_voice_and_names_files_by_speaker(tmp_path, monkeypatch):
-    from services.yarngpt_tts import generate_previews as G
+    from scripts import generate_yarngpt_previews as G
 
     seen = []
 
-    def fake_post(url, headers=None, timeout=None, json=None):
-        seen.append(json["speaker"])
-        return httpx.Response(200, content=_wav(6.0))
+    async def fake_synth(text, speaker, lang="english"):
+        seen.append(speaker)
+        return _wav(6.0)
 
-    monkeypatch.setattr(G.httpx, "post", fake_post)
-    assert G.main(["--url", "http://svc", "--token", "t", "--out", str(tmp_path)]) == 0
+    monkeypatch.setattr(Y, "is_configured", lambda: True)
+    monkeypatch.setattr(Y, "synthesize", fake_synth)
+    assert G.main(["--out", str(tmp_path)]) == 0
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(f"{s}.wav" for s in Y.YARNGPT_SPEAKERS.values())
     assert sorted(seen) == sorted(Y.YARNGPT_SPEAKERS.values())
 
 
 def test_a_failed_voice_makes_the_script_exit_nonzero(tmp_path, monkeypatch):
-    from services.yarngpt_tts import generate_previews as G
+    from scripts import generate_yarngpt_previews as G
 
-    def fake_post(url, headers=None, timeout=None, json=None):
-        return httpx.Response(500, text="boom") if json["speaker"] == "tayo" else httpx.Response(200, content=_wav(6.0))
+    async def fake_synth(text, speaker, lang="english"):
+        if speaker == "tayo":
+            raise Y.YarnGPTError("nope")
+        return _wav(6.0)
 
-    monkeypatch.setattr(G.httpx, "post", fake_post)
-    assert G.main(["--url", "http://svc", "--out", str(tmp_path)]) == 1
+    monkeypatch.setattr(Y, "is_configured", lambda: True)
+    monkeypatch.setattr(Y, "synthesize", fake_synth)
+    assert G.main(["--out", str(tmp_path)]) == 1
     assert not (tmp_path / "tayo.wav").exists()
+
+
+def test_the_preview_script_refuses_to_run_without_a_key(tmp_path, monkeypatch):
+    from scripts import generate_yarngpt_previews as G
+
+    monkeypatch.setattr(Y, "is_configured", lambda: False)
+    assert G.main(["--out", str(tmp_path)]) == 2
