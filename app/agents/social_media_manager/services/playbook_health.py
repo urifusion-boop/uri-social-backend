@@ -16,8 +16,9 @@ from typing import Any, Dict, List, Optional
 
 from . import brand_brief
 
-POSTS, IMAGES, CALENDAR, ADS, INBOX, VIDEO, BLOG, LEADS, AUTO, SCHEDULING = (
+POSTS, IMAGES, CALENDAR, ADS, INBOX, VIDEO, BLOG, LEADS, AUTO, SCHEDULING, MARKET_INTEL = (
     "Posts", "Images", "Calendar", "Ads", "Inbox", "Video", "Blog", "Leads", "Auto tab", "Scheduling",
+    "Market Intelligence",
 )
 _WRITING = [POSTS, CALENDAR, ADS, INBOX, VIDEO, BLOG]
 
@@ -91,10 +92,34 @@ FIELDS: List[Dict[str, Any]] = [
      "used_in": [POSTS, ADS, VIDEO, BLOG], "why": "Jane positions you against them — without ever naming them."},
     # Language & region
     {"key": "region", "label": "Region", "section": "Language & Region", "weight": 2,
-     "used_in": [POSTS, IMAGES, CALENDAR, ADS, INBOX, VIDEO, LEADS, SCHEDULING],
-     "why": "Local references, local-looking images, ad targeting and your posting timezone."},
+     "used_in": [POSTS, IMAGES, CALENDAR, ADS, INBOX, VIDEO, LEADS, SCHEDULING, MARKET_INTEL],
+     "why": "Local references, local-looking images, ad targeting, your posting timezone, and whether a market "
+     "finding actually matches where you operate."},
     {"key": "languages", "label": "Languages", "section": "Language & Region", "weight": 1,
      "used_in": [POSTS, CALENDAR, ADS, VIDEO, BLOG], "why": "Jane writes in the language your customers speak."},
+    # Fulfilment facts — confirmed live audit gap: these only ever appeared
+    # in Market Intelligence's own "Can you actually fulfil this?" panel,
+    # invisible from the Playbook's own completeness score and suggestions,
+    # so a "100% complete" Playbook could still leave every match labelled
+    # "Check suitability" forever with no nudge anywhere explaining why.
+    # Filed under Business Details (a real Playbook section) rather than a
+    # new section, since the actual inputs for these stay in Market
+    # Intelligence's own Settings — this makes them count toward
+    # completeness and show up in suggestions without duplicating the
+    # input fields on a page that was never meant to hold them.
+    {"key": "stock_availability", "label": "Stock availability", "section": "Business Details", "weight": 1,
+     "used_in": [MARKET_INTEL], "why": "Without it, a customer ready to buy is always labelled "
+     "'Check suitability' instead of 'Ready to act' — even when you really do have stock. "
+     "Fill this in from Market Intelligence → Listening Setup → “Can you actually fulfil this?”"},
+    {"key": "delivery_capability", "label": "Delivery capability", "section": "Business Details", "weight": 1,
+     "used_in": [MARKET_INTEL], "why": "Same as stock — Uri won't claim you can fulfil a request unless you say so. "
+     "Fill this in from Market Intelligence → Listening Setup → “Can you actually fulfil this?”"},
+    {"key": "lead_time", "label": "Lead time", "section": "Business Details", "weight": 0,
+     "used_in": [MARKET_INTEL], "why": "Lets a recommendation set the right expectation on how fast you can deliver."},
+    {"key": "budget_ceiling", "label": "Budget ceiling", "section": "Business Details", "weight": 0,
+     "used_in": [MARKET_INTEL], "why": "Keeps a recommended ad spend inside what you've said you're willing to spend."},
+    {"key": "margin_band", "label": "Margin band", "section": "Business Details", "weight": 0,
+     "used_in": [MARKET_INTEL], "why": "Helps Uri judge whether a recommended discount or promo still makes sense for you."},
     # Rules
     {"key": "guardrails", "label": "Guardrails", "section": "Guardrails", "weight": 2,
      "used_in": _WRITING, "why": "Topics to avoid, banned words and compliance notes are enforced everywhere Jane writes."},

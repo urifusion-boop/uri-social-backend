@@ -25,9 +25,19 @@ class FakeCollection:
 
     def _matches(self, doc, query):
         for key, val in query.items():
-            if doc.get(key) != val:
+            if isinstance(val, dict) and "$in" in val:
+                doc_val = doc.get(key)
+                if isinstance(doc_val, list):
+                    if not any(v in val["$in"] for v in doc_val):
+                        return False
+                elif doc_val not in val["$in"]:
+                    return False
+            elif doc.get(key) != val:
                 return False
         return True
+
+    async def count_documents(self, query):
+        return len([d for d in self.docs if self._matches(d, query)])
 
     class _Cursor:
         def __init__(self, docs):
@@ -115,6 +125,24 @@ def test_each_topics_scan_history_is_kept_separate():
     by_id = {t["id"]: t for t in res["responseData"]}
     assert by_id["t1"]["latest_scan"]["id"] == "s1"
     assert by_id["t2"]["latest_scan"]["id"] == "s2"
+
+
+def test_latest_scan_carries_what_it_actually_found():
+    """The same result-summary logic GET /scans/{id} uses also applies
+    here, so the payoff is visible on a plain page load, not just while
+    a client happens to be actively polling that one scan."""
+    from app.agents.market_intelligence.router import list_topics
+
+    db = FakeDb()
+    db["mi_topics"].docs.append({"id": "t1", "brand_id": "b1", "question": "q", "created_at": datetime(2026, 1, 1)})
+    db["mi_scans"].docs.append({"id": "s1", "topic_id": "t1", "brand_id": "b1", "status": "completed", "started_at": datetime(2026, 1, 1)})
+    db["mi_evidence"].docs.append({"id": "e1", "collection_run_id": "s1"})
+    db["mi_insights"].docs.append({"id": "i1", "topic_id": "t1", "status": "active", "evidence_ids": ["e1"]})
+
+    res = _run(list_topics(ctx=_ctx(), db=db))
+    latest = res["responseData"][0]["latest_scan"]
+    assert latest["new_insight_count"] == 1
+    assert latest["new_development_count"] == 0
 
 
 if __name__ == "__main__":

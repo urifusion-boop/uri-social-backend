@@ -21,6 +21,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Optional
 
+from ..listening.geo import region_chips_cover_country, resolve_text_country
 from ..models import (
     ComponentScore,
     Evidence,
@@ -98,18 +99,34 @@ def relevance_breakdown(cluster_evidence: list[Evidence], business_context: dict
     against the PRD §26 eval set; don't assume this is "the real" relevance
     logic."""
     products = [p.lower() for p in (business_context.get("key_products_services") or [])]
-    served_locations = [l.lower() for l in (business_context.get("service_locations") or [])]
+    # service_locations is [region] — the Playbook's own comma-joined
+    # multi-select chip string (e.g. "Nigeria, West Africa"), not a list
+    # of individual locations — see _fetch_business_context's docstring.
+    region_text = next(iter(business_context.get("service_locations") or []), None)
     goal = (business_context.get("primary_goal") or "").lower()
 
     combined_text = " ".join(e.text.lower() for e in cluster_evidence)
 
     product_fit_pts = 2 if any(p in combined_text for p in products) else (1 if products else 0)
 
-    mentioned_locations = {e.geography.explicit_location.lower() for e in cluster_evidence if e.geography.explicit_location}
-    geo_fit_pts = (
-        2 if served_locations and mentioned_locations and any(loc in " ".join(served_locations) for loc in mentioned_locations)
-        else (1 if mentioned_locations else 0)
-    )
+    # Confirmed live bug: this used to do a bare substring check of a
+    # mentioned CITY ("lagos") against the region chips joined into one
+    # lowercased string ("nigeria") — "lagos" is never a substring of
+    # "nigeria", so a real Nigeria-based account's own evidence could
+    # never earn the top point even when the city genuinely was in a
+    # country the business serves. Both sides now resolve to a real
+    # country code before comparing (listening/geo.py — the same module
+    # the location-scoped listening fix already uses).
+    mentioned_locations = [e.geography.explicit_location for e in cluster_evidence if e.geography.explicit_location]
+    geo_matches = [region_chips_cover_country(region_text, resolve_text_country(loc)) for loc in mentioned_locations]
+    if any(m is True for m in geo_matches):
+        geo_fit_pts = 2
+    elif mentioned_locations and all(m is False for m in geo_matches):
+        geo_fit_pts = 0  # confidently placed, and confidently NOT where the business serves
+    elif mentioned_locations:
+        geo_fit_pts = 1  # a location was mentioned but neither side could be confidently resolved
+    else:
+        geo_fit_pts = 0
 
     # customer_need_fit: crude proxy — presence of concern/inquiry language at all
     # already passed the classifier, so this component rewards having MULTIPLE
@@ -124,7 +141,7 @@ def relevance_breakdown(cluster_evidence: list[Evidence], business_context: dict
 
     components = [
         ComponentScore(name="product_fit", points=product_fit_pts, reason="keyword overlap with key_products_services"),
-        ComponentScore(name="served_geography", points=geo_fit_pts, reason="explicit location overlap with service_locations"),
+        ComponentScore(name="served_geography", points=geo_fit_pts, reason="evidence location resolved against the Playbook's region chips"),
         ComponentScore(name="customer_need_fit", points=need_fit_pts, reason=f"{len(cluster_evidence)} corroborating records"),
         ComponentScore(name="fulfilment_feasibility", points=feasibility_pts, reason="stock/delivery facts on record" if fulfilment_known else "stock/delivery unknown"),
         ComponentScore(name="alignment_with_goal", points=alignment_pts, reason="business goal on record" if goal else "no stated business goal"),

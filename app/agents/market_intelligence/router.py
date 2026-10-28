@@ -253,6 +253,7 @@ async def list_topics(
         latest_scan = await db["mi_scans"].find_one({"topic_id": t["id"]}, sort=[("started_at", -1)])
         if latest_scan:
             latest_scan.pop("_id", None)
+            latest_scan = await _attach_scan_result_summary(latest_scan, db)
         t["latest_scan"] = latest_scan
     return UriResponse.get_list_data_response("topic", topics)
 
@@ -361,6 +362,39 @@ async def start_scan(
     return UriResponse.get_single_data_response("scan", run.dict())
 
 
+_TERMINAL_SCAN_STATUSES = ("completed", "partial", "failed", "budget_limited")
+
+
+async def _attach_scan_result_summary(scan_doc: dict, db: AsyncIOMotorDatabase) -> dict:
+    """Confirmed live UX gap: "Run scan" -> "Scanning..." -> "Scan
+    complete" told the owner nothing about what was actually found or
+    where to look — the real payoff (Insights, Announced Events) lives on
+    two entirely different tabs with no link pointing there. Once a run
+    is done, this tells the caller exactly what it produced so the
+    frontend can show "found 3 new insights" with a direct link instead
+    of a toast that just disappears. Shared by GET /scans/{id} (polled
+    while a scan is running) and GET /topics' embedded latest_scan (read
+    on every later page load), so the payoff is visible however the page
+    was reached, not just to whichever tab happened to be open when the
+    scan finished."""
+    if scan_doc.get("status") not in _TERMINAL_SCAN_STATUSES:
+        return scan_doc
+    evidence_ids = [
+        e["id"] async for e in db["mi_evidence"].find({"collection_run_id": scan_doc["id"]}, {"id": 1})
+    ]
+    if not evidence_ids:
+        scan_doc["new_insight_count"] = 0
+        scan_doc["new_development_count"] = 0
+        return scan_doc
+    scan_doc["new_insight_count"] = await db["mi_insights"].count_documents(
+        {"topic_id": scan_doc["topic_id"], "status": "active", "evidence_ids": {"$in": evidence_ids}}
+    )
+    scan_doc["new_development_count"] = await db["mi_developments"].count_documents(
+        {"topic_id": scan_doc["topic_id"], "evidence_id": {"$in": evidence_ids}}
+    )
+    return scan_doc
+
+
 @router.get("/scans/{scan_id}")
 async def get_scan(
     scan_id: str,
@@ -372,6 +406,7 @@ async def get_scan(
         raise HTTPException(status_code=404, detail="Scan not found")
     scan_doc = await _self_heal_stale_scan(scan_doc, db)
     scan_doc.pop("_id", None)
+    scan_doc = await _attach_scan_result_summary(scan_doc, db)
     return UriResponse.get_single_data_response("scan", scan_doc)
 
 
