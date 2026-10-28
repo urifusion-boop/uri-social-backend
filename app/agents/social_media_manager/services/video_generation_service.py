@@ -10,6 +10,8 @@ import httpx
 from app.core.config import settings
 from app.database import get_db
 from app.utils.s3_upload import upload_bytes, upload_file_path
+from app.agents.social_media_manager.services import yarngpt_tts_service
+from app.agents.social_media_manager.services.yarngpt_tts_service import YARNGPT_SPEAKERS
 
 # Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
 # (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
@@ -204,29 +206,13 @@ _MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
 }
 
 
-async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
-    """minimax/h3-max/lip-sync/image-to-video hard-rejects audio under 5s
-    ("Audio duration must be between 5 and 900 seconds") — live-confirmed
-    2026-10-21: this pipeline chops a script into short (~5-10s) scenes, and
-    a single scene's cloned dialogue routinely comes in under that floor,
-    which previously made the whole talking_dialogue attempt fail over to
-    generic Veo, losing both the cloned voice AND real lip-sync. Pads with
-    trailing silence instead (mouth goes idle for the silent tail, which
-    reads fine) so a short scene still gets the real Nigerian voice.
-    0.2s margin above the bare 5.0s floor, not cutting it exactly that fine.
+def _pad_wav_bytes(raw: bytes, min_seconds: float = 5.2) -> Optional[bytes]:
+    """Trailing silence added to a PCM WAV shorter than `min_seconds`.
 
-    Returns the original URL unchanged if it's already long enough, or if it
-    can't be parsed as PCM WAV (fal-ai/f5-tts's own output; some float/non-PCM
-    encoding would fail `wave.open` here) — the caller's own fallback (see
-    _generate_scene_fal) is the last safety net if a clip still gets rejected.
-    """
+    Returns None when nothing needs doing: the clip is already long enough, or it can't
+    be parsed as PCM WAV (some float/non-PCM encoding would fail `wave.open`)."""
     import io
     import wave
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(audio_url)
-        resp.raise_for_status()
-        raw = resp.content
 
     try:
         with wave.open(io.BytesIO(raw), "rb") as w:
@@ -236,11 +222,11 @@ async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
             n_frames = w.getnframes()
             frames = w.readframes(n_frames)
     except wave.Error:
-        return audio_url
+        return None
 
     duration = n_frames / framerate
     if duration >= min_seconds:
-        return audio_url
+        return None
 
     silence_frames = int((min_seconds - duration) * framerate)
     silence = b"\x00" * (silence_frames * n_channels * sampwidth)
@@ -251,8 +237,33 @@ async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
         out.setsampwidth(sampwidth)
         out.setframerate(framerate)
         out.writeframes(frames + silence)
+    return buf.getvalue()
 
-    return await upload_bytes(buf.getvalue(), folder="uri-social/generated-audio", resource_type="audio")
+
+async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
+    """minimax/h3-max/lip-sync/image-to-video hard-rejects audio under 5s
+    ("Audio duration must be between 5 and 900 seconds") — live-confirmed
+    2026-10-21: this pipeline chops a script into short (~5-10s) scenes, and
+    a single scene's dialogue routinely comes in under that floor,
+    which previously made the whole talking_dialogue attempt fail over to
+    generic Veo, losing both the Nigerian voice AND real lip-sync. Pads with
+    trailing silence instead (mouth goes idle for the silent tail, which
+    reads fine) so a short scene still gets the real Nigerian voice.
+    0.2s margin above the bare 5.0s floor, not cutting it exactly that fine.
+
+    Returns the original URL unchanged if it's already long enough, or if it
+    can't be parsed as PCM WAV (see _pad_wav_bytes) — the caller's own fallback
+    (see _generate_scene_fal) is the last safety net if a clip still gets rejected.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(audio_url)
+        resp.raise_for_status()
+        raw = resp.content
+
+    padded = _pad_wav_bytes(raw, min_seconds)
+    if padded is None:
+        return audio_url
+    return await upload_bytes(padded, folder="uri-social/generated-audio", resource_type="audio")
 
 
 def _jobs_collection():
@@ -295,7 +306,7 @@ class VideoGenerationService:
         scenes = storyboard.get("scenes", [])
         route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         primary_model, fallback_model = route["primary"], route["fallback"]
-        if avatar_voice not in AVATAR_VOICES and avatar_voice not in NIGERIAN_VOICE_REFS:
+        if avatar_voice not in AVATAR_VOICES and avatar_voice not in NIGERIAN_VOICE_REFS and avatar_voice not in YARNGPT_SPEAKERS:
             avatar_voice = DEFAULT_AVATAR_VOICE
         await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
@@ -321,9 +332,10 @@ class VideoGenerationService:
             started = time.monotonic()
             fallback_used = False
             fallback_warning = None
+            scene_notes: dict = {}
             try:
                 video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
-                    scene, primary_model, avatar_voice, job_id
+                    scene, primary_model, avatar_voice, job_id, notes=scene_notes
                 )
                 routed_model = primary_model
             except Exception as primary_error:
@@ -372,7 +384,7 @@ class VideoGenerationService:
                 fallback_warning = f"Fell back to {MODEL_REGISTRY.get(fallback_model, {}).get('label', fallback_model)}: {primary_model} failed ({primary_error})"
                 try:
                     video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
-                        scene, fallback_model, avatar_voice, job_id
+                        scene, fallback_model, avatar_voice, job_id, notes=scene_notes
                     )
                     routed_model = fallback_model
                     fallback_used = True
@@ -400,7 +412,7 @@ class VideoGenerationService:
                 "outcome": outcome,
                 "routed_model": routed_model,
                 "fallback_used": fallback_used,
-                "warning": fallback_warning,
+                "warning": " ".join(w for w in (fallback_warning, scene_notes.get("voice_fallback")) if w) or None,
                 "latency_seconds": latency,
             }}})
 
@@ -498,7 +510,8 @@ class VideoGenerationService:
 
     @staticmethod
     async def _generate_scene_fal(
-        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE, job_id: Optional[str] = None
+        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE, job_id: Optional[str] = None,
+        notes: Optional[dict] = None,
     ) -> tuple[str, Optional[float]]:
         import fal_client
 
@@ -638,28 +651,55 @@ class VideoGenerationService:
                     round(nf / fps, 2),
                 )
 
-            if avatar_voice in NIGERIAN_VOICE_REFS:
-                # Clone the reference sample reading this scene's actual line
-                # (fal-ai/f5-tts), then lip-sync that audio to the frame image
-                # (minimax/h3-max/lip-sync/image-to-video) — see NIGERIAN_VOICE_REFS
-                # and the MODEL_REGISTRY entry above for why this two-step path
-                # exists instead of _AVATAR_TALKING's single text_input+voice call.
-                tts_result = await VideoGenerationService._submit_and_poll(
-                    "fal-ai/f5-tts",
-                    {
-                        "gen_text": dialogue,
-                        "ref_audio_url": NIGERIAN_VOICE_REFS[avatar_voice],
-                        "model_type": "F5-TTS",
-                    },
-                    _FAL_SUBSCRIBE_TIMEOUT_SECONDS,
-                    scene_num,
-                    job_id,
-                )
-                cloned_audio_url = tts_result["audio_url"]["url"]
-                try:
-                    cloned_audio_url = await _pad_wav_silence(cloned_audio_url)
-                except Exception as pad_err:
-                    print(f"[VideoGen] Scene {scene_num}: silence-padding failed ({pad_err}), using clip as-is")
+            if avatar_voice in NIGERIAN_VOICE_REFS or avatar_voice in YARNGPT_SPEAKERS:
+                # Preferred: YarnGPT speaks the line itself (its own Nigerian voice, no
+                # cloning). Only attempted when the TTS service is configured; any failure
+                # drops to the clone path below for the two voices that have a reference
+                # clip, so a down service never breaks them.
+                cloned_audio_url = None
+                voice_source = "cloned"
+                speaker = YARNGPT_SPEAKERS.get(avatar_voice)
+                if speaker and yarngpt_tts_service.is_configured():
+                    try:
+                        raw_audio = await yarngpt_tts_service.synthesize(dialogue, speaker)
+                        raw_audio = _pad_wav_bytes(raw_audio) or raw_audio
+                        cloned_audio_url = await upload_bytes(
+                            raw_audio, folder="uri-social/generated-audio", resource_type="audio"
+                        )
+                        voice_source = "YarnGPT"
+                    except Exception as yarn_err:
+                        print(f"[VideoGen] Scene {scene_num}: YarnGPT direct synthesis failed "
+                              f"({yarn_err}); falling back to the cloned voice")
+                        cloned_audio_url = None
+
+                if cloned_audio_url is None:
+                    if avatar_voice not in NIGERIAN_VOICE_REFS:
+                        # No reference clip exists for this voice, so there is nothing to
+                        # clone from. Raising lets run_job fall back to the outcome's paired model.
+                        raise ValueError(
+                            f"{avatar_voice} needs the YarnGPT service, which is unavailable for this scene"
+                        )
+                    # Clone the reference sample reading this scene's actual line
+                    # (fal-ai/f5-tts), then lip-sync that audio to the frame image
+                    # (minimax/h3-max/lip-sync/image-to-video) — see NIGERIAN_VOICE_REFS
+                    # and the MODEL_REGISTRY entry above for why this two-step path
+                    # exists instead of _AVATAR_TALKING's single text_input+voice call.
+                    tts_result = await VideoGenerationService._submit_and_poll(
+                        "fal-ai/f5-tts",
+                        {
+                            "gen_text": dialogue,
+                            "ref_audio_url": NIGERIAN_VOICE_REFS[avatar_voice],
+                            "model_type": "F5-TTS",
+                        },
+                        _FAL_SUBSCRIBE_TIMEOUT_SECONDS,
+                        scene_num,
+                        job_id,
+                    )
+                    cloned_audio_url = tts_result["audio_url"]["url"]
+                    try:
+                        cloned_audio_url = await _pad_wav_silence(cloned_audio_url)
+                    except Exception as pad_err:
+                        print(f"[VideoGen] Scene {scene_num}: silence-padding failed ({pad_err}), using clip as-is")
 
                 model = _NG_LIPSYNC
                 info = MODEL_REGISTRY[model]
@@ -674,7 +714,7 @@ class VideoGenerationService:
                     "audio_url": cloned_audio_url,
                     "resolution": "480P",
                 }
-                print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, cloned), ~{actual_seconds}s")
+                print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, {voice_source}), ~{actual_seconds}s")
             else:
                 arguments, actual_seconds = _western_avatar_args(dialogue)
                 print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}), ~{actual_seconds}s")
@@ -707,6 +747,13 @@ class VideoGenerationService:
                 # propagate up to run_job's own primary/fallback, which would
                 # lose lip-sync entirely by falling through to generic Veo.
                 print(f"[VideoGen] Scene {scene_num}: Nigerian voice path failed ({e}), using default voice instead")
+                if notes is not None:
+                    # Without this the customer hears a different, non-Nigerian voice on this scene
+                    # and nothing says why; run_job puts it on the clip as a warning.
+                    notes["voice_fallback"] = (
+                        f"The {avatar_voice} voice could not be generated for this scene, "
+                        f"so a default voice was used."
+                    )
                 model = _AVATAR_TALKING
                 info = MODEL_REGISTRY[model]
                 model_timeout = _MODEL_TIMEOUT_OVERRIDES.get(model, _FAL_SUBSCRIBE_TIMEOUT_SECONDS)
