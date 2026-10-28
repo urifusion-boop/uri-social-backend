@@ -226,7 +226,7 @@ class _SingleEvidenceAdapter:
     async def estimate_cost(self, keywords, days):
         return 0.0
 
-    async def start_collection(self, keywords, excluded_keywords, since, until):
+    async def start_collection(self, keywords, excluded_keywords, since, until, location=None):
         return "run1"
 
     async def fetch_page(self, run_id, cursor=None):
