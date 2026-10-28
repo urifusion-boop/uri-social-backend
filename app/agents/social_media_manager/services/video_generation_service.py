@@ -671,6 +671,14 @@ class VideoGenerationService:
                         print(f"[VideoGen] Scene {scene_num}: YarnGPT direct synthesis failed "
                               f"({yarn_err}); falling back to the cloned voice")
                         cloned_audio_url = None
+                        if notes is not None and avatar_voice in NIGERIAN_VOICE_REFS:
+                            # Idera and Jude still have a clone to fall back on, so the scene keeps
+                            # a Nigerian voice, but it is not the YarnGPT one the customer picked
+                            # (and the reason, e.g. out of credits, is worth seeing).
+                            notes["voice_fallback"] = (
+                                f"YarnGPT could not speak this scene ({str(yarn_err)[:140]}), so the older "
+                                f"cloned {avatar_voice} voice was used."
+                            )
 
                 default_voice_instead = False
                 if cloned_audio_url is None and avatar_voice not in NIGERIAN_VOICE_REFS:
