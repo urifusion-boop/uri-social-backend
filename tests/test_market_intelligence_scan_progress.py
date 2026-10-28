@@ -129,6 +129,47 @@ class TestPerSourceCompletion:
         assert by_provider["mock"]["error"] is None
 
 
+class TestClassificationProgress:
+    """Confirmed live: for a real scan with a few hundred posts,
+    classification (one LLM call per post) is the actual long pole after
+    collection's own per_source log says "done" — several minutes with
+    nothing visible anywhere, no way to tell it apart from being stuck.
+    classification_progress is what makes that phase visible too."""
+
+    def test_classification_progress_reaches_done_equals_total(self):
+        db = fresh_db()
+        run(_seed_run(db))
+        topic = _topic(["mock"])
+
+        with patch.object(scan_runner, "classify_evidence", side_effect=fake_classify), \
+             patch.object(scan_runner, "_fetch_business_context", side_effect=fake_business_context):
+            run(scan_runner.execute_scan(topic, "run1", db))
+
+        run_doc = run(db["mi_scans"].find_one({"id": "run1"}))
+        progress = run_doc.get("classification_progress")
+        collected = run_doc["per_source"][0]["items"]
+        if collected:
+            assert progress is not None
+            assert progress["done"] == progress["total"] == collected
+        else:
+            # Nothing collected this run (mock adapter's own dedup/volume
+            # can legitimately return zero) — no classification work means
+            # no progress field, same honest "nothing to report" as before.
+            assert progress is None
+
+    def test_no_evidence_collected_means_no_classification_progress_field(self):
+        db = fresh_db()
+        run(_seed_run(db))
+        topic = _topic(["nonexistent_provider"])  # fails collection -> zero evidence
+
+        with patch.object(scan_runner, "classify_evidence", side_effect=fake_classify), \
+             patch.object(scan_runner, "_fetch_business_context", side_effect=fake_business_context):
+            run(scan_runner.execute_scan(topic, "run1", db))
+
+        run_doc = run(db["mi_scans"].find_one({"id": "run1"}))
+        assert run_doc.get("classification_progress") is None
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

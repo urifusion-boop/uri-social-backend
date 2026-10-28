@@ -446,6 +446,13 @@ class CollectionRun(BaseModel):
     # Each item: {provider, status: pending|collecting|done|failed, items,
     # cost, error}.
     per_source: list[dict] = Field(default_factory=list)
+    # Confirmed live: once collection finishes and status flips to
+    # ANALYSING, a real (non-mock) scan classifies each collected post one
+    # at a time via an LLM call — for a few hundred posts, several minutes
+    # with nothing visible but a generic "Scanning..." spinner, no way to
+    # tell it apart from actually being stuck. {done, total}, set only
+    # once classification has real work to report.
+    classification_progress: Optional[dict] = None
 
 
 # ── Action handoff (PRD §13) ────────────────────────────────────────────────────

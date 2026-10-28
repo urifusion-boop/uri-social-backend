@@ -65,6 +65,7 @@ from .models import (
     Classification,
     Cluster,
     CollectionRun,
+    ConfidenceBand,
     Development,
     DevelopmentStatus,
     Evidence,
@@ -76,6 +77,7 @@ from .models import (
     ScoreBreakdown,
     SourceCoveragePreview,
     Topic,
+    UrgencyAssessment,
 )
 
 NOISE_FILTER_MODEL_NAME = "deterministic-filter"
@@ -225,11 +227,34 @@ def _action_readiness_from(relevance: ScoreBreakdown) -> ActionReadiness:
     """PRD §7: 'Recommendations with missing fulfilment information are
     labelled "Check suitability" rather than "Ready to act."' Reads
     relevance scoring's own fulfilment_feasibility component rather than
-    re-deriving the same fact a second way."""
+    re-deriving the same fact a second way.
+
+    Confirmed live bug: this used to check ONLY fulfilment_feasibility,
+    so an insight relevance scoring itself rated "low" overall — barely
+    matching the business at all — could still be labelled "Ready to
+    act" purely because stock/delivery facts happened to be on record. A
+    real live example: relevance 3/10 "low," labelled Ready to act
+    anyway. A low overall match is never ready to act on, regardless of
+    fulfilment facts."""
+    if relevance.band == ConfidenceBand.LOW:
+        return ActionReadiness.CHECK_SUITABILITY
     component = next((c for c in relevance.components if c.name == "fulfilment_feasibility"), None)
     if component is not None and component.points > 0:
         return ActionReadiness.READY_TO_ACT
     return ActionReadiness.CHECK_SUITABILITY
+
+
+def _urgency_gated_by_relevance(urgency: UrgencyAssessment, relevance: ScoreBreakdown) -> UrgencyAssessment:
+    """Confirmed live: urgency is computed purely from freshness (how
+    recently something was posted) with zero regard for whether it's
+    actually relevant — so a fresh but barely-related post (relevance
+    "low") was flagged "Urgent" exactly as confidently as a fresh,
+    genuinely on-target one. "Urgent" has to mean "act on this soon," not
+    just "posted recently" — downgrade it whenever the match itself is
+    weak, same bar _action_readiness_from now uses."""
+    if urgency.is_urgent and relevance.band == ConfidenceBand.LOW:
+        return UrgencyAssessment(is_urgent=False, deadline=urgency.deadline, reason=f"relevance too low to flag as urgent ({urgency.reason})")
+    return urgency
 
 
 def _majority_language(evidence_list: list[Evidence]) -> str:
@@ -570,8 +595,20 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     # call — PRD §23 cost control. A noise verdict here is still a real,
     # queryable Classification record (not a discard), just stamped with a
     # deterministic model_name instead of an LLM one.
+    #
+    # Confirmed live: for a real scan with a few hundred posts, this loop —
+    # one LLM call per post — is the actual long pole, several minutes with
+    # nothing visible anywhere once collection's own per_source log says
+    # "done." classification_progress is written periodically so a client
+    # polling GET /scans/{id} can show real progress here too, not just
+    # during collection.
+    total_to_classify = len(all_new_evidence)
+    if total_to_classify:
+        await db["mi_scans"].update_one(
+            {"id": run_id}, {"$set": {"classification_progress": {"done": 0, "total": total_to_classify}}}
+        )
     classifications: dict[str, Classification] = {}
-    for evidence in all_new_evidence:
+    for i, evidence in enumerate(all_new_evidence):
         noise_reason = deterministic_noise_reason(evidence)
         if noise_reason is not None:
             classifications[evidence.id] = Classification(
@@ -583,26 +620,33 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
                 model_name=NOISE_FILTER_MODEL_NAME,
                 prompt_version=NOISE_FILTER_PROMPT_VERSION,
             )
-            continue
+        else:
+            # PRD §23: "Cache classification by content and model version" —
+            # checked/populated around the unchanged classify_evidence() call so
+            # an exact repost or syndicated copy already classified for this
+            # brand skips a second LLM call entirely.
+            # Keyed per topic too: the relevance verdict depends on the question
+            # being researched, so another topic's verdict can't be reused.
+            cache_scope = f"{topic.brand_id}:{topic.id}"
+            result = await get_cached_classification(db, evidence.text, cache_scope)
+            if result is None:
+                result = await classify_evidence(evidence, business_context)
+                if result is not None:
+                    await store_classification_cache(db, evidence.text, cache_scope, result)
 
-        # PRD §23: "Cache classification by content and model version" —
-        # checked/populated around the unchanged classify_evidence() call so
-        # an exact repost or syndicated copy already classified for this
-        # brand skips a second LLM call entirely.
-        # Keyed per topic too: the relevance verdict depends on the question
-        # being researched, so another topic's verdict can't be reused.
-        cache_scope = f"{topic.brand_id}:{topic.id}"
-        result = await get_cached_classification(db, evidence.text, cache_scope)
-        if result is None:
-            result = await classify_evidence(evidence, business_context)
-            if result is not None:
-                await store_classification_cache(db, evidence.text, cache_scope, result)
+            if result is None:
+                gaps.append(f"evidence {evidence.source_id} could not be classified — left for manual review")
+            else:
+                result.evidence_id = evidence.id
+                classifications[evidence.id] = result
 
-        if result is None:
-            gaps.append(f"evidence {evidence.source_id} could not be classified — left for manual review")
-            continue
-        result.evidence_id = evidence.id
-        classifications[evidence.id] = result
+        # Every 5th item (and always the last) — frequent enough to feel
+        # live, infrequent enough not to turn a few-hundred-item scan into
+        # a few hundred extra writes.
+        if (i + 1) % 5 == 0 or i == total_to_classify - 1:
+            await db["mi_scans"].update_one(
+                {"id": run_id}, {"$set": {"classification_progress": {"done": i + 1, "total": total_to_classify}}}
+            )
 
     if classifications:
         await db["mi_classifications"].insert_many([c.dict() for c in classifications.values()])
@@ -686,10 +730,10 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             if not eligible:
                 gaps.append(f"cluster '{cluster.theme}' not surfaced: {reason}")
                 continue
-            urgency = urgency_for_concern(member_evidence)
 
             confidence = confidence_breakdown(member_evidence, cluster.original_thread_count)
             relevance = relevance_breakdown(member_evidence, business_context)
+            urgency = _urgency_gated_by_relevance(urgency_for_concern(member_evidence), relevance)
             member_classifications = await _resolve_classifications(db, member_evidence, classifications)
 
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
@@ -721,7 +765,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
 
         confidence = confidence_breakdown([evidence], original_thread_count=1)
         relevance = relevance_breakdown([evidence], business_context)
-        urgency = urgency_for_inquiry(evidence)
+        urgency = _urgency_gated_by_relevance(urgency_for_inquiry(evidence), relevance)
 
         pseudo_cluster = Cluster(
             id=str(uuid.uuid4()),

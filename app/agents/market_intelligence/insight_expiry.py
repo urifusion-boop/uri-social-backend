@@ -30,7 +30,7 @@ from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .classification.scoring import is_inquiry_eligible, urgency_for_inquiry
-from .models import Evidence, EvidenceType, InsightStatus
+from .models import Evidence, EvidenceType, InsightStatus, UrgencyAssessment
 
 
 async def expire_stale_inquiries(db: AsyncIOMotorDatabase, now: datetime = None) -> dict:
@@ -63,6 +63,16 @@ async def expire_stale_inquiries(db: AsyncIOMotorDatabase, now: datetime = None)
             continue
 
         new_urgency = urgency_for_inquiry(evidence, now)
+        # Same gate scan_runner.py's compose path applies at creation time
+        # (_urgency_gated_by_relevance) — a stale re-score must not
+        # resurrect "Urgent" on a match the insight's own stored relevance
+        # already rates "low," for the same reason it was never meant to
+        # say that in the first place.
+        if new_urgency.is_urgent and (doc.get("relevance") or {}).get("band") == "low":
+            new_urgency = UrgencyAssessment(
+                is_urgent=False, deadline=new_urgency.deadline,
+                reason=f"relevance too low to flag as urgent ({new_urgency.reason})",
+            )
         if new_urgency.is_urgent == doc.get("urgency", {}).get("is_urgent") and new_urgency.reason == doc.get("urgency", {}).get("reason"):
             unchanged += 1
             continue
