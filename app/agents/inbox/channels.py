@@ -197,7 +197,7 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
             if ok:
                 break
             scopes = await granted_scopes(candidate)
-            err = f"{err} [token carries: {', '.join(scopes) or 'unknown'}]"
+            err = f"{err} [token carries: {', '.join(scopes) or 'unknown'}; {await token_report(candidate)}]"
         # Store the Page's own token: replies are Page-scoped too, so a user token
         # here fails every send with the same (#210).
         await db[CHANNEL_ACCOUNTS].update_many(
@@ -299,8 +299,7 @@ def subscription_issue(error: str, page_name: str = "") -> dict:
         "Connected Accounts; if it keeps failing, contact support.")} if error else {}
 
 
-async def granted_scopes(token: str) -> list[str]:
-    """The permissions Meta says this token actually carries; [] when it can't be read."""
+async def _debug_token(token: str) -> dict:
     import httpx
 
     from app.core.config import settings
@@ -310,9 +309,27 @@ async def granted_scopes(token: str) -> list[str]:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get("https://graph.facebook.com/debug_token",
                                  params={"input_token": token, "access_token": app_token})
-        return sorted((r.json().get("data") or {}).get("scopes") or [])
+        return r.json().get("data") or {}
     except Exception:
-        return []
+        return {}
+
+
+async def granted_scopes(token: str) -> list[str]:
+    """The permissions Meta says this token actually carries; [] when it can't be read."""
+    return sorted((await _debug_token(token)).get("scopes") or [])
+
+
+async def token_report(token: str) -> str:
+    """What a refused token is: its kind, who it was issued to, and which Pages each
+    Page-scoped permission was granted for (Meta lets a user grant a permission to some
+    Pages and not others, which looks identical to "granted" in the plain scope list)."""
+    data = await _debug_token(token)
+    granular = ", ".join(
+        f"{g.get('scope')}→{'/'.join(g.get('target_ids') or ['all'])}"
+        for g in data.get("granular_scopes") or []
+        if g.get("scope") in ("pages_manage_metadata", "pages_messaging", "pages_show_list"))
+    return (f"type={data.get('type') or '?'}, user={data.get('user_id') or data.get('profile_id') or '?'}"
+            f"{', granted per Page: ' + granular if granular else ''}")
 
 
 async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:
