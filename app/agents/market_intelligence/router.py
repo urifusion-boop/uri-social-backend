@@ -238,10 +238,22 @@ async def list_topics(
     ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
+    # Confirmed live UX bug: "Run scan" -> "Scanning..." -> "check back
+    # later" had no server-visible state behind it at all — the frontend
+    # only ever knew a scan was in progress via its OWN sessionStorage, so
+    # a new tab, a closed/reopened browser, or just coming back after the
+    # client gave up polling showed nothing: no "still running," no "it
+    # finished," no "it failed." Attaching each topic's own most recent
+    # scan here means ANY page load reflects real server state, not just
+    # whatever this one browser tab happened to remember.
     cursor = db["mi_topics"].find({"brand_id": ctx["brand_id"]}).sort("created_at", -1)
     topics = [doc async for doc in cursor]
     for t in topics:
         t.pop("_id", None)
+        latest_scan = await db["mi_scans"].find_one({"topic_id": t["id"]}, sort=[("started_at", -1)])
+        if latest_scan:
+            latest_scan.pop("_id", None)
+        t["latest_scan"] = latest_scan
     return UriResponse.get_list_data_response("topic", topics)
 
 
