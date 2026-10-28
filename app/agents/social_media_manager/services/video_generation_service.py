@@ -11,7 +11,6 @@ from app.core.config import settings
 from app.database import get_db
 from app.utils.s3_upload import upload_bytes, upload_file_path
 from app.agents.social_media_manager.services import yarngpt_tts_service
-from app.agents.social_media_manager.services.yarngpt_tts_service import YARNGPT_SPEAKERS
 
 # Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
 # (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
@@ -306,7 +305,8 @@ class VideoGenerationService:
         scenes = storyboard.get("scenes", [])
         route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         primary_model, fallback_model = route["primary"], route["fallback"]
-        if avatar_voice not in AVATAR_VOICES and avatar_voice not in NIGERIAN_VOICE_REFS and avatar_voice not in YARNGPT_SPEAKERS:
+        if (avatar_voice not in AVATAR_VOICES and avatar_voice not in NIGERIAN_VOICE_REFS
+                and yarngpt_tts_service.speaker_for(avatar_voice) is None):
             avatar_voice = DEFAULT_AVATAR_VOICE
         await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
@@ -651,14 +651,14 @@ class VideoGenerationService:
                     round(nf / fps, 2),
                 )
 
-            if avatar_voice in NIGERIAN_VOICE_REFS or avatar_voice in YARNGPT_SPEAKERS:
+            if avatar_voice in NIGERIAN_VOICE_REFS or yarngpt_tts_service.speaker_for(avatar_voice):
                 # Preferred: YarnGPT speaks the line itself (its own Nigerian voice, no
                 # cloning). Only attempted when the TTS service is configured; any failure
                 # drops to the clone path below for the two voices that have a reference
                 # clip, so a down service never breaks them.
                 cloned_audio_url = None
                 voice_source = "cloned"
-                speaker = YARNGPT_SPEAKERS.get(avatar_voice)
+                speaker = yarngpt_tts_service.speaker_for(avatar_voice)
                 if speaker and yarngpt_tts_service.is_configured():
                     try:
                         raw_audio = await yarngpt_tts_service.synthesize(dialogue, speaker)
@@ -672,13 +672,18 @@ class VideoGenerationService:
                               f"({yarn_err}); falling back to the cloned voice")
                         cloned_audio_url = None
 
-                if cloned_audio_url is None:
-                    if avatar_voice not in NIGERIAN_VOICE_REFS:
-                        # No reference clip exists for this voice, so there is nothing to
-                        # clone from. Raising lets run_job fall back to the outcome's paired model.
-                        raise ValueError(
-                            f"{avatar_voice} needs the YarnGPT service, which is unavailable for this scene"
+                default_voice_instead = False
+                if cloned_audio_url is None and avatar_voice not in NIGERIAN_VOICE_REFS:
+                    # YarnGPT could not speak this line and there is no reference clip to clone
+                    # from. Keep the scripted line and the lip-sync with a default voice, and
+                    # say so on the clip, rather than losing the speech by falling to Veo.
+                    default_voice_instead = True
+                    if notes is not None:
+                        notes["voice_fallback"] = (
+                            f"The {avatar_voice} voice could not be generated for this scene, "
+                            f"so a default voice was used."
                         )
+                elif cloned_audio_url is None:
                     # Clone the reference sample reading this scene's actual line
                     # (fal-ai/f5-tts), then lip-sync that audio to the frame image
                     # (minimax/h3-max/lip-sync/image-to-video) — see NIGERIAN_VOICE_REFS
@@ -701,20 +706,24 @@ class VideoGenerationService:
                     except Exception as pad_err:
                         print(f"[VideoGen] Scene {scene_num}: silence-padding failed ({pad_err}), using clip as-is")
 
-                model = _NG_LIPSYNC
-                info = MODEL_REGISTRY[model]
-                # No duration field on this model — the output simply runs as
-                # long as the supplied audio does. Same word-count estimate
-                # _AVATAR_TALKING's own branch used, as a placeholder; overridden
-                # below with the real reported duration once the call completes.
-                word_count = max(1, len(dialogue.split()))
-                actual_seconds = min(word_count / 3.0, duration_req)
-                arguments = {
-                    "image_url": frame_image_url,
-                    "audio_url": cloned_audio_url,
-                    "resolution": "480P",
-                }
-                print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, {voice_source}), ~{actual_seconds}s")
+                if default_voice_instead:
+                    arguments, actual_seconds = _western_avatar_args(dialogue)
+                    print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice} unavailable, default voice), ~{actual_seconds}s")
+                else:
+                    model = _NG_LIPSYNC
+                    info = MODEL_REGISTRY[model]
+                    # No duration field on this model — the output simply runs as
+                    # long as the supplied audio does. Same word-count estimate
+                    # _AVATAR_TALKING's own branch used, as a placeholder; overridden
+                    # below with the real reported duration once the call completes.
+                    word_count = max(1, len(dialogue.split()))
+                    actual_seconds = min(word_count / 3.0, duration_req)
+                    arguments = {
+                        "image_url": frame_image_url,
+                        "audio_url": cloned_audio_url,
+                        "resolution": "480P",
+                    }
+                    print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, {voice_source}), ~{actual_seconds}s")
             else:
                 arguments, actual_seconds = _western_avatar_args(dialogue)
                 print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}), ~{actual_seconds}s")

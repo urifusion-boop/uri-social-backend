@@ -10,9 +10,11 @@ Standalone on purpose: it needs only `httpx`, no backend settings, so anyone wit
 run it from any checkout. The key is read from the environment and never written anywhere.
 
     YARNGPT_API_KEY=sk_live_... python scripts/generate_yarngpt_previews.py \
-        --out ../uri-social-frontent-next/public/voice-previews
+        --voices idera,femi --out ../uri-social-frontent-next/public/voice-previews
 
-Each voice costs one short synthesis from the YarnGPT account's credits (about ten in all). Voices
+--voices takes the names exactly as YarnGPT lists them (shown at the start of the run).
+
+Each voice costs one short synthesis from the YarnGPT account's credits. Voices
 YarnGPT does not offer, or that fail, are listed at the end and left out of the manifest; the exit
 code is 1 if any were left out, so a half-finished set is never mistaken for a full one.
 """
@@ -29,20 +31,7 @@ import httpx
 
 DEFAULT_API_URL = "https://api.yarngpt.ai"
 
-# UI voice label -> YarnGPT voice name. MUST match YARNGPT_SPEAKERS in
-# app/agents/social_media_manager/services/yarngpt_tts_service.py (a test compares them).
-LABELS: Dict[str, str] = {
-    "Idera (Nigerian)": "idera",
-    "Jude (Nigerian)": "jude",
-    "Chinenye (Nigerian)": "chinenye",
-    "Emma (Nigerian)": "emma",
-    "Umar (Nigerian)": "umar",
-    "Joke (Nigerian)": "joke",
-    "Zainab (Nigerian)": "zainab",
-    "Osagie (Nigerian)": "osagie",
-    "Remi (Nigerian)": "remi",
-    "Tayo (Nigerian)": "tayo",
-}
+NIGERIAN_SUFFIX = " (Nigerian)"   # the picker's label is "<Name> (Nigerian)"; keep in sync with the backend
 
 
 def preview_line(display_name: str) -> str:
@@ -105,7 +94,7 @@ def synthesize(client: httpx.Client, base: str, key: str, voice: str, text: str,
     raise RuntimeError("timed out waiting for the job")
 
 
-def run(client: httpx.Client, base: str, key: str, out: Path) -> int:
+def run(client: httpx.Client, base: str, key: str, out: Path, wanted: list) -> int:
     out.mkdir(parents=True, exist_ok=True)
     listing = client.get(f"{base}/api/v1/voices", headers={"Authorization": f"Bearer {key}"})
     offered = voice_names(listing.json()) if listing.status_code == 200 else []
@@ -115,7 +104,9 @@ def run(client: httpx.Client, base: str, key: str, out: Path) -> int:
         print("Could not read YarnGPT's voice list; trying each voice by name.\n")
 
     manifest, left_out = [], []
-    for label, speaker in LABELS.items():
+    for name in wanted:
+        speaker = name.strip().lower()
+        label = f"{speaker.capitalize()}{NIGERIAN_SUFFIX}"
         voice: Optional[str] = next((v for v in offered if v.lower() == speaker), None) if offered else speaker
         if voice is None:
             left_out.append(label)
@@ -141,14 +132,19 @@ def run(client: httpx.Client, base: str, key: str, out: Path) -> int:
 def main(argv=None, client: Optional[httpx.Client] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
+    ap.add_argument("--voices", required=True, help="comma-separated YarnGPT voice names, e.g. idera,femi")
     args = ap.parse_args(argv)
+    wanted = [v for v in (x.strip() for x in args.voices.split(",")) if v]
+    if not wanted:
+        print("Name at least one voice with --voices.")
+        return 2
     key = os.environ.get("YARNGPT_API_KEY", "").strip()
     if not key:
         print("Set YARNGPT_API_KEY first (the key from the Account page at yarngpt.ai).")
         return 2
     base = (os.environ.get("YARNGPT_API_URL") or DEFAULT_API_URL).rstrip("/")
     with (client or httpx.Client(timeout=60)) as c:
-        return run(c, base, key, Path(args.out))
+        return run(c, base, key, Path(args.out), wanted)
 
 
 if __name__ == "__main__":
