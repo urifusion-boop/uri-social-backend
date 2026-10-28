@@ -109,6 +109,11 @@ class Settings(BaseSettings):
     # fal.ai image/video generation
     FAL_API_KEY: Optional[str] = None
 
+    # YarnGPT speech service for Nigerian-voice talking videos (services/yarngpt_tts). Unset =
+    # the older voice-cloning path is used for those voices, exactly as before.
+    YARNGPT_TTS_URL: Optional[str] = None
+    YARNGPT_TTS_TOKEN: Optional[str] = None
+
     # Pexels stock video API (b-roll fetch for video production)
     PEXELS_API_KEY: Optional[str] = None
 
