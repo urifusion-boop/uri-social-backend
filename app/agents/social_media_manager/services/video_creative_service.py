@@ -224,6 +224,8 @@ class VideoCreativeService:
                 "or brand copy into a video_prompt."
             )
             preamble_lines.append(_brief)
+        preamble_lines.append("")
+        preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
         content: List[Dict[str, Any]] = [{"type": "text", "text": "\n".join(preamble_lines)}]
         for img in reference_images:
             content.append({"type": "image_url", "image_url": {"url": img}})
@@ -264,6 +266,36 @@ class VideoCreativeService:
         except json.JSONDecodeError as e:
             print(f"Creative storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
             return {"status": False, "error": "Failed to parse creative storyboard from model response."}
+
+        # The model can still use a banned word (a style's own instructions say "transformation"). Ask once for a
+        # clean rewrite of the same script; what is still left afterwards is removed below.
+        found = brand_brief.script_violations(storyboard, brand_context, direction=not creative_direction_override)
+        if found:
+            try:
+                retry = await loop.run_in_executor(
+                    None,
+                    lambda: openai_client.chat.completions.create(
+                        model=SCRIPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": content},
+                            {"role": "assistant", "content": raw},
+                            {"role": "user", "content": (
+                                f"Your script used words this brand has banned: {', '.join(found)}. Rewrite the complete "
+                                "JSON with the same story, scenes and structure, but without any form of those words "
+                                "(including endings like -ation, -ing, -ly). Return ONLY the JSON.")},
+                        ],
+                        temperature=0.4,
+                        max_completion_tokens=6000,
+                        response_format={"type": "json_object"},
+                    ),
+                )
+                retried = json.loads(re.sub(r"\s*```$", "", re.sub(
+                    r"^```(?:json)?\s*", "", (retry.choices[0].message.content or "").strip())))
+                if isinstance(retried, dict) and retried.get("scenes"):
+                    storyboard = retried
+            except Exception as e:  # keep the first script; the removal below still guarantees the rule
+                print(f"[VideoCreativeService] banned-word rewrite failed: {type(e).__name__}: {e}", flush=True)
 
         # The Playbook's word rules, guaranteed on what viewers read and hear. Before the owner's own
         # edited direction is put back below, so their wording is never rewritten.
@@ -368,12 +400,14 @@ class VideoCreativeService:
         return await VideoStoryboardService.create_frame_job(scenes)
 
     @staticmethod
-    async def run_frame_job(job_id: str, scenes: list, reference_images: List[str] = None) -> None:
+    async def run_frame_job(job_id: str, scenes: list, reference_images: List[str] = None,
+                            brand_context: Optional[Dict[str, Any]] = None) -> None:
         col = _frame_jobs_collection()
         reference_images = reference_images or []
         prev_image_url: Optional[str] = None
         for scene in scenes:
-            url = await VideoCreativeService._generate_scene_frame(scene, reference_images, prev_image_url)
+            url = await VideoCreativeService._generate_scene_frame(
+                scene, reference_images, prev_image_url, brand_context)
             if url:
                 prev_image_url = url
                 await col.update_one(
@@ -386,8 +420,14 @@ class VideoCreativeService:
         await col.update_one({"job_id": job_id}, {"$set": {"status": "complete"}})
 
     @staticmethod
+    def _frame_branding(brand_context: Optional[Dict[str, Any]], on_screen_text: str = "") -> str:
+        from . import brand_brief
+        return brand_brief.frame_branding_rules(brand_context, on_screen_text)
+
+    @staticmethod
     async def _generate_scene_frame(
-        scene: dict, reference_images: List[str], prev_image_url: Optional[str]
+        scene: dict, reference_images: List[str], prev_image_url: Optional[str],
+        brand_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         try:
             shot = scene.get("shot_type", "").replace("_", " ")
@@ -402,7 +442,9 @@ class VideoCreativeService:
                 f"Camera movement: {motion}. "
                 + (f"Continuity with the surrounding scenes: {continuity}. " if continuity else "")
                 + (f'On-screen text: "{text}". ' if text else "")
-                + "Photorealistic, dramatic lighting. Vertical 9:16 composition."
+                + "Photorealistic, dramatic lighting. Vertical 9:16 composition. "
+                # The picture model draws only what it is told: without this it invents a brand on every box.
+                + VideoCreativeService._frame_branding(brand_context, text)
             )
 
             loop = asyncio.get_running_loop()

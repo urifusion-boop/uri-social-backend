@@ -7404,7 +7404,8 @@ async def get_creative_storyboard_job(
 async def generate_creative_frames(
     request: CreativeFramesRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Start background generation of consistent frame images for a creative
@@ -7417,10 +7418,13 @@ async def generate_creative_frames(
     """
     from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
 
-    _get_user_id(token)  # auth check
+    # The scene images are drawn knowing whose video this is: its colours, and no invented brand names.
+    brand_context = await _video_brand_context(ctx, db)
 
     job_id = await VideoCreativeService.create_frame_job(request.scenes)
-    background_tasks.add_task(VideoCreativeService.run_frame_job, job_id, request.scenes, request.reference_images)
+    background_tasks.add_task(
+        VideoCreativeService.run_frame_job, job_id, request.scenes, request.reference_images, brand_context
+    )
 
     return UriResponse.get_single_data_response(
         "frame_job",

@@ -262,3 +262,166 @@ def test_video_wording_is_not_rewritten_by_the_caption_cliche_list():
     assert board["creative_direction"] == "We tell one simple transformation story, a transformative before and after."
     assert board["scenes"][0]["text_overlay"] == "Premium results"
     assert board["scenes"][0]["dialogue"] == "Unlock your journey"
+
+
+# ── pictures: no invented brands, the brand's own colours ─────────────────────
+
+def test_the_script_writer_is_told_which_brand_may_appear(monkeypatch):
+    _, fake = _describe_it(monkeypatch, _bc())
+    prompt = _user_prompt(fake)
+    assert 'The only brand name that may appear anywhere in the video is "Bukka Express".' in prompt
+    assert "plain and unbranded" in prompt
+
+
+def test_even_without_a_playbook_the_script_writer_is_told_not_to_invent_brands(monkeypatch):
+    _, fake = _describe_it(monkeypatch, {})
+    assert "Never invent or name any other brand" in _user_prompt(fake)
+
+
+def test_frame_rules_carry_the_palette_and_forbid_invented_lettering():
+    text = bb.frame_branding_rules(_bc(), "Order today")
+    assert "#FF6A00" in text and "#1B1B1B" in text
+    assert "Do NOT invent or show any brand" in text
+    assert 'exactly the on-screen text given ("Order today")' in text and '"Bukka Express"' in text
+    # no brand at all: no lettering is allowed anywhere
+    assert "there is no lettering at all" in bb.frame_branding_rules({}, "")
+
+
+class _FakeImages:
+    def __init__(self):
+        self.prompts = []
+
+    def _resp(self):
+        return SimpleNamespace(data=[SimpleNamespace(b64_json=base64.b64encode(b"img").decode())])
+
+    def generate(self, **kw):
+        self.prompts.append(kw["prompt"])
+        return self._resp()
+
+    def edit(self, **kw):
+        self.prompts.append(kw["prompt"])
+        return self._resp()
+
+
+def _frame(monkeypatch, brand, prev=None, scene=None):
+    images = _FakeImages()
+    monkeypatch.setattr(vcs, "openai_client", SimpleNamespace(images=images))
+
+    async def fake_upload(data, folder="", resource_type=""):
+        return "https://cdn.test/frame.png"
+
+    async def fake_download(url):
+        return b"prev"
+
+    monkeypatch.setattr(vcs, "upload_bytes", fake_upload)
+    monkeypatch.setattr(vcs.VideoCreativeService, "_download_image_bytes", staticmethod(fake_download))
+    monkeypatch.setattr(vcs.VideoCreativeService, "_as_file", staticmethod(lambda b: b))
+    scene = scene or {"scene_number": 1, "shot_type": "lifestyle", "video_prompt": "A seller packing boxes", "motion": "push in"}
+    url = _run(vcs.VideoCreativeService._generate_scene_frame(scene, [], prev, brand))
+    return url, images.prompts[0]
+
+
+def test_a_scene_image_is_drawn_with_the_brand_rules_first_scene(monkeypatch):
+    url, prompt = _frame(monkeypatch, _bc())
+    assert url == "https://cdn.test/frame.png"
+    assert "A seller packing boxes" in prompt and "Do NOT invent or show any brand" in prompt and "#FF6A00" in prompt
+
+
+def test_a_scene_image_is_drawn_with_the_brand_rules_when_chained_from_the_last_frame(monkeypatch):
+    _, prompt = _frame(monkeypatch, _bc(), prev="https://cdn.test/prev.png")
+    assert "Keep the same subject" in prompt and "Do NOT invent or show any brand" in prompt
+
+
+def test_a_scene_image_without_a_playbook_still_forbids_invented_brands(monkeypatch):
+    _, prompt = _frame(monkeypatch, None)
+    assert "Do NOT invent or show any brand" in prompt
+
+
+def test_the_frames_route_loads_the_active_brand_and_hands_it_to_the_job(monkeypatch, routes):
+    seen = {}
+
+    async def create_frame_job(scenes):
+        return "F1"
+
+    async def run_frame_job(*a):
+        seen["args"] = a
+
+    monkeypatch.setattr(vcs.VideoCreativeService, "create_frame_job", staticmethod(create_frame_job))
+    monkeypatch.setattr(vcs.VideoCreativeService, "run_frame_job", staticmethod(run_frame_job))
+    tasks = BackgroundTasks()
+    _run(R.generate_creative_frames(R.CreativeFramesRequest(scenes=[{"scene_number": 1}]), tasks, None, CTX))
+    assert routes["get_calls"] == [("u1", "b-active")]
+    assert tasks.tasks[0].args[3]["brand_colors"] == ["#FF6A00", "#1B1B1B"]
+
+
+# ── banned words: ask for a clean rewrite once, then remove, never swap ───────
+
+class _SequenceOpenAI:
+    """Answers each call with the next script in the list."""
+    def __init__(self, *scripts):
+        self.scripts, self.calls = list(scripts), []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw):
+        self.calls.append(kw)
+        script = self.scripts[min(len(self.calls), len(self.scripts)) - 1]
+        content = script if isinstance(script, str) else json.dumps(script)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def _write(monkeypatch, bc, *scripts, **kw):
+    fake = _SequenceOpenAI(*scripts)
+    monkeypatch.setattr(vcs, "openai_client", fake)
+    result = _run(vcs.VideoCreativeService.generate_creative_storyboard(
+        brief="A fun ad for our lunch combo", reference_images=[], brand_context=bc, **kw))
+    return result, fake
+
+
+def _script(direction, overlay=None):
+    return {"creative_direction": direction, "video_style": "clean_commercial",
+            "scenes": [{"scene_number": 1, "duration_seconds": 5, "text_overlay": overlay, "dialogue": None,
+                        "video_prompt": "A plate of rice"}]}
+
+
+def test_a_banned_word_gets_one_clean_rewrite_of_the_same_script(monkeypatch):
+    bc = _bc()
+    bc["guardrails"] = {"banned_words": "transformation"}
+    dirty = _script("We tell one simple transformation story.")
+    clean = _script("We tell one simple before-and-after story.")
+    result, fake = _write(monkeypatch, bc, dirty, clean)
+    assert result["storyboard"]["creative_direction"] == "We tell one simple before-and-after story."
+    assert len(fake.calls) == 2
+    asked = fake.calls[1]["messages"]
+    assert asked[2]["role"] == "assistant" and "transformation story" in asked[2]["content"]
+    assert "transformation" in asked[3]["content"] and "same story, scenes and structure" in asked[3]["content"]
+
+
+def test_a_clean_script_is_written_in_one_call(monkeypatch):
+    bc = _bc()
+    bc["guardrails"] = {"banned_words": "transformation"}
+    result, fake = _write(monkeypatch, bc, _script("A calm morning story."))
+    assert len(fake.calls) == 1 and result["storyboard"]["creative_direction"] == "A calm morning story."
+
+
+def test_when_the_rewrite_is_unusable_the_word_is_removed_not_swapped(monkeypatch):
+    bc = _bc()
+    bc["guardrails"] = {"banned_words": "transformation"}
+    result, fake = _write(monkeypatch, bc, _script("We tell one simple transformation story."), "not json at all")
+    assert len(fake.calls) == 2
+    direction = result["storyboard"]["creative_direction"]
+    assert "transformation" not in direction.lower() and "improve" not in direction
+    assert direction == "We tell one simple story."
+
+
+def test_the_owners_edited_direction_is_not_sent_back_for_rewriting(monkeypatch):
+    bc = _bc()
+    bc["guardrails"] = {"banned_words": "transformation"}
+    mine = "My own transformation story"
+    result, fake = _write(monkeypatch, bc, _script("ignored by the model"), creative_direction_override=mine)
+    assert len(fake.calls) == 1 and result["storyboard"]["creative_direction"] == mine
+
+
+def test_the_brands_own_words_are_removed_without_the_caption_swap_table():
+    assert bb.strip_banned_words("one simple transformation story", ["transform"], universal=False) == "one simple story"
+    # the built-in list still swaps for captions
+    assert bb.strip_banned_words("one simple transformation story") == "one simple improve story"
