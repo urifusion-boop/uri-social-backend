@@ -377,8 +377,10 @@ def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None, u
         key = word.strip().lower()
         if not key:
             continue
-        default = _BANNED_WORD_FALLBACK.get(key, "")
-        adverb = _BANNED_ADVERB_FALLBACK.get(key)
+        # The brand's own words are removed, never swapped: a swap table written for caption clichés turns
+        # "a transformation story" into "an improve story".
+        default = _BANNED_WORD_FALLBACK.get(key, "") if universal else ""
+        adverb = _BANNED_ADVERB_FALLBACK.get(key) if universal else None
 
         def _sub(m: "re.Match") -> str:
             if adverb and m.group(0).lower().endswith("ly") and not key.endswith("ly"):
@@ -627,6 +629,51 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True, un
     elif append_cta and out.strip():
         out = cta_last(out, bc)
     return out
+
+
+def script_violations(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]], direction: bool = True) -> List[str]:
+    """The brand's own banned words found in the words a viewer will read or hear (and the creative direction)."""
+    words = banned_words(bc)
+    if not words or not isinstance(storyboard, dict):
+        return []
+    texts = [str(scene.get(k) or "") for scene in storyboard.get("scenes") or [] if isinstance(scene, dict)
+             for k in ("text_overlay", "dialogue")]
+    if direction:
+        texts.append(str(storyboard.get("creative_direction") or ""))
+    return find_banned(" ".join(texts), words)
+
+
+def _brand_name(bc: Optional[Dict[str, Any]]) -> str:
+    return str((bc or {}).get("brand_name") or "").strip()
+
+
+def visual_branding_rule(bc: Optional[Dict[str, Any]]) -> str:
+    """For the script writer: what may be written into a video_prompt about brands, logos and lettering.
+    Without it the picture model invents one ("Lagos Luxe Beauty" on every box and uniform)."""
+    name = _brand_name(bc)
+    allowed = f'The only brand name that may appear anywhere in the video is "{name}". ' if name else ""
+    return (
+        "BRANDS IN THE PICTURES: " + allowed + "Never invent or name any other brand, shop, company, logo or slogan "
+        "in a video_prompt. Describe packaging, uniforms, mugs, signs, screens and documents as plain and "
+        "unbranded, with no readable words, unless the lettering is the brand's own name."
+    )
+
+
+def frame_branding_rules(bc: Optional[Dict[str, Any]], allowed_text: str = "") -> str:
+    """For the picture model, appended to every scene image prompt: the brand's own colours, and no invented
+    brand names, logos or lettering anywhere in the frame."""
+    name = _brand_name(bc)
+    colors = ", ".join(str(c) for c in ((bc or {}).get("brand_colors") or [])[:4])
+    parts = []
+    if colors:
+        parts.append(f"Colour palette to dominate the clothing, props and graphics: {colors}.")
+    only = f'any lettering is exactly "{name}"' if name else "there is no lettering at all"
+    parts.append(
+        "Do NOT invent or show any brand, shop, company or product name, logo or slogan. Packaging, uniforms, "
+        "mugs, bags, signs, screens and documents are plain and unbranded with no readable words, unless "
+        + only + (f' or exactly the on-screen text given ("{allowed_text}")' if allowed_text else "") + "."
+    )
+    return " ".join(parts)
 
 
 def video_platform(target_platform: str) -> str:
