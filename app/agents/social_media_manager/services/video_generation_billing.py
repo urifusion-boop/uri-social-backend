@@ -13,6 +13,9 @@ Everything is recorded in `video_generation_billing`, one document per job, so a
 exactly what was charged and returned, and a refund that could not be paid is left marked for follow-up
 instead of being lost.
 
+Writing a storyboard is charged the same way, separately and before the video: STORYBOARD_CREDITS each time,
+given back in full when no storyboard comes out (start_storyboard / settle_storyboard below).
+
 Mode (settings.VIDEO_GENERATION_BILLING_MODE):
   off     nothing is quoted, charged or recorded; generation is free exactly as before.
   shadow  prices and records what WOULD be charged, charges nothing. For a pilot: compare the recorded
@@ -117,6 +120,12 @@ async def start(user_id: str, storyboard: dict, outcome: str, avatar_voice: str 
     # Price it first: a video that cannot be priced (too long, nothing in it) is refused before anything is
     # recorded or any database is touched.
     priced = video_pricing.quote_for(storyboard, outcome, avatar_voice)
+    return await _charge(job_id, user_id, priced, idempotency_key, current, credits, trials, col)
+
+
+async def _charge(job_id: str, user_id: str, priced: Dict[str, Any], idempotency_key: Optional[str],
+                  current: str, credits, trials, col, what: str = "video") -> Dict[str, Any]:
+    """Record and take the credits for something already priced (`priced["credits_required"]`)."""
     needed = priced["credits_required"]
     credits, trials = _services(credits, trials)
     col = col if col is not None else _collection()
@@ -159,7 +168,7 @@ async def start(user_id: str, storyboard: dict, outcome: str, avatar_voice: str 
         await col.update_one({"job_id": job_id}, {"$set": {"status": "declined"}, "$unset": {"idempotency_key": ""}})
         remaining = (await _balance(user_id, credits, trials))["remaining"] or 0
         raise BillingDeclined(
-            f"This video needs {needed} credits, but you have {remaining}. Top up to continue.",
+            f"This {what} needs {needed} credit{'s' if needed != 1 else ''}, but you have {remaining}. Top up to continue.",
             {"credits_required": needed, "credits_remaining": remaining, "upgrade_url": UPGRADE_URL},
         )
     await col.update_one(
@@ -171,6 +180,48 @@ async def start(user_id: str, storyboard: dict, outcome: str, avatar_voice: str 
         "job_id": job_id, "existing": False,
         "billing": {"mode": "on", "credits_charged": needed, "credits_refunded": 0, "status": "charged"},
     }
+
+
+async def quote_storyboard(user_id: str, credits=None, trials=None) -> Dict[str, Any]:
+    """What writing a storyboard costs, and whether the customer can afford it."""
+    current = mode()
+    if current == "off":
+        return {"billing": "off"}
+    credits, trials = _services(credits, trials)
+    needed = video_pricing.STORYBOARD_CREDITS
+    balance = await _balance(user_id, credits, trials)
+    remaining = balance["remaining"]
+    return {
+        "billing": current, "credits_required": needed,
+        "naira_reference": needed * video_pricing.CREDIT_NAIRA_REFERENCE,
+        "balance": remaining,
+        "balance_after": None if remaining is None else max(0, remaining - needed),
+        "sufficient": True if remaining is None else remaining >= needed,
+        "is_trial": balance["is_trial"],
+    }
+
+
+async def start_storyboard(user_id: str, idempotency_key: Optional[str] = None, credits=None, trials=None,
+                           col=None) -> Dict[str, Any]:
+    """Take the credit for one storyboard run, before any writing starts. Same contract as start():
+    {"job_id", "billing", "existing"}; raises BillingDeclined when the customer cannot afford it.
+
+    The key is namespaced so a storyboard key can never collide with a video key from the same browser."""
+    current = mode()
+    job_id = uuid.uuid4().hex
+    if current == "off":
+        return {"job_id": job_id, "billing": None, "existing": False}
+    priced = {"kind": "storyboard", "scenes": 1, "credits_required": video_pricing.STORYBOARD_CREDITS,
+              "pricing_version": video_pricing.PRICING_VERSION}
+    key = f"sb:{idempotency_key}" if idempotency_key else None
+    return await _charge(job_id, user_id, priced, key, current, credits, trials, col, what="storyboard")
+
+
+async def settle_storyboard(job_id: str, succeeded: bool, credits=None, trials=None, col=None) -> Optional[dict]:
+    """The storyboard run ended: keep the credit if a storyboard came out, give it back if not. Safe to call
+    twice, and a no-op for a run that was never charged."""
+    job = {"total_scenes": 1, "clips": [{"video_url": "storyboard"}] if succeeded else []}
+    return await settle(job_id, job=job, credits=credits, trials=trials, col=col)
 
 
 def _public(record: Optional[dict]) -> Optional[dict]:

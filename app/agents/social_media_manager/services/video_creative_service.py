@@ -296,8 +296,8 @@ class VideoCreativeService:
     #    a frame-generation job are different things with different lifetimes. ──
 
     @staticmethod
-    async def create_storyboard_job() -> str:
-        job_id = uuid.uuid4().hex
+    async def create_storyboard_job(job_id: Optional[str] = None) -> str:
+        job_id = job_id or uuid.uuid4().hex
         await _creative_storyboard_jobs_collection().insert_one({
             "job_id": job_id,
             "status": "generating",
@@ -317,15 +317,27 @@ class VideoCreativeService:
         video_style: Optional[str] = None,
         creative_direction_override: Optional[str] = None,
     ) -> None:
-        result = await VideoCreativeService.generate_creative_storyboard(
-            brief=brief,
-            reference_images=reference_images,
-            brand_context=brand_context,
-            target_platform=target_platform,
-            target_duration_seconds=target_duration_seconds,
-            video_style=video_style,
-            creative_direction_override=creative_direction_override,
-        )
+        try:
+            result = await VideoCreativeService.generate_creative_storyboard(
+                brief=brief,
+                reference_images=reference_images,
+                brand_context=brand_context,
+                target_platform=target_platform,
+                target_duration_seconds=target_duration_seconds,
+                video_style=video_style,
+                creative_direction_override=creative_direction_override,
+            )
+        except Exception as e:  # never leave a charged job "generating" forever
+            print(f"[VideoCreativeService] storyboard job {job_id} crashed: {type(e).__name__}: {e}", flush=True)
+            result = {"status": False, "error": "Creative storyboard generation failed. Please try again."}
+        # The credit for this run is kept if a storyboard came out and given back if not. Settled BEFORE the job
+        # is marked finished, so the screen that sees "failed" already sees the refund. A no-op when this run
+        # was never charged (billing off).
+        try:
+            from app.agents.social_media_manager.services import video_generation_billing as billing
+            await billing.settle_storyboard(job_id, bool(result.get("status")))
+        except Exception as e:
+            print(f"[VideoCreativeService] settling storyboard job {job_id} failed: {type(e).__name__}: {e}", flush=True)
         if result.get("status"):
             await _creative_storyboard_jobs_collection().update_one(
                 {"job_id": job_id},
