@@ -357,17 +357,21 @@ def _word_strip_pattern(word: str) -> "re.Pattern":
     return re.compile(r"(?<!\w)" + re.escape(word.strip().lower()) + r"[a-z]*", re.IGNORECASE)
 
 
-def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None) -> str:
+def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None, universal: bool = True) -> str:
     """Guarantee, with certainty (no model involved): the text that comes out
     contains none of CaptionValidatorService.BANNED_WORDS and none of
     `extra_words` (a brand's own custom list), in any form. This is the floor
     enforce() applies after every AI rewrite — a model can still fail to
     comply with a correction prompt; this cannot fail to comply, because
-    nothing here calls a model at all."""
+    nothing here calls a model at all.
+
+    universal=False keeps only the brand's own words: the built-in list is about caption clichés, and its
+    swaps ("transformation" -> "improve") read wrongly in other writing, e.g. a video's creative direction."""
     if not text:
         return text
     from .caption_validator_service import CaptionValidatorService
-    words = list(CaptionValidatorService.BANNED_WORDS) + [str(w) for w in (extra_words or []) if str(w).strip()]
+    words = (list(CaptionValidatorService.BANNED_WORDS) if universal else []) + [
+        str(w) for w in (extra_words or []) if str(w).strip()]
     out = text
     for word in words:
         key = word.strip().lower()
@@ -601,7 +605,7 @@ def audit(text: str, bc: Optional[Dict[str, Any]], sources: str = "") -> List[Di
     return issues
 
 
-def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) -> str:
+def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True, universal: bool = True) -> str:
     """The rules that can be guaranteed without a model. Runs last, so whatever
     the writer or the rewrite did, these hold on what is saved:
       • "no emojis" — every emoji is removed
@@ -614,7 +618,7 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
     out = text or ""
     if emoji_mode(bc) == "no":
         out = strip_emojis(out)
-    out = strip_banned_words(out, banned_words(bc))
+    out = strip_banned_words(out, banned_words(bc), universal=universal)
     if append_cta and out.strip() and not has_cta(out, bc):
         cta = ctas(bc)[0].strip()
         if cta[-1:] not in ".!?":
@@ -633,7 +637,8 @@ def video_platform(target_platform: str) -> str:
 def enforce_video_script(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]], direction: bool = True) -> Dict[str, Any]:
     """The Playbook rules a model can still break, guaranteed on the words a viewer will read or hear: each
     scene's on-screen text and spoken line (and the creative direction, unless the owner wrote it themselves).
-    No banned word and, under "no emojis", no emoji gets through - the same floor enforce() gives captions.
+    None of the brand's own banned words and, under "no emojis", no emoji gets through. The built-in caption-cliché
+    list is NOT applied here: its swaps ("transformation" -> "improve") garble a video's wording.
     video_prompt is left alone: it describes pictures, not words."""
     if not isinstance(storyboard, dict) or not bc:
         return storyboard
@@ -642,9 +647,10 @@ def enforce_video_script(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]
             continue
         for key in ("text_overlay", "dialogue"):
             if isinstance(scene.get(key), str) and scene[key].strip():
-                scene[key] = enforce(scene[key], bc, append_cta=False)
+                scene[key] = enforce(scene[key], bc, append_cta=False, universal=False)
     if direction and isinstance(storyboard.get("creative_direction"), str):
-        storyboard["creative_direction"] = enforce(storyboard["creative_direction"], bc, append_cta=False)
+        storyboard["creative_direction"] = enforce(
+            storyboard["creative_direction"], bc, append_cta=False, universal=False)
     return storyboard
 
 

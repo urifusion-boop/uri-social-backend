@@ -252,3 +252,13 @@ def test_upload_storyboard_prompt_and_floor(monkeypatch):
     assert "NEVER mention or reference: politics." in captured["text"]
     assert "order on WhatsApp" in captured["text"]
     assert "cheap" not in result["storyboard"]["scenes"][0]["text_overlay"].lower()
+
+
+def test_video_wording_is_not_rewritten_by_the_caption_cliche_list():
+    # The Before/After style itself talks about "transformation": that must reach the creative direction intact.
+    board = {"creative_direction": "We tell one simple transformation story, a transformative before and after.",
+             "scenes": [{"text_overlay": "Premium results", "dialogue": "Unlock your journey", "video_prompt": "x"}]}
+    bb.enforce_video_script(board, _bc())
+    assert board["creative_direction"] == "We tell one simple transformation story, a transformative before and after."
+    assert board["scenes"][0]["text_overlay"] == "Premium results"
+    assert board["scenes"][0]["dialogue"] == "Unlock your journey"
