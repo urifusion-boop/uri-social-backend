@@ -237,6 +237,19 @@ def _job_jane_ads_billing():
     _run_async("jane_ads_billing", _run)
 
 
+def _job_video_billing_reaper():
+    """Give back credits for video / storyboard runs that a server restart cut short (see
+    video_generation_billing.reap_stranded). A no-op while video billing is off."""
+    async def _run():
+        from app.agents.social_media_manager.services import video_generation_billing as billing
+        if billing.mode() != "on":
+            return
+        result = await billing.reap_stranded()
+        if result.get("storyboards") or result.get("videos") or result.get("needs_review"):
+            print(f"💳 Video billing reaper: {result}")
+    _run_async("video_billing_reaper", _run)
+
+
 def _job_market_intelligence_scheduled_scans():
     """Uri Market Intelligence scheduled collection (PRD §18) — hourly check
     of active keep_updating topics. Dev-only feature (see the module's own
@@ -447,6 +460,14 @@ def start_notification_scheduler():
         _job_jane_ads_billing,
         CronTrigger(minute=0),
         id="jane_ads_billing",
+        **_JOB_DEFAULTS,
+    )
+
+    # Video credits: every 10 minutes, return credits for runs a restart cut short.
+    _scheduler.add_job(
+        _job_video_billing_reaper,
+        CronTrigger(minute="*/10"),
+        id="video_billing_reaper",
         **_JOB_DEFAULTS,
     )
 

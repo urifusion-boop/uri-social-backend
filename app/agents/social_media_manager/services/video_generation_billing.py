@@ -23,7 +23,7 @@ Mode (settings.VIDEO_GENERATION_BILLING_MODE):
   on      real charging.
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from pymongo.errors import DuplicateKeyError
@@ -289,6 +289,69 @@ async def settle(job_id: str, job: Optional[dict] = None, credits=None, trials=N
         print(f"[VideoBilling] settling job {job_id} failed: {type(e).__name__}: {e}", flush=True)
         await col.update_one({"job_id": job_id}, {"$set": {"status": "settle_failed", "error": str(e)[:300]}})
         raise
+
+
+# ── Credits stranded by a restart ────────────────────────────────────────────────────────────────────────────
+# A video or storyboard job runs inside the server process. If the server restarts mid-run the job is lost and
+# nothing ever settles it, so its credits would stay taken for work that never finished. This sweep, run every
+# few minutes by the scheduler, finds charged records whose job stopped moving and settles them the same way a
+# normal ending would: delivered scenes keep their share, the rest is returned. The thresholds are well above the
+# longest a healthy run takes, so a run that is simply slow is never touched.
+
+STORYBOARD_STALE_AFTER = timedelta(minutes=20)
+VIDEO_STALE_AFTER = timedelta(minutes=120)     # a talking clip alone can take half an hour
+SETTLING_STALE_AFTER = timedelta(minutes=30)
+INTERRUPTED_MESSAGE = "This was interrupted before it finished. Your credits for the unfinished part were returned."
+_RUNNING = ["queued", "generating"]
+
+
+async def reap_stranded(now: Optional[datetime] = None, col=None, video_jobs=None, storyboard_jobs=None,
+                        credits=None, trials=None) -> Dict[str, int]:
+    """Settle charged jobs whose run was lost. Returns counts, for the log. Safe to run on every worker at once:
+    settle() lets exactly one caller act on a record."""
+    now = now or datetime.utcnow()
+    col = col if col is not None else _collection()
+    video_jobs = video_jobs if video_jobs is not None else get_db()["video_generation_jobs"]
+    storyboard_jobs = storyboard_jobs if storyboard_jobs is not None else get_db()["creative_storyboard_jobs"]
+    counts = {"checked": 0, "storyboards": 0, "videos": 0, "needs_review": 0}
+
+    for record in await col.find({"status": {"$in": ["charged", "settling"]}, "mode": "on"}).to_list(length=200):
+        age = now - (record.get("created_at") or now)
+        job_id = record["job_id"]
+        if record["status"] == "settling":
+            # A process died between claiming the settlement and recording it. Whether the refund was paid is
+            # not known, so it is NOT guessed (that could pay it twice): it is flagged for a person to look at.
+            if age > SETTLING_STALE_AFTER:
+                await col.update_one({"job_id": job_id, "status": "settling"}, {"$set": {"status": "needs_review"}})
+                counts["needs_review"] += 1
+                print(f"[VideoBilling] job {job_id} stuck while settling - needs a manual look", flush=True)
+            continue
+        counts["checked"] += 1
+
+        if record.get("kind") == "storyboard":
+            if age <= STORYBOARD_STALE_AFTER:
+                continue
+            job = await storyboard_jobs.find_one({"job_id": job_id}) or {}
+            await settle_storyboard(job_id, job.get("status") == "complete" and bool(job.get("storyboard")),
+                                    credits=credits, trials=trials, col=col)
+            if job.get("status") in _RUNNING:
+                await storyboard_jobs.update_one(
+                    {"job_id": job_id, "status": {"$in": _RUNNING}},
+                    {"$set": {"status": "failed", "error": INTERRUPTED_MESSAGE}})
+            counts["storyboards"] += 1
+            continue
+
+        if age <= VIDEO_STALE_AFTER:
+            continue
+        job = await video_jobs.find_one({"job_id": job_id}) or {}
+        await settle(job_id, job=job or {"total_scenes": record.get("scenes") or 0, "clips": []},
+                     credits=credits, trials=trials, col=col)
+        if job.get("status") in _RUNNING:
+            await video_jobs.update_one(
+                {"job_id": job_id, "status": {"$in": _RUNNING}},
+                {"$set": {"status": "failed", "error": INTERRUPTED_MESSAGE}})
+        counts["videos"] += 1
+    return counts
 
 
 async def for_job(job_id: str, col=None) -> Optional[dict]:
