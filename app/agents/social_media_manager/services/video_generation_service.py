@@ -277,8 +277,9 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 class VideoGenerationService:
 
     @staticmethod
-    async def create_job(storyboard: dict, outcome: str, avatar_voice: str = DEFAULT_AVATAR_VOICE) -> str:
-        job_id = uuid.uuid4().hex
+    async def create_job(storyboard: dict, outcome: str, avatar_voice: str = DEFAULT_AVATAR_VOICE,
+                         job_id: Optional[str] = None, user_id: str = "", billing: Optional[dict] = None) -> str:
+        job_id = job_id or uuid.uuid4().hex
         route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         await _jobs_collection().insert_one({
             "job_id": job_id,
@@ -290,8 +291,36 @@ class VideoGenerationService:
             "current_scene": 0,
             "clips": [],
             "error": None,
+            "user_id": user_id,
+            "billing": billing,
         })
         return job_id
+
+    @staticmethod
+    async def run_job_and_settle(
+        job_id: str,
+        storyboard: dict,
+        brand_images: List[str],
+        outcome: str,
+        avatar_voice: str = DEFAULT_AVATAR_VOICE,
+    ) -> None:
+        """run_job, then close the books on the credits charged for it. The settlement runs however the job
+        ends (it finished, some scenes failed, or it crashed), so credits for work that was not delivered
+        are always returned. A no-op for jobs that were not charged."""
+        from app.agents.social_media_manager.services import video_generation_billing as billing
+
+        try:
+            await VideoGenerationService.run_job(job_id, storyboard, brand_images, outcome, avatar_voice)
+        except Exception as e:
+            print(f"[VideoGenJob {job_id}] crashed: {type(e).__name__}: {e}", flush=True)
+            await _jobs_collection().update_one(
+                {"job_id": job_id}, {"$set": {"status": "failed", "error": f"{type(e).__name__}: {str(e)[:200]}"}}
+            )
+        finally:
+            try:
+                await billing.settle(job_id)
+            except Exception as e:
+                print(f"[VideoGenJob {job_id}] billing settlement failed: {type(e).__name__}: {e}", flush=True)
 
     @staticmethod
     async def run_job(

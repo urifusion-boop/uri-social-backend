@@ -265,6 +265,10 @@ class Settings(BaseSettings):
     # via env var rather than hard-coded in the billing logic.
     VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
 
+    # Credits for AI video generation (see video_generation_billing.py). off = free, as before;
+    # shadow = record what would be charged without charging; on = charge. Prices: video_pricing.py.
+    VIDEO_GENERATION_BILLING_MODE: str = "off"
+
     # Bypass flags for local development
     # VSG-01's composited ad formats (Us vs Them, Borrowed Interface, Problem/Solution)
     # are typographic layouts DRAWN by the ad_formats library, not images from the

@@ -1,0 +1,249 @@
+"""
+Credits for AI video generation: quote it, charge it once, give back what was not delivered.
+
+Money flow for one generated video:
+  1. quote   - the server prices the storyboard it is about to render (video_pricing.py).
+  2. charge  - the credits are taken BEFORE any provider work starts, from the trial balance for a
+               trial user and from the paid wallet otherwise (never both, as video editing does).
+  3. render  - the job runs; automatic retries and fallback models are our cost, not a second charge.
+  4. settle  - once, when the job ends: scenes that never came out are refunded in proportion, and
+               a job that produced nothing, or crashed, is refunded in full.
+
+Everything is recorded in `video_generation_billing`, one document per job, so an operator can see
+exactly what was charged and returned, and a refund that could not be paid is left marked for follow-up
+instead of being lost.
+
+Mode (settings.VIDEO_GENERATION_BILLING_MODE):
+  off     nothing is quoted, charged or recorded; generation is free exactly as before.
+  shadow  prices and records what WOULD be charged, charges nothing. For a pilot: compare the recorded
+          prices with real provider costs before turning charging on.
+  on      real charging.
+"""
+import uuid
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from pymongo.errors import DuplicateKeyError
+
+from app.agents.social_media_manager.services import video_pricing
+from app.core.config import settings
+from app.database import get_db
+
+COLLECTION = "video_generation_billing"
+DEDUCT_REASON = "video_generation"      # must be a reason CreditTransaction accepts
+UPGRADE_URL = "/pricing"
+
+_index_ready = False
+
+
+def mode() -> str:
+    value = (getattr(settings, "VIDEO_GENERATION_BILLING_MODE", "off") or "off").strip().lower()
+    return value if value in ("off", "shadow", "on") else "off"
+
+
+def _collection():
+    return get_db()[COLLECTION]
+
+
+async def _ensure_index(col) -> None:
+    """One record per (user, idempotency key): a double click or a replayed request can't be charged twice."""
+    global _index_ready
+    if _index_ready:
+        return
+    await col.create_index([("user_id", 1), ("idempotency_key", 1)], unique=True, sparse=True)
+    await col.create_index([("job_id", 1)], unique=True)
+    _index_ready = True
+
+
+class BillingDeclined(Exception):
+    """The customer cannot pay for this video (not enough credits). Carries what the API should say."""
+
+    def __init__(self, message: str, details: Dict[str, Any]):
+        super().__init__(message)
+        self.message, self.details = message, details
+
+
+def _services(credits=None, trials=None):
+    if credits is None:
+        from app.services.CreditService import credit_service as credits
+    if trials is None:
+        from app.services.TrialService import trial_service as trials
+    return credits, trials
+
+
+async def _balance(user_id: str, credits, trials) -> Dict[str, Any]:
+    """Which wallet pays, and what is in it. `remaining` is None for a legacy account with no wallet."""
+    if await trials.has_active_trial(user_id):
+        status = await trials.get_trial_status(user_id)
+        return {"is_trial": True, "remaining": status.credits_remaining}
+    wallet = await credits.get_user_wallet(user_id)
+    return {"is_trial": False, "remaining": None if wallet is None else wallet.credits_remaining}
+
+
+async def quote(user_id: str, storyboard: dict, outcome: str, avatar_voice: str = "",
+                credits=None, trials=None) -> Dict[str, Any]:
+    """What this video would cost, and whether the customer can afford it. Raises PricingError if unpriceable."""
+    current = mode()
+    if current == "off":
+        return {"billing": "off"}
+    credits, trials = _services(credits, trials)
+    priced = video_pricing.quote_for(storyboard, outcome, avatar_voice)
+    balance = await _balance(user_id, credits, trials)
+    remaining = balance["remaining"]
+    needed = priced["credits_required"]
+    return {
+        "billing": current,
+        **priced,
+        "naira_reference": needed * video_pricing.CREDIT_NAIRA_REFERENCE,
+        "balance": remaining,
+        "balance_after": None if remaining is None else max(0, remaining - needed),
+        "sufficient": True if remaining is None else remaining >= needed,
+        "is_trial": balance["is_trial"],
+    }
+
+
+async def start(user_id: str, storyboard: dict, outcome: str, avatar_voice: str = "",
+                idempotency_key: Optional[str] = None, credits=None, trials=None,
+                col=None) -> Dict[str, Any]:
+    """Price the video and take the credits. Returns {"job_id", "billing", "existing"}.
+
+    `existing` is True when this idempotency key was already used: the original job id comes back and
+    nobody is charged again. Raises BillingDeclined when the customer cannot afford it."""
+    current = mode()
+    job_id = uuid.uuid4().hex
+    if current == "off":
+        return {"job_id": job_id, "billing": None, "existing": False}
+
+    # Price it first: a video that cannot be priced (too long, nothing in it) is refused before anything is
+    # recorded or any database is touched.
+    priced = video_pricing.quote_for(storyboard, outcome, avatar_voice)
+    needed = priced["credits_required"]
+    credits, trials = _services(credits, trials)
+    col = col if col is not None else _collection()
+    await _ensure_index(col)
+
+    record: Dict[str, Any] = {
+        "job_id": job_id, "user_id": user_id, "mode": current, **priced,
+        "status": "charging", "credits_charged": 0, "credits_refunded": 0,
+        "created_at": datetime.utcnow(),
+    }
+    if idempotency_key:
+        record["idempotency_key"] = idempotency_key[:80]
+    try:
+        await col.insert_one(record)
+    except DuplicateKeyError:
+        original = await col.find_one({"user_id": user_id, "idempotency_key": record.get("idempotency_key")})
+        if original:
+            return {"job_id": original["job_id"], "billing": _public(original), "existing": True}
+        raise
+
+    if current == "shadow":
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "shadow", "would_charge": needed}})
+        return {"job_id": job_id, "billing": {"mode": "shadow", "credits_required": needed}, "existing": False}
+
+    balance = await _balance(user_id, credits, trials)
+    if not balance["is_trial"] and balance["remaining"] is None:
+        # An older account with no wallet is unmetered for every other feature too (deduct_credit lets it
+        # through without taking anything). Record the job as free so settling never tries to refund a
+        # charge that was not made.
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "charged", "credits_charged": 0,
+                                                              "unmetered": True, "is_trial": False}})
+        return {"job_id": job_id, "existing": False,
+                "billing": {"mode": "on", "credits_charged": 0, "credits_refunded": 0, "status": "charged"}}
+    if balance["is_trial"]:
+        paid = await trials.deduct_trial_credit(user_id=user_id, campaign_id=job_id, reason=DEDUCT_REASON, amount=needed)
+    else:
+        paid = await credits.deduct_credit(user_id=user_id, campaign_id=job_id, reason=DEDUCT_REASON, amount=needed)
+    if not paid:
+        # Free the idempotency key so a retry after topping up is a fresh attempt.
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "declined"}, "$unset": {"idempotency_key": ""}})
+        remaining = (await _balance(user_id, credits, trials))["remaining"] or 0
+        raise BillingDeclined(
+            f"This video needs {needed} credits, but you have {remaining}. Top up to continue.",
+            {"credits_required": needed, "credits_remaining": remaining, "upgrade_url": UPGRADE_URL},
+        )
+    await col.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "charged", "credits_charged": needed, "is_trial": balance["is_trial"],
+                  "charged_at": datetime.utcnow()}},
+    )
+    return {
+        "job_id": job_id, "existing": False,
+        "billing": {"mode": "on", "credits_charged": needed, "credits_refunded": 0, "status": "charged"},
+    }
+
+
+def _public(record: Optional[dict]) -> Optional[dict]:
+    """The part of a billing record a customer may see."""
+    if not record:
+        return None
+    return {
+        "mode": record.get("mode"), "status": record.get("status"),
+        "credits_charged": record.get("credits_charged", 0),
+        "credits_refunded": record.get("credits_refunded", 0),
+        "credits_required": record.get("credits_required"),
+    }
+
+
+async def settle(job_id: str, job: Optional[dict] = None, credits=None, trials=None, col=None) -> Optional[dict]:
+    """Close the books on a finished job: refund scenes that were not delivered. Safe to call twice.
+
+    Only the call that wins the "charged" -> "settling" switch does anything, so a repeated or concurrent
+    call can neither refund twice nor skip a refund."""
+    col = col if col is not None else _collection()
+    record = await col.find_one({"job_id": job_id})
+    if not record or record.get("status") not in ("charged", "shadow"):
+        return _public(record)
+    claimed = await col.find_one_and_update(
+        {"job_id": job_id, "status": record["status"]}, {"$set": {"status": "settling"}},
+    )
+    if not claimed:
+        return _public(await col.find_one({"job_id": job_id}))
+
+    try:
+        if job is None:
+            job = await get_db()["video_generation_jobs"].find_one({"job_id": job_id}) or {}
+        clips = job.get("clips") or []
+        total = int(job.get("total_scenes") or record.get("scenes") or 0)
+        delivered = sum(1 for clip in clips if clip.get("video_url"))
+        charged = int(record.get("credits_charged") or 0)
+        refund = video_pricing.refund_for_failed_scenes(charged, total, delivered)
+        provider_cost = round(sum(float(c.get("cost_usd") or 0) for c in clips), 4)
+        fallbacks = sum(1 for c in clips if c.get("fallback_used"))
+
+        final: Dict[str, Any] = {
+            "status": "settled", "scenes_delivered": delivered, "scenes_total": total,
+            "provider_cost_usd": provider_cost, "fallbacks_used": fallbacks, "settled_at": datetime.utcnow(),
+        }
+        if record["status"] == "shadow":
+            final["status"] = "shadow_settled"
+            final["would_refund"] = video_pricing.refund_for_failed_scenes(record.get("would_charge", 0), total, delivered)
+        elif refund > 0:
+            credits, trials = _services(credits, trials)
+            reason = "refund"
+            try:
+                if record.get("is_trial"):
+                    ok = await trials.refund_trial_credit(user_id=record["user_id"], campaign_id=job_id, reason=reason, amount=refund)
+                else:
+                    ok = await credits.refund_credit(user_id=record["user_id"], campaign_id=job_id, reason=reason, amount=refund)
+            except Exception as e:  # never lose track of money owed
+                print(f"[VideoBilling] refund of {refund} for job {job_id} FAILED: {type(e).__name__}: {e}", flush=True)
+                ok = False
+            if ok:
+                final["credits_refunded"] = refund
+            else:
+                final["status"] = "refund_failed"
+                final["refund_due"] = refund
+        await col.update_one({"job_id": job_id}, {"$set": final})
+        return _public(await col.find_one({"job_id": job_id}))
+    except Exception as e:
+        print(f"[VideoBilling] settling job {job_id} failed: {type(e).__name__}: {e}", flush=True)
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "settle_failed", "error": str(e)[:300]}})
+        raise
+
+
+async def for_job(job_id: str, col=None) -> Optional[dict]:
+    """What the customer is shown about a job's charge, or None when billing was not on for it."""
+    col = col if col is not None else _collection()
+    record = await col.find_one({"job_id": job_id})
+    return _public(record) if record and record.get("mode") == "on" else None

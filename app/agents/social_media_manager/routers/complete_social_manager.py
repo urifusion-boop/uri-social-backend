@@ -5,7 +5,7 @@ import json
 import re
 import subprocess
 import traceback
-from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -7142,6 +7142,7 @@ async def generate_video_from_storyboard(
     request: VideoFromStoryboardRequest,
     background_tasks: BackgroundTasks,
     token: dict = Depends(JWTBearer()),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
     Start video generation for every scene in a storyboard, routed by outcome
@@ -7153,21 +7154,78 @@ async def generate_video_from_storyboard(
         VideoGenerationService,
     )
 
-    _get_user_id(token)  # auth check
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    from app.agents.social_media_manager.services.video_pricing import PricingError
+    from app.agents.social_media_manager.services.video_generation_service import get_job
 
-    job_id = await VideoGenerationService.create_job(request.storyboard, request.outcome, request.avatar_voice)
+    user_id = _get_user_id(token) or ""
+
+    # Credits are taken BEFORE any provider work starts (and the price comes from the scenes we are about to
+    # render, never from the client). A no-op while VIDEO_GENERATION_BILLING_MODE is "off".
+    try:
+        started = await billing.start(
+            user_id, request.storyboard, request.outcome, request.avatar_voice, idempotency_key
+        )
+    except PricingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except billing.BillingDeclined as e:
+        return JSONResponse(
+            status_code=402,
+            content={"status": False, "responseCode": 402, "responseMessage": e.message, "responseData": e.details},
+        )
+
+    if started["existing"]:
+        # The same request was already accepted (a double click, a retry): same job, nobody charged again.
+        existing = await get_job(started["job_id"]) or {}
+        return UriResponse.get_single_data_response(
+            "video_job",
+            {"job_id": started["job_id"], "status": existing.get("status", "queued"),
+             "total_scenes": existing.get("total_scenes", len(request.storyboard.get("scenes", []))),
+             "billing": started["billing"]},
+        )
+
+    try:
+        job_id = await VideoGenerationService.create_job(
+            request.storyboard, request.outcome, request.avatar_voice,
+            job_id=started["job_id"], user_id=user_id, billing=started["billing"],
+        )
+    except Exception:
+        # The job could not even be created after the credits were taken: give them straight back.
+        await billing.settle(started["job_id"], job={"total_scenes": len(request.storyboard.get("scenes", [])), "clips": []})
+        raise
     background_tasks.add_task(
-        VideoGenerationService.run_job,
+        VideoGenerationService.run_job_and_settle,
         job_id,
         request.storyboard,
         request.brand_images,
         request.outcome,
         request.avatar_voice,
     )
-    return UriResponse.get_single_data_response(
-        "video_job",
-        {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))},
-    )
+    payload = {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))}
+    if started["billing"]:
+        payload["billing"] = started["billing"]
+    return UriResponse.get_single_data_response("video_job", payload)
+
+
+@router.post("/video-quote")
+async def video_quote(
+    request: VideoFromStoryboardRequest,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    What this storyboard would cost to render, in credits, and whether the customer can afford it. The same
+    server-side calculation the charge uses, so the price shown is the price taken. When video billing is off
+    this returns {"billing": "off"} and the UI shows no price.
+    """
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    from app.agents.social_media_manager.services.video_pricing import PricingError
+
+    user_id = _get_user_id(token) or ""
+    try:
+        quoted = await billing.quote(user_id, request.storyboard, request.outcome, request.avatar_voice)
+    except PricingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return UriResponse.get_single_data_response("video_quote", quoted)
 
 
 @router.get("/video-job/{job_id}")
@@ -7188,6 +7246,16 @@ async def get_video_job(
     job = await get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # What was charged and what came back, so the screen can show it. Absent when the job was not charged.
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+
+    job.pop("user_id", None)
+    charged = await billing.for_job(job_id)
+    if charged:
+        job["billing"] = charged
+    else:
+        job.pop("billing", None)
 
     return UriResponse.get_single_data_response("video_job", job)
 

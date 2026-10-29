@@ -644,39 +644,52 @@ class CreditService:
         Atomic (single find_one_and_update), matching deduct_credit()'s
         pattern, so a concurrent refund/deduction can't read a stale amount.
         """
-        updated = await self.user_credits_collection.find_one_and_update(
-            {"user_id": user_id},
-            [
+        # Compare-and-swap with plain update operators, exactly like deduct_credit(): read the balance, compute
+        # the new one, write it back only if the balance is still what was read, and retry if someone else
+        # changed it in between. This used to be an update PIPELINE (array-form find_one_and_update), which our
+        # DocumentDB clusters (older than 5.0) reject outright ("Failed to parse update") - the same failure
+        # deduct_credit() was rewritten to avoid. A refund that throws is a customer who paid for nothing.
+        updated = None
+        for _attempt in range(8):
+            wallet = await self.user_credits_collection.find_one(
+                {"user_id": user_id},
+                {"subscription_credits": 1, "bonus_credits": 1, "credits_used": 1},
+            )
+            if not wallet:
+                # No wallet for this user - never subscribed, nothing to refund into.
+                return False
+            sub = wallet.get("subscription_credits") or 0
+            bonus = wallet.get("bonus_credits") or 0
+            used = wallet.get("credits_used") or 0
+            bonus_after = bonus + amount
+            remaining_after = sub + bonus_after
+            match_filter = {
+                "user_id": user_id,
+                "subscription_credits": (
+                    sub if wallet.get("subscription_credits") is not None else {"$in": [None, sub]}
+                ),
+                "bonus_credits": (
+                    bonus if wallet.get("bonus_credits") is not None else {"$in": [None, bonus]}
+                ),
+            }
+            updated = await self.user_credits_collection.find_one_and_update(
+                match_filter,
                 {
                     "$set": {
-                        "bonus_credits": {
-                            "$add": [{"$ifNull": ["$bonus_credits", 0]}, amount]
-                        },
-                        "credits_used": {
-                            "$max": [
-                                {"$subtract": [{"$ifNull": ["$credits_used", 0]}, amount]},
-                                0,
-                            ]
-                        },
-                    }
-                },
-                {
-                    "$set": {
-                        "total_credits": {
-                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
-                        },
-                        "credits_remaining": {
-                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
-                        },
+                        "bonus_credits": bonus_after,
+                        "credits_used": max(used - amount, 0),
+                        "total_credits": remaining_after,
+                        "credits_remaining": remaining_after,
                         "updated_at": datetime.utcnow(),
                     }
                 },
-            ],
-            return_document=ReturnDocument.AFTER,
-        )
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                break
 
         if not updated:
-            # No wallet for this user — never subscribed, nothing to refund into.
+            # Lost every race under contention: report it so the caller can follow up, rather than guess.
             return False
 
         balance_after = updated["credits_remaining"]
