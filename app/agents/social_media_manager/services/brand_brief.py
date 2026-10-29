@@ -625,6 +625,29 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
     return out
 
 
+def video_platform(target_platform: str) -> str:
+    """The social platform behind a video target ("instagram_reels" -> "instagram", "youtube_shorts" -> "youtube")."""
+    return _platform_key(str(target_platform or "").split("_")[0])
+
+
+def enforce_video_script(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]], direction: bool = True) -> Dict[str, Any]:
+    """The Playbook rules a model can still break, guaranteed on the words a viewer will read or hear: each
+    scene's on-screen text and spoken line (and the creative direction, unless the owner wrote it themselves).
+    No banned word and, under "no emojis", no emoji gets through - the same floor enforce() gives captions.
+    video_prompt is left alone: it describes pictures, not words."""
+    if not isinstance(storyboard, dict) or not bc:
+        return storyboard
+    for scene in storyboard.get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        for key in ("text_overlay", "dialogue"):
+            if isinstance(scene.get(key), str) and scene[key].strip():
+                scene[key] = enforce(scene[key], bc, append_cta=False)
+    if direction and isinstance(storyboard.get("creative_direction"), str):
+        storyboard["creative_direction"] = enforce(storyboard["creative_direction"], bc, append_cta=False)
+    return storyboard
+
+
 def cta_last(text: str, bc: Optional[Dict[str, Any]]) -> str:
     """The call-to-action line closes the piece. Writers often add one more
     line after it ("DM us to start." then "Don't forget our free trial!") when
