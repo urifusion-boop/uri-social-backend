@@ -97,7 +97,6 @@ async def quote(user_id: str, storyboard: dict, outcome: str, avatar_voice: str 
     return {
         "billing": current,
         **priced,
-        "naira_reference": needed * video_pricing.CREDIT_NAIRA_REFERENCE,
         "balance": remaining,
         "balance_after": None if remaining is None else max(0, remaining - needed),
         "sufficient": True if remaining is None else remaining >= needed,
@@ -193,7 +192,6 @@ async def quote_storyboard(user_id: str, credits=None, trials=None) -> Dict[str,
     remaining = balance["remaining"]
     return {
         "billing": current, "credits_required": needed,
-        "naira_reference": needed * video_pricing.CREDIT_NAIRA_REFERENCE,
         "balance": remaining,
         "balance_after": None if remaining is None else max(0, remaining - needed),
         "sufficient": True if remaining is None else remaining >= needed,
