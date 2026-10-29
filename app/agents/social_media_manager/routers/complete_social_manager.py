@@ -7302,6 +7302,7 @@ async def generate_creative_storyboard(
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_active_brand_context),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
     "Describe it" flow: write a creative_direction + scene-by-scene script
@@ -7319,9 +7320,33 @@ async def generate_creative_storyboard(
     """
     brand_context = await _video_brand_context(ctx, db)
 
+    from app.agents.social_media_manager.services import video_generation_billing as billing
     from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
 
-    job_id = await VideoCreativeService.create_storyboard_job()
+    # Every storyboard run costs credits, taken BEFORE any writing starts (a no-op while billing is "off").
+    # Rewriting from an edited creative direction comes through here too, so it is charged like any other run.
+    try:
+        started = await billing.start_storyboard(ctx["user_id"], idempotency_key)
+    except billing.BillingDeclined as e:
+        return JSONResponse(
+            status_code=402,
+            content={"status": False, "responseCode": 402, "responseMessage": e.message, "responseData": e.details},
+        )
+
+    if started["existing"]:
+        # The same request was already accepted (a double click, a retry): same job, nobody charged again.
+        existing = await VideoCreativeService.get_storyboard_job(started["job_id"]) or {}
+        return UriResponse.get_single_data_response(
+            "storyboard_job",
+            {"job_id": started["job_id"], "status": existing.get("status", "generating"), "billing": started["billing"]},
+        )
+
+    try:
+        job_id = await VideoCreativeService.create_storyboard_job(started["job_id"])
+    except Exception:
+        # The job could not even be created after the credit was taken: give it straight back.
+        await billing.settle_storyboard(started["job_id"], False)
+        raise
     background_tasks.add_task(
         VideoCreativeService.run_storyboard_job,
         job_id,
@@ -7334,7 +7359,22 @@ async def generate_creative_storyboard(
         request.creative_direction_override,
     )
 
-    return UriResponse.get_single_data_response("storyboard_job", {"job_id": job_id, "status": "generating"})
+    payload = {"job_id": job_id, "status": "generating"}
+    if started["billing"]:
+        payload["billing"] = started["billing"]
+    return UriResponse.get_single_data_response("storyboard_job", payload)
+
+
+@router.get("/storyboard-quote")
+async def storyboard_quote(
+    token: dict = Depends(JWTBearer()),
+):
+    """What writing a storyboard costs, and whether the customer can afford it. {"billing": "off"} when video
+    billing is off, and the UI shows no price."""
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+
+    user_id = _get_user_id(token) or ""
+    return UriResponse.get_single_data_response("storyboard_quote", await billing.quote_storyboard(user_id))
 
 
 @router.get("/creative-storyboard-job/{job_id}")
@@ -7350,6 +7390,12 @@ async def get_creative_storyboard_job(
     job = await VideoCreativeService.get_storyboard_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Storyboard job not found")
+
+    # What was charged and what came back. Absent when this run was not charged.
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    charged = await billing.for_job(job_id)
+    if charged:
+        job = {**job, "billing": charged}
 
     return UriResponse.get_single_data_response("storyboard_job", job)
 

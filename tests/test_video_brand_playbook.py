@@ -61,8 +61,8 @@ def routes(monkeypatch):
         seen["get_calls"].append((user_id, brand_id))
         return {"status": True, "responseData": dict(PROFILE)}
 
-    async def fake_create_job():
-        return "job1"
+    async def fake_create_job(job_id=None):
+        return job_id or "job1"
 
     async def fake_run(*args):
         seen["jobs"].append(args)

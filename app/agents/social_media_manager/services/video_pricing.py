@@ -34,6 +34,10 @@ VIDEO_PRICES: Dict[str, Dict[int, int]] = {
     "advanced_references": {5: 5, 15: 14, 30: 26, 60: 52},
 }
 
+# Writing a storyboard (the script and its scene images) costs this many credits every time it is run,
+# including a rewrite from an edited creative direction. Given back if no storyboard is produced.
+STORYBOARD_CREDITS = 1
+
 MAX_VIDEO_SECONDS = 60
 MAX_SCENES = 12
 _MIN_SCENE_SECONDS, _MAX_SCENE_SECONDS = 1, 15   # the longest any one clip model will run
