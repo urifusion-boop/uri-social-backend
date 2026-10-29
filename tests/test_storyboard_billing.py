@@ -167,6 +167,7 @@ def test_settling_a_run_that_was_never_charged_does_nothing(monkeypatch):
 def test_the_quote_shows_price_balance_and_whether_they_can_afford_it(on):
     out = _run(B.quote_storyboard("u1", credits=FakeWallet(5), trials=FakeTrial()))
     assert out["credits_required"] == 1 and out["balance"] == 5 and out["balance_after"] == 4 and out["sufficient"] is True
+    assert not any("naira" in k for k in out)  # credits only: no naira value shown
     broke = _run(B.quote_storyboard("u1", credits=FakeWallet(0), trials=FakeTrial()))
     assert broke["sufficient"] is False and broke["balance_after"] == 0
 

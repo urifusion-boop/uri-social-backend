@@ -17,10 +17,7 @@ from typing import Dict, Iterable, Optional
 
 PRICING_VERSION = "2026-10-28.1"
 
-# What one credit is worth, for DISPLAY only ("about N naira"). Not used to charge anything: charges are
-# in credits. The Pro and Agency plans sell a credit at this price; Starter and Growth sell it for less
-# (about 750 and 714), so the real revenue per credit depends on the customer's plan.
-CREDIT_NAIRA_REFERENCE = 800
+# Prices are in credits only: customers are never shown a naira value for a credit.
 
 # credits by video type and total length in seconds
 VIDEO_PRICES: Dict[str, Dict[int, int]] = {

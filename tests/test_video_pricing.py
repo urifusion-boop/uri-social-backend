@@ -84,7 +84,3 @@ def test_a_refund_never_exceeds_the_charge():
         for total in range(1, 13):
             for delivered in range(0, total + 1):
                 assert 0 <= P.refund_for_failed_scenes(charged, total, delivered) <= charged
-
-
-def test_the_naira_reference_is_800_a_credit():
-    assert P.CREDIT_NAIRA_REFERENCE == 800

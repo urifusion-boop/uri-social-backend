@@ -255,7 +255,7 @@ def test_talking_videos_are_priced_by_voice(on):
 def test_the_quote_shows_price_balance_and_whether_it_is_affordable(on):
     q = _run(B.quote("u1", SCENES3, "quick_video", credits=FakeWallet(10), trials=FakeTrial()))
     assert (q["credits_required"], q["balance"], q["balance_after"], q["sufficient"]) == (3, 10, 7, True)
-    assert q["naira_reference"] == 2400 and q["billing"] == "on"
+    assert q["billing"] == "on" and not any("naira" in k for k in q)  # credits only: no naira value shown
     short = _run(B.quote("u1", SCENES3, "quick_video", credits=FakeWallet(2), trials=FakeTrial()))
     assert short["sufficient"] is False and short["balance_after"] == 0
 
