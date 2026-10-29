@@ -36,6 +36,10 @@ REQUIRED = {
     # use the older voice-cloning path, exactly as before — so a missing value is safe, but the
     # SSM parameter must EXIST before this line ships or the task cannot start.
     "YARNGPT_API_KEY": f"{SSM_PREFIX}/YARNGPT_API_KEY",
+    # Credits for AI video: off | shadow | on (see video_generation_billing.py). The backend treats a missing
+    # or unrecognised value as "off", but the SSM parameter must EXIST before this line ships or the task
+    # cannot start.
+    "VIDEO_GENERATION_BILLING_MODE": f"{SSM_PREFIX}/VIDEO_GENERATION_BILLING_MODE",
 }
 
 
