@@ -7478,61 +7478,26 @@ class GenerateVideoCaptionRequest(BaseModel):
 @router.post("/generate-video-caption")
 async def generate_video_caption(
     request: GenerateVideoCaptionRequest,
-    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Generate a platform-optimised social media caption for a merged video
-    using the storyboard's scene descriptions and brand context. Moved off
-    gpt-4o onto Gemini 3.5 Flash-Lite (same reasoning as generate_storyboard
-    in video_storyboard_service.py) — this is a pure short-text write with
-    no image input, the cheapest and lowest-risk of the pipeline's model
-    swaps.
+    Generate a platform-optimised caption for a merged video, written from what the video is actually about
+    (its creative direction and each scene's on-screen text and spoken line) and from the Brand Playbook of the
+    brand the user is working in, then finished with the Playbook's word rules and call to action.
+    Moved off gpt-4o onto Gemini 3.5 Flash-Lite (same reasoning as generate_storyboard in
+    video_storyboard_service.py) — a pure short-text write with no image input.
     """
     from google.genai import types as _genai_types
+    from app.agents.social_media_manager.services import video_caption
     from app.agents.social_media_manager.services.video_storyboard_service import _gemini_client
-
-    _get_user_id(token)
 
     if not _gemini_client:
         raise HTTPException(status_code=503, detail="Caption generation is not configured.")
 
-    scenes = request.storyboard.get("scenes", [])
-    brand_context = request.storyboard.get("brand_context", {})
-    brand_name = brand_context.get("brand_name", "")
+    brand_context = await _video_brand_context(ctx, db)
     target_platform = request.platform or request.storyboard.get("target_platform", "instagram")
-    target_audience = request.storyboard.get("target_audience", "")
-    total_duration = request.storyboard.get("total_duration_seconds", 0)
-
-    scene_lines = "\n".join(
-        f"Scene {s.get('scene_number', i + 1)}: {s.get('scene_description', s.get('description', ''))}"
-        for i, s in enumerate(scenes)
-    )
-
-    platform_guides = {
-        "instagram": "Instagram — max 2200 chars, conversational, 3–5 relevant hashtags at the end, 1–2 emojis in the body.",
-        "facebook":  "Facebook — max 500 chars, warm and conversational, 0–2 hashtags, no emoji overload.",
-        "tiktok":    "TikTok — punchy, max 150 chars, 3–5 trending hashtags, high-energy tone.",
-        "linkedin":  "LinkedIn — professional tone, 1–3 paragraphs, 3–5 industry hashtags, no excessive emojis.",
-    }
-    guide = platform_guides.get(target_platform, platform_guides["instagram"])
-
-    prompt = f"""You are a social media copywriter. Write a single ready-to-post caption for a video.
-
-PLATFORM: {target_platform.upper()}
-GUIDE: {guide}
-
-VIDEO INFO:
-- Brand: {brand_name or "the brand"}
-- Audience: {target_audience or "general"}
-- Duration: {total_duration}s
-- Scenes:
-{scene_lines}
-
-Rules:
-- Write ONLY the caption text — no labels, no explanation, no markdown wrapper.
-- Make it feel native to {target_platform}, not copy-paste generic.
-- Hashtags go at the very end, on a new line.
-- Do not include a trailing newline."""
+    prompt = video_caption.build_prompt(request.storyboard, target_platform, brand_context)
 
     loop = asyncio.get_running_loop()
     try:
@@ -7547,7 +7512,7 @@ Rules:
     except Exception as e:
         print(f"[VideoCaption] generation error: {e}", flush=True)
         raise HTTPException(status_code=503, detail="Failed to generate caption.")
-    caption = (response.text or "").strip()
+    caption = video_caption.finish((response.text or "").strip(), brand_context)
     return UriResponse.get_single_data_response("caption", {"caption": caption})
 
 

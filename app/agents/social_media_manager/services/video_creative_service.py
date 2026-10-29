@@ -80,10 +80,24 @@ continuous story and must read that way end to end:
     scene 1 dialogue: "Welcome to my shop!"
     scene 2 dialogue: "Buy now and save 20%."
 
+OUTCOME — also choose which kind of video will render this concept best (suggested_outcome, ONE slug from the list)
+and say why in outcome_reason: one short plain sentence a customer can read, naming no AI models or tools. Choose
+the CHEAPEST type that fully delivers the creative direction; step up only when the concept truly needs it.
+  quick_video          everyday default: simple scenes, product or lifestyle shots, gentle camera moves (cheapest)
+  animate_product      one product or photo brought to life with camera movement (cheapest)
+  social_video         fast, trend-style cuts for social feeds (cheapest)
+  high_quality         premium, polished hero shots where the look matters most (a little more)
+  complex_cinematic    hard motion, several subjects or demanding scene-to-scene coherence (a little more)
+  talking_dialogue     ONLY when a person speaks on camera: the script has dialogue (about 2x the price)
+  advanced_references  ONLY when reference images are supplied and the video must stay exactly consistent with
+                       them (about 3x the price) — never for a concept written from words alone
+
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
   "creative_direction": "<2-4 sentence overall creative concept>",
   "video_style": "<the exact style slug you picked, e.g. clean_commercial — echo it back even if it was given to you>",
+  "suggested_outcome": "<one outcome slug from the list above>",
+  "outcome_reason": "<one short plain sentence: why this video type suits the creative direction>",
   "total_duration_seconds": <int>,
   "target_platform": "<string>",
   "aspect_ratio": "9:16",
@@ -101,6 +115,41 @@ Return ONLY valid JSON — no markdown fences, no explanation:
     }
   ]
 }"""
+
+
+VIDEO_OUTCOMES = (
+    "quick_video", "animate_product", "social_video", "high_quality", "complex_cinematic",
+    "talking_dialogue", "advanced_references",
+)
+
+
+def validated_outcome(storyboard: Dict[str, Any], has_reference_images: bool) -> None:
+    """Keep the model's outcome suggestion only if it can actually work, and fix it if it cannot. The customer
+    still chooses; this only decides what is preselected.
+      - a script with spoken dialogue always needs talking_dialogue (nothing else speaks the lines);
+      - talking_dialogue without any dialogue has nothing to say, so it is dropped;
+      - advanced_references needs reference images, so without them it steps down to high_quality;
+      - anything that is not a real outcome is dropped (the app then falls back to the style's own pick)."""
+    scenes = storyboard.get("scenes") or []
+    has_dialogue = any(isinstance(sc, dict) and str(sc.get("dialogue") or "").strip() for sc in scenes)
+    pick = storyboard.get("suggested_outcome")
+    if has_dialogue:
+        if pick != "talking_dialogue":
+            storyboard["outcome_reason"] = "Someone speaks on camera, and only this type turns the lines into real speech."
+        storyboard["suggested_outcome"] = "talking_dialogue"
+        return
+    if pick == "advanced_references" and not has_reference_images:
+        pick = storyboard["suggested_outcome"] = "high_quality"
+        storyboard["outcome_reason"] = "A polished look suits this concept, and no reference images were supplied."
+    if pick not in VIDEO_OUTCOMES or pick == "talking_dialogue":
+        storyboard.pop("suggested_outcome", None)
+        storyboard.pop("outcome_reason", None)
+        return
+    reason = str(storyboard.get("outcome_reason") or "").strip()
+    if reason:
+        storyboard["outcome_reason"] = reason[:300]
+    else:
+        storyboard.pop("outcome_reason", None)
 
 
 class VideoCreativeService:
@@ -316,6 +365,8 @@ class VideoCreativeService:
         # whatever the model echoed back, same reasoning as forced_style above.
         if creative_direction_override and creative_direction_override.strip():
             storyboard["creative_direction"] = creative_direction_override.strip()
+
+        validated_outcome(storyboard, bool(reference_images))
 
         return {"status": True, "storyboard": storyboard}
 
