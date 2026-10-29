@@ -7067,12 +7067,21 @@ async def trigger_publish_scheduled(
     return result
 
 
+async def _video_brand_context(ctx: dict, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    """The whole Brand Playbook of the brand the user is working in (their own, or the agency client they
+    switched to), in the shape the Brand Brief reads. Video scripts used to get only name, industry, colours,
+    voice and region, so the owner's rules, audience, offer and promotions never reached them."""
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    return BrandProfileService.to_brand_context(profile_data)
+
+
 @router.post("/generate-storyboard")
 async def generate_storyboard(
     request: StoryboardRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Generate a GPT-4o Vision video storyboard from brand images.
@@ -7088,20 +7097,7 @@ async def generate_storyboard(
     identical fix. See VideoStoryboardService.create_storyboard_job/
     run_storyboard_job.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    profile_result = await BrandProfileService.get(user_id, db)
-    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-
-    brand_context = {
-        "brand_name": profile_data.get("brand_name", ""),
-        "industry": profile_data.get("industry", "general_other"),
-        "brand_colors": profile_data.get("brand_colors", []),
-        "brand_voice": profile_data.get("derived_voice", ""),
-        "region": profile_data.get("region", ""),
-    }
+    brand_context = await _video_brand_context(ctx, db)
 
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
@@ -7305,7 +7301,7 @@ async def generate_creative_storyboard(
     request: CreativeStoryboardRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     "Describe it" flow: write a creative_direction + scene-by-scene script
@@ -7321,20 +7317,7 @@ async def generate_creative_storyboard(
     job_id-based) lose all in-flight work on a refresh, with nothing to
     resume. See VideoCreativeService.create_storyboard_job/run_storyboard_job.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    profile_result = await BrandProfileService.get(user_id, db)
-    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-
-    brand_context = {
-        "brand_name": profile_data.get("brand_name", ""),
-        "industry": profile_data.get("industry", "general_other"),
-        "brand_colors": profile_data.get("brand_colors", []),
-        "brand_voice": profile_data.get("derived_voice", ""),
-        "region": profile_data.get("region", ""),
-    }
+    brand_context = await _video_brand_context(ctx, db)
 
     from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
 

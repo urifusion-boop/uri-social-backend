@@ -209,7 +209,10 @@ class VideoCreativeService:
         # language), who it's for, what the business offers and what's on now —
         # video scripts used to get only name, industry, region, voice and colours.
         from . import brand_brief
-        _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), kind="video")
+        _platform = brand_brief.video_platform(target_platform)
+        brand_context = brand_brief.for_platform(brand_context, _platform)
+        _brief = brand_brief.build(brand_context, sections=("rules", "voice", "audience", "offer", "pulse"),
+                                   platform=_platform, kind="video")
         if _brief:
             preamble_lines.append("")
             # The brief is about WORDS. video_prompt goes to the video model and must stay
@@ -261,6 +264,10 @@ class VideoCreativeService:
         except json.JSONDecodeError as e:
             print(f"Creative storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
             return {"status": False, "error": "Failed to parse creative storyboard from model response."}
+
+        # The Playbook's word rules, guaranteed on what viewers read and hear. Before the owner's own
+        # edited direction is put back below, so their wording is never rewritten.
+        brand_brief.enforce_video_script(storyboard, brand_context)
 
         # Forced style: trust our own value over whatever the model echoed.
         # Inferred style: trust the model's pick only if it's a real slug —
