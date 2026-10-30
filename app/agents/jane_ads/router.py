@@ -714,6 +714,18 @@ async def creative_upload(
     return {"url": url, "is_video": is_video}
 
 
+@router.post("/creative/upload-signature")
+async def creative_upload_signature(brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """Signed Cloudinary params so the browser uploads a video directly, in chunks. A phone
+    video relayed through /creative/upload on a slow connection outlasts the request timeout."""
+    from .creative import cloudinary_upload_signature
+    import uuid as _uuid
+    signed = cloudinary_upload_signature(f"upload-{_uuid.uuid4().hex[:12]}")
+    if not signed:
+        raise HTTPException(status_code=503, detail="Uploads aren't available right now.")
+    return signed
+
+
 # ── Real wallet funding via Squad ─────────────────────────────────────────────
 
 class TopUpBody(BaseModel):
