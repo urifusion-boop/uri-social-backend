@@ -2329,8 +2329,12 @@ async def _build_campaign_plan(
     # unrelated "sporteinstein.com" left over from an earlier campaign.
     if req.goal != Goal.FOLLOWERS and requested_destination not in ("", "ask"):
         from .destination import (
-            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform, set_brand_destination,
+            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform,
+            selected_for_objective, set_brand_destination,
         )
+        # The goal the client has picked so far (None until they have): a destination
+        # their goal cannot use is never offered, so a Traffic campaign has no WhatsApp.
+        _goal_objective = objectives_coerce(body.objective) or objectives_coerce(body.message)
 
         def _early_destination_error(error: str) -> dict:
             # No `plan` yet at this point in the build — this only ever fires on a
@@ -2342,11 +2346,12 @@ async def _build_campaign_plan(
                 "question": "Where should people who tap your ad end up?",
                 "destination_options": [
                     {**opt, "current": brand_destination.get(opt["field"], "")}
-                    for opt in options_for_platform(tiktok_preferred)
+                    for opt in options_for_platform(tiktok_preferred, _goal_objective)
                 ],
                 "cta_choices": cta_choice_list(),
                 "selected": {
-                    "destination_type": destination_type.value,
+                    "destination_type": selected_for_objective(
+                        destination_type, _goal_objective, tiktok_preferred).value,
                     "destination_cta": brand_destination["destination_cta"],
                 },
                 "error": error,
@@ -2650,7 +2655,12 @@ async def _build_campaign_plan(
         not (body.destination_type or "").strip()
         and await destination_already_answered(db, brand_ctx.get("brand_id"), body.thread_id)
     )
-    if req.goal != Goal.FOLLOWERS and not destination_settled:
+    # A destination this campaign's GOAL cannot use (WhatsApp under Traffic) is not "settled"
+    # however it got saved — the brand's default, or an answer given under a different goal.
+    # Asking again here is what keeps the client from reaching a launch that refuses them.
+    from .destination import allowed_for_objective, selected_for_objective
+    destination_conflicts_with_goal = not allowed_for_objective(destination_type, plan.objective)
+    if req.goal != Goal.FOLLOWERS and (not destination_settled or destination_conflicts_with_goal):
         from .destination import cta_choice_list, options_for_platform
 
         def _destination_prompt(error: str = "") -> dict:
@@ -2662,11 +2672,12 @@ async def _build_campaign_plan(
                 # retypes their own number to change only the button.
                 "destination_options": [
                     {**opt, "current": brand_destination.get(opt["field"], "")}
-                    for opt in options_for_platform(tiktok_preferred)
+                    for opt in options_for_platform(tiktok_preferred, plan.objective)
                 ],
                 "cta_choices": cta_choice_list(),
                 "selected": {
-                    "destination_type": destination_type.value,
+                    "destination_type": selected_for_objective(
+                        destination_type, plan.objective, tiktok_preferred).value,
                     "destination_cta": brand_destination["destination_cta"],
                 },
                 # Set when an answer came back unusable (a handle that isn't one, a
@@ -2680,7 +2691,11 @@ async def _build_campaign_plan(
         # Answered on THIS request (saved already at step 1.65) → proceed. Anything
         # else (blank, or an explicit "ask") → put the question, whatever the brand
         # has stored.
-        if requested_destination in ("", "ask") or not destination_link:
+        if requested_destination in ("", "ask") or not destination_link or destination_conflicts_with_goal:
+            if destination_conflicts_with_goal and requested_destination not in ("", "ask"):
+                return _destination_prompt(
+                    f"A {plan.objective.value} campaign can't send people to "
+                    f"{destination_type.value.replace('_', ' ')} — pick one of these instead.")
             return _destination_prompt(
                 "Your ads don't have a destination yet — pick one and this campaign is "
                 "ready to build." if requested_destination not in ("", "ask") else ""
