@@ -363,6 +363,11 @@ def whole_area_request(text: str) -> str:
     same discipline objectives.coerce() uses for a typed objective. The cost of a false
     positive is a campaign silently retargeted at a whole state.
     """
+    several = several_whole_areas(re.sub(
+        r"^\s*(?:all\s+of|the\s+whole\s+of|whole\s+of|entire|across)\s+", "", (text or "").strip(),
+        flags=re.I))
+    if several:
+        return several
     raw = (text or "").strip().strip(".!?").replace("\u2019", "'")
     for pattern in (_WHOLE_AREA, _WHOLE_AREA_SUFFIX):
         hit = pattern.search(raw)
@@ -401,6 +406,27 @@ _REGION_ALIASES = {"fct": "Abuja", "benin city": "Benin City"}
 _REPLY_PADDING = {"in", "just", "only", "the", "state", "city", "metropolis"}
 
 
+_AREA_LIST_SPLIT = re.compile(r"\s*(?:,|&|/|\band\b|\bplus\b)\s*", re.I)
+
+
+def several_whole_areas(text: str) -> str:
+    """"Lagos and Abuja" → "Lagos, Abuja": a reply naming two or more states or major
+    cities and nothing else. Read as one place it matched nothing, so Jane fell back to
+    Lagos neighbourhoods and Abuja was silently dropped. Live-reported."""
+    pieces = [p for p in _AREA_LIST_SPLIT.split((text or "").strip(" .!?")) if p.strip()]
+    if len(pieces) < 2:
+        return ""
+    names = [bare_place_answer(p) for p in pieces]
+    if not all(names):
+        return ""
+    return ", ".join(dict.fromkeys(names))
+
+
+def split_areas(city: str) -> list[str]:
+    """The areas a GeoPlan city holds — one, or several from several_whole_areas()."""
+    return [a.strip() for a in (city or "").split(",") if a.strip()]
+
+
 def bare_place_answer(text: str) -> str:
     """The state or major city a reply consists of, or "" — see _NG_REGIONS."""
     raw = re.sub(r"[^a-z\s'-]", " ", (text or "").lower().replace("\u2019", "'"))
@@ -417,8 +443,8 @@ def bare_place_answer(text: str) -> str:
 
 def whole_area_answer(text: str) -> str:
     """A client reply that settles the geography as one whole area: "all of Lagos",
-    "Lagos statewide", or just "Lagos"."""
-    return whole_area_request(text) or bare_place_answer(text)
+    "Lagos statewide", or just "Lagos" — or several: "Lagos and Abuja"."""
+    return whole_area_request(text) or bare_place_answer(text) or several_whole_areas(text)
 
 
 def whole_area_plan(area: str, mode: GeoMode = GeoMode.WATERING_HOLE) -> GeoPlan:
@@ -600,6 +626,9 @@ async def meta_targeting_from_geo_named(
     if geo_locations:
         return {"geo_locations": geo_locations}
 
+    if len(split_areas(city)) > 1:
+        return await _several_areas_targeting(split_areas(city), access_token)
+
     # Nothing resolved. Widen to the city itself, which is usually nameable even when
     # its districts are not — `city` doubles as its own expected region here so the
     # Yaba/Katsina guard still applies.
@@ -623,6 +652,31 @@ async def meta_targeting_from_geo_named(
             return {"geo_locations": {"regions": [{"key": named_region["key"]}]}}
 
     print("[Geo] nothing nameable — falling back to country-wide NG", flush=True)
+    return {"geo_locations": {"countries": ["NG"]}}
+
+
+async def _several_areas_targeting(areas: list[str], access_token: str) -> dict:
+    """Every whole area the client named ("Lagos, Abuja"), each as its own named city or
+    state. One that Meta can't name is dropped; if none can, Nigeria-wide."""
+    from .geo_names import field_for_type, resolve_named_location, resolve_region
+
+    geo_locations: dict = {}
+    for area in areas:
+        try:
+            named = await resolve_named_location(area, area, access_token)
+            if named:
+                geo_locations.setdefault(field_for_type(named["type"]), []).append({"key": named["key"]})
+                continue
+            region = await resolve_region(area, access_token)
+            if region:
+                geo_locations.setdefault("regions", []).append({"key": region["key"]})
+                continue
+        except Exception as e:
+            print(f"[Geo] lookup failed for {area!r}: {e}", flush=True)
+        print(f"[Geo] {area!r} could not be named — dropped from targeting", flush=True)
+    if geo_locations:
+        return {"geo_locations": geo_locations}
+    print("[Geo] none of the named areas resolved — falling back to country-wide NG", flush=True)
     return {"geo_locations": {"countries": ["NG"]}}
 
 
