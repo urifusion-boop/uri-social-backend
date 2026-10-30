@@ -332,6 +332,34 @@ async def token_report(token: str) -> str:
             f"{', granted per Page: ' + granular if granular else ''}")
 
 
+async def page_view(page_id: str, page_token: str) -> dict:
+    """What Meta itself reports for a Page: the app's subscribed fields and the Instagram
+    account it believes is linked. Answers "is Meta sending us this Page's messages" with
+    Meta's own record instead of our own."""
+    import httpx
+
+    from app.core.config import settings
+
+    version = getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0"
+    base = f"https://graph.facebook.com/{version}/{page_id}"
+    out: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            subs = (await client.get(f"{base}/subscribed_apps", params={"access_token": page_token})).json()
+            ig = (await client.get(base, params={
+                "fields": "instagram_business_account{id,username}", "access_token": page_token})).json()
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    out["subscribed_apps"] = [{"app": a.get("name") or a.get("id"), "fields": a.get("subscribed_fields", [])}
+                              for a in subs.get("data") or []]
+    if subs.get("error"):
+        out["subscribed_error"] = (subs["error"].get("message") or "")[:200]
+    out["instagram_business_account"] = ig.get("instagram_business_account")
+    if ig.get("error"):
+        out["instagram_error"] = (ig["error"].get("message") or "")[:200]
+    return out
+
+
 async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:
     """Subscribe the Page to this app so Meta actually delivers its events.
 
