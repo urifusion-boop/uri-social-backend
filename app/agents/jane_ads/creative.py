@@ -663,6 +663,19 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
 
 # ── Source 1: GENERATE — brand data, direct controlled image call ────────────
 
+def cloudinary_upload_signature(public_id: str) -> Optional[dict]:
+    """Signed params for one upload into the uri-ads folder — used server-side and handed
+    to the browser so a large video goes straight to Cloudinary instead of through us."""
+    cloud, api_key, api_secret = (settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY,
+                                   settings.CLOUDINARY_API_SECRET)
+    if not all([cloud, api_key, api_secret]):
+        return None
+    ts = int(time.time())
+    sig = hashlib.sha1(f"folder=uri-ads&public_id={public_id}&timestamp={ts}{api_secret}".encode()).hexdigest()
+    return {"cloud_name": cloud, "api_key": api_key, "timestamp": ts, "signature": sig,
+            "public_id": public_id, "folder": "uri-ads"}
+
+
 async def _upload_bytes_to_cloudinary(
     file_bytes: bytes, public_id: str,
     resource_type: str = "image", ext: str = "png", content_type: str = "image/png",
@@ -672,17 +685,15 @@ async def _upload_bytes_to_cloudinary(
     pydantic Settings). Matches the pattern already proven in this package's b-roll
     generation — self-contained, no extra package coupling. Works for both images
     (GENERATE's gpt-image-1 stills) and videos (a user's own uploaded ad video)."""
-    cloud, api_key, api_secret = (settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY,
-                                   settings.CLOUDINARY_API_SECRET)
-    if not all([cloud, api_key, api_secret]):
+    signed = cloudinary_upload_signature(public_id)
+    if not signed:
         return None
-    ts = int(time.time())
-    sig = hashlib.sha1(f"folder=uri-ads&public_id={public_id}&timestamp={ts}{api_secret}".encode()).hexdigest()
+    cloud = signed["cloud_name"]
     form = aiohttp.FormData()
     form.add_field("file", file_bytes, filename=f"{public_id}.{ext}", content_type=content_type)
-    for k, v in (("api_key", api_key), ("timestamp", str(ts)), ("signature", sig),
-                 ("public_id", public_id), ("folder", "uri-ads"), ("resource_type", resource_type)):
-        form.add_field(k, v)
+    for k in ("api_key", "timestamp", "signature", "public_id", "folder"):
+        form.add_field(k, str(signed[k]))
+    form.add_field("resource_type", resource_type)
     # Video files are much larger than a generated still — allow more time to upload.
     timeout = 180 if resource_type == "video" else 60
     try:
