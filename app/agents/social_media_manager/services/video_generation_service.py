@@ -394,11 +394,9 @@ class VideoGenerationService:
                         "fallback_used": False,
                         "latency_seconds": latency,
                         "error": (
-                            f"{primary_model} is still generating past our {primary_error} — "
-                            "this model routinely takes several minutes. No fallback was used "
-                            "(it would mean paying for this generation twice with a worse result). "
-                            "Check fal.ai's dashboard — it may complete on its own; regenerate this "
-                            "scene once it does."
+                            "This scene is taking longer than expected — talking videos "
+                            "routinely take several minutes. We did not retry it with a different "
+                            "model, so it is not made twice. Regenerate this scene in a few minutes."
                         ),
                     }}})
                     continue
