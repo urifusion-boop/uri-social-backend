@@ -530,18 +530,52 @@ async def _resolve_tiktok_interests(
         return [], list(names)
 
     resolved: list[dict] = []
-    for raw in names[:MAX_TIKTOK_INTERESTS]:
-        name = (raw or "").strip().lower()
-        if not name:
-            continue
-        hit = next((c for c in categories if (c.get("interest_category_name") or "").strip().lower() == name), None)
+    for raw in names:
+        if len(resolved) >= MAX_TIKTOK_INTERESTS:
+            break
+        hit = _best_tiktok_interest(raw, categories)
         if not hit:
-            hit = next((c for c in categories if name in (c.get("interest_category_name") or "").strip().lower()), None)
-        if hit:
-            resolved.append({"name": hit["interest_category_name"], "interest_category_id": hit["interest_category_id"]})
-        else:
             rejected.append(raw)
+        elif hit["interest_category_id"] not in {r["interest_category_id"] for r in resolved}:
+            resolved.append({"name": hit["interest_category_name"], "interest_category_id": hit["interest_category_id"]})
     return resolved, rejected
+
+
+_INTEREST_STOPWORDS = {"and", "the", "of", "for", "in", "with", "to", "a", "an", "non", "app"}
+
+
+def _interest_words(name: str) -> tuple[str, set[str]]:
+    """'Digital marketing (marketing)' → ('digital marketing', {'digital', 'marketing'})."""
+    plain = re.sub(r"\([^)]*\)", " ", (name or "").lower()).replace("&", " and ")
+    plain = " ".join(plain.split())
+    return plain, {w for w in re.findall(r"[a-z][a-z-]+", plain) if w not in _INTEREST_STOPWORDS}
+
+
+def _best_tiktok_interest(raw: str, categories: list[dict]) -> Optional[dict]:
+    """The TikTok category for an interest Jane names in Meta's vocabulary. Exact and
+    substring matching found nothing for names like "Digital marketing (marketing)"
+    (TikTok calls it "Marketing & Advertising"), so every TikTok ad set launched with
+    no interests at all (live, 2026-10-30). Falls back to shared words, preferring
+    the broadest category on a tie."""
+    plain, words = _interest_words(raw)
+    if not plain or not words:
+        return None
+    # The last word carries the meaning — "digital MARKETING" is marketing, not a device.
+    head = re.findall(r"[a-z][a-z-]+", plain)[-1]
+    best, best_key = None, None
+    for c in categories:
+        c_plain, c_words = _interest_words(c.get("interest_category_name") or "")
+        if not c_plain:
+            continue
+        if c_plain == plain:
+            return c
+        if head not in c_words and plain not in c_plain:
+            continue
+        overlap = len(words & c_words) + (1 if plain in c_plain else 0)
+        key = (-overlap, c.get("level") or 9, len(c_plain))
+        if best_key is None or key < best_key:
+            best, best_key = c, key
+    return best
 
 
 async def _tiktok_interest_names(
