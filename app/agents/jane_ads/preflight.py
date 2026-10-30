@@ -117,6 +117,19 @@ async def video_warning(plan) -> list[str]:
     ]
 
 
+def tiktok_location_warning(geo) -> str:
+    """TikTok's location list for Nigeria stops at the country — no state or city
+    beneath it (checked live against /tool/region/, 2026-10-30) — so a TikTok ad here
+    always runs nationwide, whatever area the plan names."""
+    from .geo import split_areas
+
+    areas = [p.name for p in geo.pins] or split_areas(geo.city)
+    named = " and ".join(areas) if len(areas) <= 2 else ", ".join(areas[:-1]) + f" and {areas[-1]}"
+    return (f"TikTok can only target all of Nigeria — it has no city or state targeting here, "
+            f"so this ad will show nationwide, not only in {named}. If location matters, "
+            "choose Instagram & Facebook instead.")
+
+
 async def meta_warnings(plan) -> list[str]:
     results = await asyncio.gather(whatsapp_warning(plan), video_warning(plan), return_exceptions=True)
     return [w for r in results if isinstance(r, list) for w in r]

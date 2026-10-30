@@ -42,6 +42,7 @@ missing/present "error" key. _raise_for_error below checks that, not "error".
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
@@ -702,6 +703,35 @@ def _force_tiktok_video_ratio(video_url: str) -> str:
     return video_url[:insert_at] + "c_fill,ar_9:16,g_auto/" + video_url[insert_at:]
 
 
+def _as_mp4(video_url: str) -> str:
+    """Ask Cloudinary for an H.264 .mp4. An iPhone .MOV is HEVC in a QuickTime box,
+    which TikTok's fetch doesn't reliably take."""
+    if "/video/upload/" not in video_url:
+        return video_url
+    return re.sub(r"\.(mov|webm|m4v|mkv|avi)$", ".mp4", video_url, flags=re.I)
+
+
+_VIDEO_READY_ATTEMPTS = 12
+_VIDEO_READY_PAUSE_S = 15
+
+
+async def _wait_for_cloudinary_video(client: httpx.AsyncClient, url: str) -> None:
+    """Request the transformed video until Cloudinary serves it. A large file is
+    transcoded asynchronously and answers 423 meanwhile; the old single HEAD ignored
+    the status, so TikTok was sent a URL that wasn't ready yet and failed with
+    "Failed to fetch url data" (live, a 55MB iPhone .MOV, 2026-10-30)."""
+    for attempt in range(1, _VIDEO_READY_ATTEMPTS + 1):
+        try:
+            r = await client.head(url, timeout=90)
+            if r.status_code == 200:
+                return
+            print(f"[TikTokAdsAdapter] video not ready ({r.status_code}, attempt {attempt})", flush=True)
+        except Exception as e:
+            print(f"[TikTokAdsAdapter] video warm-up attempt {attempt} failed: {e}", flush=True)
+        await asyncio.sleep(_VIDEO_READY_PAUSE_S)
+    print("[TikTokAdsAdapter] video still not ready — trying the upload anyway", flush=True)
+
+
 def _video_thumbnail_url(video_url: str) -> str:
     """Live-caught 2026-09-23: TikTok video campaigns showed no thumbnail at all in
     Jane's own Campaign Manager list (unlike carousel/Meta cards, which render
@@ -1034,7 +1064,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # 2. Video upload — UPLOAD_BY_URL lets TikTok fetch the hosted file
                     # directly (same "server fetches it, no re-streaming needed here"
                     # shape as Meta's /advideos file_url).
-                    tiktok_video_url = _force_tiktok_video_ratio(plan.creative.image_url)
+                    tiktok_video_url = _as_mp4(_force_tiktok_video_ratio(plan.creative.image_url))
                     # Live-caught 2026-09-22: "video upload: Failed to fetch url data."
                     # Cloudinary generates a video transformation ON DEMAND on its
                     # first request — unlike images this is a real transcode, which
@@ -1053,10 +1083,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         # Cloudinary derivative to warm) — for anything not hosted on
                         # Cloudinary, the URL is unchanged and there's no cold-cache
                         # concern to pre-empt.
-                        try:
-                            await client.head(tiktok_video_url, timeout=90)
-                        except Exception as e:
-                            print(f"[TikTokAdsAdapter] video warm-up failed, continuing anyway: {e}", flush=True)
+                        await _wait_for_cloudinary_video(client, tiktok_video_url)
                     video_resp = await client.post(
                         f"{self._api_base}/file/video/ad/upload/",
                         headers=self._headers(),
