@@ -60,4 +60,7 @@ def remembered_budget_ngn(history: list[dict]) -> Optional[float]:
     from . import constants as C
 
     rec = next((h for h in history if h.get("budget_ngn")), None)
-    return C.stated_budget_from_record(rec) if rec else None
+    stated = C.stated_budget_from_record(rec) if rec else None
+    # Grossing the fee back up leaves ₦49,999.99. Jane shows "₦50,000", and a "yes" to
+    # that was checked against "49999" — never matching, so she asked again forever.
+    return float(round(stated)) if stated else None

@@ -36,6 +36,7 @@ from .models import (
     CreativeContext,
     CreativeKind,
     Goal,
+    OfferType,
     PlanDecision,
     PlanVariant,
     Platform,
@@ -2214,9 +2215,16 @@ async def _build_campaign_plan(
         }
 
     req = to_campaign_request(parsed, business_id=business_id)
+    # The consultant settled the budget and dropped its question, but left offer_type
+    # empty — and the fallback below asked for the budget again, the answer it had just
+    # accepted. Nothing downstream branches on offer_type, so it never blocks a plan.
+    if req is None and parsed.budget_ngn and not parsed.offer_type and not parsed.clarify:
+        parsed.offer_type = OfferType.OTHER.value
+        req = to_campaign_request(parsed, business_id=business_id)
     if req is None:
-        clarify = parsed.clarify or "How much would you like to spend?"
-        if known_budget and "spend" in clarify.lower():
+        clarify = parsed.clarify or ("What are you promoting — a product, a service, an event?"
+                                     if parsed.budget_ngn else "How much would you like to spend?")
+        if known_budget and not parsed.budget_ngn and "spend" in clarify.lower():
             clarify += f" Last time you spent ₦{known_budget:,.0f} — want to do the same again?"
         return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
 

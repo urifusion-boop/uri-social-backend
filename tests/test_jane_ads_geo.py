@@ -268,7 +268,7 @@ def test_prose_inside_a_longer_message_is_still_not_a_request():
 @pytest.mark.parametrize("reply,area", [
     ("Lagos", "Lagos"), ("lagos state", "Lagos"), ("Lagos.", "Lagos"),
     ("just Abuja please", "Abuja"), ("FCT", "Abuja"), ("port harcourt", "Port Harcourt"),
-    ("in Rivers", "Rivers"),
+    ("in Rivers", "Rivers"), ("Lagos and Abuja", "Lagos, Abuja"),
 ])
 def test_a_reply_that_is_only_a_city_settles_the_geography(reply, area):
     from app.agents.jane_ads.geo import whole_area_answer
@@ -276,7 +276,7 @@ def test_a_reply_that_is_only_a_city_settles_the_geography(reply, area):
 
 
 @pytest.mark.parametrize("reply", [
-    "Ikeja", "I sell shoes in Lagos", "Lagos and Abuja", "5500", "Lekki and Yaba",
+    "Ikeja", "I sell shoes in Lagos", "Lagos and Ikeja", "5500", "Lekki and Yaba",
 ])
 def test_a_pocket_or_a_sentence_is_not_a_whole_area_answer(reply):
     from app.agents.jane_ads.geo import whole_area_answer
