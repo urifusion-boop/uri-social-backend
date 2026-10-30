@@ -554,7 +554,7 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
     if _client_gave_affirmative(message):
         last_assistant = next((t.get("content", "") for t in reversed(history)
                                if t.get("role") == "assistant"), "")
-        if str(int(known_budget)) in last_assistant.replace(",", ""):
+        if str(round(known_budget)) in last_assistant.replace(",", ""):
             return (
                 f"\n\nIMPORTANT: your last message asked the client whether to reuse their "
                 f"remembered budget of ₦{known_budget:,.0f}, and their reply above is a plain "
@@ -578,7 +578,7 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
             "(not budget again)."
         )
 
-    if str(int(known_budget)) in latest_reply.replace(",", "") or stated_now == known_budget:
+    if str(round(known_budget)) in latest_reply.replace(",", "") or stated_now == known_budget:
         return (
             f"\n\nIMPORTANT: the client's latest reply above states ₦{known_budget:,.0f} "
             "themselves — that is a deliberate answer for THIS campaign, not a silent "
@@ -603,7 +603,7 @@ def _budget_grounded(amount: Optional[float], known_budget: Optional[float],
         return False
     if known_budget is None or abs(amount - known_budget) > 1:
         return True
-    needle = str(int(amount))
+    needle = str(round(amount))
     client_texts = [message] + [t.get("content", "") for t in history if t.get("role") == "user"]
     # The client writes "₦10,000"; the needle is "10000". Compare without the commas,
     # or a budget typed exactly as people type budgets counts as never said.

@@ -362,6 +362,9 @@ async def _fetch_tiktok_nigeria_locations(
     return nigeria_locations
 
 
+_TIKTOK_LOCATION_ALIASES = {"abuja": "federal capital territory", "fct": "federal capital territory"}
+
+
 async def _resolve_tiktok_locations(
     names: list[str], advertiser_id: str, access_token: str,
 ) -> tuple[list[dict], list[str]]:
@@ -396,6 +399,9 @@ async def _resolve_tiktok_locations(
         hit = next((n for n in nigeria_locations if (n.get("name") or "").strip().lower() == name), None)
         if not hit:
             hit = next((n for n in nigeria_locations if name in (n.get("name") or "").strip().lower()), None)
+        if not hit and name in _TIKTOK_LOCATION_ALIASES:
+            alias = _TIKTOK_LOCATION_ALIASES[name]
+            hit = next((n for n in nigeria_locations if alias in (n.get("name") or "").strip().lower()), None)
         if hit:
             resolved.append({"name": hit["name"], "location_id": hit["location_id"]})
         else:
@@ -893,8 +899,9 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # the whole country (live 2026-10-26). Fall back to the plan's own city.
                 city_name = (plan.geo.city or "").strip() if plan.geo else ""
                 if not resolved_locations and city_name and city_name.lower() not in {n.lower() for n in location_names}:
+                    from ..geo import split_areas
                     resolved_locations, city_unresolved = await _resolve_tiktok_locations(
-                        [city_name], self._advertiser_id, self._access_token)
+                        split_areas(city_name), self._advertiser_id, self._access_token)
                     if resolved_locations:
                         print(f"[TikTokAdsAdapter] no area resolved — targeting the plan's city "
                               f"{[r['name'] for r in resolved_locations]} instead of all of Nigeria", flush=True)

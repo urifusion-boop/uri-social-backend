@@ -31,3 +31,29 @@ def test_a_whole_city_plan_shows_the_city_not_a_dash():
                                                      radius_km=3, source=PinSource.GEOCODED)]})
     assert _location_names(pinned) == ["Ikeja"]
     assert _location_names(None) == []
+
+
+def test_two_cities_are_both_kept():
+    from app.agents.jane_ads.geo import split_areas, whole_area_answer, whole_area_request
+    assert _whole_area_answered("promote uri social. Lagos and Abuja. yes") == "Lagos, Abuja"
+    assert whole_area_answer("Lagos & FCT") == "Lagos, Abuja"
+    assert whole_area_request("All of Lagos, Abuja") == "Lagos, Abuja"
+    assert whole_area_request("All of Lagos") == "Lagos"
+    assert whole_area_answer("Ikeja and Lekki") == ""
+    assert split_areas("Lagos, Abuja") == ["Lagos", "Abuja"]
+
+
+def test_two_cities_target_both_on_meta(monkeypatch):
+    import asyncio
+    from app.agents.jane_ads import geo_names
+    from app.agents.jane_ads.geo import meta_targeting_from_geo_named
+
+    async def named(name, region, token=""):
+        return {"Lagos": {"key": "L", "type": "region"}, "Abuja": {"key": "A", "type": "city"}}.get(name)
+
+    monkeypatch.setattr(geo_names, "resolve_named_location", named)
+    plan = GeoPlan(mode=GeoMode.WATERING_HOLE, city="Lagos, Abuja", pins=[], fallback_area="Lagos, Abuja")
+    out = asyncio.run(meta_targeting_from_geo_named(plan))
+    locs = out["geo_locations"]
+    assert {"key": "L"} in locs[geo_names.field_for_type("region")]
+    assert {"key": "A"} in locs[geo_names.field_for_type("city")]
