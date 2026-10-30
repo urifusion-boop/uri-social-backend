@@ -11,7 +11,7 @@ its mutation calls are POST).
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -125,7 +125,7 @@ def _mock_client(responses):
     client.get = AsyncMock(side_effect=_next)
     # Separate from the sequenced POST/GET responses above — the video-warm-up
     # HEAD call doesn't consume from that list, its return value is never read.
-    client.head = AsyncMock(return_value=AsyncMock())
+    client.head = AsyncMock(return_value=MagicMock(status_code=200))
     return client
 
 
@@ -675,10 +675,25 @@ def test_launch_campaign_video_warm_up_timeout_does_not_block_the_launch():
         mock_client = _mock_client(list(_HAPPY_RESPONSES))
         mock_client.head = AsyncMock(side_effect=httpx_module.TimeoutException("timed out"))
         MockClient.return_value.__aenter__.return_value = mock_client
-        result = _run(adapter.launch_campaign(plan, _auth()))
+        with patch("app.agents.jane_ads.adapters.tiktok._VIDEO_READY_PAUSE_S", 0):
+            result = _run(adapter.launch_campaign(plan, _auth()))
 
     assert result.campaign_id == "111"
-    assert mock_client.head.call_count == 1
+    from app.agents.jane_ads.adapters.tiktok import _VIDEO_READY_ATTEMPTS
+    assert mock_client.head.call_count == _VIDEO_READY_ATTEMPTS
+
+
+def test_a_video_still_transcoding_is_waited_for_and_sent_as_mp4():
+    # Live 2026-10-30: a 55MB iPhone .MOV was still transcoding (Cloudinary 423) when
+    # TikTok fetched it — "video upload: Failed to fetch url data".
+    from app.agents.jane_ads.adapters.tiktok import _as_mp4, _wait_for_cloudinary_video
+    client = MagicMock()
+    client.head = AsyncMock(side_effect=[MagicMock(status_code=423), MagicMock(status_code=200)])
+    with patch("app.agents.jane_ads.adapters.tiktok._VIDEO_READY_PAUSE_S", 0):
+        _run(_wait_for_cloudinary_video(client, "u"))
+    assert client.head.call_count == 2
+    assert _as_mp4("https://res.cloudinary.com/d/video/upload/c_fill/v1/uri-ads/clip.MOV").endswith("/clip.mp4")
+    assert _as_mp4("https://cdn.example.com/clip.mov") == "https://cdn.example.com/clip.mov"
 
 
 def test_launch_campaign_carousel_raises_clearly_when_no_music_found():

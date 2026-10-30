@@ -2988,6 +2988,9 @@ async def _build_campaign_plan(
     if _runs_on_meta(plan):
         from .preflight import meta_warnings
         warnings = await meta_warnings(plan)
+    elif plan.geo and (plan.geo.city or plan.geo.pins):
+        from .preflight import tiktok_location_warning
+        warnings = [tiktok_location_warning(plan.geo)]
 
     return _PlanBuildResult(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms, warnings=warnings,
