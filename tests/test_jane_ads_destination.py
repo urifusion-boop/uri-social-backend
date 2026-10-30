@@ -20,8 +20,12 @@ from app.agents.jane_ads.destination import (
     meta_cta,
     normalize_instagram_username,
     normalize_website_url,
+    allowed_for_objective,
     options_for_platform,
+    selected_for_objective,
 )
+from app.agents.jane_ads.models import CampaignObjective
+from app.agents.jane_ads.objectives import validate
 
 
 # ── Website ───────────────────────────────────────────────────────────────────
@@ -433,3 +437,54 @@ def test_tiktok_picker_has_no_meta_wording_and_no_instagram_dms():
 def test_tiktok_picker_does_not_mutate_the_shared_options():
     options_for_platform(True)
     assert "Facebook Page" in _whatsapp_note(options_for_platform(False))
+
+
+# ── Picker options per goal ───────────────────────────────────────────────────
+
+def _values(options):
+    return [o["value"] for o in options]
+
+
+@pytest.mark.parametrize("tiktok", [False, True])
+def test_traffic_picker_has_no_whatsapp(tiktok):
+    values = _values(options_for_platform(tiktok, CampaignObjective.TRAFFIC))
+    assert "whatsapp" not in values
+    assert "website" in values and "custom" in values
+
+
+@pytest.mark.parametrize("objective", [
+    CampaignObjective.LEADS, CampaignObjective.SALES, CampaignObjective.ENGAGEMENT,
+    CampaignObjective.AWARENESS,
+])
+def test_goals_that_allow_whatsapp_still_offer_it(objective):
+    assert "whatsapp" in _values(options_for_platform(True, objective))
+
+
+def test_no_goal_yet_filters_nothing_by_goal():
+    assert _values(options_for_platform(False, None)) == _values(options_for_platform(False))
+
+
+@pytest.mark.parametrize("objective", list(CampaignObjective))
+@pytest.mark.parametrize("tiktok", [False, True])
+def test_every_option_offered_for_a_goal_can_launch_under_it(objective, tiktok):
+    for option in options_for_platform(tiktok, objective):
+        problems = validate(objective, destination_type=option["value"],
+                            destination_link="https://uri.com", require_action=False)
+        assert not [p for p in problems if "cannot send people" in p]
+
+
+def test_a_saved_whatsapp_default_is_not_preselected_under_traffic():
+    chosen = selected_for_objective(DestinationType.WHATSAPP, CampaignObjective.TRAFFIC, tiktok=True)
+    assert chosen != DestinationType.WHATSAPP
+    assert allowed_for_objective(chosen, CampaignObjective.TRAFFIC)
+
+
+def test_a_saved_destination_the_goal_allows_stays_selected():
+    assert selected_for_objective(DestinationType.WEBSITE, CampaignObjective.TRAFFIC) == DestinationType.WEBSITE
+    assert selected_for_objective(DestinationType.WHATSAPP, CampaignObjective.LEADS) == DestinationType.WHATSAPP
+    assert selected_for_objective(DestinationType.WHATSAPP, None) == DestinationType.WHATSAPP
+
+
+def test_whatsapp_under_traffic_is_the_pairing_launch_refuses():
+    assert not allowed_for_objective(DestinationType.WHATSAPP, CampaignObjective.TRAFFIC)
+    assert validate(CampaignObjective.TRAFFIC, destination_type="whatsapp", require_action=False)
