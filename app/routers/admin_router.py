@@ -877,7 +877,16 @@ async def list_access_codes(
     """
     codes = []
     async for doc in db["access_codes"].find({}, {"_id": 0}).sort("created_at", -1):
-        assigned_emails = doc.get("assigned_emails") or []
+        # Some codes predate the single-email -> roster migration (commit
+        # 8438595e) and were never backfilled, so they still carry the old
+        # assigned_to_email field instead of assigned_emails. Recover that
+        # assignment here rather than returning an empty roster and losing
+        # it from view, and always set assigned_emails explicitly — doc is
+        # the raw Mongo document, which omits the key entirely when it was
+        # never written, and the frontend assumes it's always an array.
+        legacy_email = doc.get("assigned_to_email")
+        assigned_emails = doc.get("assigned_emails") or ([legacy_email] if legacy_email else [])
+        doc["assigned_emails"] = assigned_emails
         redeemed_count = doc.get("redemption_count", 0)
         doc["assigned_count"] = len(assigned_emails)
         doc["redeemed_count"] = redeemed_count
@@ -949,7 +958,8 @@ async def list_access_code_redemptions(
             effective_status = "active"
         redemptions.append({**r, "email": email, "effective_status": effective_status})
 
-    for assigned_email in access_code.get("assigned_emails") or []:
+    legacy_email = access_code.get("assigned_to_email")
+    for assigned_email in access_code.get("assigned_emails") or ([legacy_email] if legacy_email else []):
         if assigned_email.lower() not in redeemed_emails_lower:
             redemptions.append({
                 "code": code,
@@ -1103,7 +1113,9 @@ async def update_access_code(
         revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
 
     updated = await db["access_codes"].find_one({"code": code}, {"_id": 0})
-    assigned_emails = updated.get("assigned_emails") or []
+    legacy_email = updated.get("assigned_to_email")
+    assigned_emails = updated.get("assigned_emails") or ([legacy_email] if legacy_email else [])
+    updated["assigned_emails"] = assigned_emails
     redeemed_count = updated.get("redemption_count", 0)
     updated["assigned_count"] = len(assigned_emails)
     updated["redeemed_count"] = redeemed_count
@@ -1156,7 +1168,8 @@ async def send_access_code_email(
     access_code = await db["access_codes"].find_one({"code": code}, {"_id": 0})
     if not access_code:
         raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
-    assigned_emails = access_code.get("assigned_emails") or []
+    legacy_email = access_code.get("assigned_to_email")
+    assigned_emails = access_code.get("assigned_emails") or ([legacy_email] if legacy_email else [])
     if not assigned_emails:
         raise HTTPException(status_code=400, detail="This code isn't assigned to anyone — add emails first")
     if email:
