@@ -1292,3 +1292,21 @@ def test_video_keeps_video_views_for_engagement():
 ])
 def test_carousel_keeps_the_objectives_tiktok_supports_for_it(objective, expected):
     assert _tiktok_objective_for_creative(objective, is_carousel=True) == expected
+
+
+def test_meta_style_interest_names_find_their_tiktok_category():
+    # Live 2026-10-30: every interest Jane named ("Digital marketing (marketing)") was
+    # dropped, so TikTok ad groups launched with no interests at all.
+    from app.agents.jane_ads.adapters.tiktok import _best_tiktok_interest
+    cats = [
+        {"interest_category_id": "1", "interest_category_name": "Marketing & Advertising", "level": 2},
+        {"interest_category_id": "2", "interest_category_name": "Digital Devices", "level": 2},
+        {"interest_category_id": "3", "interest_category_name": "E-Commerce (Non-app)", "level": 1},
+        {"interest_category_id": "4", "interest_category_name": "Individual Entrepreneurship", "level": 2},
+    ]
+    pick = lambda n: (_best_tiktok_interest(n, cats) or {}).get("interest_category_id")
+    assert pick("Digital marketing (marketing)") == "1"
+    assert pick("Online advertising (marketing)") == "1"
+    assert pick("E-commerce (retail)") == "3"
+    assert pick("Entrepreneurship (business and finance)") == "4"
+    assert pick("Leadership (social concept)") is None
