@@ -186,20 +186,46 @@ VALUE_FIELD_FOR_TYPE = {o["value"]: o["field"] for o in DESTINATION_OPTIONS}
 TIKTOK_WHATSAPP_INPUT_NOTE = "People who tap your TikTok ad will message this number on WhatsApp."
 
 
-def options_for_platform(tiktok: bool = False) -> list[dict]:
+def options_for_platform(tiktok: bool = False, objective=None) -> list[dict]:
     """DESTINATION_OPTIONS, minus Instagram DMs when the campaign is running on
-    TikTok — ig.me is a Meta/Instagram deep link, meaningless on a TikTok ad.
-    Every DESTINATION_OPTIONS caller building a picker response should go
-    through this rather than using the raw list directly."""
+    TikTok — ig.me is a Meta/Instagram deep link, meaningless on a TikTok ad —
+    and minus whatever the campaign's goal cannot send people to (a Traffic
+    campaign has no WhatsApp option). Every DESTINATION_OPTIONS caller building a
+    picker response should go through this rather than using the raw list directly.
+
+    `objective` is a CampaignObjective, or None for "not known yet" (nothing is
+    filtered by goal)."""
+    options = list(DESTINATION_OPTIONS)
+    if objective is not None:
+        from .objectives import destinations_for
+        allowed = set(destinations_for(objective))
+        options = [o for o in options if o["value"] in allowed]
     if not tiktok:
-        return list(DESTINATION_OPTIONS)
-    options = [o for o in DESTINATION_OPTIONS if o["value"] != DestinationType.INSTAGRAM_DM.value]
+        return options
+    options = [o for o in options if o["value"] != DestinationType.INSTAGRAM_DM.value]
     # The WhatsApp number note ("linked to your Facebook Page in Meta") is a Meta
     # requirement; a TikTok ad opens a plain wa.me link, so there is no Page to match.
     return [
         {**o, "input_note": TIKTOK_WHATSAPP_INPUT_NOTE} if o["value"] == DestinationType.WHATSAPP.value else o
         for o in options
     ]
+
+
+def allowed_for_objective(destination_type: "DestinationType", objective) -> bool:
+    """Whether a campaign with this goal may send people to this destination."""
+    if objective is None:
+        return True
+    from .objectives import destinations_for
+    return destination_type.value in destinations_for(objective)
+
+
+def selected_for_objective(destination_type: "DestinationType", objective, tiktok: bool = False) -> "DestinationType":
+    """The picker's pre-selected destination: the brand's saved one when this goal allows
+    it, otherwise the first option the goal does allow — never one the client could not launch."""
+    if allowed_for_objective(destination_type, objective):
+        return destination_type
+    options = options_for_platform(tiktok, objective)
+    return DestinationType(options[0]["value"]) if options else destination_type
 
 
 def cta_choice_list() -> list[dict]:
