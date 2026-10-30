@@ -420,6 +420,11 @@ async def resubscribe_channels(
              await db[CHANNEL_ACCOUNTS].find({"workspace_id": brand_ctx.get("brand_id")}).to_list(50)}
     subs = [{**x, "issue": None if x["subscribed"] else subscription_issue(x["error"], names.get(x["page_id"], ""))}
             for x in result["subscriptions"]]
+    tokens = {c.get("page_id"): c.get("access_token", "") for c in
+              await db[CHANNEL_ACCOUNTS].find({"workspace_id": brand_ctx.get("brand_id")}).to_list(50)}
+    from .channels import page_view
+    for x in subs:
+        x["meta_sees"] = await page_view(x["page_id"], tokens.get(x["page_id"], "")) if tokens.get(x["page_id"]) else {}
     return {"subscriptions": subs}
 
 
