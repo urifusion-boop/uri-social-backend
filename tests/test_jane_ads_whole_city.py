@@ -53,7 +53,7 @@ def test_two_cities_target_both_on_meta(monkeypatch):
 
     monkeypatch.setattr(geo_names, "resolve_named_location", named)
     plan = GeoPlan(mode=GeoMode.WATERING_HOLE, city="Lagos, Abuja", pins=[], fallback_area="Lagos, Abuja")
-    out = asyncio.run(meta_targeting_from_geo_named(plan))
+    out = asyncio.get_event_loop().run_until_complete(meta_targeting_from_geo_named(plan))
     locs = out["geo_locations"]
     assert {"key": "L"} in locs[geo_names.field_for_type("region")]
     assert {"key": "A"} in locs[geo_names.field_for_type("city")]
