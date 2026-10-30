@@ -65,3 +65,10 @@ def test_a_failing_check_never_breaks_the_plan(monkeypatch):
         raise RuntimeError("x")
     monkeypatch.setattr(preflight, "whatsapp_warning", boom)
     assert _run(preflight.meta_warnings(_plan(dest="website"))) == []
+
+
+def test_a_tiktok_plan_says_it_runs_nationwide():
+    from app.agents.jane_ads.models import GeoMode, GeoPlan
+    from app.agents.jane_ads.preflight import tiktok_location_warning
+    w = tiktok_location_warning(GeoPlan(mode=GeoMode.WATERING_HOLE, city="Lagos, Abuja"))
+    assert "all of Nigeria" in w and "Lagos and Abuja" in w
