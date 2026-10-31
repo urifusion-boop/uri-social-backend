@@ -280,8 +280,9 @@ async def resolve_ads_page_for_launch(
     own name instead of every client's ad reading "URI". A brand gets one by connecting
     via /connect/facebook-ads (that grant requests ads_management + pages_manage_ads +
     business_management and shares the Page with URI's Business Manager, which is what
-    lets the shared ad account advertise for it). Brands that haven't connected still
-    fall back to URI's shared Page, so nobody is blocked from launching.
+    lets the shared ad account advertise for it). A brand that hasn't connected is asked
+    to: its ad is never published under URI's own Page. That fallback ran a client's
+    plastic-surgery ad as "uri.social" on Instagram (live, 2026-10-31).
 
     The WhatsApp destination is deliberately NOT taken from the Page connection: ads
     route through a plain wa.me link (see adapters/meta.py), so the number only has to
@@ -306,23 +307,9 @@ async def resolve_ads_page_for_launch(
             "page_name": ads.get("account_name", ""),
         }
 
-    # A brand that connected its own Page for ads must never be moved onto URI's
-    # shared Page because that connection broke. An expired token did exactly that:
-    # the ad published as "URI" and its DMs went to URI's inbox, not the client's.
-    # They reconnect instead; the shared Page is only for brands that never connected.
-    if (ads or {}).get("page_id"):
-        raise AdsConnectionRequired(state, ads.get("account_name", ""))
-
-    if not settings.META_ADS_PAGE_ID:
-        # No brand Page AND no shared Page configured — surface the brand's real state
-        # (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE) so the caller can prompt precisely.
-        raise AdsConnectionRequired(state, (ads or {}).get("account_name", ""))
-
-    return {
-        "page_id": settings.META_ADS_PAGE_ID,
-        "whatsapp_number": wa_number,
-        "page_name": "URI Social",
-    }
+    # The brand's real state (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE/PAGE_NOT_SHARED) lets
+    # the caller prompt precisely: connect, reconnect, or pick a Page.
+    raise AdsConnectionRequired(state, (ads or {}).get("account_name", ""))
 
 
 async def run_token_health_check(db) -> dict:
