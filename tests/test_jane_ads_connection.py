@@ -304,14 +304,14 @@ def test_live_check_false_skips_the_network_call():
     mock_verify.assert_not_called()
 
 
-def test_resolve_ads_page_for_launch_uses_the_shared_page_regardless_of_any_connection():
-    # Every brand launches from URI's own shared Page — a brand with NO Facebook
-    # connection of any kind (not even content) still launches fine, as long as
-    # they've saved their own WhatsApp number.
+def test_a_brand_with_no_connection_is_asked_to_connect_even_with_a_shared_page_set():
+    # Live: a client's plastic-surgery ad ran as "uri.social" because the brand had
+    # never connected a Page and launch fell back to URI's own.
     db = FakeDb([{"brand_id": "brnd_1", "whatsapp_number": "2348031234567"}])
     with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"):
-        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
-    assert result == {"page_id": "pg_shared", "whatsapp_number": "2348031234567", "page_name": "URI Social"}
+        with pytest.raises(AdsConnectionRequired) as exc_info:
+            _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert exc_info.value.state == ConnectionState.NONE
 
 
 def test_resolve_ads_page_for_launch_raises_ads_no_whatsapp_when_brand_has_no_number_saved():
@@ -323,10 +323,11 @@ def test_resolve_ads_page_for_launch_raises_ads_no_whatsapp_when_brand_has_no_nu
 
 
 def test_resolve_ads_page_for_launch_skips_whatsapp_when_not_required():
-    db = FakeDb([])
-    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"):
+    db = FakeDb([_ads_doc(page_id="pg_brand", account_name="Brand Page", business_manager_shared=True)])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
         result = _run(resolve_ads_page_for_launch(db, None, "brnd_1", require_whatsapp=False))
-    assert result == {"page_id": "pg_shared", "whatsapp_number": "", "page_name": "URI Social"}
+    assert result == {"page_id": "pg_brand", "whatsapp_number": "", "page_name": "Brand Page"}
 
 
 def test_resolve_ads_page_for_launch_surfaces_the_real_state_with_no_shared_page():
@@ -374,9 +375,8 @@ def test_set_whatsapp_number_requires_an_existing_ads_connection():
 
 
 # ── Per-brand Page preference ─────────────────────────────────────────────────
-# Ads should publish under the CLIENT's own Page when they've connected one, so every
-# client's ad doesn't read "URI". Brands without a connection still fall back to the
-# shared Page so nobody is blocked from launching.
+# Ads publish under the CLIENT's own Page, never URI's. A brand without a usable
+# connection is asked to connect or reconnect.
 
 def test_launch_prefers_the_brands_own_connected_page_over_the_shared_one():
     db = FakeDb([
@@ -394,12 +394,14 @@ def test_launch_prefers_the_brands_own_connected_page_over_the_shared_one():
     assert result["whatsapp_number"] == "2348031234567"
 
 
-def test_launch_falls_back_to_the_shared_page_when_the_brand_has_not_connected():
+def test_a_brand_connected_only_for_posting_is_asked_to_add_ads_not_moved_to_uris_page():
     db = FakeDb([{"brand_id": "brnd_1", "whatsapp_number": "2348031234567"}])
-    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"):
-        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
-    assert result["page_id"] == "pg_shared"
-    assert result["page_name"] == "URI Social"
+    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"), \
+         patch("app.agents.jane_ads.ads_connection.get_content_connection",
+               new=AsyncMock(return_value={"platform": "facebook"})):
+        with pytest.raises(AdsConnectionRequired) as exc_info:
+            _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert exc_info.value.state == ConnectionState.CONTENT_ONLY
 
 
 def test_an_unusable_brand_connection_asks_to_reconnect_instead_of_using_uris_page():
