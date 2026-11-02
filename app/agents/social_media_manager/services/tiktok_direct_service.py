@@ -24,6 +24,7 @@ whose redirect_uri hadn't cleared TikTok's review yet. Should get a fully
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -36,9 +37,18 @@ CONNECTIONS = "social_connections"
 _TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
 _API_BASE = "https://open.tiktokapis.com/v2"
 
-# TikTok access tokens live 24h (expires_in in the token response) — refresh a
-# bit early so a publish never races a token that expires mid-flight.
+# TikTok access tokens live 2h (24h before 1 Dec 2026) and the response's expires_in says
+# which — refresh a bit early so a publish never races a token that expires mid-flight.
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
+
+# Every refresh REPLACES the refresh token and invalidates the old one, so two refreshes
+# with the same token cannot both succeed, and a new token that is not saved is a
+# connection the user must redo. These bound the three ways that goes wrong.
+_REFRESH_LOCK_SECONDS = 30          # a refresh that dies mid-flight frees its claim after this
+_REFRESH_WAIT_SECONDS = 15          # how long a second caller waits on the first one's refresh
+_REFRESH_POLL_SECONDS = 0.4
+_SAVE_ATTEMPTS = 3
+_SAVE_BACKOFF_SECONDS = 0.3
 
 # TikTok's documented per-chunk cap (the final chunk may go up to 128MB) — used
 # here as the single-chunk ceiling too, since most short-form video is well
@@ -130,41 +140,148 @@ async def _refresh_tokens(refresh_token: str) -> dict:
     return data
 
 
-async def get_valid_tiktok_access_token(db, connection_doc: dict) -> str:
-    """Returns a still-valid access_token, refreshing first if it's expired or
-    close to it — same shape as google_ads_connection.py's
-    get_valid_access_token. Persists the refreshed tokens back onto the
-    connection doc; callers never read connection_doc["access_token"] after a
-    refresh without re-fetching."""
-    expires_at = connection_doc.get("token_expires_at")
-    if isinstance(expires_at, str):
+# New tokens TikTok has already issued but we could not write to the database, by connection id.
+# TikTok has invalidated the old refresh token by then, so these are the only copy: they are
+# written out on the next call, and used in the meantime. Lost only if the process dies first.
+_unsaved_tokens: dict = {}
+
+
+def _as_utc(value) -> Optional[datetime]:
+    if isinstance(value, str):
         try:
-            expires_at = datetime.fromisoformat(expires_at)
+            value = datetime.fromisoformat(value)
         except ValueError:
-            expires_at = None
-    if isinstance(expires_at, datetime):
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
-        if remaining > _TOKEN_REFRESH_MARGIN_SECONDS:
-            return connection_doc["access_token"]
+            return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return None
 
-    refresh_token = connection_doc.get("refresh_token")
-    if not refresh_token:
-        raise TikTokDirectAPIError("no refresh_token stored on this TikTok connection — reconnect required")
 
-    data = await _refresh_tokens(refresh_token)
-    new_expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 86400)))
-    await db[CONNECTIONS].update_one(
-        {"id": connection_doc["id"]},
+def _still_valid(doc: dict) -> bool:
+    expires_at = _as_utc((doc or {}).get("token_expires_at"))
+    if not expires_at or not (doc or {}).get("access_token"):
+        return False
+    return (expires_at - datetime.now(timezone.utc)).total_seconds() > _TOKEN_REFRESH_MARGIN_SECONDS
+
+
+def _token_fields(data: dict, previous_refresh_token: str) -> dict:
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 7200)))
+    fields = {
+        "access_token": data["access_token"],
+        "refresh_token": data.get("refresh_token", previous_refresh_token),
+        "token_expires_at": expires_at.isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if data.get("refresh_expires_in") is not None:
+        refresh_expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(data["refresh_expires_in"]))
+        fields["refresh_token_expires_at"] = refresh_expires_at.isoformat()
+    return fields
+
+
+async def _save_tokens(db, connection_id: str, fields: dict, owner: Optional[str] = None) -> bool:
+    """Write refreshed tokens, retrying, and release the refresh claim in the same write.
+    Returns whether it was saved. A rotated refresh token that is not saved is a lost
+    connection, so a failed write is retried and then kept in memory, never dropped."""
+    query = {"id": connection_id}
+    if owner:
+        query["refresh_lock_owner"] = owner
+    update = {"$set": fields, "$unset": {"refresh_lock_owner": "", "refresh_lock_until": ""}}
+    for attempt in range(_SAVE_ATTEMPTS):
+        try:
+            await db[CONNECTIONS].update_one(query, update)
+            return True
+        except Exception as e:  # noqa: BLE001 - any write failure must be retried
+            print(f"[TikTokDirect] saving refreshed tokens failed (attempt {attempt + 1}): {type(e).__name__}")
+            if attempt + 1 < _SAVE_ATTEMPTS:
+                await asyncio.sleep(_SAVE_BACKOFF_SECONDS * (attempt + 1))
+    return False
+
+
+async def _claim_refresh(db, connection_id: str, refresh_token: str) -> Optional[str]:
+    """Take the right to refresh this connection, or None when someone else holds it or has
+    already moved the refresh token on. Conditional on the refresh token being the one we read,
+    so a caller holding a stale token cannot start a refresh that TikTok will refuse."""
+    now = datetime.now(timezone.utc)
+    owner = uuid.uuid4().hex
+    result = await db[CONNECTIONS].update_one(
+        {
+            "id": connection_id,
+            "refresh_token": refresh_token,
+            "$or": [
+                {"refresh_lock_until": {"$exists": False}},
+                {"refresh_lock_until": {"$lte": now.isoformat()}},
+            ],
+        },
         {"$set": {
-            "access_token": data["access_token"],
-            "refresh_token": data.get("refresh_token", refresh_token),
-            "token_expires_at": new_expires_at.isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "refresh_lock_owner": owner,
+            "refresh_lock_until": (now + timedelta(seconds=_REFRESH_LOCK_SECONDS)).isoformat(),
         }},
     )
-    return data["access_token"]
+    return owner if getattr(result, "modified_count", 0) == 1 else None
+
+
+async def _release_refresh(db, connection_id: str, owner: str) -> None:
+    try:
+        await db[CONNECTIONS].update_one(
+            {"id": connection_id, "refresh_lock_owner": owner},
+            {"$unset": {"refresh_lock_owner": "", "refresh_lock_until": ""}},
+        )
+    except Exception as e:  # noqa: BLE001 - the claim expires on its own
+        print(f"[TikTokDirect] could not release the refresh claim: {type(e).__name__}")
+
+
+async def get_valid_tiktok_access_token(db, connection_doc: dict) -> str:
+    """Returns a still-valid access_token, refreshing first if it's expired or close to it.
+
+    TikTok replaces the refresh token on every refresh and invalidates the old one, so:
+      * only one caller refreshes a connection at a time, across workers — the claim is a
+        conditional write on the refresh token we read, and everyone else waits and then
+        uses the token that caller saved;
+      * the connection is re-read from the database first, because the document the caller
+        holds may predate another worker's refresh;
+      * the new tokens are written with retries, and kept in memory if the database stays
+        unreachable, so a refresh TikTok accepted is not lost.
+    Callers never read connection_doc["access_token"] after a refresh without re-fetching."""
+    connection_id = connection_doc["id"]
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=_REFRESH_WAIT_SECONDS)
+
+    while True:
+        pending = _unsaved_tokens.get(connection_id)
+        if pending:
+            # Tokens TikTok already issued that never reached the database: the database copy is
+            # older than these and its refresh token is dead. Try to save them, and use them.
+            if await _save_tokens(db, connection_id, pending):
+                _unsaved_tokens.pop(connection_id, None)
+            current = {**connection_doc, **pending}
+        else:
+            fresh = await db[CONNECTIONS].find_one({"id": connection_id}, {"_id": 0})
+            current = fresh or connection_doc
+
+        if _still_valid(current):
+            return current["access_token"]
+
+        refresh_token = current.get("refresh_token")
+        if not refresh_token:
+            raise TikTokDirectAPIError("no refresh_token stored on this TikTok connection — reconnect required")
+
+        owner = await _claim_refresh(db, connection_id, refresh_token)
+        if owner is None:
+            # Someone else is refreshing this connection (or already did): wait for their result.
+            if datetime.now(timezone.utc) >= deadline:
+                raise TikTokDirectAPIError("TikTok is still refreshing this connection — please try again")
+            await asyncio.sleep(_REFRESH_POLL_SECONDS)
+            continue
+
+        try:
+            data = await _refresh_tokens(refresh_token)
+        except Exception:
+            await _release_refresh(db, connection_id, owner)
+            raise
+        fields = _token_fields(data, refresh_token)
+        if not await _save_tokens(db, connection_id, fields, owner=owner):
+            _unsaved_tokens[connection_id] = fields
+            print("[TikTokDirect] refreshed tokens are held in memory until the database accepts them")
+        return fields["access_token"]
 
 
 def _headers(access_token: str) -> dict:

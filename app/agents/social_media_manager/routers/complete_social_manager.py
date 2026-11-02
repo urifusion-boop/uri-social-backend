@@ -1811,7 +1811,8 @@ async def tiktok_direct_callback(
         avatar_url = user_info.get("avatar_url", "")
 
         now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(seconds=int(tokens.get("expires_in", 86400)))
+        expires_at = now + timedelta(seconds=int(tokens.get("expires_in", 7200)))
+        refresh_expires_in = tokens.get("refresh_expires_in")
         conn_doc = {
             "id": f"tt_{open_id}",
             "user_id": None,               # set by finalize
@@ -1821,6 +1822,8 @@ async def tiktok_direct_callback(
             "access_token": access_token,
             "refresh_token": tokens.get("refresh_token", ""),
             "token_expires_at": expires_at.isoformat(),
+            **({"refresh_token_expires_at": (now + timedelta(seconds=int(refresh_expires_in))).isoformat()}
+               if refresh_expires_in is not None else {}),
             "account_name": display_name,
             "profile_picture_url": avatar_url,
             "connection_status": "pending_user_match",
