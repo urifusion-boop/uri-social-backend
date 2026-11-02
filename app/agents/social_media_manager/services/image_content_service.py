@@ -909,15 +909,16 @@ class ImageContentService:
                     f"This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
-            _safe_margins = ImageContentService._safe_zone_margins_pct(specs["width"], specs["height"])
-            _tb_pct = _safe_margins["top_bottom"]
+            _safe_margins = ImageContentService._safe_zone_margins_pct(specs["width"], specs["height"], base_pct=20)
+            _top_pct = _safe_margins["top"]
+            _bottom_pct = _safe_margins["bottom"]
             _lr_pct = _safe_margins["left_right"]
             _crop_note = (
                 "\nThis image will be generated at a different aspect ratio than its final "
-                "size, then center-cropped to fit — the margins below already include a "
+                "size, then cropped to fit — the margins below already include a "
                 "buffer for that crop, so treat them as the true usable canvas, not a style "
                 "preference."
-                if (_tb_pct > 12 or _lr_pct > 12) else ""
+                if (_top_pct > 20 or _bottom_pct > 20 or _lr_pct > 20) else ""
             )
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
@@ -929,10 +930,11 @@ Every element in the image must come from the instructions below. Nothing else.
 
 CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
 Every letter of every word must be 100% inside the image canvas with no clipping.{_crop_note}
-Maintain a minimum {_tb_pct}% safe-zone margin from the top and bottom edges, and a
-minimum {_lr_pct}% safe-zone margin from the left and right edges.
-Headlines must begin at least {_tb_pct}% from the top edge. CTA text must end at least
-{_tb_pct}% from the bottom edge. If text is too large to fit within these margins, reduce the
+Maintain a minimum {_top_pct}% safe-zone margin from the top edge.
+Maintain a minimum {_bottom_pct}% safe-zone margin from the bottom edge.
+Maintain a minimum {_lr_pct}% safe-zone margin from the left and right edges.
+Headlines must begin at least {_top_pct}% from the top edge. CTA text must end at least
+{_bottom_pct}% from the bottom edge. If text is too large to fit within these margins, reduce the
 font size — do NOT let any character touch or cross any edge. This rule overrides
 any visual style, typography, or layout instruction that follows.{logo_space_note}"""
 
@@ -2965,12 +2967,32 @@ Answer with exactly one word: "yes" or "no"."""
         except (ValueError, AttributeError):
             return "1:1"
 
+    # Fraction of a top+bottom crop taken off the TOP edge (the rest comes off
+    # the bottom). Headlines are the content this bug class actually reports
+    # clipped — they sit near the top per the safe-zone prompt rule above —
+    # while the bottom (CTA) is comparatively more disposable and hasn't been
+    # reported clipped. A plain center-crop (0.5) gives the top the same odds
+    # of being clipped as the bottom despite that asymmetry; this biases the
+    # mechanical crop toward protecting the top instead, independent of
+    # whether the model actually honoured the prompt's margin instruction.
+    # _safe_zone_margins_pct's top/bottom split must stay driven by this same
+    # constant, or the margin the model is told to leave stops matching what
+    # the crop actually removes.
+    _TOP_CROP_BIAS = 0.2
+
     @staticmethod
     def _crop_to_ratio(b64: str, target_w: int, target_h: int) -> str:
         """
-        Center-crop a base64-encoded WebP image to the exact target aspect ratio.
+        Crop a base64-encoded WebP image to the exact target aspect ratio.
         Returns the cropped image as a base64 string (WebP).
         Skips cropping if the ratio already matches within 2%.
+
+        A top+bottom crop (target wider than generated) is biased toward the
+        bottom via _TOP_CROP_BIAS rather than split evenly — see that
+        constant's comment. A left+right crop stays a plain center-crop:
+        content isn't reliably weighted toward one horizontal edge the way
+        headlines are toward the top, so there's no equivalent asymmetry to
+        correct for.
         """
         import base64 as _b64
         import io
@@ -2988,12 +3010,13 @@ Answer with exactly one word: "yes" or "no"."""
             return b64
 
         if target_ratio > gen_ratio:
-            # Target is wider → crop top and bottom
+            # Target is wider → crop top and bottom, biased toward the bottom
             new_h = int(gen_w / target_ratio)
-            top = (gen_h - new_h) // 2
+            removed = gen_h - new_h
+            top = int(removed * ImageContentService._TOP_CROP_BIAS)
             box = (0, top, gen_w, top + new_h)
         else:
-            # Target is taller → crop left and right
+            # Target is taller → crop left and right, centered
             new_w = int(gen_h * target_ratio)
             left = (gen_w - new_w) // 2
             box = (left, 0, left + new_w, gen_h)
@@ -3004,25 +3027,24 @@ Answer with exactly one word: "yes" or "no"."""
         return _b64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
-    def _safe_zone_margins_pct(target_w: int, target_h: int, base_pct: int = 12) -> Dict[str, int]:
+    def _safe_zone_margins_pct(target_w: int, target_h: int, base_pct: int = 20) -> Dict[str, int]:
         """
         How much top/bottom and left/right margin the generation prompt must ask
         for so that headline/CTA text survives _crop_to_ratio's post-generation
-        center-crop, not just the raw canvas the model draws on.
+        crop, not just the raw canvas the model draws on.
 
         GPT-Image-2 only ever generates one of 3 fixed buckets (landscape
         1536x1024, portrait 1024x1536, square 1024x1024 — see the size selection
-        in _call_dalle_api) and _crop_to_ratio then center-crops that bucket down
-        to the platform's real target ratio. For a close match (square targets,
-        roughly-4:3/3:4 targets) the crop is negligible and base_pct is enough,
-        same as before this existed. For a mismatched target — LinkedIn's 1200x628
-        (1.91:1) against the 1.5:1 landscape bucket is the worst case in this app,
-        per _call_dalle_api's own comment — the crop alone removes ~11% off the
-        top AND ~11% off the bottom before the image is even resized, which eats
-        almost the entire flat 12% margin the model was told to respect and
-        reliably clips headline text. Returns the margin the model must be told
-        to leave on the axis that actually gets cropped, so "safe" in the prompt
-        means safe after the crop too, not just on the model's own canvas.
+        in _call_dalle_api) and _crop_to_ratio then crops that bucket down to
+        the platform's real target ratio, biased toward the bottom per
+        _TOP_CROP_BIAS. For a close match (square targets, roughly-4:3/3:4
+        targets) the crop is negligible and base_pct is enough. For a
+        mismatched target — LinkedIn's 1200x628 (1.91:1) against the 1.5:1
+        landscape bucket is the worst case in this app, per _call_dalle_api's
+        own comment — the crop removes a real chunk of height, split
+        unevenly: top and bottom margins are computed separately here so each
+        one reflects what its own edge actually loses, rather than one flat
+        figure that under-protects whichever edge loses more.
         """
         if target_w > target_h:
             gen_w, gen_h = 1536, 1024
@@ -3034,20 +3056,24 @@ Answer with exactly one word: "yes" or "no"."""
         gen_ratio = gen_w / gen_h
         target_ratio = target_w / target_h
 
-        top_bottom_pct = base_pct
+        top_pct = base_pct
+        bottom_pct = base_pct
         left_right_pct = base_pct
 
         if abs(gen_ratio - target_ratio) / target_ratio >= 0.02:
             if target_ratio > gen_ratio:
                 new_h = gen_w / target_ratio
-                cropped_frac_each_side = ((gen_h - new_h) / gen_h) / 2
-                top_bottom_pct = min(40, base_pct + round(cropped_frac_each_side * 100))
+                removed_frac = (gen_h - new_h) / gen_h
+                top_frac = removed_frac * ImageContentService._TOP_CROP_BIAS
+                bottom_frac = removed_frac * (1 - ImageContentService._TOP_CROP_BIAS)
+                top_pct = min(45, base_pct + round(top_frac * 100))
+                bottom_pct = min(45, base_pct + round(bottom_frac * 100))
             else:
                 new_w = gen_h * target_ratio
                 cropped_frac_each_side = ((gen_w - new_w) / gen_w) / 2
-                left_right_pct = min(40, base_pct + round(cropped_frac_each_side * 100))
+                left_right_pct = min(45, base_pct + round(cropped_frac_each_side * 100))
 
-        return {"top_bottom": top_bottom_pct, "left_right": left_right_pct}
+        return {"top": top_pct, "bottom": bottom_pct, "left_right": left_right_pct}
 
     @staticmethod
     async def crop_and_reupload_for_tiktok(image_url: str, user_id: str) -> str:
