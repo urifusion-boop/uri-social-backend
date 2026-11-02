@@ -1611,6 +1611,8 @@ async def facebook_direct_callback(
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
+    if state == "inbox":  # started from the inbox: Connected Accounts finalizes, then returns there
+        base_redirect += "&source=inbox"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -2281,6 +2283,8 @@ async def instagram_direct_callback(
     # the finalizeInstagramDirect handler lives. /settings/social-accounts
     # does not exist as a route so the finalize call would never fire there.
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
+    if state == "inbox":  # started from the inbox: Connected Accounts finalizes, then returns there
+        base_redirect += "&source=inbox"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -2718,11 +2722,14 @@ async def finalize_outstand_direct(
     if not is_personal:
         doc["brand_id"] = brand_id
 
+    # Only an earlier Outstand connection is replaced. A direct Meta connection for the same
+    # platform carries the Page token the inbox needs, which Outstand never provides, so
+    # deleting it here silently stopped DMs and auto-replies for that brand.
     brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
     await db["social_connections"].delete_many({
         "$or": [
             {"id": account_id},
-            {**brand_scope, "platform": network},
+            {**brand_scope, "platform": network, "connected_via": "outstand"},
         ]
     })
     await db["social_connections"].insert_one(doc)
