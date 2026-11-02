@@ -1611,8 +1611,8 @@ async def facebook_direct_callback(
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
-    if state == "inbox":  # started from the inbox: Connected Accounts finalizes, then returns there
-        base_redirect += "&source=inbox"
+    if state == "inbox":  # started from the inbox, which finishes the connection itself
+        base_redirect = f"{web_app_url}/workspace/?tab=messages&view=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -2287,8 +2287,8 @@ async def instagram_direct_callback(
     # the finalizeInstagramDirect handler lives. /settings/social-accounts
     # does not exist as a route so the finalize call would never fire there.
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
-    if state == "inbox":  # started from the inbox: Connected Accounts finalizes, then returns there
-        base_redirect += "&source=inbox"
+    if state == "inbox":  # started from the inbox, which finishes the connection itself
+        base_redirect = f"{web_app_url}/workspace/?tab=messages&view=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
