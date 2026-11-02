@@ -2455,13 +2455,18 @@ async def instagram_direct_finalize(
     is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
 
     update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
-    if not is_personal:
+    update: dict = {"$set": update_fields}
+    if is_personal:
+        update["$unset"] = {"brand_id": ""}
+    else:
         update_fields["brand_id"] = brand_id
 
-    result = await db["social_connections"].update_one(
-        {"ig_user_id": ig_user_id},
-        {"$set": update_fields},
-    )
+    # The callback stores the fresh connection under id=ig_user_id. Matching on
+    # ig_user_id alone could land on an older record of the same account (another
+    # brand, a dead token) and leave the fresh one pending, so the inbox never saw it.
+    result = await db["social_connections"].update_one({"id": ig_user_id}, update)
+    if result.matched_count == 0:
+        result = await db["social_connections"].update_one({"ig_user_id": ig_user_id}, update)
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Instagram connection not found — try reconnecting")
 

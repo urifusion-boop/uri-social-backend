@@ -69,3 +69,29 @@ def test_outstand_session_finalize_replaces_only_outstand_records():
         _run(SocialAccountService.finalize_connection(FakeDb(docs), "u1", "sess", ["p1"]))
     ids = {d["id"] for d in docs}
     assert ids == {"fb_pg1", "acc1"}
+
+
+class _UpdatingCollection(FakeCollection):
+    async def update_one(self, query, update):
+        for d in self.docs:
+            if _matches(d, query):
+                d.update(update.get("$set", {}))
+                for k in update.get("$unset", {}):
+                    d.pop(k, None)
+                return type("R", (), {"matched_count": 1})()
+        return type("R", (), {"matched_count": 0})()
+
+
+def test_instagram_finalize_activates_the_fresh_record_not_an_older_one():
+    from app.agents.social_media_manager.routers.complete_social_manager import instagram_direct_finalize
+
+    docs = [
+        {"id": "old_ig", "ig_user_id": "17", "brand_id": "brnd_agency", "connection_status": "active"},
+        {"id": "17", "ig_user_id": "17", "user_id": None, "connection_status": "pending_user_match"},
+    ]
+    db = FakeDb(docs)
+    db.conns = _UpdatingCollection(docs)
+    _run(instagram_direct_finalize("17", db=db, ctx={"user_id": "u1", "brand_id": None}))
+    fresh = next(d for d in docs if d["id"] == "17")
+    assert fresh["connection_status"] == "active" and fresh["user_id"] == "u1"
+    assert next(d for d in docs if d["id"] == "old_ig")["brand_id"] == "brnd_agency"
