@@ -71,6 +71,15 @@ class TikTokStillProcessingError(TikTokDirectAPIError):
     published, since success can only be shown once TikTok confirms it."""
 
 
+class TikTokReconnectRequired(TikTokDirectAPIError):
+    """The connection's refresh token is dead — TikTok's `invalid_grant`: invalid, expired
+    (180 days), revoked, or already replaced. Nothing we retry fixes it; only the user
+    connecting TikTok again does, so the connection is flagged and the user is told."""
+
+
+RECONNECT_MESSAGE = "Your TikTok connection has expired. Reconnect TikTok in Connected Accounts to keep posting."
+
+
 def _raise_for_error(data: dict, context: str) -> None:
     # TikTok's envelope: {"data": {...}, "error": {"code": "ok", "message": "...", "log_id": "..."}}
     # — a present-but-"ok" error object is success, not a top-level "error" key
@@ -134,9 +143,27 @@ async def _refresh_tokens(refresh_token: str) -> dict:
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise TikTokDirectAPIError(
+            f"token refresh failed: TikTok returned an unreadable response (HTTP {resp.status_code})"
+        ) from None
     if "access_token" not in data:
-        raise TikTokDirectAPIError(f"token refresh failed: {data}")
+        # TikTok's OAuth errors are flat: {"error": "invalid_grant", "error_description": ..., "log_id": ...}.
+        # Only invalid_grant (refresh token invalid, expired, revoked or already replaced) means the
+        # user must connect again. server_error / temporarily_unavailable are TikTok's own trouble and
+        # invalid_client is OUR credentials — none of those may mark a healthy connection as broken.
+        error = data.get("error")
+        error = (error.get("code") if isinstance(error, dict) else error) or ""
+        detail = f"token refresh failed: {error or 'no access token returned'}"
+        if data.get("error_description"):
+            detail += f" — {data['error_description']}"
+        if data.get("log_id"):
+            detail += f" [log_id={data['log_id']}]"
+        if error == "invalid_grant":
+            raise TikTokReconnectRequired(detail, code=error)
+        raise TikTokDirectAPIError(detail, code=error or None)
     return data
 
 
@@ -230,6 +257,47 @@ async def _release_refresh(db, connection_id: str, owner: str) -> None:
         print(f"[TikTokDirect] could not release the refresh claim: {type(e).__name__}")
 
 
+async def _flag_reconnect_required(db, connection_id: str, refresh_token_used: str) -> bool:
+    """Mark the connection as needing the user to reconnect — the same flags the Connected
+    Accounts card already reads. Conditional on the refresh token we failed with, so a connection
+    someone has since reconnected or refreshed is never flagged by a stale failure; returns True
+    only for the call that actually set it, which is what makes the notification go out once."""
+    result = await db[CONNECTIONS].update_one(
+        {"id": connection_id, "refresh_token": refresh_token_used, "needs_reconnect": {"$ne": True}},
+        {"$set": {
+            "needs_reconnect": True,
+            "reconnect_reason": RECONNECT_MESSAGE,
+            "needs_reconnect_since": datetime.now(timezone.utc),
+        }},
+    )
+    return getattr(result, "modified_count", 0) == 1
+
+
+async def _notify_reconnect_required(connection: dict) -> None:
+    """Tell the owner once, through the same in-app notifications the bell reads. Best effort:
+    failing to notify must never hide the real error from the caller."""
+    user_id = (connection or {}).get("user_id")
+    if not user_id:
+        return
+    try:
+        from app.services.NotificationService import notification_service
+        await notification_service._log_notification(
+            user_id=user_id,
+            notification_type="connection_disconnected",
+            channel="email",
+            subject="Reconnect TikTok",
+            status="sent",
+            metadata={
+                "platform": "tiktok",
+                "brand_id": connection.get("brand_id"),
+                "account_name": connection.get("account_name"),
+                "message": RECONNECT_MESSAGE,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[TikTokDirect] could not send the reconnect notification: {type(e).__name__}")
+
+
 async def get_valid_tiktok_access_token(db, connection_doc: dict) -> str:
     """Returns a still-valid access_token, refreshing first if it's expired or close to it.
 
@@ -260,6 +328,10 @@ async def get_valid_tiktok_access_token(db, connection_doc: dict) -> str:
         if _still_valid(current):
             return current["access_token"]
 
+        if current.get("needs_reconnect"):
+            # Already known dead: don't spend a refresh on a token TikTok will refuse again.
+            raise TikTokReconnectRequired(RECONNECT_MESSAGE)
+
         refresh_token = current.get("refresh_token")
         if not refresh_token:
             raise TikTokDirectAPIError("no refresh_token stored on this TikTok connection — reconnect required")
@@ -274,6 +346,12 @@ async def get_valid_tiktok_access_token(db, connection_doc: dict) -> str:
 
         try:
             data = await _refresh_tokens(refresh_token)
+        except TikTokReconnectRequired as dead:
+            await _release_refresh(db, connection_id, owner)
+            print(f"[TikTokDirect] refresh token rejected ({dead.code}); connection needs reconnecting")
+            if await _flag_reconnect_required(db, connection_id, refresh_token):
+                await _notify_reconnect_required(current)
+            raise TikTokReconnectRequired(RECONNECT_MESSAGE, code=dead.code) from None
         except Exception:
             await _release_refresh(db, connection_id, owner)
             raise

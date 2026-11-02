@@ -1832,7 +1832,8 @@ async def tiktok_direct_callback(
         }
         await db["social_connections"].update_one(
             {"id": f"tt_{open_id}"},
-            {"$set": conn_doc},
+            # Connecting again is the fix for a connection flagged as needing a reconnect.
+            {"$set": conn_doc, "$unset": {"needs_reconnect": "", "reconnect_reason": "", "needs_reconnect_since": ""}},
             upsert=True,
         )
         print(f"[TikTokDirectOAuth] ✅ Stored account '{display_name}' (open_id={open_id}) pending user match")
