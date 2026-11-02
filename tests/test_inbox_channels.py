@@ -345,6 +345,6 @@ def test_a_refused_subscription_is_explained_by_its_cause():
     admin = subscription_issue("(#200) User does not have sufficient administrative permission for this action on this page.", "uri.social")
     assert admin["code"] == "not_page_admin" and "Full control" in admin["message"] and "uri.social" in admin["message"]
     perm = subscription_issue("(#200) one of these permissions is needed: pages_messaging.")
-    assert perm["code"] == "missing_permission" and "connect Instagram again" in perm["message"]
+    assert perm["code"] == "missing_permission" and "Click Reconnect here" in perm["message"]
     assert subscription_issue("") == {}
     assert subscription_issue("boom")["code"] == "subscription_failed"
