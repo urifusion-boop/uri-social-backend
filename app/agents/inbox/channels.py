@@ -285,18 +285,17 @@ def subscription_issue(error: str, page_name: str = "") -> dict:
     page = page_name or "this Page"
     if "administrative permission" in low or "two factor" in low:
         return {"code": "not_page_admin", "message": (
-            f"The Facebook login used to connect doesn't have full admin control of {page}, so Meta "
-            "won't deliver its messages. In Meta Business Settings → Accounts → Pages, open the Page, "
-            "give your user Full control (and switch on two-factor authentication if Meta asks), then "
-            "disconnect and connect again in Connected Accounts.")}
+            f"The Facebook account used to connect doesn't have full control of {page}, so Meta "
+            "won't deliver its messages. Ask the Page's owner to open Meta Business Settings → "
+            "Accounts → Pages → the Page, and give your Facebook account Full control (turn on "
+            "two-factor authentication if Meta asks). Then click Reconnect here.")}
     if "pages_messaging" in low or "pages_manage_metadata" in low or "permission" in low:
         return {"code": "missing_permission", "message": (
             f"This connection of {page} was made without the permissions needed to receive messages. "
-            "In Connected Accounts, disconnect and connect Instagram again and leave every permission "
-            "switched on when Meta asks. Facebook alone can't grant them.")}
+            "Click Reconnect here and leave every permission switched on when Meta asks.")}
     return {"code": "subscription_failed", "message": (
-        f"Meta wouldn't start sending {page}'s messages to Uri. Disconnect and connect again in "
-        "Connected Accounts; if it keeps failing, contact support.")} if error else {}
+        f"Meta wouldn't start sending {page}'s messages to Uri. Click Reconnect here; if it keeps "
+        "failing, contact support.")} if error else {}
 
 
 async def granted_scopes(token: str) -> list[str]:
