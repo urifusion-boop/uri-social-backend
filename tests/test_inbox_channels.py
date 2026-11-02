@@ -346,5 +346,6 @@ def test_a_refused_subscription_is_explained_by_its_cause():
     assert admin["code"] == "not_page_admin" and "Full control" in admin["message"] and "uri.social" in admin["message"]
     perm = subscription_issue("(#200) one of these permissions is needed: pages_messaging.")
     assert perm["code"] == "missing_permission" and "Click Reconnect here" in perm["message"]
+    assert subscription_issue("(#210) A page access token is required to request this resource.")["code"] == "not_page_admin"
     assert subscription_issue("") == {}
     assert subscription_issue("boom")["code"] == "subscription_failed"

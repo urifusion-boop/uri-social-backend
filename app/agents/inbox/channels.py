@@ -283,7 +283,9 @@ def subscription_issue(error: str, page_name: str = "") -> dict:
     """What a refused Page subscription means for the owner, and what to do about it."""
     low = (error or "").lower()
     page = page_name or "this Page"
-    if "administrative permission" in low or "two factor" in low:
+    # (#210) on a Page means the login could not get that Page's own token: it has no
+    # role on the Page, the same fix as missing admin control.
+    if "administrative permission" in low or "two factor" in low or "(#210)" in low:
         return {"code": "not_page_admin", "message": (
             f"The Facebook account used to connect doesn't have full control of {page}, so Meta "
             "won't deliver its messages. Ask the Page's owner to open Meta Business Settings → "
