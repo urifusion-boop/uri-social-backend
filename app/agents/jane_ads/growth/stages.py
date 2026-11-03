@@ -6,9 +6,10 @@ URI's own stages, not Meta campaign types:
   explore   find which reasons to buy show promise — a few genuinely different
             concepts, each given enough spend to be judged
   validate  a concept looks promising: test variations of it before betting on it
-  scale     a creative has held its cost over enough results: put money behind it
+  scale     a creative has held its cost over enough results, on several days: put
+            money behind it
 
-Every creative gets one of three verdicts against the business's own target cost —
+Every creative gets a verdict against the business's own target cost — strong,
 promising, underperforming or inconclusive. Inconclusive is a real answer: ₦500
 spent without an order says nothing when an order normally costs ₦2,000, and the
 absence of evidence is never reported as evidence of failure.
@@ -25,6 +26,7 @@ from typing import Optional
 from .. import constants as C
 
 PROMISING = "promising"
+STRONG = "strong"
 UNDERPERFORMING = "underperforming"
 INCONCLUSIVE = "inconclusive"
 
@@ -37,6 +39,8 @@ JUDGE_SPEND_MULTIPLE = 2.5
 UNDERPERFORM_COST_MULTIPLE = 1.5
 MIN_RESULTS_TO_JUDGE = 3
 VALIDATED_RESULTS = 10
+# Repeatable, not a spike: results on at least this many separate days.
+STRONG_MIN_DAYS = 3
 MAX_CONCEPTS = 5
 # Orders only replace conversations as the yardstick once enough leads have a
 # recorded outcome to say something.
@@ -59,8 +63,10 @@ def yardstick(conversations: float, leads: Optional[dict], goal: dict) -> dict:
             "target_ngn": float(goal["target_cpl_ngn"]) if goal.get("target_cpl_ngn") else None}
 
 
-def judge(spend_ngn: float, results: float, target_ngn: Optional[float], metric: str = "conversations") -> dict:
-    """One creative's verdict against the target cost per result."""
+def judge(spend_ngn: float, results: float, target_ngn: Optional[float], metric: str = "conversations",
+          days_with_results: Optional[int] = None) -> dict:
+    """One creative's verdict against the target cost per result. Strong means it has
+    held the target over enough results AND on several separate days."""
     noun = "order" if metric == "orders" else "conversation"
     cost = spend_ngn / results if results else None
     base = {"spend_ngn": round(spend_ngn, 2), "results": results, "metric": metric,
@@ -79,6 +85,10 @@ def judge(spend_ngn: float, results: float, target_ngn: Optional[float], metric:
                 "reason": f"{_ngn(spend_ngn)} spent and no {noun} yet — unsurprising at a "
                           f"{_ngn(target_ngn)} target. It needs about {_ngn(judge_at)} before it can be judged."}
     confidence = "high" if results >= VALIDATED_RESULTS else "medium" if results >= MIN_RESULTS_TO_JUDGE else "low"
+    if cost <= target_ngn and results >= VALIDATED_RESULTS and (days_with_results or 0) >= STRONG_MIN_DAYS:
+        return {**base, "status": STRONG, "confidence": "high",
+                "reason": f"{_ngn(cost)} per {noun} from {results:.0f} across {days_with_results} days, "
+                          f"within the {_ngn(target_ngn)} target — repeatable, not a one-off."}
     if cost <= target_ngn:
         early = "" if results >= MIN_RESULTS_TO_JUDGE else " Early: too few results to rely on yet."
         return {**base, "status": PROMISING, "confidence": confidence,
@@ -94,8 +104,8 @@ def judge(spend_ngn: float, results: float, target_ngn: Optional[float], metric:
 
 def stage(verdicts: list[dict], has_target: bool) -> dict:
     """Where the campaign is in the loop, and the one next step that moves it on."""
+    proven = [v for v in verdicts if v["status"] == STRONG]
     promising = [v for v in verdicts if v["status"] == PROMISING]
-    proven = [v for v in promising if v["results"] >= VALIDATED_RESULTS]
     weak = [v for v in verdicts if v["status"] == UNDERPERFORMING]
     if not has_target:
         return {"stage": EXPLORE, "why": "No target cost is set yet.",
@@ -105,7 +115,7 @@ def stage(verdicts: list[dict], has_target: bool) -> dict:
         n = len(proven)
         return {"stage": SCALE, "proven_ad_ids": [v["ad_id"] for v in proven],
                 "why": f"{n} creative{'s have' if n > 1 else ' has'} held the target over "
-                       f"{VALIDATED_RESULTS}+ results.",
+                       f"{VALIDATED_RESULTS}+ results on {STRONG_MIN_DAYS}+ separate days.",
                 "next": "Raise the budget in steps of about 20% a week while the cost holds, and keep "
                         "testing new variations so there is a replacement when this one tires."}
     if promising:

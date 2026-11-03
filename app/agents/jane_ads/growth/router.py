@@ -244,16 +244,35 @@ async def set_goal(campaign_id: str, payload: dict = Body(...),
 
 
 @router.post("/recommendations/{rec_id}/approve")
-async def approve(rec_id: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+async def approve(rec_id: str, payload: Optional[dict] = Body(None),
+                  db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                   ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """Approve a suggestion as proposed, or with the owner's own figure: a budget
+    suggestion can be approved at a different amount (the original stays on record)."""
     brand = _brand(ctx)
     rec = await db[engine.RECOMMENDATIONS].find_one({"id": rec_id, "brand_id": brand})
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found")
-    if rec["status"] not in ("proposed", "failed"):
+    if rec["status"] not in ("proposed", "failed", "deferred"):
         raise HTTPException(status_code=409, detail=f"Already {rec['status']}")
     if not await _can_change(db, ctx):
         raise HTTPException(status_code=403, detail="Only an admin can approve changes to a campaign.")
+    edited = (payload or {}).get("to_ngn")
+    if edited is not None:
+        if rec["action_type"] != "set_daily_budget":
+            raise HTTPException(status_code=400, detail="Only a budget suggestion can be approved at a different amount.")
+        try:
+            to = float(edited)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Enter a daily budget in naira.")
+        rec["original_parameters"] = dict(rec.get("parameters") or {})
+        rec["parameters"] = {**(rec.get("parameters") or {}), "to_ngn": to}
+        rec["summary"] = f"Set the daily budget to ₦{to:,.0f} (edited from the suggestion)"
+        await db[engine.RECOMMENDATIONS].update_one({"id": rec_id}, {"$set": {
+            "parameters": rec["parameters"], "original_parameters": rec["original_parameters"],
+            "summary": rec["summary"], "edited_by": ctx.get("user_id", "")}})
+        await engine.event(db, brand, rec["campaign_id"], "recommendation_edited", recommendation_id=rec_id,
+                           actor=ctx.get("user_id", ""), before=rec["original_parameters"], after=rec["parameters"])
     record = await _campaign(db, brand, rec["campaign_id"])
     result = await engine.approve(db, _adapter(db, record), record, _clean(rec), ctx.get("user_id", ""))
     if result.get("status") == "refused":
@@ -265,17 +284,21 @@ async def approve(rec_id: str, db: AsyncIOMotorDatabase = Depends(get_db_depende
 async def decide(rec_id: str, payload: dict = Body(...),
                  db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                  ctx: dict = Depends(get_active_brand_context)) -> dict:
-    """Reject a suggestion, or mark one you carried out yourself as done."""
+    """Reject a suggestion, defer it for a few days, or mark one you carried out yourself as done."""
     brand = _brand(ctx)
     rec = await db[engine.RECOMMENDATIONS].find_one({"id": rec_id, "brand_id": brand})
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found")
     decision = payload.get("decision")
-    if decision not in ("rejected", "done"):
-        raise HTTPException(status_code=400, detail="decision must be rejected or done")
+    if decision not in ("rejected", "done", "deferred"):
+        raise HTTPException(status_code=400, detail="decision must be rejected, done or deferred")
     now = datetime.now(timezone.utc)
     update = {"status": decision, "decided_by": ctx.get("user_id", ""), "decided_at": now,
               "note": str(payload.get("note") or "")[:300]}
+    if decision == "deferred":
+        # Comes back as a live suggestion after the wait if the problem is still there.
+        days = max(1, min(int(payload.get("days") or 3), 30))
+        update["deferred_until"] = now + timedelta(days=days)
     if decision == "done":
         # A change made outside URI is still measured: log it so its window is evaluated.
         entry = {"action_id": rec_id, "idempotency_key": rec_id, "brand_id": brand,
@@ -444,6 +467,8 @@ async def set_lead_stage(conversation_id: str, payload: dict = Body(...),
         {"_id": ObjectId(conversation_id), "workspace_id": _brand(ctx)}, {"$set": update})
     if not res.matched_count:
         raise HTTPException(status_code=404, detail="Not found")
+    await engine.event(db, _brand(ctx), "", "business_outcome_manually_recorded", actor=ctx.get("user_id", ""),
+                       conversation_id=conversation_id, stage=stage, value_ngn=update.get("lead_value"))
     return {"status": "ok", "stage": stage}
 
 

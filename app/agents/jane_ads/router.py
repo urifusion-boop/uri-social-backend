@@ -3922,6 +3922,9 @@ async def meta_launch_from_message(
     a REAL campaign to Meta (created PAUSED, zero spend) → returns everything. For
     reviewing a plan before committing to Meta, use /meta/plan-from-message +
     /meta/plan/{id}/launch instead — this endpoint plans and launches in one call."""
+    from . import launch_governance as gov
+
+    await gov.require_launch_role(db, brand_ctx)
     built = await _build_campaign_plan(body, brand_ctx, db)
     if isinstance(built, dict):
         return built["early_return"]
@@ -3935,7 +3938,10 @@ async def meta_launch_from_message(
         raise HTTPException(status_code=400,
                              detail=_wallet_shortfall_message(balance, built.req.budget_ngn, built.fee_bypassed, own))
 
-    return await _do_launch(built, body.message, body.business_name, brand_ctx, db)
+    result = await _do_launch(built, body.message, body.business_name, brand_ctx, db)
+    await gov.audit(db, brand_ctx.get("brand_id"), (result.get("launch") or {}).get("campaign_id", ""),
+                    "campaign_published", brand_ctx.get("user_id") or "", status="paused", via="launch_from_message")
+    return result
 
 
 @router.post("/meta/plan-from-message")
@@ -4003,9 +4009,14 @@ async def meta_plan_from_message(
         # to the launch step below, which reloads this doc rather than built.
         "fee_bypassed": built.fee_bypassed,
         "status": "pending",
+        "state_history": [{"state": "review", "at": now, "actor": brand_ctx.get("user_id") or ""}],
         "created_at": now,
         "expires_at": now + timedelta(days=7),
     })
+    from . import launch_governance as gov
+    await gov.audit(db, brand_ctx.get("brand_id"), "", "strategy_generated", brand_ctx.get("user_id") or "",
+                    plan_id=plan_id, objective=built.plan.objective.value if built.plan.objective else "",
+                    plan_variant=built.selected_plan_variant or "")
 
     return {
         "stage": "planned",
@@ -4086,9 +4097,15 @@ async def meta_plan_update_creative(
     return {"plan_id": plan_id, "creative": plan.creative.model_dump(mode="json")}
 
 
+class PlanLaunchBody(BaseModel):
+    # The client confirmed they deliver to places outside their saved service area.
+    allow_out_of_area: bool = False
+
+
 @router.post("/meta/plan/{plan_id}/launch")
 async def meta_launch_plan(
     plan_id: str,
+    body: Optional[PlanLaunchBody] = Body(None),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -4098,10 +4115,16 @@ async def meta_launch_plan(
     from datetime import datetime, timezone
     from .policy import Severity, review_ad_creative
 
+    from . import launch_governance as gov
+
     brand_id = brand_ctx.get("brand_id")
+    actor = brand_ctx.get("user_id") or ""
+    await gov.require_launch_role(db, brand_ctx)
     doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
     if not doc or doc.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Plan not found")
+    if doc["status"] == "launching":
+        raise HTTPException(status_code=409, detail="This plan is already being launched — give it a moment, then refresh.")
     if doc["status"] != "pending":
         raise HTTPException(status_code=409, detail=f"This plan is already {doc['status']} — describe a new campaign to Jane to plan another.")
     expires_at = doc["expires_at"]
@@ -4113,6 +4136,14 @@ async def meta_launch_plan(
 
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
+
+    # The brand's standing brief: service area, exclusions and format constraints
+    # are held at launch, not just shown on the plan.
+    from . import brief as ads_brief
+    checks = ads_brief.check_plan(doc["plan"], doc["req"], await ads_brief.load(db, brand_id))
+    blocks = ads_brief.unresolved_blocks(checks, bool(body and body.allow_out_of_area))
+    if blocks:
+        raise HTTPException(status_code=400, detail=blocks[0]["message"])
 
     # Re-resolve the ads connection AND the destination at commit time rather than
     # trusting the page_id/number/link frozen into the plan when it was first built —
@@ -4225,7 +4256,21 @@ async def meta_launch_plan(
         budget_estimate=doc.get("budget_estimate"), summary=doc.get("summary"),
         thread_id=doc.get("thread_id", ""), fee_bypassed=fee_bypassed,
     )
-    result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+    # Claimed atomically before Meta is called: a double-click or a retried request
+    # finds the plan already launching instead of creating a second campaign.
+    if not await gov.claim(db, plan_id, actor):
+        raise HTTPException(status_code=409, detail="This plan is already being launched — give it a moment, then refresh.")
+    config = await gov.record_approval(db, doc, actor, _total_due_ngn(req.budget_ngn, fee_bypassed, own_billing))
+    await gov.audit(db, brand_id, "", "campaign_submitted", actor, plan_id=plan_id, config_hash=config)
+    try:
+        result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+    except Exception as e:
+        # Meta has no campaign (_do_launch rolls a partial one back before raising),
+        # so the plan goes back to pending to be fixed and launched again.
+        why = e.detail if isinstance(e, HTTPException) else str(e)
+        await gov.release(db, plan_id, actor, str(why))
+        await gov.audit(db, brand_id, "", "campaign_launch_failed", actor, plan_id=plan_id, error=str(why)[:300])
+        raise
 
     # Take the money now the campaign really exists on Meta. Charged AFTER the launch,
     # never before: a launch that fails raises out of _do_launch above, and a client
@@ -4286,12 +4331,69 @@ async def meta_launch_plan(
         # the honest thing is to say so rather than pretend the launch failed.
         print(f"[launch] campaign {campaign_id} created but wallet charge failed: {e}", flush=True)
         result["wallet"] = {"charged_ngn": 0.0, "charge_failed": True}
+    except Exception as e:
+        # The campaign exists on Meta, so the plan must never return to pending — a
+        # retry would create a second one. Surface the bookkeeping failure instead.
+        print(f"[launch] campaign {campaign_id} created but post-launch bookkeeping failed: {e}", flush=True)
+        result["wallet"] = {"charged_ngn": 0.0, "charge_failed": True}
 
-    await db["jane_ads_pending_plans"].update_one(
-        {"plan_id": plan_id},
-        {"$set": {"status": "launched", "campaign_id": campaign_id}},
-    )
+    await gov.mark_launched(db, plan_id, actor, campaign_id, config_hash=config)
+    await gov.audit(db, brand_id, campaign_id, "campaign_published", actor, plan_id=plan_id,
+                    status="paused", config_hash=config)
     return result
+
+
+@router.get("/brief")
+async def get_ads_brief(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The brand's standing ads brief — saved once, applied to every plan."""
+    from . import brief as ads_brief
+    return {"brief": await ads_brief.load(db, brand_ctx.get("brand_id")),
+            "constraint_options": ads_brief.CONSTRAINTS, "tracking_options": list(ads_brief.TRACKING)}
+
+
+@router.put("/brief")
+async def put_ads_brief(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import brief as ads_brief
+    from . import launch_governance as gov
+    saved = await ads_brief.save(db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id") or "")
+    await gov.audit(db, brand_ctx.get("brand_id"), "", "brief_completed", brand_ctx.get("user_id") or "",
+                    fields=sorted(ads_brief.normalise(payload)))
+    return {"brief": saved}
+
+
+@router.get("/meta/plan/{plan_id}/checks")
+async def plan_checks(
+    plan_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """What this plan launches as, what it costs, and anything in it that conflicts with
+    the brand's brief — before the client approves it."""
+    from . import brief as ads_brief
+    from . import launch_governance as gov
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    req = CampaignRequest.model_validate(doc["req"])
+    own = _google_own_billing(CampaignPlan.model_validate(doc["plan"]))
+    due = _total_due_ngn(req.budget_ngn, bool(doc.get("fee_bypassed")), own)
+    # Audience plans picked together each launch as their own campaign with the full budget.
+    siblings = 1
+    if doc.get("variant_group_id"):
+        siblings = await db["jane_ads_pending_plans"].count_documents(
+            {"brand_id": doc.get("brand_id"), "variant_group_id": doc["variant_group_id"],
+             "status": {"$in": ["pending", "launching", "launched"]}})
+    checks = ads_brief.check_plan(doc["plan"], doc["req"], await ads_brief.load(db, brand_ctx.get("brand_id")),
+                                  max(1, siblings))
+    return {**checks, "costs": ads_brief.costs(doc["req"], due),
+            "can_launch": await gov.can_launch(db, brand_ctx)}
 
 
 # ── Review step — the plan as fields the client can edit before it launches ───
@@ -4406,9 +4508,13 @@ async def meta_plan_edit_fields(
                 "client_edits": [*(doc.get("client_edits") or []), {
                     "fields": applied,
                     "at": datetime.now(timezone.utc),
+                    "by": brand_ctx.get("user_id") or "",
                 }],
             }},
         )
+        from . import launch_governance as gov
+        await gov.audit(db, brand_id, "", "strategy_edited", brand_ctx.get("user_id") or "",
+                        plan_id=plan_id, fields=applied)
         # The record of what Jane decided must also carry what the CLIENT decided —
         # otherwise the intelligence layer learns from a plan nobody actually ran.
         try:
@@ -5671,8 +5777,15 @@ async def set_meta_campaign_status(
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+    from . import launch_governance as gov
 
     brand_id = brand_ctx.get("brand_id")
+    # Turning a campaign on starts real spend: an admin's decision. Anyone on the
+    # brand may still pause one — stopping spend is never the risky direction.
+    if body.active:
+        await gov.require_launch_role(db, brand_ctx, "turn a campaign on")
+    await gov.audit(db, brand_id, campaign_id, "campaign_resume_requested" if body.active else "campaign_pause_requested",
+                    brand_ctx.get("user_id") or "")
     from . import google_flow
     google_record = await google_flow.find_record(db, campaign_id, brand_id)
     if google_record:
@@ -5754,6 +5867,10 @@ async def delete_meta_campaign(
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
+    from . import launch_governance as gov
+
+    await gov.require_launch_role(db, brand_ctx, "delete a campaign")
+    await gov.audit(db, brand_ctx.get("brand_id"), campaign_id, "campaign_delete_requested", brand_ctx.get("user_id") or "")
     brand_id = brand_ctx.get("brand_id")
     from . import google_flow
     google_record = await google_flow.find_record(db, campaign_id, brand_id)
