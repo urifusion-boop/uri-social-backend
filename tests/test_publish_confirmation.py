@@ -330,6 +330,29 @@ class TestSubmitHelpers:
         assert _quiet_notifications == [(False, msg)]
 
 
+class _MotorLikeDB(_DB):
+    """A real Motor database raises if it is used as a boolean ("Database objects do not implement
+    truth value testing"); a plain dict never does, which is how this went unnoticed."""
+
+    def __bool__(self):
+        raise NotImplementedError("Database objects do not implement truth value testing or bool().")
+
+
+class TestARealDatabaseIsNeverTestedForTruth:
+    def test_an_unclassified_failure_still_counts_against_the_connection_and_notifies(self, _quiet_notifications):
+        db, draft = _setup()
+        db = _MotorLikeDB(db)
+        msg = _run(pc.failed_on_submit(db, draft, {"outstand_account_id": "acc1"}, "something nobody has seen before"))
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 1
+        assert _quiet_notifications == [(False, msg)]  # the owner is told; bookkeeping did not abort first
+
+    def test_a_successful_publish_resets_the_counter(self):
+        db, draft = _setup()
+        db["social_connections"].docs[0]["consecutive_publish_failures"] = 2
+        _run(pc._record_publish_success(_MotorLikeDB(db), draft))
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 0
+
+
 class TestFailureAlertIsAlwaysOn:
     def test_post_failed_reaches_the_owner_whatever_they_picked(self):
         assert bn.channels_for("post_failed", bn.preferences({})) == ["email"]

@@ -196,7 +196,8 @@ async def _should_flag_connection(db, draft: Dict[str, Any], category: str, mess
     "this connection is actually broken". Known and content-issue categories
     are decided entirely by explain() and never reach this function with
     anything to do."""
-    if category != "unknown" or not db:
+    # `is None`, not `not db`: a Motor database refuses to be used as a boolean.
+    if category != "unknown" or db is None:
         return False
     try:
         updated = await db["social_connections"].find_one_and_update(
@@ -216,7 +217,7 @@ async def _record_publish_success(db, draft: Dict[str, Any]) -> None:
     """Resets the unrecognized-failure counter on an actual successful
     publish, so a connection that struggled once and recovered doesn't carry
     a stale count toward a future, unrelated run of failures."""
-    if not db:
+    if db is None:
         return
     try:
         await db["social_connections"].update_many(_reconnect_match(draft), {"$set": {"consecutive_publish_failures": 0}})
