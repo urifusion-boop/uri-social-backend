@@ -186,7 +186,8 @@ class ApprovalWorkflowService:
                         "platform": draft["platform"],
                         "post_type": draft.get("post_type", "feed"),
                         "status": update_data["status"],
-                        "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None
+                        "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None,
+                        "brand_id": draft.get("brand_id"),
                     })
 
                 except Exception as e:
@@ -218,7 +219,10 @@ class ApprovalWorkflowService:
                         # Facebook carousels: Outstand with scheduled_at + multiple media_urls
                         # publishes each slide as a separate post; cron handles them correctly
                         # by calling _publish_to_platform at publish time with scheduled_at=None.
-                        if _d["platform"] == "instagram" or (
+                        from app.agents.social_media_manager.services import publish_dispatch as _pd_sched
+                        _fb_direct = _d["platform"] == "facebook" and bool(
+                            await _pd_sched.preferred_direct_facebook(db, user_id, _d.get("brand_id")))
+                        if _d["platform"] == "instagram" or _fb_direct or (
                             _d["platform"] == "facebook" and _d.get("post_type", "feed") == "carousel"
                         ):
                             print(f"📸 {_d['platform']} carousel/direct — cron will publish at scheduled_date ({_schedule_dt.isoformat()})")
@@ -863,13 +867,17 @@ class ApprovalWorkflowService:
                             })
                             print(f"🔍 LinkedIn fallback lookup | found={bool(connection)} connected_via={connection.get('connected_via') if connection else 'N/A'} has_token={bool(connection.get('linkedin_access_token')) if connection else False} has_urn={bool(connection.get('person_urn') or connection.get('active_author_urn')) if connection else False}")
                     else:
-                        connections_cursor = db["social_connections"].find({
-                            "user_id": draft_user_id,
-                            "platform": _platform_key,
-                            "connection_status": "active",
-                        }).sort("created_at", -1).limit(1)
-                        conn_list = await connections_cursor.to_list(length=1)
-                        connection = conn_list[0] if conn_list else None
+                        connection = None
+                        if _platform_key == "facebook":
+                            connection = await _pd.preferred_direct_facebook(db, draft_user_id, draft.get("brand_id"))
+                        if not connection:
+                            connections_cursor = db["social_connections"].find({
+                                "user_id": draft_user_id,
+                                "platform": _platform_key,
+                                "connection_status": "active",
+                            }).sort("created_at", -1).limit(1)
+                            conn_list = await connections_cursor.to_list(length=1)
+                            connection = conn_list[0] if conn_list else None
 
                     # Outstand live-lookup fallback — skip platforms that always use direct APIs
                     if not connection and draft["platform"] not in ("instagram", "linkedin"):
@@ -1091,6 +1099,12 @@ class ApprovalWorkflowService:
                     })
                     if connection:
                         print(f"🔗 Preferring direct TikTok connection open_id={connection.get('open_id')}")
+
+                # Facebook: a Page connected directly with Meta wins over a newer Outstand connection.
+                if platform == "facebook":
+                    connection = await _pd.preferred_direct_facebook(db, user_id, draft.get("brand_id"))
+                    if connection:
+                        print(f"🔗 Preferring direct Facebook connection page_id={connection.get('page_id')}")
 
                 if not connection:
                     connections_cursor = db["social_connections"].find({
@@ -1795,7 +1809,11 @@ class ApprovalWorkflowService:
         # ── Facebook direct OAuth — always route through Outstand ────────────────
         # Direct FB API post IDs (pageId_postId format) break the Outstand polling
         # loop and cause 8x duplicate publishes. Always use Outstand for Facebook.
-        if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
+        # Exception: a direct connection that holds the Page and its token posts straight to the Page
+        # (publish_dispatch.posts_directly) and falls through to the direct block further down.
+        from app.agents.social_media_manager.services import publish_dispatch as _pd_route
+        if (platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth"
+                and not _pd_route.posts_directly(platform, connection)):
             if db is not None:
                 _fb_user_id = connection.get("user_id")
                 _fb_page_id = str(connection.get("page_id") or "")

@@ -159,3 +159,44 @@ def not_waiting(now: datetime) -> Dict[str, Any]:
     """Mongo condition: this draft is not waiting for a later time (no `next_attempt_at`, or it has passed)."""
     return {"$or": [{"next_attempt_at": {"$exists": False}}, {"next_attempt_at": None},
                     {"next_attempt_at": {"$lte": now}}]}
+
+
+# ── Which Facebook connection a post goes through ─────────────────────────────
+
+def facebook_direct_enabled() -> bool:
+    """A Facebook Page connected directly with Meta posts straight to the Page (Graph API). On by
+    default; FACEBOOK_POST_DIRECT=false restores the older behaviour of sending those posts through
+    Outstand when it has the Page, without a deploy."""
+    return os.getenv("FACEBOOK_POST_DIRECT", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def posts_directly(platform: str, connection: Optional[Dict[str, Any]]) -> bool:
+    """True when this post should go to Facebook itself: a direct Meta connection that holds the
+    Page and its token. The direct result is a plain Graph post id (pageId_postId) with no `via`, so
+    nothing polls Outstand for it. That polling was what once produced duplicate posts."""
+    c = connection or {}
+    return bool(
+        facebook_direct_enabled()
+        and (platform or "").lower() == "facebook"
+        and c.get("connected_via") == "facebook_direct_oauth"
+        and c.get("page_id")
+        and c.get("page_access_token")
+    )
+
+
+async def preferred_direct_facebook(db, user_id: str, brand_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """The user's direct Facebook connection, to use ahead of the newest-connection pick (which would
+    otherwise choose a newer Outstand one). A draft that belongs to a brand only ever uses that brand's
+    Page, or a connection not tied to any brand; it never borrows another brand's Page."""
+    if not facebook_direct_enabled() or db is None or not user_id:
+        return None
+    base = {"user_id": user_id, "platform": "facebook", "connected_via": "facebook_direct_oauth",
+            "connection_status": "active", "page_id": {"$exists": True, "$ne": None},
+            "page_access_token": {"$exists": True, "$ne": None}}
+    if brand_id:
+        found = await db["social_connections"].find_one({**base, "brand_id": brand_id})
+        if found:
+            return found
+        return await db["social_connections"].find_one(
+            {**base, "$or": [{"brand_id": {"$exists": False}}, {"brand_id": None}]})
+    return await db["social_connections"].find_one(base)
