@@ -82,3 +82,7 @@ PUBLISH_JOB_WAIT_MAX_S=600
 PUBLISH_IMMEDIATE_WAIT_MAX_S=20
 # Longest one background job sleeps retrying a temporary rate limit before giving up, seconds:
 PUBLISH_INLINE_RETRY_BUDGET_S=60
+
+# Facebook Pages connected directly with Meta post straight to the Page (Graph API). Set to false to send
+# them through Outstand again when Outstand has the Page (publish_dispatch.facebook_direct_enabled):
+FACEBOOK_POST_DIRECT=true
