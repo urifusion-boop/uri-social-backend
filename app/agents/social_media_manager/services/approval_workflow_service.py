@@ -627,6 +627,7 @@ class ApprovalWorkflowService:
 
             current_time = datetime.utcnow()
             print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()} env={_app_env} status={_sched_status}")
+            from app.agents.social_media_manager.services import publish_dispatch as _pd
 
             # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago).
             # Do NOT clear platform_post_id here — if a post_id was already stored (step 1
@@ -647,6 +648,9 @@ class ApprovalWorkflowService:
                     "status": _sched_status,
                     "scheduled_date": {"$lte": earliest_allowed},
                     "platform_post_id": None,
+                    # A draft deliberately waiting for a rate limit to clear is not overdue until
+                    # that wait itself is more than a day old.
+                    **_pd.not_waiting(earliest_allowed),
                 },
                 {"$set": {"status": "publish_failed", "error_message": "Scheduled time expired (>24h overdue). Re-schedule to publish.", "updated_at": current_time}},
             )
@@ -676,6 +680,8 @@ class ApprovalWorkflowService:
                     "platform_post_id": None,
                     "scheduled_date": {"$lte": current_time, "$type": "date"},
                     "publish_retry_count": {"$not": {"$gte": 3}},
+                    # A daily / app-wide cap is not retried: it only burns the same limit again.
+                    "publish_error_kind": {"$nin": list(_pd.CAP_KINDS)},
                 },
                 {
                     "$set": {"status": _sched_status, "updated_at": current_time},
@@ -688,9 +694,11 @@ class ApprovalWorkflowService:
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
                     # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
-                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False}},
+                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False},
+                     **_pd.not_waiting(current_time)},
                     # Drafts due for publishing with a null platform_post_id
-                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": None},
+                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": None,
+                     **_pd.not_waiting(current_time)},
                     # Outstand-scheduled drafts: poll for published status
                     {"status": _sched_status, "platform_post_id": {"$exists": True, "$ne": None}},
                     # Recover publish_failed drafts that Outstand may have published
@@ -914,13 +922,27 @@ class ApprovalWorkflowService:
                         continue
 
                     print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} connected_via={connection.get('connected_via')} user_id={draft_user_id}")
-                    publish_result = await ApprovalWorkflowService._publish_to_platform(
-                        platform=draft["platform"],
-                        draft=draft,
-                        connection=connection,
-                        scheduled_datetime=None,  # We publish immediately when the time arrives
-                        db=db,
-                    )
+                    async def _send():
+                        return await ApprovalWorkflowService._publish_to_platform(
+                            platform=draft["platform"],
+                            draft=draft,
+                            connection=connection,
+                            scheduled_datetime=None,  # We publish immediately when the time arrives
+                            db=db,
+                        )
+
+                    # One post at a time per account, spaced out — and never wait inside the tick
+                    # (it is bounded to 300s): if the account is busy or rate limited, put the draft
+                    # back with the time to try again and move on to the next one.
+                    sent = await _pd.dispatch(db, draft["platform"], connection, _send, wait_max_s=0.0)
+                    if sent.deferred:
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"], "status": "publishing"},
+                            {"$set": _pd.deferral_fields(draft, sent.resume_at, sent.info, sent.message)},
+                        )
+                        print(f"⏳ Deferred scheduled draft {draft.get('id')} ({draft.get('platform')}): {sent.message}")
+                        continue
+                    publish_result, limit_info = sent.result, sent.info
                     if publish_result is None:
                         publish_result = {"success": False, "error": f"_publish_to_platform returned None for platform={draft['platform']} connected_via={connection.get('connected_via')} — unhandled publish path"}
                     print(f"📊 Scheduled publish result | draft_id={draft['id']}: {publish_result}")
@@ -934,7 +956,7 @@ class ApprovalWorkflowService:
                     if publish_result.get("success") and _pc.needs_confirmation(publish_result):
                         # Accepted, not yet live: "Publishing…" until the network answers.
                         await db["content_drafts"].update_one(
-                            {"id": draft["id"]}, {"$set": _pc.awaiting_fields(publish_result)},
+                            {"id": draft["id"]}, {"$set": _pc.awaiting_fields(publish_result), "$unset": _pd.CLEAR_WAIT},
                         )
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                         print(f"⏳ Outstand accepted scheduled post | draft={draft.get('id')} → confirming")
@@ -960,7 +982,8 @@ class ApprovalWorkflowService:
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
                                 "error_message": None,
-                            }},
+                            },
+                             "$unset": _pd.CLEAR_WAIT},
                         )
                         print(f"💾 Status→published update | draft={draft.get('id')} matched={update_res.matched_count} modified={update_res.modified_count}")
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
@@ -979,7 +1002,7 @@ class ApprovalWorkflowService:
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
                     else:
-                        _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "")
+                        _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "", limit_info)
                         await db["content_drafts"].update_one(
                             {"id": draft["id"]},
                             {"$set": {
@@ -987,6 +1010,7 @@ class ApprovalWorkflowService:
                                 "error_message": _msg,
                                 "network_error": (publish_result.get("error") or "")[:1000] or None,
                                 "updated_at": datetime.utcnow(),
+                                **_pd.cap_fields(limit_info),
                             }},
                         )
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
@@ -1039,6 +1063,8 @@ class ApprovalWorkflowService:
         via Outstand's native scheduledAt support instead of publishing immediately.
         """
         results = {}
+        from app.agents.social_media_manager.services import publish_dispatch as _pd
+        from app.agents.social_media_manager.services import rate_limit as _rl
 
         for draft_id in draft_ids:
             try:
@@ -1134,13 +1160,37 @@ class ApprovalWorkflowService:
                     continue
 
                 print(f"🔗 Using connection: connected_via={connection.get('connected_via')} outstand_account_id={connection.get('outstand_account_id')}")
-                publish_result = await ApprovalWorkflowService._publish_to_platform(
-                    platform=platform,
-                    draft=draft,
-                    connection=connection,
-                    scheduled_datetime=scheduled_datetime,
-                    db=db,
-                )
+
+                async def _send():
+                    return await ApprovalWorkflowService._publish_to_platform(
+                        platform=platform,
+                        draft=draft,
+                        connection=connection,
+                        scheduled_datetime=scheduled_datetime,
+                        db=db,
+                    )
+
+                limit_info = None
+                if scheduled_datetime is not None:
+                    # Handing Outstand a post with a future send time is a submission, not a publish:
+                    # the real send is gated when the scheduler dispatches it.
+                    publish_result = await _send()
+                else:
+                    # One post at a time per account, spaced out. If the account is busy or rate
+                    # limited, wait only a few seconds, then answer "queued" and let the scheduler
+                    # post it — not a failure, and not counted as one.
+                    sent = await _pd.dispatch(db, platform, connection, _send,
+                                              wait_max_s=_rl.get_settings().immediate_wait_max_s)
+                    if sent.deferred:
+                        await db["content_drafts"].update_one(
+                            {"id": draft_id},
+                            {"$set": _pd.deferral_fields(draft, sent.resume_at, sent.info, sent.message),
+                             "$unset": {"last_dispatch_warning": ""}},
+                        )
+                        print(f"⏳ Deferred draft_id={draft_id}: {sent.message}")
+                        results[draft_id] = _pd.queued_result(sent)
+                        continue
+                    publish_result, limit_info = sent.result, sent.info
                 print(f"📊 Publish result for draft_id={draft_id}: {publish_result}")
 
                 conn_filter = (
@@ -1155,7 +1205,7 @@ class ApprovalWorkflowService:
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {**_pc.awaiting_fields(publish_result), "scheduled_date": None},
-                         "$unset": {"last_dispatch_warning": ""}},
+                         "$unset": {"last_dispatch_warning": "", **_pd.CLEAR_WAIT}},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                     publish_result["status"] = _pc.CONFIRMING
@@ -1172,7 +1222,7 @@ class ApprovalWorkflowService:
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
                             },
-                            "$unset": {"last_dispatch_warning": ""},
+                            "$unset": {"last_dispatch_warning": "", **_pd.CLEAR_WAIT},
                         },
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
@@ -1211,7 +1261,7 @@ class ApprovalWorkflowService:
                         }},
                     )
                 else:
-                    _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "")
+                    _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "", limit_info)
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
@@ -1219,6 +1269,7 @@ class ApprovalWorkflowService:
                             "error_message": _msg,
                             "network_error": (publish_result.get("error") or "")[:1000] or None,
                             "updated_at": datetime.utcnow(),
+                            **_pd.cap_fields(limit_info),
                         }},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
@@ -1231,6 +1282,20 @@ class ApprovalWorkflowService:
                 results[draft_id] = {"success": False, "error": str(e)}
 
         return results
+
+    @staticmethod
+    def _facebook_result(success: bool, post_id, response) -> Dict[str, Any]:
+        """The result of a direct Facebook feed/carousel publish. On failure it now carries what Meta
+        said (`error`) and, for a throttle, the typed `rate_limit` — before, a refused post came back
+        with no error at all, so a Facebook rate limit (or an expired token) was invisible."""
+        result: Dict[str, Any] = {"success": success, "post_id": post_id, "raw_response": response}
+        if not success and isinstance(response, dict):
+            meta = response.get("meta_error") or {}
+            if meta.get("message"):
+                result["error"] = f"Facebook publish failed: {meta['message']}"
+            if response.get("rate_limit") is not None:
+                result["rate_limit"] = response["rate_limit"]
+        return result
 
     @staticmethod
     async def _upload_base64_to_imgbb(data_url: str) -> Optional[str]:
@@ -1812,7 +1877,12 @@ class ApprovalWorkflowService:
                 return {"success": True, "post_id": publish_id, "raw_response": {"publish_id": publish_id, "status": status}}
             except TikTokDirectAPIError as e:
                 print(f"❌ TikTok direct publish failed: {e}")
-                return {"success": False, "error": f"TikTok direct publish failed: {str(e)}"}
+                failed = {"success": False, "error": f"TikTok direct publish failed: {str(e)}"}
+                # A rate limit / cap is carried as typed info so the caller can defer (temporary) or
+                # explain (cap) rather than treat it as a plain failure.
+                if getattr(e, "rate_limit", None) is not None:
+                    failed["rate_limit"] = e.rate_limit
+                return failed
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
@@ -2264,7 +2334,7 @@ class ApprovalWorkflowService:
                     resp_data = response.get("responseData") or {}
                     post_id = resp_data.get("id") or resp_data.get("post_id")
                     success = response.get("status", False) and post_id is not None
-                return {"success": success, "post_id": post_id, "raw_response": response}
+                return ApprovalWorkflowService._facebook_result(success, post_id, response)
 
             # ── Facebook story ─────────────────────────────────────────────────
             elif post_type == "story":
@@ -2352,7 +2422,7 @@ class ApprovalWorkflowService:
                     post_id = resp_data.get("id") or resp_data.get("post_id")
                     success = response.get("status", False) and post_id is not None
 
-                return {"success": success, "post_id": post_id, "raw_response": response}
+                return ApprovalWorkflowService._facebook_result(success, post_id, response)
 
         return {"success": False, "error": f"Platform '{platform}' publishing not implemented yet"}
 
