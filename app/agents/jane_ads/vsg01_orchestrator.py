@@ -871,6 +871,19 @@ async def _build_problem_solution(business_name: str, category: str, description
 
 # ── Shared: extract a REAL quote, never compose one ───────────────────────
 
+def _normalise_for_match(text: str) -> str:
+    import re
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    return re.sub(r"\s+", " ", re.sub(r"[\"'.,!?;:()\-–—]", " ", text.lower())).strip()
+
+
+def _appears_in(fragment: str, source: str) -> bool:
+    """Whether `fragment` is in `source` word for word, ignoring case, quote marks
+    and punctuation. An empty fragment never counts."""
+    f = _normalise_for_match(fragment)
+    return bool(f) and f in _normalise_for_match(source)
+
+
 async def _extract_real_quote(description: str) -> Optional[dict]:
     """Used by Review Card and Testimonial+Offer — both require a genuine
     customer quote (§2.1/§2.2). Only ever extracts what the caller's own
@@ -891,6 +904,13 @@ async def _extract_real_quote(description: str) -> Optional[dict]:
     )
     d = await _call_content_model(prompt)
     if not d or not d.get("quote"):
+        return None
+    # The model is asked for a verbatim quote but nothing made it one: a paraphrase
+    # or an invented line presented as a customer's words is a fabricated
+    # testimonial (Ads PRD CR-07). Both the words and who said them must appear in
+    # the business's own text, or the format is not used.
+    if not _appears_in(str(d["quote"]), description) or \
+            not _appears_in(str(d.get("attribution") or ""), description):
         return None
     star = d.get("star_rating")
     star = int(star) if isinstance(star, (int, float)) and 1 <= int(star) <= 5 else None
@@ -1001,7 +1021,7 @@ async def _build_review_card(business_name: str, category: str, description: str
         return None
     try:
         document = review_card.build_document(
-            photo_url, real["quote"], real["attribution"] or "A happy customer",
+            photo_url, real["quote"], real["attribution"],
             star_rating=real["star_rating"], canvas_size=_CANVAS_SIZE, tokens=tokens,
             brand_logo_url=brand_logo_url,
         )
@@ -1127,7 +1147,7 @@ async def _build_testimonial_offer(business_name: str, category: str, descriptio
         return None
     try:
         document = testimonial_offer.build_document(
-            photo_url, real["quote"], real["attribution"] or "A happy customer",
+            photo_url, real["quote"], real["attribution"],
             offer["offer_text"], permission_on_file=True,
             price_or_terms=offer["price_or_terms"], canvas_size=_CANVAS_SIZE, tokens=tokens,
             brand_logo_url=brand_logo_url,
