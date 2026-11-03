@@ -20,6 +20,12 @@ def test_on_target_is_promising_and_well_over_is_underperforming():
     assert near["status"] == st.INCONCLUSIVE and "near" in near["reason"]
 
 
+def test_strong_needs_enough_results_on_separate_days():
+    assert st.judge(6000, 12, 1000, days_with_results=3)["status"] == st.STRONG
+    assert st.judge(6000, 12, 1000, days_with_results=1)["status"] == st.PROMISING
+    assert st.judge(6000, 6, 1000, days_with_results=5)["status"] == st.PROMISING
+
+
 def test_without_a_target_nothing_is_called_a_loser():
     v = st.judge(50000, 0, None)
     assert v["status"] == st.INCONCLUSIVE and "No target" in v["reason"]
@@ -47,12 +53,13 @@ def _v(ad, status, results, cost=None, spend_to_judge=None, concept=None):
 
 
 def test_stage_moves_explore_to_validate_to_scale():
-    assert st.stage([_v("a", st.PROMISING, 12, 400)], True)["stage"] == st.SCALE
+    assert st.stage([_v("a", st.STRONG, 12, 400)], True)["stage"] == st.SCALE
+    assert st.stage([_v("a", st.PROMISING, 12, 400)], True)["stage"] == st.VALIDATE
     v = st.stage([_v("a", st.PROMISING, 4, 400, concept="appetite appeal"), _v("b", st.INCONCLUSIVE, 1)], True)
     assert v["stage"] == st.VALIDATE and "appetite appeal" in v["next"]
     e = st.stage([_v("a", st.INCONCLUSIVE, 0, spend_to_judge=3000), _v("b", st.INCONCLUSIVE, 0, spend_to_judge=1000)], True)
     assert e["stage"] == st.EXPLORE and "₦4,000" in e["next"]
-    assert st.stage([_v("a", st.PROMISING, 12, 400)], False)["stage"] == st.EXPLORE
+    assert st.stage([_v("a", st.STRONG, 12, 400)], False)["stage"] == st.EXPLORE
 
 
 def test_structure_fits_the_budget_and_says_when_it_cannot():
@@ -85,7 +92,7 @@ def test_engine_judges_against_the_target_and_logs_experiments(fake, monkeypatch
     run(db[engine.GOALS].insert_one({"campaign_id": "c1", "target_cpl_ngn": 100}))
     run(engine.run_campaign(db, fake, record))
     logged = {e["ad_id"]: e for e in run(db[engine.EXPERIMENTS].find({}).to_list(10))}
-    assert logged["ad1"]["status"] == st.PROMISING and logged["ad1"]["stage"] == st.SCALE
+    assert logged["ad1"]["status"] == st.STRONG and logged["ad1"]["stage"] == st.SCALE
     assert logged["weak"]["status"] == st.UNDERPERFORMING
     d = run(db[engine.DIAGNOSES].find_one({"issue_type": "creative_underperforming"}))
     assert d["entity_id"] == "weak" and fake.ads["weak"] == "ACTIVE"

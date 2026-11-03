@@ -188,7 +188,8 @@ async def assess(db, record: dict, ad_rows: list[dict], goal: dict) -> dict:
         t = totals(rs)
         lead_stats = await leads.stats(db, brand, [ad_id], t["spend_ngn"])
         y = stages.yardstick(t["conversations"], lead_stats, goal)
-        v = stages.judge(t["spend_ngn"], y["results"], y["target_ngn"], y["metric"])
+        active_days = len({r["date"] for r in rs if r.get("date") and (r.get("conversations") or 0) > 0})
+        v = stages.judge(t["spend_ngn"], y["results"], y["target_ngn"], y["metric"], active_days)
         verdicts.append({**v, "ad_id": ad_id, "attributes": attrs.get(ad_id, {})})
     has_target = bool(goal.get("target_cpl_ngn") or goal.get("target_cost_per_order_ngn"))
     return {"verdicts": verdicts, **stages.stage(verdicts, has_target)}
@@ -223,6 +224,11 @@ async def run_campaign(db, adapter, record: dict, notify=None) -> dict:
     await event(db, brand, cid, "data_validated", fresh=ctx["state"]["data_fresh"])
     history = await evaluate.track_record(db, brand)
     market = await market_signals(db, brand)
+
+    # Deferred suggestions whose wait is over become live again while their problem lasts.
+    await db[RECOMMENDATIONS].update_many(
+        {"campaign_id": cid, "status": "deferred", "deferred_until": {"$lte": _now()}},
+        {"$set": {"status": "proposed"}, "$unset": {"deferred_until": ""}})
 
     seen, created = set(), []
     for f in findings:
@@ -259,7 +265,7 @@ async def run_campaign(db, adapter, record: dict, notify=None) -> dict:
         if d["fingerprint"] not in seen:
             await db[DIAGNOSES].update_one({"_id": d["_id"]}, {"$set": {
                 "status": "resolved", "resolved_at": _now(), "resolution": "No longer detected"}})
-            await db[RECOMMENDATIONS].update_many({"diagnosis_id": d["id"], "status": "proposed"},
+            await db[RECOMMENDATIONS].update_many({"diagnosis_id": d["id"], "status": {"$in": ["proposed", "deferred"]}},
                                                   {"$set": {"status": "superseded"}})
 
     executed = []
