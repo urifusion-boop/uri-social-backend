@@ -138,6 +138,19 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create scheduled_job_locks TTL index: {e}")
 
+    # TTL-expire per-account publish gates (services/rate_limit.py): one document per connected
+    # account holding its lease, minimum gap and any rate-limit pause. `expires_at` is set to a day
+    # past the latest of those, so an account's gate disappears once it has been quiet for a day.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["publish_account_gate"].create_index(
+            "expires_at", expireAfterSeconds=0, name="expires_at_ttl"
+        )
+        print("✅ publish_account_gate TTL index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create publish_account_gate TTL index: {e}")
+
     # TTL-expire daily-notification claims (NotificationService._try_claim_
     # daily_notification) — only needed to survive same-day duplicate-send
     # races, so a 2-day expiry is comfortably past its useful life.
