@@ -20,6 +20,7 @@ def _jwt():
 from . import actions as act
 from . import creative, engine, evaluate, forecast, leads, metrics
 from . import policy as pol
+from . import stages
 from .detect import totals_for_ui
 
 router = APIRouter(prefix="/jane-ads/growth", tags=["Jane + Ads — Growth Intelligence"])
@@ -128,6 +129,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         ends = engine._aware((await _adapter(db, r).fetch_adset_schedule(campaign_id)).get("end_time"))
     except Exception:
         pass
+    controls = await _controls(db, r)
     return {
         "campaign_id": campaign_id, "name": r.get("display_name") or "Campaign",
         "totals": t, "daily": [daily[k] for k in sorted(daily)],
@@ -140,9 +142,21 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         "leads": await leads.stats(db, brand, ad_ids, t["spend_ngn"]),
         "follow_ups": await leads.follow_up_gaps(db, brand, ad_ids),
         "creative_test": creative.compare(variants, ad_rows) if variants else None,
+        "testing": await _testing(db, r, ad_rows, controls.get("daily_budget_ngn")),
         "forecast": forecast.project(rows, ends),
-        "controls": await _controls(db, r),
+        "controls": controls,
     }
+
+
+async def _testing(db, r: dict, ad_rows: list[dict], daily_budget_ngn: Optional[float]) -> dict:
+    """The campaign's stage, each creative's verdict, and how the next round should be laid out."""
+    goal = await engine.load_goal(db, r["campaign_id"])
+    a = await engine.assess(db, r, ad_rows, goal)
+    proven = len(a.get("proven_ad_ids") or [])
+    daily = float(daily_budget_ngn or r.get("launch_daily_ngn") or 0)
+    target = goal.get("target_cost_per_order_ngn") or goal.get("target_cpl_ngn")
+    a["next_round"] = stages.recommend_structure(daily, 7, target, proven=proven) if daily else None
+    return a
 
 
 async def _controls(db, r: dict) -> dict:
@@ -214,6 +228,7 @@ async def set_goal(campaign_id: str, payload: dict = Body(...),
             "target_cpl_ngn": num("target_cpl_ngn"),
             "target_cost_per_qualified_ngn": num("target_cost_per_qualified_ngn"),
             "target_results": num("target_results"),
+            "target_cost_per_order_ngn": num("target_cost_per_order_ngn"),
             "conversion_definition": str(payload.get("conversion_definition") or
                                          "A conversation started from the ad")[:200],
             "updated_by": ctx.get("user_id", ""), "updated_at": datetime.now(timezone.utc)}
@@ -379,6 +394,31 @@ async def add_variant(campaign_id: str, payload: dict = Body(...),
                                 payload.get("attributes") or {}, str(payload.get("test_group") or ""),
                                 ctx.get("user_id", ""))
     return {"variant": {k: v[k] for k in v if k != "_id"}}
+
+
+@router.get("/structure")
+async def structure(daily_budget_ngn: float, days: int = 7, target_cost_ngn: Optional[float] = None,
+                    concepts: Optional[int] = None,
+                    _ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """How many concepts a budget can genuinely test, and how to lay them out on Meta."""
+    if daily_budget_ngn <= 0 or days < 1:
+        raise HTTPException(status_code=400, detail="Enter a daily budget and a number of days.")
+    return stages.recommend_structure(daily_budget_ngn, days,
+                                      target_cost_ngn if target_cost_ngn and target_cost_ngn > 0 else None,
+                                      concepts)
+
+
+@router.get("/experiments")
+async def experiments(status: Optional[str] = None, limit: int = 100,
+                      db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                      ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """What each creative this brand has run taught us, newest first."""
+    q: dict = {"brand_id": _brand(ctx)}
+    if status:
+        q["status"] = status
+    docs = await db[engine.EXPERIMENTS].find(q, {"_id": 0}).sort("updated_at", -1) \
+        .limit(max(1, min(limit, 500))).to_list(500)
+    return {"experiments": docs}
 
 
 @router.patch("/leads/{conversation_id}")
