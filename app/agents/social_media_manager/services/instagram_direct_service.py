@@ -18,6 +18,7 @@ import httpx
 from typing import Any, Dict, Optional
 
 from app.core.config import settings
+from app.agents.social_media_manager.services import rate_limit as rl
 
 GRAPH_BASE = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
 
@@ -225,7 +226,7 @@ class InstagramDirectService:
             if not creation_id:
                 error_msg = (container_data.get("error") or {}).get("message", str(container_data))
                 print(f"❌ Instagram media container failed: {container_data}")
-                return {"success": False, "error": f"Media container error: {error_msg}"}
+                return {"success": False, "error": f"Media container error: {error_msg}", **rl.meta_limit_fields(container_resp, container_data)}
 
             # Step 1b — give Instagram time to process the container.
             # We intentionally skip polling GET /{container_id}?fields=status_code because
@@ -265,7 +266,7 @@ class InstagramDirectService:
 
                 # Any other error is not retriable
                 error_msg = err.get("message", str(publish_data))
-                return {"success": False, "error": f"Instagram publish failed: {error_msg}"}
+                return {"success": False, "error": f"Instagram publish failed: {error_msg}", **rl.meta_limit_fields(publish_resp, publish_data)}
 
             print(f"❌ Instagram publish timed out after 6 attempts for container {creation_id}")
             return {"success": False, "error": "Instagram media container was not ready after 60s. Try again."}
@@ -329,7 +330,7 @@ class InstagramDirectService:
                 if not item_id:
                     error_msg = (item_data.get("error") or {}).get("message", str(item_data))
                     print(f"❌ Carousel item {i} container failed: {item_data}")
-                    return {"success": False, "error": f"Carousel item {i} container error: {error_msg}"}
+                    return {"success": False, "error": f"Carousel item {i} container error: {error_msg}", **rl.meta_limit_fields(item_resp, item_data)}
                 item_ids.append(item_id)
                 print(f"✅ Carousel item {i} container created: {item_id}")
 
@@ -351,7 +352,7 @@ class InstagramDirectService:
             if not creation_id:
                 error_msg = (carousel_data.get("error") or {}).get("message", str(carousel_data))
                 print(f"❌ Carousel container failed: {carousel_data}")
-                return {"success": False, "error": f"Carousel container error: {error_msg}"}
+                return {"success": False, "error": f"Carousel container error: {error_msg}", **rl.meta_limit_fields(carousel_resp, carousel_data)}
 
             # Skip status polling — requires instagram_basic scope which page_access_token
             # often lacks (code 100, subcode 33). Carousels take ~10–20s to process.
@@ -376,7 +377,7 @@ class InstagramDirectService:
                     print(f"⏳ Carousel not ready — retrying in {wait}s")
                     await _asyncio.sleep(wait)
                     continue
-                return {"success": False, "error": f"Instagram carousel publish failed: {err.get('message', str(publish_data))}"}
+                return {"success": False, "error": f"Instagram carousel publish failed: {err.get('message', str(publish_data))}", **rl.meta_limit_fields(publish_resp, publish_data)}
             return {"success": False, "error": "Instagram carousel container was not ready after 60s. Try again."}
 
     @staticmethod
@@ -428,7 +429,7 @@ class InstagramDirectService:
             if not creation_id:
                 error_msg = (container_data.get("error") or {}).get("message", str(container_data))
                 print(f"❌ Instagram story container failed: {container_data}")
-                return {"success": False, "error": f"Story container error: {error_msg}"}
+                return {"success": False, "error": f"Story container error: {error_msg}", **rl.meta_limit_fields(container_resp, container_data)}
 
             # Skip status polling — requires instagram_basic scope which page_access_token
             # often lacks (code 100, subcode 33). Stories process in ~5–10s.
@@ -453,7 +454,7 @@ class InstagramDirectService:
                     print(f"⏳ Story not ready — retrying in {wait}s")
                     await _asyncio.sleep(wait)
                     continue
-                return {"success": False, "error": f"Instagram story publish failed: {err.get('message', str(publish_data))}"}
+                return {"success": False, "error": f"Instagram story publish failed: {err.get('message', str(publish_data))}", **rl.meta_limit_fields(publish_resp, publish_data)}
             return {"success": False, "error": "Instagram story container was not ready after 60s. Try again."}
 
     @staticmethod
@@ -495,7 +496,7 @@ class InstagramDirectService:
             if not creation_id:
                 error_msg = (container_data.get("error") or {}).get("message", str(container_data))
                 print(f"❌ Instagram reel container failed: {container_data}")
-                return {"success": False, "error": f"Reel container error: {error_msg}"}
+                return {"success": False, "error": f"Reel container error: {error_msg}", **rl.meta_limit_fields(container_resp, container_data)}
 
             print(f"⏳ Reel container {creation_id} created — waiting 30s for Instagram to ingest video...")
             await _asyncio.sleep(30)
@@ -517,5 +518,5 @@ class InstagramDirectService:
                     print(f"⏳ Reel not ready — retrying in {wait}s")
                     await _asyncio.sleep(wait)
                     continue
-                return {"success": False, "error": f"Instagram reel publish failed: {err.get('message', str(publish_data))}"}
+                return {"success": False, "error": f"Instagram reel publish failed: {err.get('message', str(publish_data))}", **rl.meta_limit_fields(publish_resp, publish_data)}
             return {"success": False, "error": "Instagram reel video was not ready after retries. Try again."}

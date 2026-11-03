@@ -25,6 +25,8 @@ from typing import Any, Dict, Optional
 
 from pymongo import ReturnDocument
 
+from app.agents.social_media_manager.services import rate_limit as _rate_limit
+
 CONFIRMING = "confirming"
 SLOW_AFTER = timedelta(minutes=30)
 GIVE_UP_AFTER = timedelta(hours=24)
@@ -81,7 +83,7 @@ def network_name(platform: str) -> str:
     return _NETWORK_NAMES.get((platform or "").lower(), (platform or "the network").title())
 
 
-def explain(platform: str, raw: str) -> Dict[str, Any]:
+def explain(platform: str, raw: str, limit: Optional["_rate_limit.RateLimitInfo"] = None) -> Dict[str, Any]:
     """The network's error in words an owner can act on, whether the account
     needs reconnecting right now, and which category it falls in:
     "known" (a catalogued signature, always escalates immediately),
@@ -94,6 +96,15 @@ def explain(platform: str, raw: str) -> Dict[str, Any]:
     name = network_name(platform)
     text = " ".join(str(raw or "").split())
     low = text.lower()
+    # A rate limit or cap first, before anything else can claim it. It is NOT a broken connection:
+    # reconnect stays False, and "rate_limit" / "daily_cap" are neither "known" (which flags the
+    # connection) nor "unknown" (which counts toward the repeated-failure threshold that eventually
+    # tells the owner to reconnect) — so no number of limits can ever send someone to Reconnect.
+    # `limit` is the typed rate limit the platform call attached, when it did; otherwise read the text.
+    limit = limit or _rate_limit.classify_text(platform, text)
+    if limit:
+        return {"reconnect": False, "category": "rate_limit" if limit.retryable else "daily_cap",
+                "message": f"{limit.user_message} ({name} said: {text[:220]})"}
     for marker, build_message, reconnect in _SPECIFIC_CAUSES:
         if marker in low:
             return {"reconnect": reconnect, "category": "known" if reconnect else "content",
@@ -322,10 +333,11 @@ async def run(db, limit: int = 200) -> Dict[str, int]:
     return counts
 
 
-async def failed_on_submit(db, draft: Dict[str, Any], connection: Dict[str, Any], raw_error: str) -> str:
+async def failed_on_submit(db, draft: Dict[str, Any], connection: Dict[str, Any], raw_error: str,
+                           limit: Optional["_rate_limit.RateLimitInfo"] = None) -> str:
     """A post the network refused outright when it was sent. Returns the message
     to store; flags the connection when its login has lapsed and tells the owner."""
-    info = explain(draft.get("platform", ""), raw_error or "")
+    info = explain(draft.get("platform", ""), raw_error or "", limit)
     try:
         _draft = {**draft, "outstand_account_id": (connection or {}).get("outstand_account_id")}
         reconnect = info["reconnect"]
