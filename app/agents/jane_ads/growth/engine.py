@@ -16,14 +16,16 @@ from typing import Optional
 from . import actions as act
 from . import detect as det
 from . import diagnose as dia
-from . import evaluate, leads, metrics
+from . import creative, evaluate, leads, metrics
 from . import policy as pol
+from . import stages
 
 DIAGNOSES = "jane_ads_growth_diagnoses"
 RECOMMENDATIONS = "jane_ads_growth_recommendations"
 POLICIES = "jane_ads_growth_policy"
 GOALS = "jane_ads_growth_goals"
 EVENTS = "jane_ads_growth_events"
+EXPERIMENTS = "jane_ads_experiments"
 CAMPAIGNS = "jane_ads_meta_campaigns"
 
 LANDING_RECHECK = timedelta(hours=12)
@@ -170,6 +172,37 @@ async def context(db, adapter, record: dict, policy: dict, pull: bool = True) ->
     }
 
 
+async def assess(db, record: dict, ad_rows: list[dict], goal: dict) -> dict:
+    """Explore / validate / scale for one campaign: a verdict per creative against the
+    business's target, and the stage those verdicts put the campaign in."""
+    from .stats import totals
+    brand = record.get("brand_id")
+    attrs = {v["ad_id"]: v.get("attributes") or {}
+             for v in await db[creative.VARIANTS].find({"campaign_id": record["campaign_id"]}).to_list(50)}
+    by_ad: dict[str, list[dict]] = {}
+    for r in ad_rows:
+        if r.get("ad_id"):
+            by_ad.setdefault(r["ad_id"], []).append(r)
+    verdicts = []
+    for ad_id, rs in sorted(by_ad.items()):
+        t = totals(rs)
+        lead_stats = await leads.stats(db, brand, [ad_id], t["spend_ngn"])
+        y = stages.yardstick(t["conversations"], lead_stats, goal)
+        v = stages.judge(t["spend_ngn"], y["results"], y["target_ngn"], y["metric"])
+        verdicts.append({**v, "ad_id": ad_id, "attributes": attrs.get(ad_id, {})})
+    has_target = bool(goal.get("target_cpl_ngn") or goal.get("target_cost_per_order_ngn"))
+    return {"verdicts": verdicts, **stages.stage(verdicts, has_target)}
+
+
+async def record_experiments(db, record: dict, assessment: dict) -> None:
+    """Keep what each creative taught us, so later recommendations start from evidence."""
+    for v in assessment["verdicts"]:
+        doc = stages.experiment(record, v["ad_id"], v, v.get("attributes") or {}, assessment["stage"])
+        await db[EXPERIMENTS].update_one(
+            {"campaign_id": record["campaign_id"], "ad_id": v["ad_id"]},
+            {"$set": {**doc, "updated_at": _now()}, "$setOnInsert": {"created_at": _now()}}, upsert=True)
+
+
 async def _open_blocker(db, cid: str) -> str:
     d = await db[DIAGNOSES].find_one({"campaign_id": cid, "status": "open", "blocks_actions": True})
     return d["title"] if d else ""
@@ -183,6 +216,9 @@ async def run_campaign(db, adapter, record: dict, notify=None) -> dict:
     cid, brand = record["campaign_id"], record.get("brand_id")
     policy = await load_policy(db, brand)
     ctx = await context(db, adapter, record, policy)
+    assessment = await assess(db, record, ctx["ad_rows"], ctx["goal"])
+    await record_experiments(db, record, assessment)
+    ctx["detect"]["verdicts"] = assessment["verdicts"]
     findings = det.detect(ctx["rows"], ctx["detect"])
     await event(db, brand, cid, "data_validated", fresh=ctx["state"]["data_fresh"])
     history = await evaluate.track_record(db, brand)
