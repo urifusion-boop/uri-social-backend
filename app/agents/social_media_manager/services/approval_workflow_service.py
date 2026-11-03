@@ -129,7 +129,7 @@ async def _mark_connection_disconnected_and_notify(
     Facebook Page (confirmed live via CloudWatch: repeated "Error validating
     access token" failures, connection never marked disconnected, user never
     notified)."""
-    if not user_id or not db:
+    if not user_id or db is None:
         return
     try:
         # connection is only available at a few call sites (an already-looked-up
@@ -196,7 +196,7 @@ async def _should_flag_connection(
     """
     if _is_token_invalidation_error(raw_error):
         return True, "token invalidated (recognized error signature)"
-    if not db or not user_id:
+    if db is None or not user_id:
         return False, ""
     try:
         updated = await db["social_connections"].find_one_and_update(
@@ -222,7 +222,7 @@ async def _record_publish_success(
     """Resets the unrecognized-failure counter on an actual successful
     publish, so a connection that struggled once and then recovered doesn't
     carry a stale count toward a future, unrelated run of failures."""
-    if not db or not user_id:
+    if db is None or not user_id:
         return
     try:
         await db["social_connections"].update_one(
