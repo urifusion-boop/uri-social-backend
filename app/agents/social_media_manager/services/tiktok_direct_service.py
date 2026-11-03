@@ -32,6 +32,7 @@ from typing import Optional
 import httpx
 
 from app.core.config import settings
+from app.agents.social_media_manager.services import rate_limit as rl
 
 CONNECTIONS = "social_connections"
 _TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
@@ -55,6 +56,10 @@ _SAVE_BACKOFF_SECONDS = 0.3
 # under this.
 _MAX_SINGLE_CHUNK_BYTES = 64 * 1024 * 1024
 
+# How long to back off when a status check is rate limited and TikTok gave no Retry-After.
+# Status fetches are capped at 30/min per user, so a short pause is enough.
+_STATUS_LIMIT_WAIT_S = 10.0
+
 
 class TikTokDirectAPIError(Exception):
     """A TikTok API call failed, or this module is misconfigured. Never
@@ -77,10 +82,22 @@ class TikTokReconnectRequired(TikTokDirectAPIError):
     connecting TikTok again does, so the connection is flagged and the user is told."""
 
 
+class TikTokRateLimitError(TikTokDirectAPIError, rl.RateLimitedError):
+    """TikTok refused a call because of a rate limit: `.rate_limit` says whether it is a temporary
+    per-minute limit (retry) or a daily / app-wide cap (never retry). Still a TikTokDirectAPIError,
+    so existing handlers keep working, and `.code` keeps TikTok's own code."""
+
+    def __init__(self, message: str, info: "rl.RateLimitInfo", code: Optional[str] = None) -> None:
+        # Not super().__init__: the two bases take different arguments.
+        Exception.__init__(self, message)
+        self.code = code or info.code
+        self.rate_limit = info
+
+
 RECONNECT_MESSAGE = "Your TikTok connection has expired. Reconnect TikTok in Connected Accounts to keep posting."
 
 
-def _raise_for_error(data: dict, context: str) -> None:
+def _raise_for_error(data: dict, context: str, status: Optional[int] = None, headers=None) -> None:
     # TikTok's envelope: {"data": {...}, "error": {"code": "ok", "message": "...", "log_id": "..."}}
     # — a present-but-"ok" error object is success, not a top-level "error" key
     # the way Meta/Google shape their errors.
@@ -94,7 +111,33 @@ def _raise_for_error(data: dict, context: str) -> None:
         # support asks for, always go into the error shown to the user and the logs.
         log_id = err.get("log_id")
         suffix = f" [{code}{f', log_id={log_id}' if log_id else ''}]"
-        raise TikTokDirectAPIError(f"{context}: {err.get('message') or code}{suffix}", code=code)
+        message = f"{context}: {err.get('message') or code}{suffix}"
+        info = rl.classify_tiktok(code, err.get("message") or "", status, headers)
+        if info:
+            raise TikTokRateLimitError(message, info, code=code)
+        raise TikTokDirectAPIError(message, code=code)
+
+
+def _checked(resp, context: str) -> dict:
+    """A TikTok response's JSON, raised on as a TikTok error. Checks the HTTP status too: a 429 (or
+    5xx) often comes back as a bare page, not TikTok's JSON envelope, and used to crash with a
+    JSONDecodeError instead of being recognised as a rate limit."""
+    status = getattr(resp, "status_code", None)
+    headers = getattr(resp, "headers", None)
+    try:
+        data = resp.json()
+    except ValueError:
+        info = rl.classify_tiktok(None, status=status, headers=headers)
+        if info:
+            raise TikTokRateLimitError(f"{context}: TikTok is rate limiting us (HTTP {status})", info, code=info.code)
+        raise TikTokDirectAPIError(f"{context}: unexpected response from TikTok (HTTP {status})",
+                                   code=f"http_{status}" if status else None)
+    _raise_for_error(data, context, status, headers)
+    return data
+
+
+def _classify(exc: BaseException) -> Optional["rl.RateLimitInfo"]:
+    return rl.classify_exception(exc, "tiktok")
 
 
 async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
@@ -375,13 +418,17 @@ async def _fetch_creator_info(access_token: str) -> dict:
     PUBLIC_TO_EVERYONE). Skipping this and guessing a value is exactly what
     trips TikTok's "please review our integration guidelines" catch-all
     rejection on video/init."""
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            f"{_API_BASE}/post/publish/creator_info/query/",
-            headers=_headers(access_token),
-        )
-    data = resp.json()
-    _raise_for_error(data, "creator info query")
+    async def call() -> dict:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"{_API_BASE}/post/publish/creator_info/query/",
+                headers=_headers(access_token),
+            )
+        return _checked(resp, "creator info query")
+
+    # Refused before anything happened, so safe to retry a temporary limit (creator-info is capped
+    # at 20/min per token, and the Post to TikTok screen calls it too).
+    data = await rl.with_backoff(call, classify=_classify)
     return data.get("data") or {}
 
 
@@ -538,22 +585,26 @@ async def publish_tiktok_direct(
         chunk_size = _MAX_SINGLE_CHUNK_BYTES
         total_chunks = (video_size + chunk_size - 1) // chunk_size
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        init_resp = await client.post(
-            f"{_API_BASE}/post/publish/video/init/",
-            headers=_headers(access_token),
-            json={
-                "post_info": post_info,
-                "source_info": {
-                    "source": "FILE_UPLOAD",
-                    "video_size": video_size,
-                    "chunk_size": chunk_size,
-                    "total_chunk_count": total_chunks,
+    async def init_call() -> dict:
+        async with httpx.AsyncClient(timeout=120) as client:
+            init_resp = await client.post(
+                f"{_API_BASE}/post/publish/video/init/",
+                headers=_headers(access_token),
+                json={
+                    "post_info": post_info,
+                    "source_info": {
+                        "source": "FILE_UPLOAD",
+                        "video_size": video_size,
+                        "chunk_size": chunk_size,
+                        "total_chunk_count": total_chunks,
+                    },
                 },
-            },
-        )
-    init_data = init_resp.json()
-    _raise_for_error(init_data, "video init")
+            )
+        return _checked(init_resp, "video init")
+
+    # A temporary limit on init means TikTok refused it before creating anything, so retrying
+    # cannot double-post. 6 inits/min per user token is TikTok's documented cap.
+    init_data = await rl.with_backoff(init_call, classify=_classify)
     inner = init_data.get("data") or {}
     upload_url = inner.get("upload_url")
     publish_id = inner.get("publish_id")
@@ -567,19 +618,28 @@ async def publish_tiktok_direct(
             start = i * chunk_size
             end = min(start + chunk_size, video_size) - 1
             chunk = video_bytes[start:end + 1]
-            put_resp = await client.put(
-                upload_url,
-                content=chunk,
-                headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Length": str(len(chunk)),
-                    "Content-Range": f"bytes {start}-{end}/{video_size}",
-                },
-            )
-            if put_resp.status_code not in (200, 201, 206):
-                raise TikTokDirectAPIError(
-                    f"chunk {i + 1}/{total_chunks} upload failed: HTTP {put_resp.status_code} {put_resp.text[:300]}"
+
+            async def put_chunk(chunk=chunk, start=start, end=end, i=i) -> None:
+                put_resp = await client.put(
+                    upload_url,
+                    content=chunk,
+                    headers={
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(len(chunk)),
+                        "Content-Range": f"bytes {start}-{end}/{video_size}",
+                    },
                 )
+                if put_resp.status_code not in (200, 201, 206):
+                    message = (f"chunk {i + 1}/{total_chunks} upload failed: HTTP {put_resp.status_code} "
+                               f"{put_resp.text[:300]}")
+                    info = rl.classify_tiktok(None, status=put_resp.status_code,
+                                              headers=getattr(put_resp, "headers", None))
+                    if info:
+                        raise TikTokRateLimitError(message, info, code=info.code)
+                    raise TikTokDirectAPIError(message, code=f"http_{put_resp.status_code}")
+
+            # The same bytes to the same range, so a refused (rate-limited) attempt is safe to repeat.
+            await rl.with_backoff(put_chunk, classify=_classify)
 
     return await _wait_for_publish(access_token, publish_id)
 
@@ -599,8 +659,13 @@ async def _wait_for_publish(access_token: str, publish_id: str) -> tuple[str, st
                 headers=_headers(access_token),
                 json={"publish_id": publish_id},
             )
-            status_data = status_resp.json()
-            _raise_for_error(status_data, "publish status")
+            try:
+                status_data = _checked(status_resp, "publish status")
+            except TikTokRateLimitError as e:
+                # The post was already accepted: being told to slow down on a status check is not a
+                # failure of the post. Wait out the limit (counts as a missed poll) and keep going.
+                await asyncio.sleep(min(e.rate_limit.retry_after_s or _STATUS_LIMIT_WAIT_S, 60.0))
+                continue
             inner = status_data.get("data") or {}
             status = inner.get("status", status)
             fail_reason = inner.get("fail_reason") or fail_reason
@@ -649,23 +714,25 @@ async def publish_tiktok_photo_direct(
         post_info["brand_organic_toggle"] = settings_.brand_organic
         post_info["brand_content_toggle"] = settings_.brand_content
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{_API_BASE}/post/publish/content/init/",
-            headers=_headers(access_token),
-            json={
-                "media_type": "PHOTO",
-                "post_mode": "DIRECT_POST",
-                "post_info": post_info,
-                "source_info": {
-                    "source": "PULL_FROM_URL",
-                    "photo_cover_index": 0,
-                    "photo_images": image_urls,
+    async def init_call() -> dict:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{_API_BASE}/post/publish/content/init/",
+                headers=_headers(access_token),
+                json={
+                    "media_type": "PHOTO",
+                    "post_mode": "DIRECT_POST",
+                    "post_info": post_info,
+                    "source_info": {
+                        "source": "PULL_FROM_URL",
+                        "photo_cover_index": 0,
+                        "photo_images": image_urls,
+                    },
                 },
-            },
-        )
-    data = resp.json()
-    _raise_for_error(data, "photo init")
+            )
+        return _checked(resp, "photo init")
+
+    data = await rl.with_backoff(init_call, classify=_classify)
     publish_id = (data.get("data") or {}).get("publish_id")
     if not publish_id:
         raise TikTokDirectAPIError(f"photo init did not return a publish_id: {data}")
