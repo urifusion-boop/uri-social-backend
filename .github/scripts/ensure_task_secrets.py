@@ -40,6 +40,10 @@ REQUIRED = {
     # or unrecognised value as "off", but the SSM parameter must EXIST before this line ships or the task
     # cannot start.
     "VIDEO_GENERATION_BILLING_MODE": f"{SSM_PREFIX}/VIDEO_GENERATION_BILLING_MODE",
+    # Minimum seconds between two Instagram/Facebook posts to the same account (rate_limit.py). The code
+    # defaults to 5 when it is absent, but the SSM parameter must EXIST before this line ships or the task
+    # cannot start. Raise it on dev to see Approve answer "queued" instead of waiting.
+    "META_MIN_GAP_S": f"{SSM_PREFIX}/META_MIN_GAP_S",
 }
 
 
