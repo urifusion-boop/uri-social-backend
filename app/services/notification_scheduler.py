@@ -126,6 +126,17 @@ def _job_publish_confirmations():
     _run_async("publish_confirmations", _run)
 
 
+def _job_sweep_publish_jobs():
+    """Publish jobs whose worker went away mid-publish (a restart) are failed with a clear message
+    instead of showing "uploading" forever."""
+    async def _run():
+        from app.agents.social_media_manager.services import video_publish_service
+        marked = await video_publish_service.mark_stale_jobs()
+        if marked:
+            print(f"🧹 sweep_publish_jobs: marked {marked} interrupted publish job(s) as failed")
+    _run_async("sweep_publish_jobs", _run)
+
+
 def _job_connection_health_check():
     """Asks Outstand directly whether each connected account's session is
     still alive, instead of only finding out reactively when a publish
@@ -609,6 +620,14 @@ def start_notification_scheduler():
         _job_publish_confirmations,
         CronTrigger(minute="*/2"),
         id="publish_confirmations",
+        **_JOB_DEFAULTS,
+    )
+
+    # Fail publish jobs whose worker restarted mid-publish, so they don't spin forever.
+    _scheduler.add_job(
+        _job_sweep_publish_jobs,
+        CronTrigger(minute="*/10"),
+        id="sweep_publish_jobs",
         **_JOB_DEFAULTS,
     )
 

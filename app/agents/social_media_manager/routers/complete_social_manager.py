@@ -7831,6 +7831,13 @@ async def get_tiktok_creator_info(
         else:
             info = await OutstandService().get_tiktok_creator_info(conn["outstand_account_id"])
     except (TikTokDirectAPIError, ValueError) as e:
+        # Creator info is capped at 20 requests a minute per token. Say so (429 + Retry-After),
+        # instead of a generic "couldn't load" the user would just keep retrying.
+        from app.agents.social_media_manager.services import rate_limit as rl
+        limited = rl.http_limit_response(e, "tiktok")
+        if limited:
+            status_code, message, headers = limited
+            raise HTTPException(status_code=status_code, detail=message, headers=headers)
         raise HTTPException(status_code=502, detail=f"Couldn't load your TikTok account details: {e}")
 
     return UriResponse.get_single_data_response("tiktok_creator_info", {
@@ -7852,13 +7859,14 @@ async def get_video_publish_job(
     token: dict = Depends(JWTBearer()),
 ):
     """Poll the status of a video publish job."""
-    from app.agents.social_media_manager.services.video_publish_service import get_publish_job
+    from app.agents.social_media_manager.services.video_publish_service import get_publish_job, public_job_view
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
     job = await get_publish_job(job_id)
-    if not job:
+    # Someone else's job is "not found", not "forbidden": no reason to confirm the id exists.
+    if not job or not user_id or job.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Publish job not found")
-    return UriResponse.get_single_data_response("publish_job", job)
+    return UriResponse.get_single_data_response("publish_job", public_job_view(job))
 
 
 @router.post("/extract-image-text")

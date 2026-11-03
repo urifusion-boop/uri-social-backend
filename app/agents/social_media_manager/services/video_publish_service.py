@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
@@ -8,6 +8,7 @@ import httpx
 from app.core.config import settings
 from app.database import get_db
 from app.agents.social_media_manager.services.outstand_service import OutstandService
+from app.agents.social_media_manager.services import rate_limit as rl
 
 GRAPH_BASE = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
 
@@ -69,12 +70,69 @@ def explain_outstand_tiktok_failure(reason: Optional[str]) -> str:
     return f"TikTok publish failed via Outstand: {reason or 'unknown reason'}"
 
 
+class MetaAPIError(ValueError):
+    """A Meta Graph API call failed. Still a ValueError with the same message as before, so existing
+    handling is unchanged; `.rate_limit` is set when Meta said it was throttling us."""
+
+    def __init__(self, message: str, rate_limit: Optional["rl.RateLimitInfo"] = None) -> None:
+        super().__init__(message)
+        self.rate_limit = rate_limit
+
+
+def _meta_error(prefix: str, resp, data, platform: str) -> "MetaAPIError":
+    message = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+    return MetaAPIError(f"{prefix}: {message}", rl.meta_limit_fields(resp, data, platform).get("rate_limit"))
+
+
 def _jobs_col():
     return get_db()["video_publish_jobs"]
 
 
 async def get_publish_job(job_id: str) -> Optional[Dict[str, Any]]:
     return await _jobs_col().find_one({"job_id": job_id}, {"_id": 0})
+
+
+# What the app is allowed to see of a job. A whitelist, not "everything on the document", so adding
+# internal bookkeeping fields (account keys, user ids) never leaks them through the status endpoint.
+_PUBLIC_JOB_FIELDS = (
+    "job_id", "draft_id", "platform", "status", "platform_post_id", "post_url", "error",
+    "error_code", "retryable", "next_attempt_at", "resume_at", "wait_reason", "created_at", "updated_at",
+)
+
+
+def public_job_view(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: job[k] for k in _PUBLIC_JOB_FIELDS if k in job}
+
+
+# A job is "alive" only while its background task is. If the worker restarts mid-publish the task is
+# gone and nothing ever updates the job again — it would show "uploading" forever. A job normally
+# touches `updated_at` whenever its status changes, and the longest legitimate stretch without a
+# change (waiting for the account up to PUBLISH_JOB_WAIT_MAX_S, then an Outstand post polled for up
+# to ~12 min) is far under this, so a job quiet for this long is dead.
+STALE_JOB_MINUTES = 45
+
+
+async def mark_stale_jobs(now: Optional[datetime] = None) -> int:
+    """Fail jobs left "queued"/"uploading" by a worker that went away, saying so — and that trying
+    again is fine — instead of leaving them spinning. Returns how many it marked."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(minutes=STALE_JOB_MINUTES)).isoformat()
+    # `updated_at` is an ISO string on jobs (like `created_at`); jobs from before it existed fall
+    # back to their creation time.
+    result = await _jobs_col().update_many(
+        {"status": {"$in": ["queued", "uploading"]},
+         "$or": [{"updated_at": {"$lte": cutoff}},
+                 {"updated_at": {"$exists": False}, "created_at": {"$lte": cutoff}}]},
+        {"$set": {
+            "status": "failed",
+            "error": "This post was interrupted before it finished (the server restarted). "
+                     "It may not have been sent — check the account, then try again.",
+            "error_code": "interrupted",
+            "retryable": True,
+            "updated_at": now.isoformat(),
+        }},
+    )
+    return getattr(result, "modified_count", 0) or 0
 
 
 class VideoPublishService:
@@ -92,6 +150,7 @@ class VideoPublishService:
             "post_url": None,
             "error": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         })
         return job_id
 
@@ -107,23 +166,22 @@ class VideoPublishService:
         tiktok_settings=None,
     ) -> None:
         col = _jobs_col()
+        key, gap, net = VideoPublishService._gate_target(platform, conn)
         try:
-            await col.update_one({"job_id": job_id}, {"$set": {"status": "uploading"}})
-
-            if platform == "instagram_reels":
-                post_id, post_url = await VideoPublishService._publish_instagram_reel(
-                    conn["ig_user_id"], conn["page_access_token"], video_url, caption
-                )
-            elif platform == "facebook_reels":
-                post_id, post_url = await VideoPublishService._publish_facebook_video(
-                    conn["page_access_token"], video_url, caption
-                )
-            elif platform == "tiktok":
-                post_id, post_url = await VideoPublishService._publish_tiktok(
-                    conn, video_url, caption, db, tiktok_settings
-                )
-            else:
+            async def publish():
+                if platform == "instagram_reels":
+                    return await VideoPublishService._publish_instagram_reel(
+                        conn["ig_user_id"], conn["page_access_token"], video_url, caption
+                    )
+                if platform == "facebook_reels":
+                    return await VideoPublishService._publish_facebook_video(
+                        conn["page_access_token"], video_url, caption
+                    )
+                if platform == "tiktok":
+                    return await VideoPublishService._publish_tiktok(conn, video_url, caption, db, tiktok_settings)
                 raise ValueError(f"Unsupported platform: {platform}")
+
+            post_id, post_url = await VideoPublishService._with_gate(job_id, key, gap, net, publish)
 
             await col.update_one(
                 {"job_id": job_id},
@@ -131,6 +189,7 @@ class VideoPublishService:
                     "status": "published",
                     "platform_post_id": post_id,
                     "post_url": post_url,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }},
             )
             # Mark the source draft as published
@@ -141,21 +200,104 @@ class VideoPublishService:
 
         except Exception as e:
             print(f"[VideoPublish {job_id}] failed: {e}")
-            await col.update_one(
-                {"job_id": job_id},
-                {"$set": VideoPublishService._failure_update(e)},
-            )
+            await VideoPublishService._fail(job_id, e, net)
+
+    # ── Rate limits: one post at a time per account, and say so when a limit stops one ──
 
     @staticmethod
-    def _failure_update(exc: Exception) -> Dict[str, Any]:
+    def _gate_target(platform: str, conn: Dict[str, Any]):
+        """(gate key, minimum gap in seconds, network) for the account a job posts to, or a None key
+        when we can't tell which account it is (then the job simply isn't gated). Job platform names
+        (`instagram_reels`, `facebook_reels`) are mapped to the network."""
+        network = {"instagram_reels": "instagram", "facebook_reels": "facebook"}.get(platform, platform)
+        return rl.gate_target_for_connection(network, conn)
+
+    @staticmethod
+    async def _with_gate(job_id: str, key: Optional[str], min_gap_s: float, network: str, body):
+        """Run body() as the only post in flight for this account, with the minimum gap before the
+        next one. While it waits for the account the job is "queued" with the time it expects to go
+        (`next_attempt_at`). If a rate limit stops the post, the account is paused so the next post
+        doesn't walk into the same wall; after a clean post the account's backoff resets.
+
+        The wait is bounded (PUBLISH_JOB_WAIT_MAX_S): a job that still can't go then fails with a
+        message saying when to try again, rather than sitting "queued" forever."""
+        col = _jobs_col()
+        if not key:
+            await col.update_one({"job_id": job_id}, {"$set": {"status": "uploading",
+                                 "updated_at": datetime.now(timezone.utc).isoformat()}})
+            return await body()
+
+        cfg = rl.get_settings()
+        db = get_db()
+        owner = rl.new_owner()
+
+        async def waiting(decision: "rl.GateDecision") -> None:
+            await col.update_one({"job_id": job_id}, {"$set": {
+                "status": "queued",
+                "account_key": key,
+                "wait_reason": "rate_limited" if decision.reason == "paused" else "account_busy",
+                "next_attempt_at": decision.retry_at.isoformat() if decision.retry_at else None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }})
+
+        decision = await rl.wait_for(db, key, owner, max_wait_s=cfg.job_wait_max_s, lease_s=cfg.lease_s,
+                                     wait_through_pause=True, on_wait=waiting)
+        if not decision.granted:
+            kind = rl.LimitKind.WINDOW if decision.reason == "paused" else rl.LimitKind.TEMPORARY
+            info = rl.RateLimitInfo(kind=kind, platform=network, code=decision.pause_code or decision.reason,
+                                    resume_at=decision.retry_at)
+            raise rl.RateLimitedError(rl.give_up_message(info), info)
+
+        try:
+            await col.update_one({"job_id": job_id}, {
+                "$set": {"status": "uploading", "account_key": key,
+                         "updated_at": datetime.now(timezone.utc).isoformat()},
+                "$unset": {"wait_reason": "", "next_attempt_at": ""},
+            })
+            result = await body()
+            await rl.clear_backoff(db, key)
+            return result
+        except Exception as e:
+            info = rl.classify_exception(e, network)
+            if info and info.retryable:
+                await rl.pause(db, key, until=info.resume_at or (
+                    rl.utcnow() + timedelta(seconds=info.retry_after_s) if info.retry_after_s else None),
+                    code=info.code, reason=str(e)[:300])
+            raise
+        finally:
+            await rl.release(db, key, owner, min_gap_s=min_gap_s)
+
+    @staticmethod
+    async def _fail(job_id: str, exc: Exception, network: str = "tiktok") -> None:
+        fields = VideoPublishService._failure_update(exc, network)
+        fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _jobs_col().update_one({"job_id": job_id}, {"$set": fields})
+
+    @staticmethod
+    def _failure_update(exc: Exception, network: str = "tiktok") -> Dict[str, Any]:
         """Job fields for an exception. A TikTok post that was accepted but hasn't
         reached a final state is "processing" (with the explanation), never
-        "published" and not "failed" either — success needs TikTok's confirmation."""
+        "published" and not "failed" either — success needs TikTok's confirmation.
+
+        A rate limit is a failure with its own `error_code` ("rate_limited" for a temporary limit
+        or window, "daily_cap" / "app_cap" for caps) and `retryable`, so the app can say what
+        happened and whether trying again helps, instead of showing a raw platform error."""
         from app.agents.social_media_manager.services.tiktok_direct_service import (
             TikTokStillProcessingError,
         )
         if isinstance(exc, TikTokStillProcessingError):
             return {"status": "processing", "error": str(exc)}
+        info = rl.classify_exception(exc, network)
+        if info:
+            fields: Dict[str, Any] = {
+                "status": "failed",
+                "error": rl.give_up_message(info),
+                "error_code": info.error_code,
+                "retryable": info.retryable,
+            }
+            if info.resume_at:
+                fields["resume_at"] = info.resume_at.isoformat()
+            return fields
         return {"status": "failed", "error": str(exc)}
 
     @staticmethod
@@ -177,17 +319,19 @@ class VideoPublishService:
         )
 
         col = _jobs_col()
+        key, gap, net = VideoPublishService._gate_target("tiktok", conn)
         try:
-            await col.update_one({"job_id": job_id}, {"$set": {"status": "uploading"}})
-            access_token = await get_valid_tiktok_access_token(db, conn)
-            publish_id, status = await publish_tiktok_photo_direct(
-                access_token, image_urls, tiktok_settings, auto_add_music
-            )
+            async def publish():
+                access_token = await get_valid_tiktok_access_token(db, conn)
+                return await publish_tiktok_photo_direct(access_token, image_urls, tiktok_settings, auto_add_music)
+
+            publish_id, status = await VideoPublishService._with_gate(job_id, key, gap, net, publish)
             print(f"✅ TikTok direct photo publish: publish_id={publish_id} status={status}")
 
             await col.update_one(
                 {"job_id": job_id},
-                {"$set": {"status": "published", "platform_post_id": publish_id, "post_url": None}},
+                {"$set": {"status": "published", "platform_post_id": publish_id, "post_url": None,
+                          "updated_at": datetime.now(timezone.utc).isoformat()}},
             )
             await db["content_drafts"].update_one(
                 {"id": draft_id},
@@ -199,10 +343,7 @@ class VideoPublishService:
             )
         except Exception as e:
             print(f"[TikTokPhotoPublish {job_id}] failed: {e}")
-            await col.update_one(
-                {"job_id": job_id},
-                {"$set": VideoPublishService._failure_update(e)},
-            )
+            await VideoPublishService._fail(job_id, e, net)
 
     @staticmethod
     async def run_tiktok_photo_job_outstand(
@@ -218,17 +359,21 @@ class VideoPublishService:
         Outstand: the images are handed to Outstand, which posts them with the user's
         choices from the Post to TikTok screen."""
         col = _jobs_col()
+        key, gap, net = VideoPublishService._gate_target("tiktok", conn)
         try:
-            await col.update_one({"job_id": job_id}, {"$set": {"status": "uploading"}})
-            outstand = OutstandService()
-            media_urls = [await outstand.upload_media_from_url(u) for u in image_urls]
-            caption = tiktok_settings.description or tiktok_settings.title or ""
-            post_id, post_url = await VideoPublishService._publish_tiktok_via_outstand(
-                conn["outstand_account_id"], caption, media_urls, tiktok_settings, auto_add_music, photo=True
-            )
+            async def publish():
+                outstand = OutstandService()
+                media_urls = [await outstand.upload_media_from_url(u) for u in image_urls]
+                caption = tiktok_settings.description or tiktok_settings.title or ""
+                return await VideoPublishService._publish_tiktok_via_outstand(
+                    conn["outstand_account_id"], caption, media_urls, tiktok_settings, auto_add_music, photo=True
+                )
+
+            post_id, post_url = await VideoPublishService._with_gate(job_id, key, gap, net, publish)
             await col.update_one(
                 {"job_id": job_id},
-                {"$set": {"status": "published", "platform_post_id": post_id, "post_url": post_url}},
+                {"$set": {"status": "published", "platform_post_id": post_id, "post_url": post_url,
+                          "updated_at": datetime.now(timezone.utc).isoformat()}},
             )
             await db["content_drafts"].update_one(
                 {"id": draft_id},
@@ -240,7 +385,7 @@ class VideoPublishService:
             )
         except Exception as e:
             print(f"[TikTokPhotoPublishOutstand {job_id}] failed: {e}")
-            await col.update_one({"job_id": job_id}, {"$set": VideoPublishService._failure_update(e)})
+            await VideoPublishService._fail(job_id, e, net)
 
     # ── Instagram Reels ───────────────────────────────────────────────────────
 
@@ -264,7 +409,7 @@ class VideoPublishService:
             )
             create_data = create_resp.json()
             if "error" in create_data:
-                raise ValueError(f"IG container create error: {create_data['error'].get('message')}")
+                raise _meta_error("IG container create error", create_resp, create_data, "instagram")
             container_id = create_data["id"]
 
             # Step 2: poll until FINISHED
@@ -275,6 +420,12 @@ class VideoPublishService:
                     params={"fields": "status_code,status", "access_token": page_access_token},
                 )
                 status_data = status_resp.json()
+                # A hiccup on a status check is ignored (we keep polling), as before — but a rate
+                # limit is not: more calls only lengthen the lockout, so stop and say so.
+                if "error" in status_data:
+                    limited = rl.meta_limit_fields(status_resp, status_data, "instagram")
+                    if limited:
+                        raise _meta_error("IG container status error", status_resp, status_data, "instagram")
                 status_code = status_data.get("status_code", "")
                 print(f"[IGPublish] container {container_id} status: {status_code}")
                 if status_code == "FINISHED":
@@ -291,7 +442,7 @@ class VideoPublishService:
             )
             publish_data = publish_resp.json()
             if "error" in publish_data:
-                raise ValueError(f"IG publish error: {publish_data['error'].get('message')}")
+                raise _meta_error("IG publish error", publish_resp, publish_data, "instagram")
 
             media_id = publish_data["id"]
             post_url = f"https://www.instagram.com/p/{media_id}/"
@@ -313,7 +464,7 @@ class VideoPublishService:
             )
             me_data = me_resp.json()
             if "error" in me_data:
-                raise ValueError(f"FB /me error: {me_data['error'].get('message')}")
+                raise _meta_error("FB /me error", me_resp, me_data, "facebook")
             page_id = me_data["id"]
 
             # Post as a video to the page feed (supports public URL via file_url)
@@ -328,7 +479,7 @@ class VideoPublishService:
             )
             post_data = post_resp.json()
             if "error" in post_data:
-                raise ValueError(f"FB video post error: {post_data['error'].get('message')}")
+                raise _meta_error("FB video post error", post_resp, post_data, "facebook")
 
             video_id = post_data["id"]
             post_url = f"https://www.facebook.com/video/{video_id}"
@@ -389,11 +540,16 @@ class VideoPublishService:
         # failure, and recovering means submitting a brand-new post — the
         # original post_id is already dead on Outstand's side.
         tiktok_config = outstand_tiktok_config(tiktok_settings, auto_add_music, photo)
-        result = await outstand.publish_post(
-            outstand_account_ids=[outstand_account_id],
-            content=caption,
-            media_urls=media_urls,
-            platform_config={"tiktok": tiktok_config},
+        # A 429 on creating the post means Outstand refused it before creating anything, so a
+        # temporary limit is safe to retry here (it cannot double-post).
+        result = await rl.with_backoff(
+            lambda: outstand.publish_post(
+                outstand_account_ids=[outstand_account_id],
+                content=caption,
+                media_urls=media_urls,
+                platform_config={"tiktok": tiktok_config},
+            ),
+            classify=lambda e: rl.classify_exception(e, "tiktok"),
         )
         log_outstand_warnings(result)
         post_obj = result.get("post") or result.get("data") or {}
@@ -412,6 +568,12 @@ class VideoPublishService:
         # own TikTok app, not by waiting for an audit) — say so, and don't fall back.
         if not published and failure_reason and "url_ownership_unverified" in failure_reason.lower():
             raise ValueError(explain_outstand_tiktok_failure(failure_reason))
+
+        # A rate limit or cap is not a reason to submit more posts: every extra one would spend the
+        # same limit, and the fallbacks below would just add noise. Say what happened instead.
+        limit = rl.classify_text("tiktok", failure_reason) if (not published and failure_reason) else None
+        if limit:
+            raise rl.RateLimitedError(rl.give_up_message(limit), limit)
 
         audit_block = bool(failure_reason) and (
             "privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower()
@@ -495,7 +657,15 @@ class VideoPublishService:
         """
         for _ in range(max_polls or _OUTSTAND_MAX_POLLS):
             await asyncio.sleep(_OUTSTAND_POLL_INTERVAL)
-            post_data = await outstand.get_post(post_id)
+            try:
+                post_data = await outstand.get_post(post_id)
+            except httpx.HTTPStatusError as e:
+                # The post is already created: Outstand telling us to slow down on a status check
+                # must not fail it. Wait it out (a missed poll) and carry on.
+                if e.response is not None and e.response.status_code == 429:
+                    await asyncio.sleep(min(rl.parse_retry_after(e.response.headers) or _OUTSTAND_POLL_INTERVAL * 2, 60.0))
+                    continue
+                raise
             post = post_data.get("post") or post_data.get("data") or {}
             if isinstance(post, list):
                 post = post[0] if post else {}
