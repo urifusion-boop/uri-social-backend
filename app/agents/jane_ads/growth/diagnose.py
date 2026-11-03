@@ -34,6 +34,7 @@ ISSUE_LABELS = {
     "scale_opportunity": "Results are cheap and the budget is the limit",
     "daily_incomplete": "Meta's day-by-day figures don't add up",
     "creative_issues": "An ad has gaps that hurt delivery",
+    "creative_underperforming": "An ad is well above your target cost",
 }
 
 # Evaluation windows: long enough for results and attribution to land.
@@ -202,6 +203,16 @@ def diagnose(finding: dict, ctx: dict) -> dict:
         recs = [_rec("pause_ad", "Pause the weakest ad so delivery shifts to the strongest.",
                      "Lower cost per conversation", "Low — reversible.",
                      "Campaign cost per conversation", params={"ad_id": ev.get("weakest_ad")})]
+
+    elif issue == "creative_underperforming":
+        noun = "order" if ev.get("metric") == "orders" else "conversation"
+        hypotheses = [_h("This creative's message or format isn't persuading this audience", "medium",
+                         ev.get("reason") or "")]
+        alternatives = ["Meta may have shown it to a weaker slice of the audience than the other ads.",
+                        "The offer or what happens after the click may be the problem, not the creative."]
+        recs = [_rec("pause_ad", "Pause this ad so its budget goes to the ads that are working.",
+                     f"Lower cost per {noun}", "Low — reversible.",
+                     f"Campaign cost per {noun}", params={"ad_id": ev.get("ad_id")})]
 
     elif issue == "scale_opportunity":
         budget = float(ev.get("daily_budget_ngn") or 0)
