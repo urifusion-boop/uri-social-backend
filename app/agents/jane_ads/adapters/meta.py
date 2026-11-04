@@ -559,7 +559,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             "page_id": plan.page_id,
                             "whatsapp_phone_number": plan.whatsapp_number,
                         }
-                    else:
+                    elif plan.objective != CampaignObjective.AWARENESS:
+                        # Awareness stays on REACH: Meta refuses LINK_CLICKS under
+                        # OUTCOME_AWARENESS (subcode 2490408).
                         adset_payload["optimization_goal"] = "LINK_CLICKS"
 
                 # The manual campaign's routing: ONE ad set whose destination covers
@@ -969,7 +971,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         "effective_status,"
                         "adsets{end_time},"
                         "ads{effective_status},"
-                        "insights{impressions,reach,spend,actions,cost_per_action_type}"
+                        "insights.date_preset(maximum){impressions,reach,spend,actions,cost_per_action_type}"
                     ),
                 },
             )
@@ -1027,6 +1029,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 params={
                     "access_token": self._access_token,
                     "fields": "spend,actions",
+                    "date_preset": "maximum",
                 },
             )
             data = resp.json()
