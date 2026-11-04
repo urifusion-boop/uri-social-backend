@@ -9,6 +9,8 @@ never hard-codes them. Confirm against live platform docs at integration time
 """
 from __future__ import annotations
 
+import math
+
 # ── FX ──────────────────────────────────────────────────────────────────────
 USD_TO_NGN: float = 1550.0
 
@@ -86,6 +88,12 @@ AD_SPEND_MARKUP: float = round(1.0 / (1.0 - SERVICE_FEE_RATE), 6)
 # on its own record and falls back to this for records that predate the stamp, so a
 # live campaign is never re-based mid-flight onto maths it wasn't sold under.
 LEGACY_AD_SPEND_MARKUP: float = 1.10
+
+
+def budget_for_ad_spend(ad_spend_ngn: float) -> float:
+    """The smallest round budget a client can state that leaves this much for the ads
+    once URI's fee is taken out."""
+    return math.ceil(ad_spend_ngn / (1.0 - SERVICE_FEE_RATE) / 100) * 100.0
 
 
 def ad_spend_from_budget(budget_ngn: float) -> float:

@@ -269,6 +269,7 @@ def choose_platform(
         per_business_cap_ngn=funded_amount_ngn,
         account_cap_ngn=total_funded_wallets_ngn,
         budget_tier=budget_tier_for(budget),
+        objective=default_objective_for(request.goal),
         explanation=_explain(request, behaviour, platform_plans),
         trace=trace,
     )

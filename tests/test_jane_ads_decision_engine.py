@@ -4,7 +4,10 @@ Unit tests for the Jane + Ads decision engine (Corrected Platform Decision Logic
 GOAL first, behaviour drives, business type is a hint, decided per campaign, always
 explained. Pure logic — no network, no server, no DB.
 """
+import pytest
+
 from app.agents.jane_ads import constants as C
+from app.agents.jane_ads.models import CampaignObjective
 from app.agents.jane_ads.decision_engine import default_behaviour, choose_platform, budget_tier_for, _days_for
 from app.agents.jane_ads.models import (
     CampaignRequest,
@@ -285,3 +288,17 @@ def test_a_messages_goal_defaults_to_engagement():
     from app.agents.jane_ads.models import CampaignObjective
     res = _plan(goal=Goal.MESSAGES)
     assert all(p.objective == CampaignObjective.ENGAGEMENT for p in res.plan.platforms)
+
+
+# ── The campaign launches with the objective its goal implies ──────────────────
+
+@pytest.mark.parametrize("goal,objective", [
+    (Goal.AWARENESS, CampaignObjective.AWARENESS),
+    (Goal.TRAFFIC, CampaignObjective.TRAFFIC),
+    (Goal.SALES, CampaignObjective.SALES),
+    (Goal.MESSAGES, CampaignObjective.ENGAGEMENT),
+])
+def test_the_campaign_and_its_platforms_agree_on_the_objective(goal, objective):
+    plan = _plan(goal=goal, budget_ngn=50_000.0).plan
+    assert plan.objective == objective
+    assert all(p.objective == objective for p in plan.platforms)

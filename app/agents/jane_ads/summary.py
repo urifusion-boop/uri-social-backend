@@ -195,7 +195,7 @@ def build_campaign_summary(
     # this from also hard-coding "Meta" when the plan is TikTok-bound.
     from .destination import clicks_label, coerce_type, optimization_for
     _dest = coerce_type(getattr(plan, "destination_type", "") or "")
-    _opt_value, _opt_reason = optimization_for(_dest, platform_label=plat_label)
+    _opt_value, _opt_reason = optimization_for(_dest, platform_label=plat_label, objective=plan.objective)
     optimization = ReasonedValue(value=_opt_value, reason=_opt_reason)
 
     # Estimates. Audience size = Meta's addressable pool for the targeting (real data,
