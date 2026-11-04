@@ -4268,6 +4268,9 @@ async def meta_launch_plan(
         custom_url=brand_destination["custom_url"],
     )
     plan.destination_cta = brand_destination["destination_cta"]
+    if plan.creative is not None:
+        from .creative_paths import disclose
+        plan.creative.primary_text = disclose(plan.creative.primary_text, plan.creative.provenance)
     if plan.goal != Goal.FOLLOWERS and not plan.destination_link:
         raise HTTPException(
             status_code=400,

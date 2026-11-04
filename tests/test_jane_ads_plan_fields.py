@@ -57,6 +57,13 @@ def test_daily_spend_is_editable_and_destination_is_not():
     assert fields["destination"]["editable"] is False
 
 
+def test_editing_the_caption_cannot_remove_a_paid_partnership_label():
+    plan = _plan()
+    plan.creative.provenance = {"path": "ugc", "ugc_kind": "paid_creator", "disclosure": "Paid partnership"}
+    plan, _, _, _ = _run(apply_edits(plan, _req(), {"caption": "Fresh bread, delivered before 8am."}))
+    assert plan.creative.primary_text == "Fresh bread, delivered before 8am.\n\nPaid partnership."
+
+
 def test_editing_the_caption_is_what_launches():
     plan, req, applied, rejected = _run(apply_edits(
         _plan(), _req(), {"caption": "Fresh bread, delivered before 8am."}))
