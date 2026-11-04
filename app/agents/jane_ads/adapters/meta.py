@@ -895,6 +895,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "access_token": self._access_token,
                     "level": "ad",
                     "fields": "ad_id,spend",
+                    "date_preset": "maximum",
                 },
             )
             data = resp.json()
