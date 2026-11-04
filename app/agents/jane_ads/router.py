@@ -4476,6 +4476,7 @@ async def creative_creator_brief(
     from . import brief as ads_brief
     from . import creative_paths as cp
     from .creative import get_brand_context, write_shoot_script
+    from .nl import parse_message
 
     brief = await ads_brief.load(db, brand_ctx.get("brand_id") or "")
     if not cp.availability(brief)["ugc"]["open"]:
@@ -4491,12 +4492,11 @@ async def creative_creator_brief(
     shots = None
     try:
         parsed = await parse_message(description, name, category)
+        description = cp.without_budget(description, parsed.budget_ngn)
         script = await write_shoot_script(name, category, "messages",
-                                          "a real person on camera builds trust",
-                                          cp.without_budget(description, parsed.budget_ngn),
+                                          "a real person on camera builds trust", description,
                                           brand_context, filmed_by=cp.FILMED_BY[kind])
-        shots = [{"shot": f"Shot {i + 1} · {s.seconds}s", "direction": s.direction,
-                  **({"say": s.say} if s.say and kind == "staff_demo" else {})}
+        shots = [{"shot": f"Shot {i + 1} · {s.seconds}s", "direction": s.direction}
                  for i, s in enumerate(script.shots)] or None
     except Exception as e:
         print(f"[creator-brief] shoot script skipped: {e}", flush=True)

@@ -207,3 +207,35 @@ def test_the_ad_budget_is_taken_out_before_a_script_is_written():
     assert "20k" not in cp.without_budget("Kit is 8k, budget 20k", 20000)
     assert cp.without_budget("Bags at ₦120,000", 20000) == "Bags at ₦120,000"
     assert cp.without_budget(chat, None) == chat
+
+
+def test_only_a_video_of_the_owner_or_team_gets_talking_points():
+    assert cp.creator_brief("Shea Co", "", "", "", "staff_demo")["talking_points"] == cp.TALKING_POINTS
+    for kind in ("real_customer", "paid_creator", "creator_style"):
+        assert "talking_points" not in cp.creator_brief("Shea Co", "", "", "", kind)
+
+
+def test_no_brief_endpoint_shot_carries_a_written_line(monkeypatch):
+    from types import SimpleNamespace
+    from app.agents.jane_ads import brief as ab_brief, creative, nl, router
+
+    async def script(*_, **__):
+        return SimpleNamespace(shots=[SimpleNamespace(seconds=5, direction="Hold the kit", say="It has lip balm")])
+
+    async def parsed(*_):
+        return SimpleNamespace(budget_ngn=None)
+
+    async def brand(*_):
+        return {"brand_name": "Shea Co"}
+
+    async def no_brief(*_):
+        return {}
+
+    monkeypatch.setattr(creative, "write_shoot_script", script)
+    monkeypatch.setattr(creative, "get_brand_context", brand)
+    monkeypatch.setattr(nl, "parse_message", parsed)
+    monkeypatch.setattr(ab_brief, "load", no_brief)
+    out = run(router.creative_creator_brief({"ugc_kind": "staff_demo", "description": "kit"}, None,
+                                            {"user_id": "u1", "brand_id": "b1"}))["brief"]
+    assert out["shots"] == [{"shot": "Shot 1 · 5s", "direction": "Hold the kit"}]
+    assert "lip balm" not in str(out)
