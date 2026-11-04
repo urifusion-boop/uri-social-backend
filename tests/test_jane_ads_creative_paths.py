@@ -167,3 +167,8 @@ def test_mode_defaults_to_guided_is_per_user_and_validated():
     assert run(ab.load_mode(db, "b1", "u1")) == "advanced" and run(ab.load_mode(db, "b1", "u2")) == "guided"
     with pytest.raises(ValueError):
         run(ab.save_mode(db, "b1", "u1", "expert"))
+
+
+def test_every_kind_of_video_tells_the_script_writer_who_is_filming():
+    assert set(cp.FILMED_BY) == set(cp.UGC_KINDS)
+    assert "not the owner" in cp.FILMED_BY["creator_style"] and "owner" in cp.FILMED_BY["staff_demo"]
