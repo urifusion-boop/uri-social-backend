@@ -603,7 +603,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
 
 async def write_shoot_script(business_name: str, category: str, goal: str,
                              video_recommendation_reason: str, description: str = "",
-                             brand_context: Optional[dict] = None) -> ShootScript:
+                             brand_context: Optional[dict] = None, filmed_by: str = "") -> ShootScript:
     """Path C (PRD §4.1): when a video was recommended over the (photo-only)
     AI generator, write a short, phone-filmable shoot script instead — no crew or
     equipment assumed. The business owner films it themselves; the footage is
@@ -619,10 +619,12 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
         f"{category or 'local business'}) whose goal is {goal}. Why video: "
         f"{video_recommendation_reason}.{(' ' + brand_bits) if brand_bits else ''}\n"
-        f"Context: {description or 'none'}\n"
-        "The business owner will film this themselves on a phone — no crew, no "
-        "equipment, no editing skill assumed. Keep it to 3-5 short shots totalling "
-        "15-30 seconds.\n"
+        f"What this ad promotes: {description or 'none'}\n"
+        "If that names a specific product or offer, the script is about it — the brand "
+        "details above only set tone and rules, never swap in a different product.\n"
+        f"{filmed_by or 'The business owner will film this themselves.'} It is filmed on a "
+        "phone — no crew, no equipment, no editing skill assumed. Write every direction "
+        "for that person. Keep it to 3-5 short shots totalling 15-30 seconds.\n"
         "Return JSON with:\n"
         "- hook_line: the first ~2 seconds — what's said or shown to stop someone "
         "scrolling\n"
