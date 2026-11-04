@@ -2491,6 +2491,13 @@ class MetaLaunchFromMessageBody(BaseModel):
     preferred_platform: str = ""          # "" | "meta" | "tiktok" | "google"
     # Where on Google: search | display | demand_gen (YouTube & Discover) | pmax (everywhere).
     google_placement: str = ""
+    # The production path, when it isn't plain static/upload (creative_paths.py):
+    # "ai_video" uses a finished AI studio video (video_job_id); "ugc" marks the
+    # uploaded video as a person on camera, of kind ugc_kind, used with their consent.
+    creative_path: str = ""               # "" | ai_video | ugc
+    video_job_id: str = ""
+    ugc_kind: str = ""                    # creative_paths.UGC_KINDS
+    ugc_rights_confirmed: bool = False
 
 
 class _PlanBuildResult(BaseModel):
@@ -2580,6 +2587,29 @@ def _extract_trailing_bare_budget(message: str, last_assistant_turn: str) -> Opt
     return value if value > 0 else None
 
 
+async def _resolve_creative_path(body: MetaLaunchFromMessageBody, brand_ctx: dict, db) -> dict:
+    """Turn an AI-video or UGC pick into the upload it really is, and return its
+    provenance (empty for the plain paths). An AI video is resolved to its single
+    merged file here, so every later step treats it exactly like an uploaded video."""
+    from . import creative_paths as cp
+
+    if body.creative_path not in ("ai_video", "ugc"):
+        return {}
+    if body.creative_path == "ai_video":
+        try:
+            url, job = await cp.resolve_ai_video(db, brand_ctx.get("user_id") or "", body.video_job_id)
+        except LookupError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        body.creative_source, body.reference_image_url, body.is_video = "upload", url, True
+        return cp.provenance("ai_video", video_job_id=body.video_job_id, has_people=cp.video_has_people(job))
+    if not body.reference_image_url or not body.is_video:
+        raise HTTPException(status_code=400, detail="Upload the creator or customer video first.")
+    if body.ugc_kind not in cp.UGC_KINDS:
+        raise HTTPException(status_code=400, detail="Say who is in the video.")
+    body.creative_source = "upload"
+    return cp.provenance("ugc", ugc_kind=body.ugc_kind, rights_confirmed=body.ugc_rights_confirmed)
+
+
 async def _build_campaign_plan(
     body: MetaLaunchFromMessageBody, brand_ctx: dict, db: AsyncIOMotorDatabase,
 ) -> "_PlanBuildResult | dict":
@@ -2604,6 +2634,8 @@ async def _build_campaign_plan(
 
     from . import google_flow
     from .creative import search_ad_creative
+
+    creative_prov = await _resolve_creative_path(body, brand_ctx, db)
 
     # Google runs in the brand's OWN linked Google Ads account, so a brand can be
     # ready for Google with no Meta Page at all. Known up front (our own record, no
@@ -3457,6 +3489,11 @@ async def _build_campaign_plan(
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
+    if creative_prov:
+        from .creative_paths import disclose
+        creative.provenance = creative_prov
+        creative.primary_text = disclose(creative.primary_text, creative_prov)
+
     # plan.explanation's "you have photos"/"video" phrase (decision_engine._explain) was
     # written from the NL-guessed has_video BEFORE the user actually chose upload/generate
     # here — a real upload of a video left it stuck saying "you have photos". Patch it now
@@ -3929,6 +3966,13 @@ async def meta_launch_from_message(
     if isinstance(built, dict):
         return built["early_return"]
 
+    from . import brief as ads_brief
+    checks = ads_brief.check_plan(built.plan.model_dump(mode="json"), built.req.model_dump(mode="json"),
+                                  await ads_brief.load(db, brand_ctx.get("brand_id") or ""))
+    blocks = ads_brief.unresolved_blocks(checks, allow_out_of_area=False)
+    if blocks:
+        raise HTTPException(status_code=400, detail=blocks[0]["message"])
+
     # Wallet gate — the ad wallet must actually have the money before anything
     # reaches Meta. Blocks with the exact shortfall rather than silently launching
     # a campaign whose real Meta daily budget got clamped to less than requested.
@@ -4366,6 +4410,95 @@ async def put_ads_brief(
     await gov.audit(db, brand_ctx.get("brand_id"), "", "brief_completed", brand_ctx.get("user_id") or "",
                     fields=sorted(ads_brief.normalise(payload)))
     return {"brief": saved}
+
+
+@router.get("/mode")
+async def get_ads_mode(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Guided or Advanced — how much of the ads machinery this user sees for this brand."""
+    from . import brief as ads_brief
+    return {"mode": await ads_brief.load_mode(db, brand_ctx.get("brand_id") or "", brand_ctx.get("user_id") or ""),
+            "modes": list(ads_brief.MODES)}
+
+
+@router.put("/mode")
+async def put_ads_mode(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import brief as ads_brief
+    from . import launch_governance as gov
+    try:
+        mode = await ads_brief.save_mode(db, brand_ctx.get("brand_id") or "", brand_ctx.get("user_id") or "",
+                                         str(payload.get("mode") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await gov.audit(db, brand_ctx.get("brand_id"), "", "mode_changed", brand_ctx.get("user_id") or "", mode=mode)
+    return {"mode": mode}
+
+
+@router.get("/creative/paths")
+async def creative_paths_for_brand(
+    category: str = "",
+    description: str = "",
+    has_own_media: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Which creative paths the brand's brief leaves open, and which Jane suggests first."""
+    from . import brief as ads_brief
+    from . import creative_paths as cp
+    brief = await ads_brief.load(db, brand_ctx.get("brand_id") or "")
+    return {**cp.recommend(category, description, brief, has_own_media),
+            "ugc_kinds": {k: v["label"] for k, v in cp.UGC_KINDS.items()}}
+
+
+@router.get("/creative/ai-videos")
+async def creative_ai_videos(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The user's finished AI studio videos that can become an ad."""
+    from . import creative_paths as cp
+    return {"videos": await cp.ai_videos(db, brand_ctx.get("user_id") or "")}
+
+
+@router.post("/creative/creator-brief")
+async def creative_creator_brief(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """CR-06: a filmable brief for a creator, customer or the owner's team."""
+    from . import brief as ads_brief
+    from . import creative_paths as cp
+    from .creative import get_brand_context, write_shoot_script
+
+    brief = await ads_brief.load(db, brand_ctx.get("brand_id") or "")
+    if not cp.availability(brief)["ugc"]["open"]:
+        raise HTTPException(status_code=400, detail="Your ads brief rules out creator or UGC-style content.")
+    kind = str(payload.get("ugc_kind") or "creator_style")
+    if kind not in cp.UGC_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown kind of video.")
+    user_id = brand_ctx.get("user_id") or ""
+    brand_context = await get_brand_context(user_id, db, brand_ctx.get("brand_id")) if user_id else {}
+    name = str(payload.get("business_name") or brand_context.get("brand_name") or "")
+    category = str(payload.get("category") or brand_context.get("industry") or "")
+    description = str(payload.get("description") or "")
+    shots = None
+    try:
+        script = await write_shoot_script(name, category, "messages",
+                                          "A person on camera builds trust for this business.",
+                                          description, brand_context)
+        shots = [{"shot": f"Shot {i + 1} · {s.seconds}s", "direction": s.direction,
+                  **({"say": s.say} if s.say and kind == "staff_demo" else {})}
+                 for i, s in enumerate(script.shots)] or None
+    except Exception as e:
+        print(f"[creator-brief] shoot script skipped: {e}", flush=True)
+    return {"brief": cp.creator_brief(name, category, description, str(payload.get("offer") or ""), kind, shots)}
 
 
 @router.get("/meta/plan/{plan_id}/checks")

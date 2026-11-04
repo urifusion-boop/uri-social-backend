@@ -181,7 +181,8 @@ def costs(req: dict, due_ngn: float, production_ngn: float = 0.0) -> dict:
 
 
 def check_plan(plan: dict, req: dict, brief: dict, sibling_plans: int = 1) -> dict:
-    issues = _area_checks(plan, brief) + _constraint_checks(plan, brief)
+    from .creative_paths import checks as path_checks
+    issues = _area_checks(plan, brief) + _constraint_checks(plan, brief) + path_checks(plan, brief)
     note = optimisation_note(plan, brief)
     if note:
         issues.append(note)
@@ -199,3 +200,25 @@ def check_plan(plan: dict, req: dict, brief: dict, sibling_plans: int = 1) -> di
 
 def unresolved_blocks(checks: dict, allow_out_of_area: bool) -> list[dict]:
     return [i for i in checks["blocking"] if not (allow_out_of_area and i.get("overridable"))]
+
+
+# ── Guided / Advanced mode (PRD §8) ───────────────────────────────────────────
+# How much of the machinery a user sees — never what is decided or charged. A mode
+# is per user per brand, and switching it changes no plan, campaign or setting.
+
+MODES_COLLECTION = "jane_ads_modes"
+MODES = ("guided", "advanced")
+
+
+async def load_mode(db, brand_id: str, user_id: str) -> str:
+    doc = await db[MODES_COLLECTION].find_one({"brand_id": brand_id, "user_id": user_id}, {"mode": 1})
+    return (doc or {}).get("mode") or "guided"
+
+
+async def save_mode(db, brand_id: str, user_id: str, mode: str) -> str:
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}")
+    await db[MODES_COLLECTION].update_one(
+        {"brand_id": brand_id, "user_id": user_id},
+        {"$set": {"mode": mode, "updated_at": datetime.now(timezone.utc)}}, upsert=True)
+    return mode

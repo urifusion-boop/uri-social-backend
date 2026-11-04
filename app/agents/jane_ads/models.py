@@ -399,6 +399,10 @@ class AdCreative(BaseModel):
     # event pipeline yet to emit it to (see that module's own docstring).
     vsg01_format_id: str = ""
     vsg01_format_attributes: dict = Field(default_factory=dict)
+    # What this creative IS (creative_paths.provenance): the production path, whether
+    # it's synthetic, and for UGC who is speaking and on what terms. Empty for the
+    # paths that predate it.
+    provenance: dict = Field(default_factory=dict)
 
 
 # ── Path C: script-and-shoot (PRD §4.1) ───────────────────────────────────────
