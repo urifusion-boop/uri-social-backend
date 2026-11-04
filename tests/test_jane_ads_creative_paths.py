@@ -193,8 +193,17 @@ def test_the_shoot_script_prompt_names_the_filmer_and_the_promoted_product(monke
                                     "shea butter starter kit", {}, filmed_by=cp.FILMED_BY["paid_creator"]))
     assert cp.FILMED_BY["paid_creator"] in sent["prompt"] and "shea butter starter kit" in sent["prompt"]
     assert "The business owner will film" not in sent["prompt"]
+    assert "never put them in the script" in sent["prompt"]
 
 
 def test_the_brief_message_never_pastes_the_chat():
     chat = "Promote our kit, ₦20,000 for 7 days. Static images are fine"
     assert "₦20,000" not in cp.creator_brief("Shea Co", "", chat)["message"]
+
+
+def test_the_ad_budget_is_taken_out_before_a_script_is_written():
+    chat = "Promote our ₦8,000 starter kit, ₦20,000 for 7 days. All of Lekki"
+    assert cp.without_budget(chat, 20000) == "Promote our ₦8,000 starter kit. All of Lekki"
+    assert "20k" not in cp.without_budget("Kit is 8k, budget 20k", 20000)
+    assert cp.without_budget("Bags at ₦120,000", 20000) == "Bags at ₦120,000"
+    assert cp.without_budget(chat, None) == chat
