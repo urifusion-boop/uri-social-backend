@@ -1034,7 +1034,7 @@ async def _build_review_card(business_name: str, category: str, description: str
     return document
 
 
-# ── SEED-082: Text on a Face (needs a real, attested customer photo) ─────
+# ── SEED-082: Text on a Face (needs an attested photo of the owner or their team) ─────
 
 async def _content_text_on_a_face(business_name: str, category: str, description: str,
                                   correction: str = "",
@@ -1085,7 +1085,7 @@ async def _build_text_on_a_face(business_name: str, category: str, description: 
         # happens) IS the permission confirmation this format requires.
         return text_on_a_face.build_document(
             photo_url, stmt, permission_on_file=True, canvas_size=_CANVAS_SIZE, tokens=tokens,
-            brand_logo_url=brand_logo_url,
+            brand_logo_url=brand_logo_url, speaker="owner",
         )
 
     try:
@@ -1986,6 +1986,18 @@ async def render_vsg01_creative(
     return {"png_bytes": png_bytes, "format_id": strategy.strategy_id, "attributes": attributes}
 
 
+PHOTO_ATTESTATIONS = ("product_photo", "real_customer_photo", "owner_photo")
+
+# Whose words a person-photo format may put beside them. Text on a Face lays a line
+# composed in the OWNER's voice across the face, so over a customer's photo it would
+# put invented words in a real customer's mouth; Testimonial + Offer presents the
+# person as a customer, which the owner or their staff are not.
+_FORMATS_NOT_FOR_PERSON = {
+    "real_customer_photo": frozenset({"SEED-082"}),
+    "owner_photo": frozenset({"SEED-074"}),
+}
+
+
 def _vsg01_candidate_params(
     *, photo_url: Optional[str], photo_attestation: Optional[str], recomposite: bool,
 ) -> tuple[Optional[frozenset], bool, bool, Optional[str]]:
@@ -1994,10 +2006,13 @@ def _vsg01_candidate_params(
     pre-generation suggest-format endpoint (router.py's POST /jane-ads/creative/
     suggest-format) computes the SAME eligible pool a real generation call
     would, rather than a second hand-maintained copy that could drift."""
-    if photo_url and photo_attestation:
+    if photo_url and photo_attestation in PHOTO_ATTESTATIONS:
         candidate_ids = RECOMPOSITE_PHOTO_FORMAT_IDS if recomposite else UPLOAD_PHOTO_FORMAT_IDS
         has_product_photo = photo_attestation == "product_photo"
-        has_real_customer_photo = photo_attestation == "real_customer_photo"
+        # Both are a real, consenting person — what differs is whose words a format
+        # may put beside them (see _FORMATS_BY_PERSON).
+        has_real_customer_photo = photo_attestation in ("real_customer_photo", "owner_photo")
+        candidate_ids = candidate_ids - _FORMATS_NOT_FOR_PERSON.get(photo_attestation, frozenset())
         return candidate_ids, has_product_photo, has_real_customer_photo, photo_url
     return NO_PHOTO_FORMAT_IDS, False, False, None
 
