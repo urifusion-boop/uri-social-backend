@@ -6013,6 +6013,60 @@ async def set_meta_campaign_status(
     return result
 
 
+# TikTok's spend report only looks back this far, so an older campaign's real spend
+# can't be confirmed from it.
+_TIKTOK_SPEND_WINDOW_DAYS = 30
+
+
+async def _spend_before_delete(adapter, record: dict, window_days: Optional[int] = None) -> Optional[float]:
+    """The campaign's real spend, read while it still exists. None means nothing can be
+    refunded automatically. A failed read stops the delete: once it's gone the spend
+    can't be read, and guessing could hand back money that was already spent."""
+    if not record.get("charged_upfront_ngn"):
+        return None
+    if window_days is not None:
+        from datetime import datetime, timedelta, timezone
+        created = record.get("created_at")
+        if not isinstance(created, datetime) or (
+                datetime.now(timezone.utc) - created.replace(tzinfo=created.tzinfo or timezone.utc)
+                > timedelta(days=window_days)):
+            return None
+    try:
+        return sum(row.spend_ngn for row in await adapter.fetch_per_ad_spend(record["campaign_id"]))
+    except Exception as e:
+        print(f"[delete] spend read failed for {record['campaign_id']}: {e}", flush=True)
+        raise HTTPException(status_code=502, detail="Couldn't confirm what this campaign has spent, "
+                                                    "so it wasn't deleted. Please try again.")
+
+
+async def _remove_and_refund(db, collection: str, campaign_id: str, spent: Optional[float],
+                             brand_ctx: dict) -> float:
+    """Drop our record and return the unspent budget. Removing the record is the atomic
+    step, so two delete requests can't both refund."""
+    from . import launch_governance as gov
+    from .billing import unspent_refund_ngn
+    from .store import MongoWalletStore
+    from .wallet import WalletService
+
+    record = await db[collection].find_one_and_delete({"campaign_id": campaign_id})
+    if not record or spent is None:
+        return 0.0
+    amount = unspent_refund_ngn(record, spent)
+    if amount <= 0:
+        return 0.0
+    actor = brand_ctx.get("user_id") or ""
+    try:
+        await WalletService(MongoWalletStore(db)).refund_ad_spend(record["business_id"], amount, campaign_id)
+    except Exception as e:
+        await gov.audit(db, brand_ctx.get("brand_id"), campaign_id, "campaign_refund_failed", actor,
+                        amount_ngn=amount, error=str(e)[:300])
+        raise HTTPException(status_code=500, detail=f"The campaign was deleted, but ₦{amount:,.0f} of unspent "
+                                                    "budget couldn't be returned. Please contact support.")
+    await gov.audit(db, brand_ctx.get("brand_id"), campaign_id, "campaign_refunded", actor,
+                    amount_ngn=amount, spent_ngn=spent)
+    return amount
+
+
 @router.delete("/meta/campaigns/{campaign_id}")
 async def delete_meta_campaign(
     campaign_id: str,
@@ -6058,24 +6112,26 @@ async def delete_meta_campaign(
         if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
             raise HTTPException(status_code=400, detail="TikTok ads not configured")
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        spent = await _spend_before_delete(adapter, record, _TIKTOK_SPEND_WINDOW_DAYS)
         try:
             await adapter.delete_campaign(campaign_id)
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
-        await db["jane_ads_tiktok_campaigns"].delete_one({"campaign_id": campaign_id})
-        return {"deleted": True}
+        refunded = await _remove_and_refund(db, "jane_ads_tiktok_campaigns", campaign_id, spent, brand_ctx)
+        return {"deleted": True, "refunded_ngn": refunded}
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured")
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    spent = await _spend_before_delete(adapter, record)
     try:
         await adapter.delete_campaign(campaign_id)
     except MetaAPIError as e:
         _raise_http_for_meta_error(e)
 
-    await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": campaign_id})
-    return {"deleted": True}
+    refunded = await _remove_and_refund(db, "jane_ads_meta_campaigns", campaign_id, spent, brand_ctx)
+    return {"deleted": True, "refunded_ngn": refunded}
 
 
 @router.get("/demo", response_class=HTMLResponse)
