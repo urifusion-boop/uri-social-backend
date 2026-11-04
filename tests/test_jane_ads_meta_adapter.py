@@ -676,6 +676,21 @@ def test_a_website_destination_never_goes_native():
     assert spec["link_data"]["link"] == "https://example.com/shop"
 
 
+def test_an_awareness_link_ad_optimises_for_reach_not_clicks():
+    """Meta refuses LINK_CLICKS under OUTCOME_AWARENESS (subcode 2490408)."""
+    from app.agents.jane_ads.models import CampaignObjective
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 objective=CampaignObjective.AWARENESS)
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(plan, _auth()))
+
+    assert mock_client.post.call_args_list[0].kwargs["json"]["objective"] == "OUTCOME_AWARENESS"
+    assert mock_client.post.call_args_list[1].kwargs["json"]["optimization_goal"] == "REACH"
+
+
 async def _fixed_region(place, access_token="", timeout=8.0):
     """geo resolves the campaign's STATE before guarding pockets against it. Tests
     pin it so they exercise the matching, not Meta's gazetteer."""
