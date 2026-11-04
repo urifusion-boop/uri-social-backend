@@ -204,6 +204,18 @@ def checks(plan: dict, brief: dict) -> list[dict]:
     return out
 
 
+def without_budget(text: str, budget_ngn: Optional[float]) -> str:
+    """Takes the ad budget out of campaign text, so a script writer can't read it as a price."""
+    if not budget_ngn or budget_ngn <= 0:
+        return text
+    n = int(budget_ngn)
+    forms = [f"{n:,}", str(n)] + ([f"{n // 1000}k"] if n % 1000 == 0 else [])
+    figure = "|".join(re.escape(f) for f in forms)
+    pattern = (rf"(?:,\s*)?(?:(?:₦|NGN\s*|\bN)\s*)?(?<![\d,.])(?:{figure})(?![\d,]|\.\d)(?:\s*naira)?"
+               r"(?:\s+(?:budget|for\s+\d+\s+(?:days?|weeks?)))?")
+    return re.sub(pattern, "", text, flags=re.I).strip(" ,")
+
+
 def creator_brief(business_name: str, category: str, description: str, offer: str = "",
                   ugc_kind: str = "creator_style", shots: Optional[list[dict]] = None) -> dict:
     """CR-06: a brief a creator, customer or staff member can film from — message,
