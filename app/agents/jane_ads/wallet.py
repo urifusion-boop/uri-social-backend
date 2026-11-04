@@ -96,6 +96,34 @@ class WalletService:
         await self._store.add_transaction(txn)
         return txn
 
+    async def refund_ad_spend(
+        self, business_id: str, amount_ngn: float, campaign_id: str, now: Optional[datetime] = None,
+    ) -> Transaction:
+        """Give back a deleted campaign's unspent budget. Once per campaign."""
+        now = now or _now()
+        reference = f"refund:{campaign_id}"
+        for t in await self._store.list_transactions(business_id):
+            if t.type == TransactionType.REFUND and t.reference == reference:
+                return t
+
+        wallet = await self.get_or_create(business_id)
+        wallet.balance_ngn = round(wallet.balance_ngn + amount_ngn, 2)
+        wallet.updated_at = now
+        await self._store.upsert_wallet(wallet)
+
+        txn = Transaction(
+            transaction_id=f"txn_{uuid.uuid4().hex[:16]}",
+            business_id=business_id,
+            type=TransactionType.REFUND,
+            amount_ngn=round(amount_ngn, 2),
+            balance_after_ngn=wallet.balance_ngn,
+            campaign_id=campaign_id,
+            reference=reference,
+            created_at=now,
+        )
+        await self._store.add_transaction(txn)
+        return txn
+
     # ── Dynamic pricing (PRD B3) ────────────────────────────────────────────────
     @staticmethod
     def price_conversation(trailing_cost_ngn: Optional[float]) -> float:
