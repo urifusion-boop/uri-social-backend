@@ -3011,12 +3011,23 @@ async def _build_campaign_plan(
     # deliberately as one who tapped a card — so that answer skips the picker too.
     # Without this it regenerated a fresh set of variants and asked again, which reads
     # as the app ignoring what they just told it.
+    from .threads import chosen_audience, remember_audience
     selected_variant: Optional[PlanVariant] = None
-    if body.selected_plan_variant is not None:
+    variant_dump = body.selected_plan_variant
+    if variant_dump is None and not own_audience:
+        # Answered earlier in this campaign: a later step, or a reload, doesn't resend it.
+        remembered = await chosen_audience(db, brand_ctx.get("brand_id"), body.thread_id)
+        variant_dump = remembered.get("variant")
+        own_audience = (remembered.get("own_audience") or "").strip()
+    if variant_dump is not None:
         try:
-            selected_variant = PlanVariant.model_validate(body.selected_plan_variant)
+            selected_variant = PlanVariant.model_validate(variant_dump)
         except Exception as e:
             print(f"[oneshot] selected_plan_variant malformed, ignoring: {e}", flush=True)
+    if selected_variant is not None or own_audience:
+        await remember_audience(db, brand_ctx.get("brand_id"), body.thread_id,
+                                variant=selected_variant.model_dump() if selected_variant else None,
+                                own_audience=own_audience if not selected_variant else "")
     if selected_variant is None and not own_audience:
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
