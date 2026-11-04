@@ -44,6 +44,9 @@ REQUIRED = {
     # defaults to 5 when it is absent, but the SSM parameter must EXIST before this line ships or the task
     # cannot start. Raise it on dev to see Approve answer "queued" instead of waiting.
     "META_MIN_GAP_S": f"{SSM_PREFIX}/META_MIN_GAP_S",
+    # Minimum seconds between two TikTok posts to the same account (rate_limit.py). The code defaults to 12
+    # when it is absent, but the SSM parameter must EXIST before this line ships or the task cannot start.
+    "TIKTOK_MIN_GAP_S": f"{SSM_PREFIX}/TIKTOK_MIN_GAP_S",
 }
 
 
