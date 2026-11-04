@@ -52,6 +52,18 @@ async def _notify(notification_service, *, user_id: str, subject: str, message: 
     )
 
 
+def unspent_refund_ngn(record: dict, spend_ngn: float) -> float:
+    """What a deleted campaign gives back: what it was charged upfront, less its real
+    spend at the same markup the fee was charged at, so the fee is only kept on money
+    that was actually spent. Records billed as they spend hold no prepaid money. TikTok
+    records carry no markup because a TikTok plan is charged with no fee."""
+    charged = float(record.get("charged_upfront_ngn") or 0)
+    if charged <= 0:
+        return 0.0
+    markup = float(record.get("ad_spend_markup") or 1.0)
+    return round(max(0.0, charged - spend_ngn * markup), 2)
+
+
 async def reconcile_ad_spend_charges(db) -> dict:
     """One pass over every launched campaign, Meta and TikTok both: debit the
     owner's wallet for the new platform spend since last sweep (× markup), and
