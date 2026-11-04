@@ -2861,6 +2861,8 @@ async def _build_campaign_plan(
     # would have picked, so this can never silently apply to a Meta plan.
     fee_bypassed = (body.preferred_platform == "tiktok")
     req.budget_ngn = stated_budget_ngn if fee_bypassed else C.ad_spend_from_budget(stated_budget_ngn)
+    from .destination import website_in_text
+    _typed_website = website_in_text(body.message)
 
     # TikTok rejects an ad group under its own daily floor (₦31,000) — at launch, after the
     # wallet check. With no fee taken, the stated budget IS the ad spend, so say so now.
@@ -2949,7 +2951,8 @@ async def _build_campaign_plan(
                 "understood": parsed.model_dump(),
                 "question": "Where should people who tap your ad end up?",
                 "destination_options": [
-                    {**opt, "current": brand_destination.get(opt["field"], "")}
+                    {**opt, "current": (_typed_website if opt["field"] == "website_url" and _typed_website
+                                         else brand_destination.get(opt["field"], ""))}
                     for opt in options_for_platform(tiktok_preferred, _goal_objective)
                 ],
                 "cta_choices": cta_choice_list(),
@@ -2990,6 +2993,11 @@ async def _build_campaign_plan(
             return _early_destination_error(str(e))
         from .threads import mark_destination_answered
         await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
+
+    # A budget that can't run is said before the client picks an audience, not after.
+    budget_check = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
+    if budget_check.decision == PlanDecision.ADVISE:
+        return _budget_advice(parsed, budget_check.advice, stated_budget_ngn, fee_bypassed)
 
     # 1.7. Multi-Plan Audience Variants (spec v1.0.0) — most businesses have more than
     # one viable audience, and the client knows their customers better than Jane's
@@ -3050,8 +3058,7 @@ async def _build_campaign_plan(
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
     if result.decision == PlanDecision.ADVISE:
-        return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
-                "advice": result.advice.model_dump(), "trace": result.advice.trace}}
+        return _budget_advice(parsed, result.advice, stated_budget_ngn, fee_bypassed)
     plan = result.plan
 
     # Consultant's own reasoning (jane-strategy-extraction §7.6/§8) — state the geography
@@ -3325,7 +3332,8 @@ async def _build_campaign_plan(
                 # Pre-fill: what this brand already has on file, per option, so nobody
                 # retypes their own number to change only the button.
                 "destination_options": [
-                    {**opt, "current": brand_destination.get(opt["field"], "")}
+                    {**opt, "current": (_typed_website if opt["field"] == "website_url" and _typed_website
+                                         else brand_destination.get(opt["field"], ""))}
                     for opt in options_for_platform(tiktok_preferred, plan.objective)
                 ],
                 "cta_choices": cta_choice_list(),
@@ -3946,6 +3954,24 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "platform": "google" if is_google else "tiktok" if is_tiktok else "meta",
         },
     }
+
+
+def _budget_advice(parsed, advice, stated_budget_ngn: float, fee_bypassed: bool) -> dict:
+    """Tells the client about a too-small budget in the number they typed: what they
+    stated, what's left for ads after the fee, and what to state instead."""
+    if not fee_bypassed:
+        floor = advice.suggested_min_ngn
+        needed = C.budget_for_ad_spend(floor)
+        fee = round(C.SERVICE_FEE_RATE * 100)
+        advice = advice.model_copy(update={
+            "suggested_min_ngn": needed,
+            "reason": (f"₦{stated_budget_ngn:,.0f} leaves ₦{C.ad_spend_from_budget(stated_budget_ngn):,.0f} "
+                       f"for your ads after URI's {fee}% service fee, and they need at least "
+                       f"₦{floor:,.0f} "
+                       f"to work properly. Make your budget at least ₦{needed:,.0f}."),
+        })
+    return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
+            "advice": advice.model_dump(), "trace": advice.trace}}
 
 
 @router.post("/meta/launch-from-message")
