@@ -204,6 +204,17 @@ def checks(plan: dict, brief: dict) -> list[dict]:
     return out
 
 
+# What to cover on camera, for the person to say in their own words. Fixed on purpose:
+# a written line can name products or benefits the business doesn't have.
+TALKING_POINTS = [
+    "What it is and who it's for",
+    "What's actually in it. Only name what you really sell",
+    "Something you've really seen it do. No promises you can't back up",
+    "The real price, if you want to mention it",
+    "How to order",
+]
+
+
 def without_budget(text: str, budget_ngn: Optional[float]) -> str:
     """Takes the ad budget out of campaign text, so a script writer can't read it as a price."""
     if not budget_ngn or budget_ngn <= 0:
@@ -236,6 +247,7 @@ def creator_brief(business_name: str, category: str, description: str, offer: st
         "proof": "Show, don't claim: the product itself, a result, or a price on screen. "
                  "No figures or results that aren't real.",
         "shots": shots or default_shots,
+        **({"talking_points": TALKING_POINTS} if ugc_kind == "staff_demo" else {}),
         "length": "15–30 seconds, vertical (9:16), captions on",
         "honesty": f"This video is {kind['honest_as']}. Don't script customer reviews or put words in "
                    "anyone's mouth; let them say it their way.",
