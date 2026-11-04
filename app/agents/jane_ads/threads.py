@@ -148,6 +148,28 @@ async def destination_already_answered(db, brand_id: str, thread_id: str) -> boo
     return bool((doc or {}).get("destination_answered"))
 
 
+async def remember_audience(db, brand_id: str, thread_id: str, *, variant: Optional[dict] = None,
+                            own_audience: str = "") -> None:
+    """Keep the audience picked for this campaign on the thread, so a later step (or a
+    page reload) that doesn't resend it doesn't put the plan picker back up."""
+    if not (brand_id and thread_id) or not (variant or own_audience):
+        return
+    await db[THREADS_COLLECTION].update_one(
+        {"brand_id": brand_id, "thread_id": thread_id},
+        {"$set": {"chosen_audience": {"variant": variant, "own_audience": own_audience}}},
+    )
+
+
+async def chosen_audience(db, brand_id: str, thread_id: str) -> dict:
+    """The audience already picked in this thread, or {}."""
+    if not (brand_id and thread_id):
+        return {}
+    doc = await db[THREADS_COLLECTION].find_one(
+        {"brand_id": brand_id, "thread_id": thread_id}, {"_id": 0, "chosen_audience": 1}
+    )
+    return (doc or {}).get("chosen_audience") or {}
+
+
 async def thread_history(db, brand_id: str, thread_id: str) -> list[dict]:
     """The messages tagged to one thread, oldest first."""
     if not (brand_id and thread_id) or db is None:
