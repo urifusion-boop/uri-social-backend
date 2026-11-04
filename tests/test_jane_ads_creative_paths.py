@@ -239,3 +239,32 @@ def test_no_brief_endpoint_shot_carries_a_written_line(monkeypatch):
                                             {"user_id": "u1", "brand_id": "b1"}))["brief"]
     assert out["shots"] == [{"shot": "Shot 1 · 5s", "direction": "Hold the kit"}]
     assert "lip balm" not in str(out)
+
+
+def test_a_too_small_budget_is_explained_in_the_number_the_client_typed():
+    from types import SimpleNamespace
+    from app.agents.jane_ads import constants as C
+    from app.agents.jane_ads.models import PlanAdvice
+    from app.agents.jane_ads.router import _budget_advice
+    advice = PlanAdvice(reason="x", suggested_min_ngn=5000, can_pool=True, trace=[])
+    parsed = SimpleNamespace(model_dump=lambda: {})
+    out = _budget_advice(parsed, advice, 5000, False)["early_return"]["advice"]
+    assert "₦5,000 leaves ₦4,500" in out["reason"] and "at least ₦5,600" in out["reason"]
+    assert out["suggested_min_ngn"] == 5600 and C.ad_spend_from_budget(5600) >= 5000
+    assert _budget_advice(parsed, advice, 4000, True)["early_return"]["advice"]["reason"] == "x"
+
+
+def test_a_website_typed_in_chat_is_found_and_social_links_are_not():
+    from app.agents.jane_ads.destination import website_in_text
+    assert website_in_text("Website is https://urisocial.com. Budget 6,000") == "https://urisocial.com"
+    assert website_in_text("see www.shop.ng, thanks") == "www.shop.ng"
+    assert website_in_text("wa.me/234 and https://instagram.com/x") == ""
+    assert website_in_text("no link here") == ""
+
+
+def test_awareness_on_meta_is_described_as_reach_wherever_the_tap_goes():
+    from app.agents.jane_ads.destination import DestinationType, optimization_for
+    from app.agents.jane_ads.models import CampaignObjective
+    assert optimization_for(DestinationType.WEBSITE, "Meta (Instagram & Facebook)", CampaignObjective.AWARENESS)[0] == "Reach"
+    assert optimization_for(DestinationType.WEBSITE, "TikTok", CampaignObjective.AWARENESS)[0] == "Website link clicks"
+    assert optimization_for(DestinationType.WEBSITE)[0] == "Website link clicks"
