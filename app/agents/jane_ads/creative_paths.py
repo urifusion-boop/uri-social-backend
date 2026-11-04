@@ -220,8 +220,7 @@ def creator_brief(business_name: str, category: str, description: str, offer: st
     return {
         "for": kind["label"],
         "message": f"Why {business_name or 'this business'} is worth it, in the speaker's own words"
-                   + (f" — the offer: {offer}" if offer else
-                      f" — about: {description.strip()[:160]}" if description.strip() else ""),
+                   + (f" — the offer: {offer}" if offer else ""),
         "proof": "Show, don't claim: the product itself, a result, or a price on screen. "
                  "No figures or results that aren't real.",
         "shots": shots or default_shots,
