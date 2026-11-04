@@ -2,9 +2,24 @@
 Shared fixtures for Uri Social API tests.
 """
 
+import asyncio
+
 import pytest
 import httpx
 from tests.config import BASE_URL, TEST_EMAIL, TEST_PASSWORD, TEST_FIRST, TEST_LAST
+
+
+@pytest.fixture(autouse=True)
+def _event_loop_for_sync_tests():
+    """Many sync tests call asyncio.get_event_loop(). pytest-asyncio's async tests leave
+    none set behind them, which failed those sync tests only when run after one."""
+    try:
+        loop = asyncio.get_event_loop_policy().get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    yield
 
 
 @pytest.fixture(scope="session")

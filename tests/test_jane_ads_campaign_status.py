@@ -42,6 +42,11 @@ class FakeCollection:
                 return dict(d)
         return None
 
+    async def update_one(self, query, update):
+        for d in self.docs:
+            if all(d.get(k) == v for k, v in query.items()):
+                d.update(update.get("$set", {}))
+
     async def delete_one(self, query):
         before = len(self.docs)
         self.docs = [d for d in self.docs if not all(d.get(k) == v for k, v in query.items())]
