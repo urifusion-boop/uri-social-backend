@@ -195,5 +195,6 @@ def test_the_shoot_script_prompt_names_the_filmer_and_the_promoted_product(monke
     assert "The business owner will film" not in sent["prompt"]
 
 
-def test_the_brief_message_names_the_campaign_when_there_is_no_offer():
-    assert "shea butter kit" in cp.creator_brief("Uri Social", "", "shea butter kit")["message"]
+def test_the_brief_message_never_pastes_the_chat():
+    chat = "Promote our kit, ₦20,000 for 7 days. Static images are fine"
+    assert "₦20,000" not in cp.creator_brief("Shea Co", "", chat)["message"]
