@@ -48,6 +48,18 @@ UGC_KINDS = {
     },
 }
 
+# Who appears on camera, handed to the shoot-script writer so the shots describe the
+# right person — never the owner in a creator's or a customer's video.
+FILMED_BY = {
+    "real_customer": "A real, existing customer films themselves using or receiving the product and says "
+                     "what they think in their own words. The owner does not appear. Do not script their opinion.",
+    "paid_creator": "A paid creator (not the owner, not presented as a customer) films themselves trying the "
+                    "product in their own style, on their phone.",
+    "creator_style": "A presenter films a creator-style video for the brand, as the brand's own content — "
+                     "not the owner and never presented as a customer.",
+    "staff_demo": "The owner or a member of staff films themselves showing and explaining the product.",
+}
+
 # Wording that presents the speaker as a customer. Only a real customer's video
 # may carry it.
 _CUSTOMER_CLAIM = re.compile(

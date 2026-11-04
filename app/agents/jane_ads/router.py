@@ -4490,9 +4490,7 @@ async def creative_creator_brief(
     description = str(payload.get("description") or "")
     shots = None
     try:
-        script = await write_shoot_script(name, category, "messages",
-                                          "A person on camera builds trust for this business.",
-                                          description, brand_context)
+        script = await write_shoot_script(name, category, "messages", cp.FILMED_BY[kind], description, brand_context)
         shots = [{"shot": f"Shot {i + 1} · {s.seconds}s", "direction": s.direction,
                   **({"say": s.say} if s.say and kind == "staff_demo" else {})}
                  for i, s in enumerate(script.shots)] or None
