@@ -172,3 +172,28 @@ def test_mode_defaults_to_guided_is_per_user_and_validated():
 def test_every_kind_of_video_tells_the_script_writer_who_is_filming():
     assert set(cp.FILMED_BY) == set(cp.UGC_KINDS)
     assert "not the owner" in cp.FILMED_BY["creator_style"] and "owner" in cp.FILMED_BY["staff_demo"]
+
+
+def test_the_shoot_script_prompt_names_the_filmer_and_the_promoted_product(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from app.agents.jane_ads import creative
+    sent = {}
+
+    class Completions:
+        async def create(self, **kw):
+            sent["prompt"] = kw["messages"][0]["content"]
+            msg = SimpleNamespace(content=json.dumps({"shots": [{"direction": "x", "say": "", "seconds": 5}]}))
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(creative, "settings", SimpleNamespace(jane_ads_openai_key="k"))
+    monkeypatch.setattr(creative.openai, "AsyncOpenAI",
+                        lambda **_: SimpleNamespace(chat=SimpleNamespace(completions=Completions())))
+    run(creative.write_shoot_script("Uri Social", "software", "messages", "trust",
+                                    "shea butter starter kit", {}, filmed_by=cp.FILMED_BY["paid_creator"]))
+    assert cp.FILMED_BY["paid_creator"] in sent["prompt"] and "shea butter starter kit" in sent["prompt"]
+    assert "The business owner will film" not in sent["prompt"]
+
+
+def test_the_brief_message_names_the_campaign_when_there_is_no_offer():
+    assert "shea butter kit" in cp.creator_brief("Uri Social", "", "shea butter kit")["message"]
