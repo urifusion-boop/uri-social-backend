@@ -524,6 +524,11 @@ class WritingDNAService:
             return analysis
         except Exception as e:
             print(f"⚠️ Writing sample analysis failed: {e}")
+            # Own independent OpenAI client, not AIService.py's — see
+            # image_content_service.py's _call_dalle_api for why this matters.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             return {}
 
     @staticmethod
@@ -563,6 +568,11 @@ class WritingDNAService:
             return analysis
         except Exception as e:
             print(f"⚠️ Aspirational writer analysis failed: {e}")
+            # Own independent OpenAI client, not AIService.py's — see
+            # image_content_service.py's _call_dalle_api for why this matters.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             return {}
 
     @staticmethod
@@ -798,6 +808,11 @@ class WritingDNAService:
 
         except Exception as e:
             print(f"⚠️ learn_from_edits failed for brand={brand_id or user_id}: {e}")
+            # Own independent OpenAI client, not AIService.py's — see
+            # image_content_service.py's _call_dalle_api for why this matters.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
 
     @staticmethod
     async def accumulate_published_sample(

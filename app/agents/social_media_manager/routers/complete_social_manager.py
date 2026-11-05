@@ -8455,6 +8455,11 @@ async def agent_chat_stream(
 
         except Exception as e:
             print(f"❌ agent_chat_stream error: {e}")
+            # Own independent OpenAI client, not AIService.py's — see
+            # image_content_service.py's _call_dalle_api for why this matters.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             yield f"data: {json.dumps({'error': 'Stream failed. Please try again.'})}\n\n"
             return
 
@@ -8591,6 +8596,13 @@ async def agent_chat(
     except Exception as e:
         print(f"❌ agent_chat error: {e}")
         traceback.print_exc()
+        # The image_url branch above uses its own independent OpenAI client,
+        # not AIService.py's (whose own chat_completion already alerts
+        # internally, so the non-image branch is covered without this) — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return UriResponse.error_response("Agent is unavailable right now. Please try again.")
 
 
@@ -9772,6 +9784,11 @@ Rules:
         decisions = _json.loads(raw)
     except Exception as exc:
         print(f"[MultiClip/analyze] GPT error: {exc}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
         decisions = {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
 
     print(f"[MultiClip/analyze] job={job_id} cuts={len(decisions.get('cuts', []))} zooms={len(decisions.get('zooms', []))}", flush=True)

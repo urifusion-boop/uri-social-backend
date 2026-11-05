@@ -465,6 +465,16 @@ class VideoEditService:
 
         except Exception as e:
             print(f"[VideoEdit] transcription failed: {e}")
+            # Sync method (no event loop of its own to await on) — fire-and-forget
+            # onto whatever loop is running the request, never raising if there
+            # isn't one (e.g. called from a plain thread/CLI context).
+            if "insufficient_quota" in str(e):
+                try:
+                    import asyncio
+                    from app.services.AIService import _alert_openai_out_of_credit
+                    asyncio.get_running_loop().create_task(_alert_openai_out_of_credit(str(e)))
+                except RuntimeError:
+                    pass
             return []
 
     @staticmethod

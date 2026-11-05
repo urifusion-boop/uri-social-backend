@@ -199,6 +199,12 @@ async def _job_generate_image_path_a(
             print(f"⚠️ [Path A] Falling back to brand-colored placeholder: {e}")
             needs_attention = True
             error_message = str(e)
+            # Falls back to a placeholder and the job still reports success — an
+            # exhausted OpenAI balance would silently degrade to placeholders
+            # forever with no alert, if not caught right here before the fallback.
+            if "insufficient_quota" in error_message:
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(error_message)
             imagery_result = await ImagePathService.generate_placeholder_image(brand_primary, format=format)
 
         imagery_layer = LayerData(
@@ -220,6 +226,11 @@ async def _job_generate_image_path_a(
         })
     except Exception as e:
         print(f"❌ [Job {job_id}] generate_image_path_a failed unexpectedly: {e}")
+        # Module-level openai_client here — never routed through AIService.py's
+        # out-of-credit alert like every other caller.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         await _fail_job(db, job_id, str(e))
 
 
@@ -258,6 +269,9 @@ async def _job_upload_image_path_b(
         })
     except Exception as e:
         print(f"❌ [Job {job_id}] upload_image_path_b failed unexpectedly: {e}")
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         await _fail_job(db, job_id, str(e))
 
 
@@ -287,6 +301,9 @@ async def _job_upload_image_path_b_recomposite(
         })
     except Exception as e:
         print(f"❌ [Job {job_id}] upload_image_path_b_recomposite failed unexpectedly: {e}")
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         await _fail_job(db, job_id, str(e))
 
 
@@ -318,6 +335,9 @@ async def _job_carousel_generate_images(
         })
     except Exception as e:
         print(f"❌ [Job {job_id}] carousel_generate_images failed unexpectedly: {e}")
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         await _fail_job(db, job_id, str(e))
 
 
@@ -360,6 +380,9 @@ async def _job_carousel_upload_images(
         })
     except Exception as e:
         print(f"❌ [Job {job_id}] carousel_upload_images failed unexpectedly: {e}")
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         await _fail_job(db, job_id, str(e))
 
 

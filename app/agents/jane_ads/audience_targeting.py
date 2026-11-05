@@ -314,6 +314,11 @@ async def resolve_audience_targeting(audience_text: str, access_token: str) -> d
         hints = await _extract_hints(text)
     except Exception as e:
         print(f"[AudienceTargeting] extraction skipped: {e}", flush=True)
+        # Own independent OpenAI client (jane_ads_openai_key) — never routed
+        # through AIService.py's out-of-credit alert like every other caller.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return {}
 
     targeting: dict = {}

@@ -100,6 +100,9 @@ async def generate_voiceover_script(
         return text or None
     except Exception as exc:
         print(f"[Voiceover] script generation failed: {exc}", flush=True)
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
         return None
 
 

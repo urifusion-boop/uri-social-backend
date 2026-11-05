@@ -117,17 +117,29 @@ async def openai_json(system: str, user: str) -> dict:
     from app.core.config import settings
 
     client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
-    resp = await client.chat.completions.create(
-        model=MODEL,
-        response_format={"type": "json_object"},
-        temperature=0.2,
-        # A short customer-service answer should never become an essay: the cap keeps
-        # one reply's cost bounded however the model is prompted.
-        max_tokens=onebox.DEFAULT_CONFIG["max_output_tokens"],
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        timeout=20,
-    )
+    # The one chokepoint every inbox AI call (classify/suggest/_process_inbound/
+    # process_inbound) already goes through — none of them has its own
+    # try/except, so this was the only place to add the alert without changing
+    # any caller's behavior. Peeks at the error purely for the alert, then
+    # re-raises unchanged so every existing caller still sees the exact same
+    # exception it always did.
+    try:
+        resp = await client.chat.completions.create(
+            model=MODEL,
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            # A short customer-service answer should never become an essay: the cap keeps
+            # one reply's cost bounded however the model is prompted.
+            max_tokens=onebox.DEFAULT_CONFIG["max_output_tokens"],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            timeout=20,
+        )
+    except Exception as e:
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
+        raise
     onebox.note_usage(MODEL, getattr(resp, "usage", None))
     return json.loads(resp.choices[0].message.content or "{}")
 
