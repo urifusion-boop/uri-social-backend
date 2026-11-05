@@ -3441,8 +3441,20 @@ Answer with exactly one word: "yes" or "no"."""
 
         except Exception as e:
             print(f"❌ Image generation failed: {e}")
+            # The single chokepoint for this whole function's provider-fallback
+            # chain (Imagen -> gpt-image-1 edit -> gpt-image-2 -> fal.ai ->
+            # gpt-image-1.5 above) — reached only once every provider has
+            # already failed. AIService.py wires this same alert into its own
+            # chat/structured completions, but image generation (arguably the
+            # single most credit-intensive OpenAI usage on this platform) went
+            # through this separate file and was never connected to it, so an
+            # exhausted OpenAI balance broke every image here with no alert
+            # ever firing — confirmed live.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             return {"success": False, "error": str(e)}
-    
+
     @staticmethod
     async def generate_brand_consistent_images(
         user_id: str,
