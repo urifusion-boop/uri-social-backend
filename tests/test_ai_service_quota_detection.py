@@ -62,7 +62,12 @@ def test_insufficient_quota_is_detected_even_though_it_is_also_a_rate_limit_erro
     monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
 
     result = run(AIService.chat_completion(_request()))
-    assert result == {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
+    # This message's wording is prod's own pre-existing copy, kept as-is when this
+    # fix was ported over (merge/quota-alerts-to-prod) — only the detection order
+    # and the alert call are the actual fix; the text was never the bug.
+    assert result == {
+        "error": "Content generation is temporarily unavailable. Our team has been notified and will resolve this shortly."
+    }
 
 
 def test_a_plain_rate_limit_with_no_quota_wording_still_gets_the_generic_message(monkeypatch):
@@ -70,7 +75,7 @@ def test_a_plain_rate_limit_with_no_quota_wording_still_gets_the_generic_message
     monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
 
     result = run(AIService.chat_completion(_request()))
-    assert result == {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
+    assert result == {"error": "We're experiencing high demand right now. Please try again in a few moments."}
 
 
 def test_insufficient_quota_raises_the_platform_alert(monkeypatch):
@@ -121,7 +126,9 @@ def test_a_broken_alert_path_never_breaks_the_actual_ai_error_response(monkeypat
     monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
 
     result = run(AIService.chat_completion(_request()))  # must not raise
-    assert result == {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
+    assert result == {
+        "error": "Content generation is temporarily unavailable. Our team has been notified and will resolve this shortly."
+    }
 
 
 def test_structured_chat_completion_has_the_same_fix(monkeypatch):
