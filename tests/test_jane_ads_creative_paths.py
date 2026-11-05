@@ -314,3 +314,24 @@ def test_every_ad_in_the_test_answers_to_the_brief_not_just_the_first():
     generated = {**_plan({}), "concepts": [{"source": "generate", "headline": "h", "primary_text": "t"}]}
     rules = {"constraints": ["own_photos_only"]}
     assert "constraint_own_photos" in {i["code"] for i in ab.check_plan(generated, {"budget_ngn": 14000}, rules)["blocking"]}
+
+
+def test_working_through_test_n_ideas_stops_once_the_plan_has_them():
+    from unittest.mock import patch
+    from app.agents.jane_ads import router
+    from app.agents.jane_ads.models import AdCreative
+    db = mongomock_motor.AsyncMongoMockClient()["ads"]
+    plan = {"business_id": "b1", "goal": "traffic", "behaviour": "discover", "per_business_cap_ngn": 1, "account_cap_ngn": 1,
+            "platforms": [{"platform": "meta", "budget_ngn": 12600, "days": 2, "variants": 1, "test_scope": "none"}],
+            "creative": {"image_url": "https://x/a.jpg", "headline": "h", "primary_text": "p", "concept": "problem"},
+            "concepts": [{"image_url": "https://x/b.jpg", "headline": "h", "primary_text": "p"}],
+            "concepts_wanted": 2}
+    run(db["jane_ads_pending_plans"].insert_one({"plan_id": "p1", "brand_id": "b1", "status": "pending", "plan": plan,
+                                                 "business_id": "b1", "req": {}}))
+    out = run(router.meta_plan_add_ad("p1", router.PlanAdBody(auto=True), db, {"brand_id": "b1", "user_id": "u1"}))
+    assert out["concepts_wanted"] == 0 and len(out["concepts"]) == 1
+    out = run(router.meta_plan_remove_ad("p1", 0, db, {"brand_id": "b1"}))
+    assert out["concepts"] == [] and out["concepts_wanted"] == 0
+    assert run(router.meta_plan_set_layout("p1", router.PlanLayoutBody(layout="single_ad_set"), db, {"brand_id": "b1"}))
+    with __import__("pytest").raises(HTTPException):
+        run(router.meta_plan_remove_ad("p1", 0, db, {"brand_id": "other"}))

@@ -231,6 +231,9 @@ class CampaignPlan(BaseModel):
     concepts: list["AdCreative"] = Field(default_factory=list)
     # single_ad_set: every ad in one ad set. abo: one ad set each, budget split equally.
     ad_layout: str = "single_ad_set"
+    # How many ads Jane is still working up to. One request can't make them all before
+    # the connection times out, so the rest are added one at a time after the plan.
+    concepts_wanted: int = 0
     shoot_script: Optional["ShootScript"] = None  # Path C — set only when creative.video_recommendation
                                              # fired; the user can film this and swap it in via
                                              # POST /meta/plan/{id}/creative before launching
