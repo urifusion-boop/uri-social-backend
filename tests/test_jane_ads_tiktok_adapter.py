@@ -150,6 +150,7 @@ _HAPPY_RESPONSES = [
          "username": "uri.creative", "display_name": "uricreative"},
     ]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+    {"code": 0, "message": "OK"},  # ad/status/update, which keeps the new ad off
 ]
 
 
@@ -357,7 +358,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert result.campaign_id == "111"
     assert result.ad_ids == {"b1": "333"}
     assert result.platforms == [Platform.TIKTOK]
-    assert mock_client.post.call_count == 5
+    assert mock_client.post.call_count == 6
     assert mock_client.get.call_count == 1
 
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
@@ -368,15 +369,15 @@ def test_launch_campaign_happy_path_full_call_sequence():
     # warm up — the HEAD pre-fetch must not fire needlessly.
     assert mock_client.head.call_count == 0
 
-    video_json = mock_client.post.call_args_list[1].kwargs["json"]
+    video_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert video_json["upload_type"] == "UPLOAD_BY_URL"
     assert video_json["video_url"] == "https://cdn.example.com/clip.mp4"
 
-    cover_json = mock_client.post.call_args_list[2].kwargs["json"]
+    cover_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert cover_json["upload_type"] == "UPLOAD_BY_URL"
     assert cover_json["image_url"] == "https://cdn.example.com/cover.jpg"
 
-    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert adgroup_json["operation_status"] == "DISABLE"
     assert adgroup_json["budget"] == 70_000
     assert adgroup_json["campaign_id"] == "111"
@@ -409,15 +410,16 @@ def test_launch_campaign_happy_path_full_call_sequence():
     # A second launch must reuse the cached identity — no repeat lookup call.
     mock_client2 = _mock_client([
         {"code": 0, "message": "OK", "data": {"campaign_id": "444"}},
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "555"}},
         {"code": 0, "message": "OK", "data": [{"video_id": "vid_000", "video_cover_url": "https://cdn.example.com/cover2.jpg"}]},
         {"code": 0, "message": "OK", "data": {"image_id": "img_000"}},
-        {"code": 0, "message": "OK", "data": {"adgroup_id": "555"}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["666"]}},
+        {"code": 0, "message": "OK"},  # ad/status/update
     ])
     with patch("httpx.AsyncClient") as MockClient2:
         MockClient2.return_value.__aenter__.return_value = mock_client2
         _run(adapter.launch_campaign(_plan(business_id="b2"), _auth()))
-    assert mock_client2.post.call_count == 5
+    assert mock_client2.post.call_count == 6
     assert mock_client2.get.call_count == 0
     ad_json_2 = mock_client2.post.call_args_list[4].kwargs["json"]
     assert ad_json_2["creatives"][0]["identity_id"] == "identity_777"
@@ -430,23 +432,23 @@ def test_launch_campaign_happy_path_full_call_sequence():
 
 
 def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
-    # campaign(POST), video(POST), cover(POST), region lookup(GET), interest
-    # lookup(GET), adgroup(POST), identity(GET), ad(POST) — the two new lookups
-    # land between the creative upload and adgroup/create, exactly where
-    # they're inserted in launch_campaign, since _mock_client's .get/.post
-    # share one response queue.
+    # region lookup(GET), interest lookup(GET), campaign(POST), adgroup(POST),
+    # video(POST), cover(POST), identity(GET), ad(POST), ad status(POST). The lookups
+    # come first because the ad group needs them, and _mock_client's .get/.post share
+    # one response queue.
     responses = [
-        {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
-        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
-        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         _REGION_TREE_RESPONSE,
         _INTEREST_CATEGORIES_RESPONSE,
+        {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
         {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
+        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         {"code": 0, "message": "OK", "data": {"identity_list": [
             {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
              "username": "uri.creative", "display_name": "uricreative"},
         ]}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+        {"code": 0, "message": "OK"},  # ad/status/update
     ]
     db = FakeDb()
     adapter = _adapter(db)
@@ -463,10 +465,10 @@ def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
         result = _run(adapter.launch_campaign(plan, _auth()))
 
     assert result.campaign_id == "111"
-    assert mock_client.post.call_count == 5
+    assert mock_client.post.call_count == 6
     assert mock_client.get.call_count == 3  # region lookup + interest lookup + identity lookup
 
-    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert adgroup_json["location_ids"] == ["2001"]  # Ikeja, resolved
     assert adgroup_json["gender"] == "GENDER_FEMALE"
     assert adgroup_json["age_groups"] == ["AGE_25_34", "AGE_35_44", "AGE_45_54"]
@@ -480,14 +482,15 @@ def test_launch_campaign_omits_interest_category_ids_when_none_given():
     # an interest lookup call, and must not send the key rather than an empty list.
     responses = [
         {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
         {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
         {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
-        {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
         {"code": 0, "message": "OK", "data": {"identity_list": [
             {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
              "username": "uri.creative", "display_name": "uricreative"},
         ]}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+        {"code": 0, "message": "OK"},  # ad/status/update
     ]
     adapter = _adapter()
     with patch("httpx.AsyncClient") as MockClient:
@@ -497,7 +500,7 @@ def test_launch_campaign_omits_interest_category_ids_when_none_given():
 
     assert result.campaign_id == "111"
     assert mock_client.get.call_count == 1  # identity lookup only
-    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert "interest_category_ids" not in adgroup_json
 
 
@@ -511,15 +514,16 @@ def test_launch_campaign_omits_interest_category_ids_when_none_given():
 # as "The source of this post is invalid" before this was added.
 _CAROUSEL_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"image_id": "img_a"}},
     {"code": 0, "message": "OK", "data": {"image_id": "img_b"}},
-    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"identity_list": [
         {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
          "username": "uri.creative", "display_name": "uricreative"},
     ]}},
     {"code": 0, "message": "OK", "data": {"musics": [{"music_id": "music_999", "name": "Upbeat Track"}]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+    {"code": 0, "message": "OK"},  # ad/status/update, which keeps the new ad off
 ]
 
 
@@ -543,12 +547,12 @@ def test_launch_campaign_carousel_happy_path():
         result = _run(adapter.launch_campaign(_carousel_plan(), _auth()))
 
     assert result.campaign_id == "111"
-    assert mock_client.post.call_count == 5
+    assert mock_client.post.call_count == 6
     assert mock_client.get.call_count == 2  # identity lookup + music lookup
 
-    img1_json = mock_client.post.call_args_list[1].kwargs["json"]
+    img1_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert img1_json["image_url"] == "https://cdn.example.com/a.jpg"
-    img2_json = mock_client.post.call_args_list[2].kwargs["json"]
+    img2_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert img2_json["image_url"] == "https://cdn.example.com/b.jpg"
 
     music_params = mock_client.get.call_args_list[1].kwargs["params"]
@@ -584,9 +588,9 @@ def test_launch_campaign_carousel_forces_jpg_on_cloudinary_urls():
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(plan, _auth()))
 
-    img1_json = mock_client.post.call_args_list[1].kwargs["json"]
+    img1_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert img1_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/a.webp"
-    img2_json = mock_client.post.call_args_list[2].kwargs["json"]
+    img2_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert img2_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/b.webp"
 
 
@@ -655,7 +659,7 @@ def test_launch_campaign_forces_tiktok_ratio_on_cloudinary_video():
     warmed_url = mock_client.head.call_args_list[0].args[0]
     assert warmed_url == "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
 
-    video_json = mock_client.post.call_args_list[1].kwargs["json"]
+    video_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert video_json["video_url"] == (
         "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
     )
@@ -786,13 +790,11 @@ def test_launch_campaign_raises_on_tiktok_error():
 
 def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_original_error():
     adapter = _adapter()
-    # Campaign + video + cover image upload succeed, ad group creation fails ->
+    # The campaign succeeds, ad group creation fails ->
     # rollback should DELETE the already-created campaign, and the ORIGINAL
     # error (not a rollback error) propagates.
     responses = [
         {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
-        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
-        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         {"code": 40002, "message": "ad group rejected: invalid location_ids"},
         {"code": 0, "message": "OK"},  # the rollback's own DELETE-status call
     ]
@@ -802,7 +804,7 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
         with pytest.raises(TikTokAdsAPIError, match="ad group rejected"):
             _run(adapter.launch_campaign(_plan(), _auth()))
 
-    rollback_json = mock_client.post.call_args_list[4].kwargs["json"]
+    rollback_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert rollback_json["operation_status"] == "DELETE"
     assert rollback_json["campaign_ids"] == ["111"]
     # Live-caught 2026-09-22: the URL itself had campaign/update/status/ — a real
@@ -810,7 +812,7 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
     # earlier this session deleting real diagnostic campaigns). The JSON-body
     # assertions above would pass against either path, which is exactly how this
     # shipped unnoticed — assert the actual URL too.
-    rollback_url = mock_client.post.call_args_list[4].args[0]
+    rollback_url = mock_client.post.call_args_list[2].args[0]
     assert rollback_url.endswith("/campaign/status/update/")
 
 
@@ -915,6 +917,7 @@ def test_fetch_campaign_summary_active_campaign():
     with patch("httpx.AsyncClient") as MockClient:
         mock_client = _mock_client([
             {"code": 0, "message": "OK", "data": {"list": [{"operation_status": "ENABLE"}]}},
+            {"code": 0, "message": "OK", "data": {"list": []}},  # the ad's delivery status
             {"code": 0, "message": "OK", "data": {"list": [{"metrics": {
                 "impressions": "1000", "reach": "800", "clicks": "20", "spend": "5000",
             }}]}},
@@ -1233,8 +1236,8 @@ def test_fetch_adgroup_schedule_derives_daily_rate_from_the_total_budget():
             "data": {"list": [{
                 "adgroup_id": "222", "operation_status": "ENABLE",
                 "budget": 217000.0, "budget_mode": "BUDGET_MODE_TOTAL",
-                "schedule_start_time": "2026-09-20 10:00:00",
-                "schedule_end_time": "2026-09-27 10:00:00",
+                "schedule_start_time": "2099-09-20 10:00:00",
+                "schedule_end_time": "2099-09-27 10:00:00",
             }]},
         }])
         MockClient.return_value.__aenter__.return_value = mock_client

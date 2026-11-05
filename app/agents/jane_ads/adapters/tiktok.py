@@ -1067,7 +1067,13 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         },
                     )
                     adgroup_data = adgroup_resp.json()
-                    _raise_for_error(adgroup_data, "ad group creation")
+                    try:
+                        _raise_for_error(adgroup_data, "ad group creation")
+                    except TikTokAdsAPIError:
+                        # The caller never learns this campaign's id, so nothing else can
+                        # clean it up, and it would sit on the account with no ad group.
+                        await self._rollback_partial_launch(new_campaign_id)
+                        raise
                     new_adgroup_id = str(adgroup_data["data"]["adgroup_id"])
                     return new_campaign_id, new_adgroup_id
 
