@@ -3209,6 +3209,16 @@ async def _build_campaign_plan(
             else:
                 plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
 
+    # The duration the client asked for, wherever they said it. The planner otherwise
+    # picks one from the budget alone, so "for 2 days" was silently ignored.
+    from . import concepts as concepts_mod
+    asked_days = concepts_mod.stated_days(body.message)
+    if asked_days:
+        for p in plan.platforms:
+            floor = (max(C.HARD_FLOOR_DAILY_NGN.get(p.platform.value, 0), C.MIN_DAILY_SPEND_NGN)
+                     if p.platform == Platform.META else C.HARD_FLOOR_DAILY_NGN.get(p.platform.value, 0))
+            p.days = concepts_mod.days_for_budget(asked_days, p.budget_ngn, floor)
+
     # 3. Geo refinement — prefer the consultant's own §7 judgment (which of own-radius/
     # watering-hole/mixed/non-local, and which named pockets), validated by real
     # geocoding; fall back to the legacy heuristic if the consultant didn't set one
@@ -3490,8 +3500,6 @@ async def _build_campaign_plan(
                 status_code=402,
                 detail="You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead.",
             )
-        from . import concepts as concepts_mod
-
         n_concepts = min(max(1, body.concepts), _concepts_allowed(plan, creative_platform))
         if n_concepts > 1 and not await credit_service.check_sufficient_credits(user_id, required=n_concepts):
             raise HTTPException(
@@ -3516,7 +3524,7 @@ async def _build_campaign_plan(
             )
 
         if n_concepts > 1:
-            angles = [key for key, _ in concepts_mod.ANGLES[:n_concepts]]
+            angles = [a[0] for a in concepts_mod.ANGLES[:n_concepts]]
             made = await asyncio.gather(*(_one(a) for a in angles))
             for angle, c in zip(angles, made):
                 c.concept = angle
@@ -3864,6 +3872,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         },
         "creative": plan.creative.model_dump(mode="json"),
         "concepts": [c.model_dump(mode="json") for c in plan.concepts],
+        "ad_layout": plan.ad_layout,
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
         # So the review can show where leads land (and let the user catch a wrong
@@ -4002,12 +4011,12 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
 
 
 def _concepts_allowed(plan, creative_platform: str) -> int:
-    """How many concepts this plan can test in one campaign: Meta only, by its budget."""
+    """How many ads Jane can make to test in one campaign. Meta only: they share one ad
+    set by default, so a small budget can still test them."""
     from . import concepts as concepts_mod
     if creative_platform != Platform.META.value or not plan.platforms:
         return 1
-    p = plan.platforms[0]
-    return concepts_mod.max_concepts(p.budget_ngn, p.days)
+    return concepts_mod.MAX_JANE_MADE
 
 
 def _budget_advice(parsed, advice, stated_budget_ngn: float, fee_bypassed: bool) -> dict:
@@ -4221,6 +4230,149 @@ async def meta_plan_update_creative(
     return {"plan_id": plan_id, "creative": plan.creative.model_dump(mode="json")}
 
 
+class PlanAdBody(BaseModel):
+    source: str = "generate"           # generate | upload
+    reference_image_url: str = ""
+    is_video: bool = False
+    asset_attestation: Optional[str] = None
+    creative_path: str = ""            # "" | ai_video | ugc
+    video_job_id: str = ""
+    ugc_kind: str = ""
+    ugc_rights_confirmed: bool = False
+
+
+class PlanLayoutBody(BaseModel):
+    layout: str
+
+
+async def _pending_meta_plan(db, plan_id: str, brand_ctx: dict) -> tuple[dict, CampaignPlan]:
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if doc["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"This plan is already {doc['status']}.")
+    plan = CampaignPlan.model_validate(doc["plan"])
+    if not plan.platforms or plan.platforms[0].platform != Platform.META or not plan.creative:
+        raise HTTPException(status_code=400, detail="Testing several ads is only available on Instagram & Facebook.")
+    return doc, plan
+
+
+async def _save_plan_ads(db, plan_id: str, plan: CampaignPlan) -> dict:
+    from . import concepts as concepts_mod
+    await db["jane_ads_pending_plans"].update_one(
+        {"plan_id": plan_id}, {"$set": {"plan": plan.model_dump(mode="json")}})
+    p = plan.platforms[0]
+    ads = 1 + len(plan.concepts)
+    return {"plan_id": plan_id, "concepts": [c.model_dump(mode="json") for c in plan.concepts],
+            "ad_layout": plan.ad_layout, "can_split": concepts_mod.can_split(p.budget_ngn, p.days, ads)}
+
+
+@router.post("/meta/plan/{plan_id}/ads")
+async def meta_plan_add_ad(
+    plan_id: str,
+    body: PlanAdBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Add another ad to the test this plan runs: one Jane makes, or the client's own
+    photo or video. Any mix works, and each answers to the same checks as the first."""
+    from app.services.CreditService import credit_service
+    from . import concepts as concepts_mod
+    from .creative import creative_from_upload, generate_ad_creative, service_area_from_geo
+    from .creative_paths import disclose
+    from .policy import Severity, review_ad_creative
+
+    doc, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if 1 + len(plan.concepts) >= concepts_mod.MAX_ADS:
+        raise HTTPException(status_code=400, detail=f"A test can hold up to {concepts_mod.MAX_ADS} ads.")
+    req = CampaignRequest.model_validate(doc["req"])
+    user_id = brand_ctx.get("user_id") or ""
+    brand_id = brand_ctx.get("brand_id")
+    variant = doc.get("selected_plan_variant") or {}
+    city = plan.geo.city if plan.geo else ""
+    shared = dict(
+        user_id=user_id, db=db, brand_id=brand_id, city=city,
+        service_area=service_area_from_geo(plan.geo, city),
+        audience_segment=variant.get("audience_segment", ""), who_its_for=variant.get("who_its_for", ""),
+        destination_type=plan.destination_type, destination_cta=plan.destination_cta,
+    )
+    name = req.business_name or doc.get("business_name") or "Your Business"
+    prov: dict = {}
+    if body.source == "generate":
+        if not await credit_service.check_sufficient_credits(user_id, required=1):
+            raise HTTPException(status_code=402, detail="You're out of content credits. Top up, or add your own photo or video.")
+        angle = concepts_mod.next_angle([c.concept for c in [plan.creative, *plan.concepts]])
+        ad = await generate_ad_creative(
+            name, req.category, req.goal.value, concepts_mod.brief_for(req.description, angle),
+            behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn, **shared)
+        ad.concept = angle
+    else:
+        path_body = MetaLaunchFromMessageBody(
+            message=doc.get("message") or "", creative_source="upload",
+            reference_image_url=body.reference_image_url, is_video=body.is_video,
+            creative_path=body.creative_path, video_job_id=body.video_job_id,
+            ugc_kind=body.ugc_kind, ugc_rights_confirmed=body.ugc_rights_confirmed)
+        prov = await _resolve_creative_path(path_body, brand_ctx, db)
+        if not path_body.reference_image_url:
+            raise HTTPException(status_code=400, detail="Upload the photo or video first.")
+        ad = await creative_from_upload(
+            name, req.category, path_body.reference_image_url, req.goal.value, req.description,
+            is_video=path_body.is_video, asset_attestation=body.asset_attestation, **shared)
+    if not ad.image_url:
+        raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+    if prov:
+        ad.provenance = prov
+        ad.primary_text = disclose(ad.primary_text, prov)
+    blocking = [v for v in review_ad_creative(ad.headline, ad.primary_text, platform=Platform.META.value).violations
+                if v.severity == Severity.BLOCK]
+    if blocking:
+        raise HTTPException(status_code=400, detail=f"Can't use this ad — {blocking[0].guidance}")
+    if body.source == "generate":
+        await credit_service.deduct_credit(user_id, campaign_id=doc["business_id"], reason="campaign_generation")
+    plan.concepts.append(ad)
+    p = plan.platforms[0]
+    if not concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts)):
+        plan.ad_layout = concepts_mod.SINGLE_AD_SET
+    return await _save_plan_ads(db, plan_id, plan)
+
+
+@router.delete("/meta/plan/{plan_id}/ads/{index}")
+async def meta_plan_remove_ad(
+    plan_id: str,
+    index: int,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Take an added ad back out of the test. `index` counts the added ads only, so the
+    plan always keeps its main ad."""
+    _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if not 0 <= index < len(plan.concepts):
+        raise HTTPException(status_code=404, detail="That ad isn't in this plan.")
+    plan.concepts.pop(index)
+    return await _save_plan_ads(db, plan_id, plan)
+
+
+@router.post("/meta/plan/{plan_id}/layout")
+async def meta_plan_set_layout(
+    plan_id: str,
+    body: PlanLayoutBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """All the ads in one ad set, or one ad set each with an equal budget."""
+    from . import concepts as concepts_mod
+    if body.layout not in (concepts_mod.SINGLE_AD_SET, concepts_mod.ABO):
+        raise HTTPException(status_code=400, detail="Unknown layout.")
+    _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    p = plan.platforms[0]
+    ads = 1 + len(plan.concepts)
+    if body.layout == concepts_mod.ABO and not concepts_mod.can_split(p.budget_ngn, p.days, ads):
+        raise HTTPException(status_code=400, detail=f"Each ad set needs at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} a day. "
+                                                    "Raise the budget or test fewer ads.")
+    plan.ad_layout = body.layout
+    return await _save_plan_ads(db, plan_id, plan)
+
+
 class PlanLaunchBody(BaseModel):
     # The client confirmed they deliver to places outside their saved service area.
     allow_out_of_area: bool = False
@@ -4324,7 +4476,8 @@ async def meta_launch_plan(
     plan.destination_cta = brand_destination["destination_cta"]
     if plan.creative is not None:
         from .creative_paths import disclose
-        plan.creative.primary_text = disclose(plan.creative.primary_text, plan.creative.provenance)
+        for ad in [plan.creative, *plan.concepts]:
+            ad.primary_text = disclose(ad.primary_text, ad.provenance)
     if plan.goal != Goal.FOLLOWERS and not plan.destination_link:
         raise HTTPException(
             status_code=400,

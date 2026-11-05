@@ -368,8 +368,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # Meta also enforces its own daily-budget floor per currency; a too-small
         # budget will come back as a descriptive error from the API, not a silent
         # failure, so this is intentionally not pre-validated here.
-        # Several concepts split the daily budget equally, one ad set each.
-        n_adsets = 1 + len(plan.concepts)
+        # One ad set each splits the daily budget equally. Ads sharing an ad set share it.
+        split_adsets = plan.ad_layout == "abo" and bool(plan.concepts)
+        n_adsets = 1 + len(plan.concepts) if split_adsets else 1
         daily_budget_minor = max(int((total_budget_ngn / days / n_adsets) * 100), 100)
         # A real end date, not just a `days` number in copy — without this the ad
         # set has no natural stop and would run (and spend) indefinitely once
@@ -788,22 +789,25 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     plan.creative, adset_id, video_id, video_thumbnail_url)
                 ad_ids = [ad_id]
                 adset_ids = [adset_id]
-                # Every other concept being tested: its own ad set, same targeting,
-                # an equal share of the budget (ABO).
+                # Every other ad being tested: in the same ad set, or in its own with the
+                # same targeting and an equal share of the budget (ABO).
                 for i, extra in enumerate(plan.concepts, start=2):
                     suffix = f"-{extra.concept or i}"
-                    extra_resp = await client.post(
-                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
-                        params={"access_token": self._access_token},
-                        json={**adset_payload, "name": f"JaneAds-{plan.business_id}-adset{suffix}"},
-                    )
-                    extra_data = extra_resp.json()
-                    _raise_for_error(extra_data, "ad set creation")
+                    target_adset = adset_id
+                    if split_adsets:
+                        extra_resp = await client.post(
+                            f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                            params={"access_token": self._access_token},
+                            json={**adset_payload, "name": f"JaneAds-{plan.business_id}-adset{suffix}"},
+                        )
+                        extra_data = extra_resp.json()
+                        _raise_for_error(extra_data, "ad set creation")
+                        target_adset = extra_data["id"]
+                        adset_ids.append(target_adset)
                     extra_vid, extra_thumb = (None, None)
                     if extra.is_video:
                         extra_vid, extra_thumb = await self._upload_video_to_meta(extra.image_url)
-                    _, extra_ad = await _creative_and_ad(extra, extra_data["id"], extra_vid, extra_thumb, suffix)
-                    adset_ids.append(extra_data["id"])
+                    _, extra_ad = await _creative_and_ad(extra, target_adset, extra_vid, extra_thumb, suffix)
                     ad_ids.append(extra_ad)
         except Exception:
             await self._rollback_partial_launch(campaign_id, creative_id)
