@@ -184,7 +184,8 @@ def build_document(
     _check_one_line(lines)
 
     plate_height = int(_FONT_STATEMENT * 1.8)
-    plate_y = int(height * 0.52)
+    # Below the face, not across it: a line over someone's mouth reads as a gag.
+    plate_y = int(height * 0.72)
 
     layers = []
     z = 0

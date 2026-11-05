@@ -30,8 +30,8 @@ ANGLES = [
      "own account. It must not look like a customer wrote it."),
 ]
 
-MAX_JANE_MADE = 3   # what one tap of "Test ideas" makes
 MAX_ADS = len(ANGLES)  # most ads one campaign can test
+MAX_JANE_MADE = MAX_ADS
 
 SINGLE_AD_SET = "single_ad_set"
 ABO = "abo"

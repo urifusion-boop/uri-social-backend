@@ -4015,6 +4015,14 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     }
 
 
+async def _refund_undelivered_ad(brand_ctx: dict, business_id: str) -> None:
+    from app.services.CreditService import credit_service
+    try:
+        await credit_service.refund_credit(brand_ctx.get("user_id") or "", campaign_id=business_id)
+    except Exception as e:
+        print(f"[credits] refund after dropped connection failed: {e}", flush=True)
+
+
 def _can_split_ads(plan) -> bool:
     from . import concepts as concepts_mod
     p = plan.platforms[0]
@@ -4091,6 +4099,7 @@ async def meta_launch_from_message(
 @router.post("/meta/plan-from-message")
 async def meta_plan_from_message(
     body: MetaLaunchFromMessageBody,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -4105,6 +4114,9 @@ async def meta_plan_from_message(
     built = await _build_campaign_plan(body, brand_ctx, db)
     if isinstance(built, dict):
         return built["early_return"]
+    # The connection dropped while the ad was being made, so nobody will ever see it.
+    if built.plan.creative and built.plan.creative.source == "generate" and await request.is_disconnected():
+        await _refund_undelivered_ad(brand_ctx, built.business_id)
 
     own_billing = _google_own_billing(built.plan)
     balance, sufficient = await _wallet_status(
@@ -4288,6 +4300,7 @@ async def meta_plan_add_ad(
     body: PlanAdBody,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
+    request: Request = None,
 ) -> dict:
     """Add another ad to the test this plan runs: one Jane makes, or the client's own
     photo or video. Any mix works, and each answers to the same checks as the first."""
@@ -4357,6 +4370,44 @@ async def meta_plan_add_ad(
     p = plan.platforms[0]
     if not concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts)):
         plan.ad_layout = concepts_mod.SINGLE_AD_SET
+    saved = await _save_plan_ads(db, plan_id, plan)
+    # Kept on the plan, but the client may never see it: don't charge for that.
+    if body.source == "generate" and request is not None and await request.is_disconnected():
+        await _refund_undelivered_ad(brand_ctx, doc["business_id"])
+    return saved
+
+
+class PlanAdEditBody(BaseModel):
+    headline: str = ""
+    primary_text: str = ""
+
+
+@router.patch("/meta/plan/{plan_id}/ads/{index}")
+async def meta_plan_edit_ad(
+    plan_id: str,
+    index: int,
+    body: PlanAdEditBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Edit the words of an added ad. Same checks as the main ad's caption edit."""
+    from .creative_paths import disclose
+    from .policy import Severity, review_ad_creative
+
+    _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if not 0 <= index < len(plan.concepts):
+        raise HTTPException(status_code=404, detail="That ad isn't in this plan.")
+    headline, text = body.headline.strip(), body.primary_text.strip()
+    if not headline or not text:
+        raise HTTPException(status_code=400, detail="Headline and caption cannot be empty.")
+    if len(headline) > 40:
+        raise HTTPException(status_code=400, detail="Keep the headline to 40 characters.")
+    blocking = [v for v in review_ad_creative(headline, text, platform=Platform.META.value).violations
+                if v.severity == Severity.BLOCK]
+    if blocking:
+        raise HTTPException(status_code=400, detail=f"Ad copy rejected: {blocking[0].guidance}")
+    ad = plan.concepts[index]
+    ad.headline, ad.primary_text = headline, disclose(text, ad.provenance)
     return await _save_plan_ads(db, plan_id, plan)
 
 
