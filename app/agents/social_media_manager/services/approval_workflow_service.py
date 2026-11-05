@@ -84,16 +84,20 @@ class ApprovalWorkflowService:
         draft_ids: List[str],
         schedule_option: str = "immediate",  # immediate, schedule, save_draft
         scheduled_datetime: Optional[datetime] = None,
-        approval_notes: Optional[str] = None
+        approval_notes: Optional[str] = None,
+        tiktok_settings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Approve content drafts and optionally schedule them
-        
+
         Args:
             draft_ids: List of draft IDs to approve
             schedule_option: 'immediate', 'schedule', or 'save_draft'
             scheduled_datetime: When to publish (if schedule_option is 'schedule')
             approval_notes: Optional notes from approver
+            tiktok_settings: What the user chose on the Post to TikTok screen. Required to schedule a
+                TikTok image / carousel post (TikTok allows no default), saved on the draft for the
+                scheduler to post with.
         """
         try:
             print(f"✅ approve_content | user_id={user_id} draft_ids={draft_ids} schedule_option={schedule_option}")
@@ -108,6 +112,9 @@ class ApprovalWorkflowService:
             # frontend show a hard failure toast for a post that actually is
             # queued, which is its own kind of misleading.
             warnings = []
+            # Scheduled TikTok photo posts: published by the scheduler with the saved choices, never
+            # handed to Outstand's own scheduler (which would post with defaults the user didn't pick).
+            scheduled_tiktok_photos = set()
 
             for draft_id in draft_ids:
                 try:
@@ -147,6 +154,15 @@ class ApprovalWorkflowService:
                                 errors.append({"draft_id": draft_id, "error": "Instagram carousel requires slides. Re-generate the post."})
                                 continue
 
+                        if draft.get("platform") == "tiktok" and not draft.get("video_url"):
+                            from app.agents.social_media_manager.services import tiktok_media_proxy
+                            from app.agents.social_media_manager.services.tiktok_direct_service import schedule_problem
+                            problem = schedule_problem(tiktok_settings, len(tiktok_media_proxy.draft_image_sources(draft)))
+                            if problem:
+                                errors.append({"draft_id": draft_id, "error": problem})
+                                continue
+                            scheduled_tiktok_photos.add(draft_id)
+
                         # Cancel only "publishing"/"ready_to_publish" stuck states for this
                         # user+platform — NOT already-scheduled posts for other dates.
                         # Users should be able to queue multiple posts for different times.
@@ -173,6 +189,8 @@ class ApprovalWorkflowService:
                         update_data["status"] = "scheduled" if _app_env == "production" else "staging_scheduled"
                         update_data["user_id"] = user_id
                         update_data["platform_post_id"] = None  # reset so cron picks it up fresh
+                        if draft_id in scheduled_tiktok_photos:
+                            update_data["tiktok_settings"] = tiktok_settings
                     elif schedule_option == "immediate":
                         update_data["status"] = "ready_to_publish"
 
@@ -220,6 +238,9 @@ class ApprovalWorkflowService:
                         # publishes each slide as a separate post; cron handles them correctly
                         # by calling _publish_to_platform at publish time with scheduled_at=None.
                         from app.agents.social_media_manager.services import publish_dispatch as _pd_sched
+                        if _d["draft_id"] in scheduled_tiktok_photos:
+                            print(f"🎵 TikTok photo — cron will publish at scheduled_date ({_schedule_dt.isoformat()}) with the saved choices")
+                            continue
                         _fb_direct = _d["platform"] == "facebook" and bool(
                             await _pd_sched.preferred_direct_facebook(db, user_id, _d.get("brand_id")))
                         if _d["platform"] == "instagram" or _fb_direct or (
@@ -870,6 +891,11 @@ class ApprovalWorkflowService:
                         connection = None
                         if _platform_key == "facebook":
                             connection = await _pd.preferred_direct_facebook(db, draft_user_id, draft.get("brand_id"))
+                        elif _platform_key == "tiktok":
+                            # The same account the Post to TikTok screen and Publish Now use: a direct
+                            # TikTok-login connection first, else the Outstand one.
+                            from app.agents.social_media_manager.services.tiktok_direct_service import resolve_tiktok_connection
+                            _, connection = await resolve_tiktok_connection(db, draft_user_id)
                         if not connection:
                             connections_cursor = db["social_connections"].find({
                                 "user_id": draft_user_id,
@@ -1876,6 +1902,13 @@ class ApprovalWorkflowService:
                     print(f"⚠️ FB — no Outstand Facebook account found anywhere, falling back to direct FB API")
                     # fall through to legacy Facebook block below
 
+        # ── Scheduled TikTok image / carousel post: the choices made when scheduling ──
+        # (who can view, comments, disclosure) were saved on the draft, and go out with the post
+        # whichever way the account is connected.
+        if platform == "tiktok" and not draft.get("video_url") and draft.get("tiktok_settings"):
+            from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+            return await VideoPublishService.publish_scheduled_tiktok_photo(draft, connection, db)
+
         # ── TikTok direct (FILE_UPLOAD, bypasses Outstand) ───────────────────────
         if platform == "tiktok" and connection.get("connected_via") == "tiktok_direct_oauth":
             from app.agents.social_media_manager.services.tiktok_direct_service import (
@@ -1885,6 +1918,9 @@ class ApprovalWorkflowService:
             )
             video_url = draft.get("video_url") or ""
             if not video_url:
+                if draft.get("image_url") or draft.get("slides"):
+                    # A photo post scheduled before its posting choices were saved with it.
+                    return {"success": False, "error": "This TikTok photo post is missing its posting choices (who can view it, comments, disclosure). Open it and schedule it again."}
                 return {"success": False, "error": "TikTok post has no video_url. Re-generate the video before publishing."}
             if db is None:
                 return {"success": False, "error": "TikTok direct publish requires a database handle."}

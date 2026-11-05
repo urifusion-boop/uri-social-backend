@@ -259,6 +259,8 @@ class ApprovalRequest(BaseModel):
     schedule_option: str = "save_draft"  # immediate, schedule, save_draft
     scheduled_datetime: Optional[datetime] = None
     approval_notes: Optional[str] = None
+    # Required to schedule a TikTok image / carousel post: what the user chose on the Post to TikTok screen.
+    tiktok: Optional[TikTokPostSettingsRequest] = None
 
 class DenialRequest(BaseModel):
     draft_ids: List[str] = Field(..., min_items=1)
@@ -2948,7 +2950,8 @@ async def approve_content(
             draft_ids=request.draft_ids,
             schedule_option=request.schedule_option,
             scheduled_datetime=request.scheduled_datetime,
-            approval_notes=request.approval_notes
+            approval_notes=request.approval_notes,
+            tiktok_settings=request.tiktok.model_dump() if request.tiktok else None,
         )
 
         return result
