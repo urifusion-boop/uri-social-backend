@@ -1041,7 +1041,7 @@ async def generate_ad_creative(
     who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     budget_ngn: float = 0.0, destination_type: str = DEFAULT_DESTINATION.value,
     destination_cta: str = "", vsg01_format_id: Optional[str] = None,
-    platform: str = "meta",
+    platform: str = "meta", exclude_format_ids: Optional[list[str]] = None,
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -1101,7 +1101,7 @@ async def generate_ad_creative(
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
-            forced_format_id=vsg01_format_id,
+            forced_format_id=vsg01_format_id, exclude_format_ids=exclude_format_ids,
         )
         if vsg01_result is not None:
             image_url = await _upload_bytes_to_cloudinary(

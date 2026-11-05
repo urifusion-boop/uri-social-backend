@@ -335,3 +335,22 @@ def test_working_through_test_n_ideas_stops_once_the_plan_has_them():
     assert run(router.meta_plan_set_layout("p1", router.PlanLayoutBody(layout="single_ad_set"), db, {"brand_id": "b1"}))
     with __import__("pytest").raises(HTTPException):
         run(router.meta_plan_remove_ad("p1", 0, db, {"brand_id": "other"}))
+
+
+def test_ads_in_a_test_never_repeat_a_format():
+    from unittest.mock import AsyncMock, patch
+    from types import SimpleNamespace
+    from app.agents.jane_ads import vsg01_orchestrator as v
+    tried = []
+
+    async def render(strategy, *_, **__):
+        tried.append(strategy.strategy_id)
+        return {"format_id": strategy.strategy_id}
+
+    ranked = [SimpleNamespace(strategy_id=i) for i in ("SEED-075", "SEED-097")]
+    fmt = SimpleNamespace(FORMAT=SimpleNamespace(requires_isolation=False))
+    with patch.object(v, "select_ranked_ad_formats", new=AsyncMock(return_value=ranked)), \
+            patch.object(v, "render_vsg01_creative", new=render), \
+            patch.dict(v.FORMAT_MODULES, {"SEED-075": fmt, "SEED-097": fmt}):
+        out = run(v.select_and_render_vsg01_creative(None, "b", "c", "d", {}, exclude_format_ids=["SEED-075"]))
+    assert out["format_id"] == "SEED-097" and tried == ["SEED-097"]

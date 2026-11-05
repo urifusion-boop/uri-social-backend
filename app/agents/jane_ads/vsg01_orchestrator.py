@@ -2046,6 +2046,7 @@ async def select_and_render_vsg01_creative(
     recomposite: bool = False,
     forced_format_id: Optional[str] = None,
     day30_photo_url: Optional[str] = None,
+    exclude_format_ids: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """The one call creative.py's GENERATE/UPLOAD/RECOMPOSITE paths need:
     select eligible formats from the real corpus (scoped to what this module
@@ -2095,6 +2096,8 @@ async def select_and_render_vsg01_creative(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
         isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT, candidate_ids=candidate_ids, description=description,
     )
+    # Ads tested together must differ in structure, not just wording.
+    ranked = [s for s in ranked if s.strategy_id not in (exclude_format_ids or [])]
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
     if effective_forced is None:

@@ -84,5 +84,7 @@ def brief_for(description: str, angle: str) -> str:
     """The campaign description with this ad's angle and visual structure added."""
     for key, line, layout in ANGLES:
         if key == angle:
-            return f"{description.strip()}\n\nCreative angle for this version: {line} {layout}"
+            return (f"{description.strip()}\n\nCreative angle for this version: {line} {layout} "
+                    "Its headline and opening line must come from this angle and not read like "
+                    "other versions of the ad.")
     return description
