@@ -78,6 +78,8 @@ _VIDEO_POLL_INTERVAL_SECONDS = 5
 
 # Meta's `effective_status` values, translated to plain language for the campaign-
 # list view — callers never see raw Ads-Manager jargon.
+RETRY_DELAY_SECONDS = 4
+
 _DELIVERY_LABELS = {
     "ACTIVE": "Active",
     "PAUSED": "Paused",
@@ -656,6 +658,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
 
                 async def _creative_and_ad(ad_creative, for_adset: str, vid, thumb, suffix: str = ""):
                     """One creative and its ad inside an ad set."""
+                    headline, description = creative_text(ad_creative)
                     if is_followers_goal:
                         message = ad_creative.primary_text or ad_creative.headline or "Follow us for more!"
                         # LIKE_PAGE drives the tap straight to following the Page — confirmed
@@ -758,12 +761,20 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                                 cta_type, ig.get("ig_id", "")),
                             **messaging_ad.creative_extras(),
                         }
-                    creative_resp = await client.post(
-                        f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
-                        params={"access_token": self._access_token},
-                        json=creative_body,
-                    )
-                    creative_data = creative_resp.json()
+                    # Meta's code 2 means "temporarily unavailable, try again": asks are
+                    # retried here rather than failing a launch of several ads at the last one.
+                    for attempt in range(3):
+                        creative_resp = await client.post(
+                            f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
+                            params={"access_token": self._access_token},
+                            json=creative_body,
+                        )
+                        creative_data = creative_resp.json()
+                        if (creative_data.get("error") or {}).get("code") != 2 or attempt == 2:
+                            break
+                        print(f"[MetaAds] creative creation temporarily unavailable, retrying "
+                              f"({ad_creative.concept or ad_creative.image_url[-30:]})", flush=True)
+                        await asyncio.sleep(RETRY_DELAY_SECONDS)
                     if want_native_whatsapp and _whatsapp_refusal(creative_data):
                         _raise_not_linked(creative_data, plan)
                     _raise_for_error(creative_data, "ad creative creation")
