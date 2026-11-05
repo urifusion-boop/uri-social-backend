@@ -287,6 +287,11 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
 
         except Exception as e:
             print(f"⚠️ CarouselGenerationService.generate error: {e}")
+            # Own independent OpenAI client, not AIService.py's — see
+            # image_content_service.py's _call_dalle_api for why this matters.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             # Graceful fallback
             slides = [
                 {
@@ -338,6 +343,11 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             return caption[:125]
         except Exception as e:
             print(f"⚠️ CarouselGenerationService.generate_story_caption error: {e}")
+            # Own independent OpenAI client, not AIService.py's — see
+            # image_content_service.py's _call_dalle_api for why this matters.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             return seed_content[:125]
 
     @staticmethod

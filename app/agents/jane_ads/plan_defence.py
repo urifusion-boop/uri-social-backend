@@ -91,6 +91,10 @@ async def classify_followup(message: str, current_budget_ngn: Optional[float] = 
         d = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[PlanDefence] classify error: {e}", flush=True)
+        # Own independent AsyncOpenAI client — AIService.py's alerting never saw this.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return FollowupIntent(kind="new_campaign")
     kind = d.get("kind")
     if kind not in ("question", "challenge", "new_campaign"):
@@ -152,6 +156,10 @@ async def explain_plan(
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         print(f"[PlanDefence] explain error: {e}", flush=True)
+        # Own independent AsyncOpenAI client — AIService.py's alerting never saw this.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         raise NlUnavailableError(str(e)) from e
 
 

@@ -161,6 +161,11 @@ class LLMPinProposer(PinProposer):
             return [(p.get("name", ""), p.get("reason", "")) for p in data.get("pins", []) if p.get("name")]
         except Exception as e:
             print(f"[Geo] LLM proposer error: {e}", flush=True)
+            # This proposer's one and only OpenAI call — its own independent
+            # AsyncOpenAI client, so AIService.py's alerting never saw it.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             return []
 
 

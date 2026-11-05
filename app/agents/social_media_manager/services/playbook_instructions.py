@@ -498,6 +498,9 @@ async def instruct(db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[st
         proposal = await (ask or _ask_model)(text, profile)
     except Exception as e:  # model unavailable or returned garbage
         print(f"[PlaybookInstruct] model call failed: {e}")
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         raise InstructError("Jane couldn't read that just now — please try again in a minute.", status=503)
 
     if not proposal.get("understood", True) and not proposal.get("changes") and not proposal.get("remember"):

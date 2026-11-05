@@ -371,6 +371,11 @@ async def _call_ad_copy_model(prompt: str) -> Optional[dict]:
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[Creative] copy error: {e}", flush=True)
+        # Own independent OpenAI client (jane_ads_openai_key) — never routed
+        # through AIService.py's out-of-credit alert like every other caller.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return None
 
 
@@ -658,6 +663,11 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
         )
     except Exception as e:
         print(f"[Creative] shoot script error: {e}", flush=True)
+        # Own independent OpenAI client (jane_ads_openai_key) — never routed
+        # through AIService.py's out-of-credit alert like every other caller.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return ShootScript()
 
 
@@ -810,6 +820,11 @@ async def describe_ad_image(image_url: str) -> str:
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         print(f"[Creative] image describe error: {e}", flush=True)
+        # Own independent OpenAI client (jane_ads_openai_key) — never routed
+        # through AIService.py's out-of-credit alert like every other caller.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return ""
 
 
