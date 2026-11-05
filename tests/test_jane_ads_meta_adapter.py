@@ -1009,7 +1009,7 @@ def test_a_whatsapp_ad_without_a_number_never_becomes_a_link_ad(whatsapp_only):
 
 
 def test_several_concepts_launch_as_one_campaign_with_an_ad_set_each_and_an_even_budget():
-    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop", ad_layout="abo",
                  creative=AdCreative(image_url="https://cdn/a.jpg", headline="A", primary_text="pa",
                                      concept="problem"),
                  concepts=[AdCreative(image_url="https://cdn/b.jpg", headline="B", primary_text="pb", concept="offer"),
@@ -1035,3 +1035,28 @@ def test_several_concepts_launch_as_one_campaign_with_an_ad_set_each_and_an_even
     assert result.campaign_id == "cmp_1"
     record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
     assert record["ad_ids"] == ["ad_1", "ad_2", "ad_3"] and record["concepts"] == ["problem", "offer", "outcome"]
+
+
+def test_several_ads_share_one_ad_set_and_its_whole_budget_by_default_images_and_videos_mixed():
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 creative=AdCreative(image_url="https://cdn/a.jpg", headline="A", primary_text="pa", concept="problem"),
+                 concepts=[AdCreative(image_url="https://cdn/v.mp4", headline="V", primary_text="pv", is_video=True),
+                           AdCreative(image_url="https://cdn/c.jpg", headline="C", primary_text="pc", concept="outcome")])
+    responses = [{"id": "cmp_1"}, {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"},
+                 {"id": "cr_2"}, {"id": "ad_2"}, {"id": "cr_3"}, {"id": "ad_3"}]
+    db = FakeDb()
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient, patch.object(
+            MetaAdPlatformAdapter, "_upload_video_to_meta", new=AsyncMock(return_value=("vid_1", "https://cdn/t.jpg"))):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth()))
+
+    posts = [c.kwargs["json"] for c in mock_client.post.call_args_list]
+    adsets = [p for p in posts if "daily_budget" in p]
+    specs = [p["object_story_spec"] for p in posts if "object_story_spec" in p]
+    assert len(adsets) == 1 and adsets[0]["daily_budget"] == int(10_000 / 7 * 100)
+    assert {p["adset_id"] for p in posts if "adset_id" in p and "creative" in p} == {"as_1"}
+    assert specs[1]["video_data"]["video_id"] == "vid_1" and "link_data" in specs[0] and "link_data" in specs[2]
+    record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
+    assert record["ad_ids"] == ["ad_1", "ad_2", "ad_3"] and record["adset_ids"] == ["as_1"]

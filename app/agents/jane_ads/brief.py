@@ -153,14 +153,19 @@ def structure(plan: dict, req: dict, sibling_plans: int = 1) -> dict:
     daily = budget / days if days else budget
     rec = recommend_structure(daily, days)
     n = 1 + len(plan.get("concepts") or [])
-    out = {"campaigns": 1, "ad_sets": n, "ads_per_ad_set": 1, "budget_type": "daily, on the ad set",
+    split = n > 1 and plan.get("ad_layout") == "abo"
+    out = {"campaigns": 1, "ad_sets": n if split else 1, "ads_per_ad_set": 1 if split else n,
+           "budget_type": "daily, on the ad set",
            "daily_ngn": round(daily, 2), "days": days, "total_ngn": budget,
            "why": "One campaign, one ad set and one ad keeps the whole budget learning in one place.",
            "recommended": rec, "warnings": []}
-    if n > 1:
+    if split:
         out.update({"per_ad_set_daily_ngn": round(daily / n, 2),
-                    "why": f"{n} different ideas, each in its own ad set with an equal ₦{daily / n:,.0f} "
+                    "why": f"{n} different ads, each in its own ad set with an equal ₦{daily / n:,.0f} "
                            "a day, so each gets a fair chance before any is judged."})
+    elif n > 1:
+        out["why"] = (f"{n} different ads share one ad set and its budget. Meta shows them to the same "
+                      "audience and leans toward whichever is doing better, so it can favour one early.")
     if sibling_plans > 1:
         out["warnings"].append({
             "code": "split_budget", "level": "warning",
@@ -187,7 +192,15 @@ def costs(req: dict, due_ngn: float, production_ngn: float = 0.0) -> dict:
 
 def check_plan(plan: dict, req: dict, brief: dict, sibling_plans: int = 1) -> dict:
     from .creative_paths import checks as path_checks
-    issues = _area_checks(plan, brief) + _constraint_checks(plan, brief) + path_checks(plan, brief)
+    issues = _area_checks(plan, brief)
+    # Every ad being tested answers to the brief, not just the first.
+    seen = set()
+    for ad in [plan.get("creative") or {}, *(plan.get("concepts") or [])]:
+        one = {**plan, "creative": ad}
+        for issue in _constraint_checks(one, brief) + path_checks(one, brief):
+            if (issue["code"], issue["message"]) not in seen:
+                seen.add((issue["code"], issue["message"]))
+                issues.append(issue)
     note = optimisation_note(plan, brief)
     if note:
         issues.append(note)

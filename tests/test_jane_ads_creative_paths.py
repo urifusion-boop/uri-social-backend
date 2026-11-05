@@ -281,6 +281,36 @@ def test_concepts_follow_the_budget_and_carry_a_different_angle():
 
 def test_the_plan_card_says_how_concepts_split_the_budget():
     from app.agents.jane_ads.brief import structure
-    plan = {"platforms": [{"budget_ngn": 42000, "days": 7}], "concepts": [{}, {}]}
+    plan = {"platforms": [{"budget_ngn": 42000, "days": 7}], "concepts": [{}, {}], "ad_layout": "abo"}
     s = structure(plan, {"budget_ngn": 42000})
-    assert s["ad_sets"] == 3 and s["per_ad_set_daily_ngn"] == 2000
+    assert s["ad_sets"] == 3 and s["ads_per_ad_set"] == 1 and s["per_ad_set_daily_ngn"] == 2000
+    shared = structure({**plan, "ad_layout": "single_ad_set"}, {"budget_ngn": 42000})
+    assert shared["ad_sets"] == 1 and shared["ads_per_ad_set"] == 3 and "per_ad_set_daily_ngn" not in shared
+
+
+def test_the_duration_the_client_typed_is_understood_and_the_latest_wins():
+    from app.agents.jane_ads import concepts
+    assert concepts.stated_days("Budget 14,000 for 2 days, all of Lagos") == 2
+    assert concepts.stated_days("6,000 for 2 days. Make it 9,000 for 3 days") == 3
+    assert concepts.stated_days("run it for 2 weeks") == 14 and concepts.stated_days("for a week") == 7
+    assert concepts.stated_days("delivery in 3 days") is None
+    assert concepts.days_for_budget(2, 12600, 2000) == 2
+    assert concepts.days_for_budget(7, 6000, 2000) == 3 and concepts.days_for_budget(30, 90000, 2000) == 7
+
+
+def test_each_ad_set_needs_the_daily_floor_before_it_can_split():
+    from app.agents.jane_ads import concepts
+    assert concepts.can_split(12600, 2, 3) and not concepts.can_split(6000, 2, 3)
+    assert not concepts.can_split(100000, 2, 1)
+    assert concepts.next_angle(["problem", ""]) == "offer"
+
+
+def test_every_ad_in_the_test_answers_to_the_brief_not_just_the_first():
+    clean = cp.provenance("ugc", ugc_kind="real_customer", rights_confirmed=True)
+    no_consent = cp.provenance("ugc", ugc_kind="paid_creator")
+    plan = {**_plan(clean), "concepts": [{"source": "upload", "headline": "h", "primary_text": "t",
+                                          "provenance": no_consent}]}
+    assert "ugc_rights_missing" in {i["code"] for i in ab.check_plan(plan, {"budget_ngn": 14000}, {})["blocking"]}
+    generated = {**_plan({}), "concepts": [{"source": "generate", "headline": "h", "primary_text": "t"}]}
+    rules = {"constraints": ["own_photos_only"]}
+    assert "constraint_own_photos" in {i["code"] for i in ab.check_plan(generated, {"budget_ngn": 14000}, rules)["blocking"]}
