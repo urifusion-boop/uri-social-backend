@@ -3437,6 +3437,10 @@ async def _build_campaign_plan(
     # picture and copy are made the feed-ad way. Only Search is text-only.
     google_visual = creative_platform == Platform.GOOGLE.value and google_placement != "search"
     copy_platform = Platform.META.value if google_visual else creative_platform
+    # The budget is how the ad runs, never a price to print on it. The message carries
+    # the whole conversation, so "₦14,000 for 2 days" reached the writer as an offer.
+    from .creative_paths import without_budget
+    creative_brief = without_budget(req.description, parsed.budget_ngn)
 
     if creative_platform == Platform.GOOGLE.value and not google_visual:
         # A Search ad is text: Jane writes it in the brand's voice and nothing is
@@ -3451,7 +3455,7 @@ async def _build_campaign_plan(
         )
     elif body.creative_source == "upload":
         creative = await creative_from_upload(
-            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            business_name, category, body.reference_image_url, req.goal.value, creative_brief,
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -3462,7 +3466,7 @@ async def _build_campaign_plan(
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
-            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            business_name, category, body.reference_image_url, req.goal.value, creative_brief,
             user_id=user_id, db=db, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -3486,7 +3490,7 @@ async def _build_campaign_plan(
         # keep the image from the prior plan. Copy is still rewritten to match any changed
         # brief, but no image is generated, so no content credit is spent.
         creative = await creative_from_upload(
-            business_name, category, body.reuse_image_url, req.goal.value, req.description,
+            business_name, category, body.reuse_image_url, req.goal.value, creative_brief,
             user_id=user_id, db=db, brand_id=brand_id, is_video=False,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -3514,7 +3518,7 @@ async def _build_campaign_plan(
         async def _one(angle: str = ""):
             return await generate_ad_creative(
                 business_name, category, req.goal.value,
-                concepts_mod.brief_for(req.description, angle) if angle else req.description,
+                concepts_mod.brief_for(creative_brief, angle) if angle else creative_brief,
                 user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
                 behaviour=plan.behaviour.value, service_area=service_area,
                 audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -4290,7 +4294,7 @@ async def meta_plan_add_ad(
     from app.services.CreditService import credit_service
     from . import concepts as concepts_mod
     from .creative import creative_from_upload, generate_ad_creative, service_area_from_geo
-    from .creative_paths import disclose
+    from .creative_paths import disclose, without_budget
     from .policy import Severity, review_ad_creative
 
     doc, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
@@ -4311,14 +4315,18 @@ async def meta_plan_add_ad(
         destination_type=plan.destination_type, destination_cta=plan.destination_cta,
     )
     name = req.business_name or doc.get("business_name") or "Your Business"
+    # The budget is how the ad runs, never a price to print on it.
+    clean_brief = without_budget(req.description, (doc.get("understood") or {}).get("budget_ngn"))
     prov: dict = {}
     if body.source == "generate":
         if not await credit_service.check_sufficient_credits(user_id, required=1):
             raise HTTPException(status_code=402, detail="You're out of content credits. Top up, or add your own photo or video.")
         angle = concepts_mod.next_angle([c.concept for c in [plan.creative, *plan.concepts]])
         ad = await generate_ad_creative(
-            name, req.category, req.goal.value, concepts_mod.brief_for(req.description, angle),
-            behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn, **shared)
+            name, req.category, req.goal.value, concepts_mod.brief_for(clean_brief, angle),
+            behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn,
+            exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id],
+            **shared)
         ad.concept = angle
     else:
         path_body = MetaLaunchFromMessageBody(
@@ -4330,7 +4338,7 @@ async def meta_plan_add_ad(
         if not path_body.reference_image_url:
             raise HTTPException(status_code=400, detail="Upload the photo or video first.")
         ad = await creative_from_upload(
-            name, req.category, path_body.reference_image_url, req.goal.value, req.description,
+            name, req.category, path_body.reference_image_url, req.goal.value, clean_brief,
             is_video=path_body.is_video, asset_attestation=body.asset_attestation, **shared)
     if not ad.image_url:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
