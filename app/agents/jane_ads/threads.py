@@ -149,14 +149,15 @@ async def destination_already_answered(db, brand_id: str, thread_id: str) -> boo
 
 
 async def remember_audience(db, brand_id: str, thread_id: str, *, variant: Optional[dict] = None,
-                            own_audience: str = "") -> None:
+                            own_audience: str = "", passed: bool = False) -> None:
     """Keep the audience picked for this campaign on the thread, so a later step (or a
-    page reload) that doesn't resend it doesn't put the plan picker back up."""
-    if not (brand_id and thread_id) or not (variant or own_audience):
+    page reload) that doesn't resend it doesn't put the plan picker back up. `passed`
+    records that the step went by with nothing to choose."""
+    if not (brand_id and thread_id) or not (variant or own_audience or passed):
         return
     await db[THREADS_COLLECTION].update_one(
         {"brand_id": brand_id, "thread_id": thread_id},
-        {"$set": {"chosen_audience": {"variant": variant, "own_audience": own_audience}}},
+        {"$set": {"chosen_audience": {"variant": variant, "own_audience": own_audience, "passed": passed}}},
     )
 
 

@@ -3018,6 +3018,7 @@ async def _build_campaign_plan(
     from .threads import chosen_audience, remember_audience
     selected_variant: Optional[PlanVariant] = None
     variant_dump = body.selected_plan_variant
+    remembered: dict = {}
     if variant_dump is None and not own_audience:
         # Answered earlier in this campaign: a later step, or a reload, doesn't resend it.
         remembered = await chosen_audience(db, brand_ctx.get("brand_id"), body.thread_id)
@@ -3032,7 +3033,9 @@ async def _build_campaign_plan(
         await remember_audience(db, brand_ctx.get("brand_id"), body.thread_id,
                                 variant=selected_variant.model_dump() if selected_variant else None,
                                 own_audience=own_audience if not selected_variant else "")
-    if selected_variant is None and not own_audience:
+    # Past this step once with no picker: asking again later would put it up after the
+    # client has already answered what comes next, because generation can differ per call.
+    if selected_variant is None and not own_audience and not remembered.get("passed"):
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
             corpus = await _retrieve_for_plan_generation(db, parsed, business_id)
@@ -3069,6 +3072,7 @@ async def _build_campaign_plan(
         # Only ever 0 or 1 genuinely distinct audience exists — nothing to choose
         # between, so fall straight through with Jane's own single read (unchanged
         # today's behaviour) rather than showing a pointless one-card "choice".
+        await remember_audience(db, brand_ctx.get("brand_id"), body.thread_id, passed=True)
 
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
@@ -3520,7 +3524,7 @@ async def _build_campaign_plan(
                 # Drives creative-stage retrieval; without it budget is 0, retrieval
                 # bails early, and the ad ships with corpus_coverage="none".
                 budget_ngn=float(parsed.budget_ngn or 0),
-                vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
+                vsg01_format_id=None if angle else body.vsg01_format_id, platform=copy_platform,
             )
 
         if n_concepts > 1:
