@@ -406,6 +406,16 @@ async def emergency_stop(payload: dict = Body(default={}),
     return {"policy": await engine.load_policy(db, brand)}
 
 
+@router.post("/campaigns/{campaign_id}/variation-jobs")
+async def start_variation_job(campaign_id: str, payload: dict = Body(...),
+                              db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                              ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """Make a variation in the background: see ad_jobs.py for why."""
+    from .. import ad_jobs
+    await _campaign(db, _brand(ctx), campaign_id)
+    return {"job_id": await ad_jobs.start(db, _brand(ctx), lambda: make_variation(campaign_id, payload, db, ctx))}
+
+
 @router.post("/campaigns/{campaign_id}/variations")
 async def make_variation(campaign_id: str, payload: dict = Body(...),
                          db: AsyncIOMotorDatabase = Depends(get_db_dependency),

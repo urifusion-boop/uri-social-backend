@@ -1043,6 +1043,7 @@ async def generate_ad_creative(
     budget_ngn: float = 0.0, destination_type: str = DEFAULT_DESTINATION.value,
     destination_cta: str = "", vsg01_format_id: Optional[str] = None,
     platform: str = "meta", exclude_format_ids: Optional[list[str]] = None,
+    image_layout: str = "",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -1123,7 +1124,10 @@ async def generate_ad_creative(
         # from the brand's real ad destination, not the brand playbook's generic one.
         image_brand_context = {**(brand_context or {}),
                                "override_cta": image_cta(coerce_type(destination_type))}
-        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt, platform=platform)
+        # When no format rendered, the layout has to reach the picture directly: the copy
+        # writer's scene idea alone comes back the same structure every time.
+        seed = f"{image_layout} Scene: {copy.image_prompt}" if image_layout else copy.image_prompt
+        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=seed, platform=platform)
         # Caption LAST, matched to the actual generated image (vision) so it references the
         # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
         # original copy if the vision pass fails. Skipped for a VSG-01 render above — that

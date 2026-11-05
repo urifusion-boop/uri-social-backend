@@ -80,6 +80,11 @@ def next_angle(used: list[str]) -> str:
     return ANGLES[0][0]
 
 
+def layout_for(angle: str) -> str:
+    """How this angle's picture should be laid out, for the image model."""
+    return next((layout for key, _, layout in ANGLES if key == angle), "")
+
+
 def brief_for(description: str, angle: str) -> str:
     """The campaign description with this ad's angle and visual structure added."""
     for key, line, layout in ANGLES:
