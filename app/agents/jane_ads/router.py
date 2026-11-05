@@ -10,6 +10,7 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Optional
@@ -2494,6 +2495,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     # The production path, when it isn't plain static/upload (creative_paths.py):
     # "ai_video" uses a finished AI studio video (video_job_id); "ugc" marks the
     # uploaded video as a person on camera, of kind ugc_kind, used with their consent.
+    # How many different concepts Jane makes to test in one campaign (Meta, generated
+    # images only). Each gets its own ad set and an equal share of the budget.
+    concepts: int = 1
     creative_path: str = ""               # "" | ai_video | ugc
     video_job_id: str = ""
     ugc_kind: str = ""                    # creative_paths.UGC_KINDS
@@ -3384,7 +3388,9 @@ async def _build_campaign_plan(
         return {"early_return": {
             "stage": "choose_creative_source",
             "understood": parsed.model_dump(),
-            "creative_options": {"can_generate": True, "drafts": drafts},
+            "creative_options": {"can_generate": True, "drafts": drafts,
+                                 "max_concepts": _concepts_allowed(
+                                     plan, plan.platforms[0].platform.value if plan.platforms else "")},
             # Jane's geography/audience call (stated_plan, jane-strategy-extraction §7.6) is
             # REQUIRED to be confirmed back to the client, never silently decided — this was
             # being computed into plan.explanation but never reaching the client at this step,
@@ -3484,24 +3490,47 @@ async def _build_campaign_plan(
                 status_code=402,
                 detail="You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead.",
             )
-        creative = await generate_ad_creative(
-            business_name, category, req.goal.value, req.description,
-            user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
-            behaviour=plan.behaviour.value, service_area=service_area,
-            audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
-            # Drives creative-stage retrieval; without it budget is 0, retrieval
-            # bails early, and the ad ships with corpus_coverage="none".
-            budget_ngn=float(parsed.budget_ngn or 0),
-            vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
-        )
-        if creative.image_url:
-            # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
-            # (the function's own default) is the closest existing match; there's no
-            # ad-specific reason value and adding one is a shared-model change beyond
-            # this feature's scope.
-            await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
+        from . import concepts as concepts_mod
+
+        n_concepts = min(max(1, body.concepts), _concepts_allowed(plan, creative_platform))
+        if n_concepts > 1 and not await credit_service.check_sufficient_credits(user_id, required=n_concepts):
+            raise HTTPException(
+                status_code=402,
+                detail=f"Testing {n_concepts} ideas takes {n_concepts} content credits — top up, "
+                       "or test one idea instead.",
+            )
+
+        async def _one(angle: str = ""):
+            return await generate_ad_creative(
+                business_name, category, req.goal.value,
+                concepts_mod.brief_for(req.description, angle) if angle else req.description,
+                user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+                behaviour=plan.behaviour.value, service_area=service_area,
+                audience_segment=variant_segment, who_its_for=variant_who_its_for,
+                geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+                destination_cta=destination_cta,
+                # Drives creative-stage retrieval; without it budget is 0, retrieval
+                # bails early, and the ad ships with corpus_coverage="none".
+                budget_ngn=float(parsed.budget_ngn or 0),
+                vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
+            )
+
+        if n_concepts > 1:
+            angles = [key for key, _ in concepts_mod.ANGLES[:n_concepts]]
+            made = await asyncio.gather(*(_one(a) for a in angles))
+            for angle, c in zip(angles, made):
+                c.concept = angle
+            # A concept that failed to render is dropped, not launched empty.
+            good = [c for c in made if c.image_url]
+            creative = good[0] if good else made[0]
+            plan.concepts = good[1:]
+        else:
+            creative = await _one()
+        for c in [creative, *plan.concepts]:
+            if c.image_url:
+                # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
+                # (the function's own default) is the closest existing match.
+                await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
     if (not creative.headline) if (creative_platform == Platform.GOOGLE.value and not google_visual) \
             else (not creative.image_url):
         # Empty creative almost always means the image/copy model failed (often the
@@ -3555,6 +3584,10 @@ async def _build_campaign_plan(
             status_code=400,
             detail=f"Can't use this creative — {blocking[0].guidance}",
         )
+    # Another concept that fails policy is dropped rather than failing the whole plan.
+    plan.concepts = [c for c in plan.concepts if not any(
+        v.severity == Severity.BLOCK
+        for v in review_ad_creative(c.headline, c.primary_text, platform=creative_platform).violations)]
     for v in policy_result.violations:
         print(f"[policy] WARN on plan for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
 
@@ -3830,6 +3863,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             } if plan.google_keyword_context else None,
         },
         "creative": plan.creative.model_dump(mode="json"),
+        "concepts": [c.model_dump(mode="json") for c in plan.concepts],
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
         # So the review can show where leads land (and let the user catch a wrong
@@ -3965,6 +3999,15 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "platform": "google" if is_google else "tiktok" if is_tiktok else "meta",
         },
     }
+
+
+def _concepts_allowed(plan, creative_platform: str) -> int:
+    """How many concepts this plan can test in one campaign: Meta only, by its budget."""
+    from . import concepts as concepts_mod
+    if creative_platform != Platform.META.value or not plan.platforms:
+        return 1
+    p = plan.platforms[0]
+    return concepts_mod.max_concepts(p.budget_ngn, p.days)
 
 
 def _budget_advice(parsed, advice, stated_budget_ngn: float, fee_bypassed: bool) -> dict:
@@ -4310,12 +4353,11 @@ async def meta_launch_plan(
     # since the plan was built, so this is a genuine safety re-validation, not just
     # a formality.
     launch_platform_value = plan.platforms[0].platform.value if plan.platforms else Platform.META.value
-    policy_result = review_ad_creative(
-        plan.creative.headline, plan.creative.primary_text, platform=launch_platform_value,
-    )
-    blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
-    if blocking:
-        raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")
+    for ad in [plan.creative, *plan.concepts]:
+        policy_result = review_ad_creative(ad.headline, ad.primary_text, platform=launch_platform_value)
+        blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
+        if blocking:
+            raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")
 
     # TEMP (2026-09-17, revert when real TikTok testing is done): carried over from
     # /meta/plan-from-message via the pending-plan doc.
@@ -4394,6 +4436,19 @@ async def meta_launch_plan(
         # moment every input still exists together — the understanding, the ranked
         # plans, the corpus citations and what was actually charged. Best-effort: it
         # never raises, so it cannot cost a launch the client has just paid for.
+        if plan.concepts:
+            # Each concept registered with what it tests, so Growth can judge them apart.
+            # Best-effort: the campaign is live and paid for either way.
+            from .growth import creative as growth_creative
+            try:
+                launched = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id}) or {}
+                for ad, ad_id in zip([plan.creative, *plan.concepts], launched.get("ad_ids") or []):
+                    await growth_creative.register(
+                        db, brand_ctx.get("brand_id", ""), campaign_id, ad_id,
+                        {"concept": ad.concept, "hook": ad.headline, "image": ad.image_url},
+                        "concepts", brand_ctx.get("user_id") or "")
+            except Exception as e:
+                print(f"[launch] concept registration skipped for {campaign_id}: {e}", flush=True)
         from .campaign_record import write_campaign_record
 
         await write_campaign_record(

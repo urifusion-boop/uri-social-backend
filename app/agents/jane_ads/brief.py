@@ -152,10 +152,15 @@ def structure(plan: dict, req: dict, sibling_plans: int = 1) -> dict:
     days = max(int(p.get("days") or 1) for p in platforms)
     daily = budget / days if days else budget
     rec = recommend_structure(daily, days)
-    out = {"campaigns": 1, "ad_sets": 1, "ads_per_ad_set": 1, "budget_type": "daily, on the ad set",
+    n = 1 + len(plan.get("concepts") or [])
+    out = {"campaigns": 1, "ad_sets": n, "ads_per_ad_set": 1, "budget_type": "daily, on the ad set",
            "daily_ngn": round(daily, 2), "days": days, "total_ngn": budget,
            "why": "One campaign, one ad set and one ad keeps the whole budget learning in one place.",
            "recommended": rec, "warnings": []}
+    if n > 1:
+        out.update({"per_ad_set_daily_ngn": round(daily / n, 2),
+                    "why": f"{n} different ideas, each in its own ad set with an equal ₦{daily / n:,.0f} "
+                           "a day, so each gets a fair chance before any is judged."})
     if sibling_plans > 1:
         out["warnings"].append({
             "code": "split_budget", "level": "warning",
