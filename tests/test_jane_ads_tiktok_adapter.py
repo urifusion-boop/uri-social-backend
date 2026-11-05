@@ -142,9 +142,9 @@ def _adapter(db=None) -> TikTokAdsAdapter:
 # image_ids entry ("You must upload an image."), even though it's video-only.
 _HAPPY_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
     {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
-    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"identity_list": [
         {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
          "username": "uri.creative", "display_name": "uricreative"},

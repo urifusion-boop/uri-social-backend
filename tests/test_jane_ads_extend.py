@@ -317,8 +317,8 @@ def test_tiktok_extending_charges_only_after_tiktok_confirms(monkeypatch):
     out = _run(extend_campaign("c1", ExtendBody(days=7, confirm=True),
                                db=_MultiCollDb(_tiktok_record()), brand_ctx={"brand_id": "b1"}))
     assert adapter.extended_to is not None
-    # 31,000/day * 7 days * 1.1 markup = 238,700
-    assert wallet.charges == [238700.0]
+    # TikTok pays no URI fee: 31,000/day * 7 days, exactly its ad spend.
+    assert wallet.charges == [217000.0]
     assert out["extended_by_days"] == 7
     # Both budget AND end date move together — the whole point of
     # extend_adgroup existing separately from Meta's end-date-only extend.

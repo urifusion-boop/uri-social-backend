@@ -406,6 +406,64 @@ async def emergency_stop(payload: dict = Body(default={}),
     return {"policy": await engine.load_policy(db, brand)}
 
 
+@router.post("/campaigns/{campaign_id}/variations")
+async def make_variation(campaign_id: str, payload: dict = Body(...),
+                         db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                         ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """One new ad based on a winner, added to the ad set the winner runs in. One per
+    request, because a single ad takes most of the connection's 120 seconds."""
+    from app.services.CreditService import credit_service
+    from ..creative import generate_ad_creative
+    from ..policy import Severity, review_ad_creative
+    from . import variations
+
+    r = await _campaign(db, _brand(ctx), campaign_id)
+    if (r.get("platform") or "meta") != "meta":
+        raise HTTPException(status_code=400, detail="Variations are only available on Instagram & Facebook.")
+    source_ad = str(payload.get("ad_id") or "")
+    ad_ids = list(r.get("ad_ids") or ([r["ad_id"]] if r.get("ad_id") else []))
+    if source_ad not in ad_ids:
+        raise HTTPException(status_code=404, detail="That ad isn't in this campaign.")
+    if len(ad_ids) >= variations.MAX_ADS:
+        raise HTTPException(status_code=400, detail=f"This campaign already has {variations.MAX_ADS} ads. Pause one first.")
+    user_id = ctx.get("user_id") or ""
+    if not await credit_service.check_sufficient_credits(user_id, required=1):
+        raise HTTPException(status_code=402, detail="You're out of content credits. Top up to make a variation.")
+    adapter = _adapter(db, r)
+    if getattr(adapter, "demo", False):
+        raise HTTPException(status_code=400, detail="Variations aren't available on the demo campaign.")
+    try:
+        source = await variations.read_source(adapter, source_ad)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    ad = await generate_ad_creative(
+        r.get("display_name") or r.get("name") or "Your Business", r.get("category") or "",
+        r.get("goal") or "messages",
+        (f"Make a fresh variation of this winning ad. Keep its core message, change the hook and "
+         f"the picture.\nIts headline: {source['headline']}\nIts text: {source['text']}"),
+        user_id=user_id, db=db, brand_id=_brand(ctx), city=r.get("city") or "",
+        destination_type=r.get("destination_type") or "whatsapp",
+        destination_cta=r.get("destination_cta") or "")
+    if not ad.image_url:
+        raise HTTPException(status_code=503, detail="We couldn't make that ad just now. Please try again.")
+    if any(v.severity == Severity.BLOCK for v in review_ad_creative(ad.headline, ad.primary_text).violations):
+        raise HTTPException(status_code=400, detail="That version didn't pass the ad policy check. Please try again.")
+    try:
+        new_ad = await variations.add_to_ad_set(
+            adapter, source, ad.headline, ad.primary_text, ad.image_url,
+            f"JaneAds-{r.get('business_id')}-ad-variation-{len(ad_ids) + 1}")
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    await credit_service.deduct_credit(user_id, campaign_id=campaign_id, reason="campaign_generation")
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": campaign_id}, {"$set": {"ad_ids": [*ad_ids, new_ad]}})
+    await creative.register(db, _brand(ctx), campaign_id, new_ad,
+                            {"concept": f"Variation of {source['headline']}"[:200], "hook": ad.headline,
+                             "image": ad.image_url}, "variations", user_id)
+    await engine.event(db, _brand(ctx), campaign_id, "variation_added", actor=user_id, source_ad=source_ad, ad_id=new_ad)
+    return {"ad_id": new_ad, "headline": ad.headline, "primary_text": ad.primary_text, "image_url": ad.image_url}
+
+
 @router.post("/campaigns/{campaign_id}/variants")
 async def add_variant(campaign_id: str, payload: dict = Body(...),
                       db: AsyncIOMotorDatabase = Depends(get_db_dependency),

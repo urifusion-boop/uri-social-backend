@@ -360,3 +360,46 @@ def test_removing_a_targeting_word_leaves_a_clean_line():
     from app.agents.jane_ads.creative import _strip_leaked_terms
     assert _strip_leaked_terms("Lagos: use Your Social Media", ["Lagos"]) == "Use Your Social Media"
     assert _strip_leaked_terms("Palagos stays", ["Lagos"]) == "Palagos stays"
+
+
+def test_a_variation_keeps_the_winners_routing_and_changes_the_words_and_picture():
+    from app.agents.jane_ads.growth.variations import _story_for
+    story = {"page_id": "p1", "link_data": {"link": "https://x.ng", "message": "old", "name": "old",
+                                            "picture": "https://old", "image_hash": "h",
+                                            "call_to_action": {"type": "LEARN_MORE"}}}
+    out = _story_for(story, "New", "New text", "https://new")["link_data"]
+    assert out["link"] == "https://x.ng" and out["message"] == "New text" and out["picture"] == "https://new"
+    assert out["call_to_action"] == {"type": "LEARN_MORE"} and "image_hash" not in out
+    video = {"page_id": "p1", "video_data": {"video_id": "v", "call_to_action": {"type": "LEARN_MORE", "value": {"link": "https://x.ng"}}}}
+    converted = _story_for(video, "New", "T", "https://new")
+    assert "video_data" not in converted and converted["link_data"]["link"] == "https://x.ng"
+    with pytest.raises(ValueError):
+        _story_for({"video_data": {"call_to_action": {"type": "WHATSAPP_MESSAGE"}}}, "N", "T", "https://new")
+
+
+def test_a_variation_only_comes_from_an_ad_in_this_campaign():
+    from unittest.mock import AsyncMock, patch
+    from app.agents.jane_ads.growth import router as growth
+    with patch.object(growth, "_campaign", new=AsyncMock(return_value={"ad_ids": ["a1"], "brand_id": "b1"})):
+        with pytest.raises(HTTPException) as e:
+            run(growth.make_variation("c1", {"ad_id": "other"}, None, {"brand_id": "b1", "user_id": "u1"}))
+    assert e.value.status_code == 404
+
+
+def test_an_added_ad_can_be_edited_and_keeps_its_disclosure():
+    from app.agents.jane_ads import router
+    db = mongomock_motor.AsyncMongoMockClient()["ads"]
+    plan = {"business_id": "b1", "goal": "traffic", "behaviour": "discover", "per_business_cap_ngn": 1, "account_cap_ngn": 1,
+            "platforms": [{"platform": "meta", "budget_ngn": 12600, "days": 2, "variants": 1, "test_scope": "none"}],
+            "creative": {"image_url": "https://x/a.jpg", "headline": "h", "primary_text": "p"},
+            "concepts": [{"image_url": "https://x/b.jpg", "headline": "h", "primary_text": "p",
+                          "provenance": {"path": "ugc", "disclosure": "Paid partnership"}}]}
+    run(db["jane_ads_pending_plans"].insert_one({"plan_id": "p1", "brand_id": "b1", "status": "pending", "plan": plan,
+                                                 "business_id": "b1", "req": {}}))
+    ctx = {"brand_id": "b1", "user_id": "u1"}
+    out = run(router.meta_plan_edit_ad("p1", 0, router.PlanAdEditBody(headline="New", primary_text="Fresh bread."), db, ctx))
+    assert out["concepts"][0]["headline"] == "New" and out["concepts"][0]["primary_text"].endswith("Paid partnership.")
+    with pytest.raises(HTTPException):
+        run(router.meta_plan_edit_ad("p1", 5, router.PlanAdEditBody(headline="N", primary_text="T"), db, ctx))
+    with pytest.raises(HTTPException):
+        run(router.meta_plan_edit_ad("p1", 0, router.PlanAdEditBody(headline="", primary_text="T"), db, ctx))
