@@ -140,6 +140,26 @@ def _classify(exc: BaseException) -> Optional["rl.RateLimitInfo"]:
     return rl.classify_exception(exc, "tiktok")
 
 
+def build_authorize_url(client_key: str, redirect_uri: str, state: str) -> str:
+    """The TikTok login/consent URL a user is sent to when connecting an account.
+
+    disable_auto_auth=1 makes TikTok always show its authorization page. Without it TikTok
+    silently approves whichever account the browser is already logged into, so someone who wants
+    to connect a different TikTok account never gets the chance to switch.
+    """
+    import urllib.parse
+
+    params = {
+        "client_key": client_key,
+        "redirect_uri": redirect_uri,
+        "scope": "user.info.basic,video.publish",
+        "response_type": "code",
+        "state": state,
+        "disable_auto_auth": 1,
+    }
+    return "https://www.tiktok.com/v2/auth/authorize/?" + urllib.parse.urlencode(params)
+
+
 async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
     """One-shot code->tokens exchange, right after the OAuth consent redirect."""
     async with httpx.AsyncClient(timeout=20) as client:

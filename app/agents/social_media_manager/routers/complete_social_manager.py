@@ -1750,7 +1750,7 @@ async def tiktok_direct_initiate(source: Optional[str] = Query("settings")):
     """Redirect the user's browser to TikTok's OAuth page to connect their
     TikTok account directly (without Outstand). On completion, TikTok
     redirects to /connect/tiktok-direct/callback."""
-    import urllib.parse
+    from app.agents.social_media_manager.services.tiktok_direct_service import build_authorize_url
 
     client_key = settings.TIKTOK_APP_CLIENT_KEY
     if not client_key:
@@ -1759,15 +1759,7 @@ async def tiktok_direct_initiate(source: Optional[str] = Query("settings")):
     _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
     redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
 
-    params = {
-        "client_key": client_key,
-        "redirect_uri": redirect_uri,
-        "scope": "user.info.basic,video.publish",
-        "response_type": "code",
-        "state": source or "settings",
-    }
-    auth_url = "https://www.tiktok.com/v2/auth/authorize/?" + urllib.parse.urlencode(params)
-    return RedirectResponse(auth_url)
+    return RedirectResponse(build_authorize_url(client_key, redirect_uri, source or "settings"))
 
 
 @router.get("/connect/tiktok-direct/callback")
