@@ -519,6 +519,12 @@ async def _generate_hook_text(transcript: str) -> Optional[str]:
         return text or None
     except Exception as exc:
         print(f"[HookText] generation failed: {exc}", flush=True)
+        # Fails soft by design (see docstring) — but a soft failure from an
+        # exhausted OpenAI balance still deserves the same admin alert every
+        # other quota exhaustion triggers, not silent degradation.
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
         return None
 
 
@@ -757,6 +763,9 @@ async def _generate_broll_image(image_prompt: str) -> Optional[str]:
         return cdn
     except Exception as e:
         print(f"[B-roll:gen] error: {e}", flush=True)
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return None
 
 
@@ -2666,6 +2675,12 @@ async def run_production_job(
 
     except Exception as exc:
         print(f"[VideoProduction] FAILED job={job_id}: {exc}", flush=True)
+        # The job's own last-resort handler — covers analyze_content()'s OpenAI
+        # call above, which has no try/except of its own (only around the JSON
+        # parse that follows a successful call).
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
             {"$set": {"status": "failed", "status_message": str(exc), "progress": 0}},

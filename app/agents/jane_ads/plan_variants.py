@@ -288,6 +288,10 @@ async def generate_plan_variants(
                 data = retried
     except Exception as e:
         print(f"[PlanVariants] generation error: {e}", flush=True)
+        # Own independent AsyncOpenAI client — AIService.py's alerting never saw this.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         raise PlanVariantsUnavailableError(str(e)) from e
 
     raw_variants = data.get("variants") or []

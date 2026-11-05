@@ -243,6 +243,11 @@ async def _call_keyword_model(prompt: str) -> Optional[dict]:
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[GoogleAdsAdapter] keyword generation error: {e}", flush=True)
+        # Own independent OpenAI client (jane_ads_openai_key) — never routed
+        # through AIService.py's out-of-credit alert like every other caller.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return None
 
 

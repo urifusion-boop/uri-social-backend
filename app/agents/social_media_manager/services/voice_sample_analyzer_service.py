@@ -80,6 +80,12 @@ Be specific and extract ACTUAL patterns from the captions, not generic descripti
 
         except Exception as e:
             print(f"⚠️ Voice sample analysis failed: {e}")
+            # Own independent OpenAI client, not AIService.py's — same gap as
+            # image_content_service.py had, an out-of-credit account here
+            # failed silently with no admin alert.
+            if "insufficient_quota" in str(e):
+                from app.services.AIService import _alert_openai_out_of_credit
+                await _alert_openai_out_of_credit(str(e))
             return {}
 
     @staticmethod
