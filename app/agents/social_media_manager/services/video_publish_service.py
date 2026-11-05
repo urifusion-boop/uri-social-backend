@@ -301,6 +301,63 @@ class VideoPublishService:
         return {"status": "failed", "error": str(exc)}
 
     @staticmethod
+    async def publish_scheduled_tiktok_photo(draft: Dict[str, Any], conn: Dict[str, Any], db) -> Dict[str, Any]:
+        """Posts a scheduled TikTok image / carousel draft with the choices its owner made on the
+        Post to TikTok screen when scheduling (draft["tiktok_settings"]). Called by the scheduler at
+        the due time, which already holds the account's gate, so this neither gates nor records a job.
+
+        Returns the result shape _publish_to_platform uses: success + post_id, or error (+ rate_limit)."""
+        from app.agents.social_media_manager.services import tiktok_media_proxy
+        from app.agents.social_media_manager.services.tiktok_direct_service import (
+            TikTokPostSettings,
+            TikTokStillProcessingError,
+            get_valid_tiktok_access_token,
+            publish_tiktok_photo_direct,
+        )
+
+        saved = draft.get("tiktok_settings") or {}
+        try:
+            tiktok_settings = TikTokPostSettings(**saved)
+        except TypeError:
+            return {"success": False, "error": "This scheduled TikTok post is missing its posting choices. Open it and schedule it again."}
+        count = len(tiktok_media_proxy.draft_image_sources(draft))
+        if count == 0:
+            return {"success": False, "error": "This post has no image to publish."}
+        image_urls = tiktok_media_proxy.signed_urls(draft["id"], count)
+        auto_add_music = bool(draft.get("tiktok_auto_add_music"))
+
+        try:
+            if conn.get("connected_via") == "tiktok_direct_oauth":
+                try:
+                    access_token = await get_valid_tiktok_access_token(db, conn)
+                    publish_id, status = await publish_tiktok_photo_direct(
+                        access_token, image_urls, tiktok_settings, auto_add_music
+                    )
+                except TikTokStillProcessingError as e:
+                    # TikTok has the post and is still working on it. Failing here would make the
+                    # scheduler send it again, so record it as sent and let TikTok finish.
+                    publish_id, status = getattr(e, "publish_id", None), "PROCESSING"
+                    if not publish_id:
+                        raise
+                print(f"✅ Scheduled TikTok photo: publish_id={publish_id} status={status}")
+                return {"success": True, "post_id": publish_id, "raw_response": {"publish_id": publish_id, "status": status}}
+
+            outstand = OutstandService()
+            media_urls = [await outstand.upload_media_from_url(u) for u in image_urls]
+            caption = tiktok_settings.description or tiktok_settings.title or ""
+            post_id, post_url = await VideoPublishService._publish_tiktok_via_outstand(
+                conn["outstand_account_id"], caption, media_urls, tiktok_settings, auto_add_music, photo=True
+            )
+            return {"success": True, "post_id": post_id, "raw_response": {"post_id": post_id, "post_url": post_url}}
+        except Exception as e:
+            print(f"❌ Scheduled TikTok photo failed: {e}")
+            failed: Dict[str, Any] = {"success": False, "error": f"TikTok publish failed: {e}"}
+            info = rl.classify_exception(e, "tiktok")
+            if info is not None:
+                failed["rate_limit"] = info
+            return failed
+
+    @staticmethod
     async def run_tiktok_photo_job(
         job_id: str,
         draft_id: str,

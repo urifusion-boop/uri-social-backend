@@ -543,6 +543,24 @@ def _validate_settings(settings_: TikTokPostSettings, creator_info: dict, photo:
         raise TikTokDirectAPIError("Stitch is disabled in this creator's TikTok settings.")
 
 
+def schedule_problem(settings: Optional[dict], image_count: int) -> Optional[str]:
+    """Why a TikTok photo post can't be scheduled with these choices, or None. Checks only what is
+    known when scheduling: whether this account still offers the chosen privacy level is checked again
+    when the post goes out (_validate_settings), against creator_info fetched then."""
+    if image_count == 0:
+        return "This post has no image to publish."
+    if not settings or not settings.get("privacy_level"):
+        # TikTok: no default, the user must choose. A schedule with no choice can't be published later.
+        return "Choose who can view this TikTok post before scheduling it."
+    if settings.get("brand_content") and settings["privacy_level"] == "SELF_ONLY":
+        return "Branded content visibility cannot be set to private."
+    if len(settings.get("title") or "") > _MAX_PHOTO_TITLE_LENGTH:
+        return f"Title is too long (max {_MAX_PHOTO_TITLE_LENGTH} characters)."
+    if len(settings.get("description") or "") > _MAX_PHOTO_DESCRIPTION_LENGTH:
+        return f"Description is too long (max {_MAX_PHOTO_DESCRIPTION_LENGTH} characters)."
+    return None
+
+
 async def publish_tiktok_direct(
     access_token: str,
     video_url: str,
@@ -698,9 +716,13 @@ async def _wait_for_publish(access_token: str, publish_id: str) -> tuple[str, st
         raise TikTokDirectAPIError(f"TikTok reported publish failure for publish_id={publish_id}{detail}")
 
     if status != "PUBLISH_COMPLETE":
-        raise TikTokStillProcessingError(
+        still = TikTokStillProcessingError(
             "TikTok is still processing this post. It can take a few minutes — check your TikTok profile shortly."
         )
+        # TikTok already has the post. A caller that can't show "processing" (the scheduler) needs
+        # this id to record it, because publishing again would post it twice.
+        still.publish_id = publish_id
+        raise still
 
     return publish_id, status
 
