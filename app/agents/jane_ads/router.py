@@ -3873,6 +3873,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "creative": plan.creative.model_dump(mode="json"),
         "concepts": [c.model_dump(mode="json") for c in plan.concepts],
         "ad_layout": plan.ad_layout,
+        "can_split": bool(plan.platforms and _can_split_ads(plan)),
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
         # So the review can show where leads land (and let the user catch a wrong
@@ -4008,6 +4009,12 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "platform": "google" if is_google else "tiktok" if is_tiktok else "meta",
         },
     }
+
+
+def _can_split_ads(plan) -> bool:
+    from . import concepts as concepts_mod
+    p = plan.platforms[0]
+    return concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts))
 
 
 def _concepts_allowed(plan, creative_platform: str) -> int:
