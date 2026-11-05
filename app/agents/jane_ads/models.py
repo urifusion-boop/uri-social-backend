@@ -227,6 +227,8 @@ class CampaignPlan(BaseModel):
                                              # Meta rejects link-ad creation with no real media
                                              # attached, so the real adapter needs this, not just
                                              # the platform/budget decision
+    # The other concepts being tested beside `creative`, one ad set each (concepts.py).
+    concepts: list["AdCreative"] = Field(default_factory=list)
     shoot_script: Optional["ShootScript"] = None  # Path C — set only when creative.video_recommendation
                                              # fired; the user can film this and swap it in via
                                              # POST /meta/plan/{id}/creative before launching
@@ -403,6 +405,8 @@ class AdCreative(BaseModel):
     # it's synthetic, and for UGC who is speaking and on what terms. Empty for the
     # paths that predate it.
     provenance: dict = Field(default_factory=dict)
+    # Which test concept this creative is, when one campaign tests several (concepts.py).
+    concept: str = ""
 
 
 # ── Path C: script-and-shoot (PRD §4.1) ───────────────────────────────────────

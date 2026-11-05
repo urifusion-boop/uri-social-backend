@@ -268,3 +268,19 @@ def test_awareness_on_meta_is_described_as_reach_wherever_the_tap_goes():
     assert optimization_for(DestinationType.WEBSITE, "Meta (Instagram & Facebook)", CampaignObjective.AWARENESS)[0] == "Reach"
     assert optimization_for(DestinationType.WEBSITE, "TikTok", CampaignObjective.AWARENESS)[0] == "Website link clicks"
     assert optimization_for(DestinationType.WEBSITE)[0] == "Website link clicks"
+
+
+def test_concepts_follow_the_budget_and_carry_a_different_angle():
+    from app.agents.jane_ads import concepts
+    assert concepts.max_concepts(6000, 2) == 1
+    assert concepts.max_concepts(42000, 7) == 3
+    assert concepts.max_concepts(28000, 7) == 2
+    assert "offer itself" in concepts.brief_for("Shea kit", "offer")
+    assert concepts.brief_for("Shea kit", "") == "Shea kit"
+
+
+def test_the_plan_card_says_how_concepts_split_the_budget():
+    from app.agents.jane_ads.brief import structure
+    plan = {"platforms": [{"budget_ngn": 42000, "days": 7}], "concepts": [{}, {}]}
+    s = structure(plan, {"budget_ngn": 42000})
+    assert s["ad_sets"] == 3 and s["per_ad_set_daily_ngn"] == 2000

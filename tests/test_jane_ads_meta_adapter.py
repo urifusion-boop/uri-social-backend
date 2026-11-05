@@ -1006,3 +1006,32 @@ def test_a_whatsapp_ad_without_a_number_never_becomes_a_link_ad(whatsapp_only):
         with pytest.raises(ValueError, match="WhatsApp number"):
             _run(_adapter().launch_campaign(plan, _auth()))
     assert mock_client.post.call_count == 0          # nothing created on Meta
+
+
+def test_several_concepts_launch_as_one_campaign_with_an_ad_set_each_and_an_even_budget():
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 creative=AdCreative(image_url="https://cdn/a.jpg", headline="A", primary_text="pa",
+                                     concept="problem"),
+                 concepts=[AdCreative(image_url="https://cdn/b.jpg", headline="B", primary_text="pb", concept="offer"),
+                           AdCreative(image_url="https://cdn/c.jpg", headline="C", primary_text="pc", concept="outcome")])
+    responses = [{"id": "cmp_1"},
+                 {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"},
+                 {"id": "as_2"}, {"id": "cr_2"}, {"id": "ad_2"},
+                 {"id": "as_3"}, {"id": "cr_3"}, {"id": "ad_3"}]
+    db = FakeDb()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(_adapter(db).launch_campaign(plan, _auth()))
+
+    posts = [c.kwargs["json"] for c in mock_client.post.call_args_list]
+    adsets = [p for p in posts if "daily_budget" in p]
+    ads = [p for p in posts if "adset_id" in p and "creative" in p]
+    pictures = [p["object_story_spec"]["link_data"]["picture"] for p in posts if "object_story_spec" in p]
+    assert len(adsets) == 3 and len({a["daily_budget"] for a in adsets}) == 1
+    assert adsets[0]["daily_budget"] == int(10_000 / 7 / 3 * 100)
+    assert [a["adset_id"] for a in ads] == ["as_1", "as_2", "as_3"]
+    assert pictures == ["https://cdn/a.jpg", "https://cdn/b.jpg", "https://cdn/c.jpg"]
+    assert result.campaign_id == "cmp_1"
+    record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
+    assert record["ad_ids"] == ["ad_1", "ad_2", "ad_3"] and record["concepts"] == ["problem", "offer", "outcome"]
