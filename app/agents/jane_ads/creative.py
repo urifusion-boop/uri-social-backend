@@ -307,8 +307,9 @@ def _strip_leaked_terms(text: str, leaked: list[str]) -> str:
     silently) — remove the exact phrase and tidy up double spaces/punctuation."""
     import re as _re
     for term in leaked:
-        text = _re.sub(_re.escape(term), "", text, flags=_re.IGNORECASE)
-    return _re.sub(r"\s{2,}", " ", text).strip(" ,.-")
+        text = _re.sub(rf"\b{_re.escape(term)}\b", "", text, flags=_re.IGNORECASE)
+    text = _re.sub(r"\s{2,}", " ", text).strip(" ,.-:")
+    return text[:1].upper() + text[1:]
 
 
 def _zone_a_block(geo_target: str, audience_segment: str, interest_category: str, goal: str,
