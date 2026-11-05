@@ -403,3 +403,42 @@ def test_an_added_ad_can_be_edited_and_keeps_its_disclosure():
         run(router.meta_plan_edit_ad("p1", 5, router.PlanAdEditBody(headline="N", primary_text="T"), db, ctx))
     with pytest.raises(HTTPException):
         run(router.meta_plan_edit_ad("p1", 0, router.PlanAdEditBody(headline="", primary_text="T"), db, ctx))
+
+
+def test_an_ad_job_reports_its_result_and_its_failure_and_stays_with_its_brand():
+    import asyncio
+    from app.agents.jane_ads import ad_jobs
+    db = mongomock_motor.AsyncMongoMockClient()["jobs"]
+
+    async def flow():
+        async def good():
+            return {"concepts": []}
+
+        async def bad():
+            raise HTTPException(status_code=402, detail="Out of credits")
+
+        ok = await ad_jobs.start(db, "b1", good)
+        no = await ad_jobs.start(db, "b1", bad)
+        await asyncio.sleep(0.05)
+        return await ad_jobs.read(db, "b1", ok), await ad_jobs.read(db, "b1", no), ok
+
+    done, failed, ok = run(flow())
+    assert done == {"status": "done", "result": {"concepts": []}}
+    assert failed["status"] == "failed" and failed["detail"] == "Out of credits" and failed["status_code"] == 402
+    with pytest.raises(HTTPException):
+        run(ad_jobs.read(db, "b2", ok))
+
+
+def test_a_stale_job_stops_the_wait():
+    from datetime import datetime, timedelta, timezone
+    from app.agents.jane_ads import ad_jobs
+    db = mongomock_motor.AsyncMongoMockClient()["jobs"]
+    run(db[ad_jobs.JOBS].insert_one({"job_id": "j", "brand_id": "b1", "status": "running",
+                                     "created_at": datetime.now(timezone.utc) - timedelta(hours=1)}))
+    assert run(ad_jobs.read(db, "b1", "j"))["status"] == "failed"
+
+
+def test_each_angle_has_a_different_layout_for_the_picture():
+    from app.agents.jane_ads import concepts
+    layouts = [concepts.layout_for(a[0]) for a in concepts.ANGLES]
+    assert len(set(layouts)) == len(layouts) and all(layouts) and concepts.layout_for("") == ""

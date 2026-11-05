@@ -3519,6 +3519,7 @@ async def _build_campaign_plan(
             return await generate_ad_creative(
                 business_name, category, req.goal.value,
                 concepts_mod.brief_for(creative_brief, angle) if angle else creative_brief,
+                image_layout=concepts_mod.layout_for(angle),
                 user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
                 behaviour=plan.behaviour.value, service_area=service_area,
                 audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -4339,6 +4340,7 @@ async def meta_plan_add_ad(
             name, req.category, req.goal.value, concepts_mod.brief_for(clean_brief, angle),
             behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn,
             exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id],
+            image_layout=concepts_mod.layout_for(angle),
             **shared)
         ad.concept = angle
     else:
@@ -4380,6 +4382,31 @@ async def meta_plan_add_ad(
 class PlanAdEditBody(BaseModel):
     headline: str = ""
     primary_text: str = ""
+
+
+@router.post("/meta/plan/{plan_id}/ad-jobs")
+async def meta_plan_start_ad_job(
+    plan_id: str,
+    body: PlanAdBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Add an ad in the background: see ad_jobs.py for why."""
+    from . import ad_jobs
+    await _pending_meta_plan(db, plan_id, brand_ctx)
+    job_id = await ad_jobs.start(db, brand_ctx.get("brand_id"),
+                                 lambda: meta_plan_add_ad(plan_id, body, db, brand_ctx))
+    return {"job_id": job_id}
+
+
+@router.get("/ad-jobs/{job_id}")
+async def read_ad_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import ad_jobs
+    return await ad_jobs.read(db, brand_ctx.get("brand_id"), job_id)
 
 
 @router.patch("/meta/plan/{plan_id}/ads/{index}")
