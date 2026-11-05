@@ -126,6 +126,10 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[NL] parse error: {e}", flush=True)
+        # Own independent AsyncOpenAI client — AIService.py's alerting never saw this.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         raise NlUnavailableError(str(e)) from e
 
     parsed = _coerce(data, business_name, category)

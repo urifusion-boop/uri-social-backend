@@ -300,6 +300,11 @@ async def _detect_subject_position(path: str) -> str:
             return result
     except Exception as e:
         print(f"[MultiClip] subject position detection error: {e}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
     return "center"
 
 
@@ -407,6 +412,11 @@ async def _transcribe_clip(path: str) -> Dict[str, Any]:
 
     except Exception as e:
         print(f"[MultiClip] transcription error: {e}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return {"text": "", "srt": "", "words": []}
     finally:
         if audio_path and os.path.exists(audio_path):
@@ -477,6 +487,11 @@ Rules:
         return ordered
     except Exception as e:
         print(f"[MultiClip] order suggestion error: {e}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return [c["clip_id"] for c in clips]
 
 
@@ -940,6 +955,11 @@ async def _refine_silence_cuts(
         }
     except Exception as exc:
         print(f"[MultiClip/refine_cuts] GPT error: {exc} — passing all cuts through", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
         return silence_cuts
 
     approved = [silence_cuts[c["index"]] for c in cut_contexts if verdicts.get(c["index"], "cut") == "cut"]
@@ -1028,6 +1048,11 @@ async def _detect_transcript_repetitions(
         return cuts
     except Exception as exc:
         print(f"[MultiClip/repeat_pass] error: {exc}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
         return []
 
 
@@ -1207,6 +1232,11 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         )
     except Exception as exc:
         print(f"[MultiClip/_run_ai_analysis] GPT error: {exc}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(exc):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(exc))
 
     # ── Merge and deduplicate ─────────────────────────────────────────────────
     # Safety cap: timing_cuts are audio/text-grounded (measured silence, exact
@@ -1562,6 +1592,11 @@ Shot type guide:
         }
     except Exception as e:
         print(f"[MultiClip] vision describe error clip={clip_id}: {e}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return {"clip_id": clip_id, "shows": "product footage", "shot_type": "general", "role": "general"}
 
 
@@ -1609,6 +1644,11 @@ Return JSON only:
         return {"draft": draft, "lines": lines}
     except Exception as e:
         print(f"[MultiClip] script draft error: {e}", flush=True)
+        # Own independent OpenAI client, not AIService.py's — see
+        # image_content_service.py's _call_dalle_api for why this matters.
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
         return {"draft": "", "lines": []}
 
 
