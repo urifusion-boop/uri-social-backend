@@ -1060,3 +1060,20 @@ def test_several_ads_share_one_ad_set_and_its_whole_budget_by_default_images_and
     assert specs[1]["video_data"]["video_id"] == "vid_1" and "link_data" in specs[0] and "link_data" in specs[2]
     record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
     assert record["ad_ids"] == ["ad_1", "ad_2", "ad_3"] and record["adset_ids"] == ["as_1"]
+
+
+def test_a_temporarily_unavailable_creative_is_retried_and_each_ad_keeps_its_own_headline():
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 creative=AdCreative(image_url="https://cdn/a.jpg", headline="First", primary_text="pa"),
+                 concepts=[AdCreative(image_url="https://cdn/b.jpg", headline="Second", primary_text="pb")])
+    busy = {"error": {"code": 2, "message": "temporarily unavailable"}}
+    responses = [{"id": "cmp_1"}, {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"}, busy, {"id": "cr_2"}, {"id": "ad_2"}]
+    with patch("httpx.AsyncClient") as MockClient, patch(
+            "app.agents.jane_ads.adapters.meta.RETRY_DELAY_SECONDS", 0):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(_adapter().launch_campaign(plan, _auth()))
+    assert result.campaign_id == "cmp_1"
+    specs = [c.kwargs["json"]["object_story_spec"]["link_data"] for c in mock_client.post.call_args_list
+             if "object_story_spec" in c.kwargs["json"]]
+    assert [s["name"] for s in specs] == ["First", "Second", "Second"]
