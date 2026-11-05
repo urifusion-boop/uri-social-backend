@@ -10,7 +10,6 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from typing import Optional
@@ -3528,21 +3527,17 @@ async def _build_campaign_plan(
             )
 
         if n_concepts > 1:
-            angles = [a[0] for a in concepts_mod.ANGLES[:n_concepts]]
-            made = await asyncio.gather(*(_one(a) for a in angles))
-            for angle, c in zip(angles, made):
-                c.concept = angle
-            # A concept that failed to render is dropped, not launched empty.
-            good = [c for c in made if c.image_url]
-            creative = good[0] if good else made[0]
-            plan.concepts = good[1:]
+            # The first ad now; the page adds the rest through POST /plan/{id}/ads.
+            first_angle = concepts_mod.ANGLES[0][0]
+            creative = await _one(first_angle)
+            creative.concept = first_angle
+            plan.concepts_wanted = n_concepts
         else:
             creative = await _one()
-        for c in [creative, *plan.concepts]:
-            if c.image_url:
-                # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
-                # (the function's own default) is the closest existing match.
-                await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
+        if creative.image_url:
+            # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
+            # (the function's own default) is the closest existing match.
+            await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
     if (not creative.headline) if (creative_platform == Platform.GOOGLE.value and not google_visual) \
             else (not creative.image_url):
         # Empty creative almost always means the image/copy model failed (often the
@@ -3877,6 +3872,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "creative": plan.creative.model_dump(mode="json"),
         "concepts": [c.model_dump(mode="json") for c in plan.concepts],
         "ad_layout": plan.ad_layout,
+        "concepts_wanted": plan.concepts_wanted,
         "can_split": bool(plan.platforms and _can_split_ads(plan)),
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
@@ -4243,6 +4239,9 @@ async def meta_plan_update_creative(
 
 class PlanAdBody(BaseModel):
     source: str = "generate"           # generate | upload
+    # Working through "test N ideas": a no-op once the plan has what it asked for, so a
+    # reload part-way can't overshoot, or undo an ad the client has since removed.
+    auto: bool = False
     reference_image_url: str = ""
     is_video: bool = False
     asset_attestation: Optional[str] = None
@@ -4275,7 +4274,8 @@ async def _save_plan_ads(db, plan_id: str, plan: CampaignPlan) -> dict:
     p = plan.platforms[0]
     ads = 1 + len(plan.concepts)
     return {"plan_id": plan_id, "concepts": [c.model_dump(mode="json") for c in plan.concepts],
-            "ad_layout": plan.ad_layout, "can_split": concepts_mod.can_split(p.budget_ngn, p.days, ads)}
+            "ad_layout": plan.ad_layout, "concepts_wanted": plan.concepts_wanted,
+            "can_split": concepts_mod.can_split(p.budget_ngn, p.days, ads)}
 
 
 @router.post("/meta/plan/{plan_id}/ads")
@@ -4294,6 +4294,9 @@ async def meta_plan_add_ad(
     from .policy import Severity, review_ad_creative
 
     doc, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if body.auto and 1 + len(plan.concepts) >= plan.concepts_wanted:
+        plan.concepts_wanted = 0
+        return await _save_plan_ads(db, plan_id, plan)
     if 1 + len(plan.concepts) >= concepts_mod.MAX_ADS:
         raise HTTPException(status_code=400, detail=f"A test can hold up to {concepts_mod.MAX_ADS} ads.")
     req = CampaignRequest.model_validate(doc["req"])
@@ -4341,6 +4344,8 @@ async def meta_plan_add_ad(
     if body.source == "generate":
         await credit_service.deduct_credit(user_id, campaign_id=doc["business_id"], reason="campaign_generation")
     plan.concepts.append(ad)
+    if 1 + len(plan.concepts) >= plan.concepts_wanted:
+        plan.concepts_wanted = 0
     p = plan.platforms[0]
     if not concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts)):
         plan.ad_layout = concepts_mod.SINGLE_AD_SET
@@ -4360,6 +4365,7 @@ async def meta_plan_remove_ad(
     if not 0 <= index < len(plan.concepts):
         raise HTTPException(status_code=404, detail="That ad isn't in this plan.")
     plan.concepts.pop(index)
+    plan.concepts_wanted = 0
     return await _save_plan_ads(db, plan_id, plan)
 
 
