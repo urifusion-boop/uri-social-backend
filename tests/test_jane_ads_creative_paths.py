@@ -354,3 +354,9 @@ def test_ads_in_a_test_never_repeat_a_format():
             patch.dict(v.FORMAT_MODULES, {"SEED-075": fmt, "SEED-097": fmt}):
         out = run(v.select_and_render_vsg01_creative(None, "b", "c", "d", {}, exclude_format_ids=["SEED-075"]))
     assert out["format_id"] == "SEED-097" and tried == ["SEED-097"]
+
+
+def test_removing_a_targeting_word_leaves_a_clean_line():
+    from app.agents.jane_ads.creative import _strip_leaked_terms
+    assert _strip_leaked_terms("Lagos: use Your Social Media", ["Lagos"]) == "Use Your Social Media"
+    assert _strip_leaked_terms("Palagos stays", ["Lagos"]) == "Palagos stays"
