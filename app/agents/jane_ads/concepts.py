@@ -82,7 +82,9 @@ def next_angle(used: list[str]) -> str:
 
 def layout_for(angle: str) -> str:
     """How this angle's picture should be laid out, for the image model."""
-    return next((layout for key, _, layout in ANGLES if key == angle), "")
+    layout = next((layout for key, _, layout in ANGLES if key == angle), "")
+    # A layout asks for more text, and text near the edge gets cut off in the final crop.
+    return f"{layout} Keep every word well inside the edges, with wide margins on all sides." if layout else ""
 
 
 def brief_for(description: str, angle: str) -> str:
