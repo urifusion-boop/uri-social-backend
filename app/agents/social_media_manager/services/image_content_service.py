@@ -933,6 +933,10 @@ Every letter of every word must be 100% inside the image canvas with no clipping
 Maintain a minimum {_top_pct}% safe-zone margin from the top edge.
 Maintain a minimum {_bottom_pct}% safe-zone margin from the bottom edge.
 Maintain a minimum {_lr_pct}% safe-zone margin from the left and right edges.
+This margin applies to EVERY visual element, not only text — decorative shapes, stars,
+arrows, icons, illustrations, badges and any other graphic flourish must also stay fully
+inside it. A star or icon placed right at the edge is just as broken as clipped text once
+the crop runs: it gets cut in half. Treat decoration with the same discipline as copy.
 Headlines must begin at least {_top_pct}% from the top edge. CTA text must end at least
 {_bottom_pct}% from the bottom edge. If text is too large to fit within these margins, reduce the
 font size — do NOT let any character touch or cross any edge. This rule overrides
