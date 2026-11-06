@@ -11,7 +11,6 @@ import re
 import subprocess
 import tempfile
 import time
-import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -231,24 +230,7 @@ async def _upload_audio_to_cloudinary(audio_bytes: bytes, public_id: str) -> Opt
 
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
 
-# Cloudinary transition style per video type — fadewhite is the flash cut Shotstack lacked
-# Luma matte public IDs uploaded to our Cloudinary account.
-# Black→white wipe: black areas show the base clip, white areas show the next clip.
-_LUMA_MATTE_BY_TYPE: Dict[str, str] = {
-    "tiktok":   "uri-transitions/circle-wipe",    # hard-edge circle expanding from center
-    "product":  "uri-transitions/diagonal-wipe",  # diagonal sweep top-left → bottom-right
-    "founder":  "uri-transitions/circle-wipe",    # same circle but slower (2.5s)
-}
-# Per-type transition duration (seconds) — must match the actual luma-matte video's length
-# uploaded to Cloudinary, because that determines how many seconds of overlap occur.
-# Used only when luma_pid is not None; hard-cut paths use transition_dur=0.0.
-_TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
-    "tiktok":   0.8,
-    "product":  0.8,
-    "founder":  1.0,
-}
-_CLD_TRANSITION_DUR = 1.0   # default fallback
-_MIN_SEG_DUR       = 4.0   # minimum keep-segment length (must exceed max transition_dur)
+_MIN_SEG_DUR = 4.0   # minimum keep-segment length — a shorter one creates a jarring cut
 
 # Shotstack overlay style per video type for topic-change transitions.
 # "color: None" → falls back to the brand primary_color at render time.
@@ -367,17 +349,8 @@ async def _resolve_icon_html(category: str) -> str:
     )
 
 
-def _cloudinary_public_id(url: str) -> str:
-    """Extract Cloudinary public_id from a full upload URL.
-    e.g. .../video/upload/v1234567/uri-video-production/abc.mp4 → uri-video-production/abc
-    """
-    import re
-    m = re.search(r"/video/upload/(?:v\d+/)?(.+?)(?:\.\w+)?$", url)
-    return m.group(1) if m else ""
-
-
 def _wrap_hook_text(text: str, max_chars: int = 20) -> str:
-    """Split text at word boundaries for multi-line Cloudinary text overlay."""
+    """Split text at word boundaries for multi-line text overlay."""
     words = text.split()
     lines, line = [], ""
     for word in words:
@@ -427,70 +400,6 @@ async def _generate_hook_text(transcript: str) -> Optional[str]:
             from app.services.AIService import _alert_openai_out_of_credit
             await _alert_openai_out_of_credit(str(exc))
         return None
-
-
-def _cld_encode_text(text: str) -> str:
-    """URL-encode text for a Cloudinary l_text layer. Commas and slashes must be double-encoded."""
-    encoded = urllib.parse.quote(text, safe='')
-    encoded = encoded.replace('%2C', '%252C')
-    encoded = encoded.replace('%2F', '%252F')
-    return encoded
-
-
-def _build_cloudinary_cut_url(
-    public_id: str,
-    keep_segments: List[Dict],
-    luma_matte_pid: Optional[str] = "uri-transitions/circle-wipe",
-    transition_dur: float = 1.0,
-    hook_text: str = "",
-    primary_color: str = "#FFD700",
-) -> str:
-    """
-    Build a Cloudinary transformation URL: luma-matte transitions between segments,
-    then a branded hook text overlay baked into the first 2.5s of the video.
-
-    Pass luma_matte_pid=None for hard cuts (no transition effect between segments).
-    Hook overlay uses Cloudinary's native l_text layer — rendered server-side at
-    full resolution, completely avoiding Shotstack's unreliable HTML renderer.
-    """
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    if not cloud or not keep_segments:
-        return ""
-
-    pid_enc = public_id.replace("/", ":")
-
-    first = keep_segments[0]
-    parts: List[str] = [
-        f"so_{first['src_start']:.3f},eo_{first['src_end']:.3f}"
-    ]
-    for seg in keep_segments[1:]:
-        s = f"{seg['src_start']:.3f}"
-        e = f"{seg['src_end']:.3f}"
-        if luma_matte_pid:
-            luma_enc = luma_matte_pid.replace("/", ":")
-            parts.append(
-                f"l_video:{pid_enc}/so_{s},eo_{e}"
-                f"/e_transition,l_video:{luma_enc}/fl_layer_apply"
-                f"/fl_layer_apply"
-            )
-        else:
-            # Hard cut — fl_splice appends the segment sequentially (end-to-end).
-            # Without fl_splice, l_video/fl_layer_apply would OVERLAY both segments
-            # simultaneously, causing all audio tracks to play at the same time.
-            parts.append(
-                f"fl_splice,l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
-            )
-
-    url = (
-        f"https://res.cloudinary.com/{cloud}/video/upload/"
-        + "/".join(parts)
-    )
-
-    # Hook text overlay — baked into the Cloudinary video, shown for the first 2.5s.
-    # Using Montserrat 900 (Google Fonts), brand primary color background, white text.
-    # Font size scales with text length so it never overflows the 1080px frame.
-    url += f"/{public_id}.mp4"
-    return url
 
 
 async def _pexels_search(query: str) -> Optional[str]:
@@ -1452,21 +1361,17 @@ def _original_to_timeline(
     t: float,
     keep_segments: List[Dict[str, float]],
     clamp: bool = False,
-    transition_dur: float = 0.0,
 ) -> Optional[float]:
     """Map a timestamp in the original video to its position in the output timeline.
-    transition_dur: when Cloudinary overlaps adjacent segments by this amount, each
-    subsequent segment starts earlier — pass the same value used in _build_cloudinary_cut_url.
     clamp: if t is in a cut, return the start of the next kept segment instead of None."""
     offset = 0.0
-    for i, seg in enumerate(keep_segments):
+    for seg in keep_segments:
         seg_dur = seg["src_end"] - seg["src_start"]
         if seg["src_start"] <= t <= seg["src_end"]:
             return offset + (t - seg["src_start"])
         if clamp and t < seg["src_start"]:
             return offset
-        overlap = transition_dur if i < len(keep_segments) - 1 else 0.0
-        offset += seg_dur - overlap
+        offset += seg_dur
     return None
 
 
@@ -1482,8 +1387,6 @@ def build_shotstack_timeline(
     job_id: str = "",
     music_url: Optional[str] = None,
     hook_text: str = "",
-    cloudinary_cut_url: str = "",   # pre-cut + transitioned video from Cloudinary
-    transition_dur: float = 0.0,    # overlap per cut used by Cloudinary (for SRT timing)
     logo_url: str = "",             # brand logo; slides in over the last 3s
     brand_name: str = "",           # brand name for lower-third and outro
     primary_color: str = "#FFD700", # caption active-word background + hook accent
@@ -1504,79 +1407,60 @@ def build_shotstack_timeline(
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
-    raw_total = sum(s["src_end"] - s["src_start"] for s in keep_segments)
-    # Cloudinary transitions overlap adjacent segments, reducing total duration
-    total_duration = raw_total - max(0, len(keep_segments) - 1) * transition_dur
+    total_duration = sum(s["src_end"] - s["src_start"] for s in keep_segments)
 
-    # ── Video track ───────────────────────────────────────────────────────────
+    # ── Video track: multi-clip Shotstack timeline, per-segment Ken Burns + skew ──
     video_clips: List[Dict] = []
 
     _orig_volume = 0 if mute_original_audio else 1
 
-    if cloudinary_cut_url:
-        # Cloudinary pre-rendered the cuts + transitions — Shotstack gets ONE clip.
-        # Apply a global slow zoom so the full video has forward motion.
-        video_clips = [{
-            "asset": {"type": "video", "src": cloudinary_cut_url, "volume": _orig_volume},
-            "start": 0,
-            "length": round(total_duration, 3),
+    timeline_pos = 0.0
+    for i, seg in enumerate(keep_segments):
+        seg_dur = seg["src_end"] - seg["src_start"]
+        if seg_dur < 0.1:
+            continue
+
+        seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
+        base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
+
+        clip: Dict[str, Any] = {
+            "asset": {
+                "type": "video",
+                "src": video_url,
+                "trim": seg["src_start"],
+                "volume": _orig_volume,
+            },
+            "start": round(timeline_pos, 3),
+            "length": round(seg_dur, 3),
             "fit": "cover",
-            "effect": "zoomInSlow",
-        }]
-        print(
-            f"[VideoProduction] using Cloudinary pre-cut URL ({len(keep_segments)} segments) "
-            f"orig_volume={_orig_volume}",
-            flush=True,
-        )
-    else:
-        # Fallback: multi-clip Shotstack timeline with per-segment Ken Burns + skew
-        timeline_pos = 0.0
-        for i, seg in enumerate(keep_segments):
-            seg_dur = seg["src_end"] - seg["src_start"]
-            if seg_dur < 0.1:
-                continue
+            "effect": base_effect,
+        }
 
-            seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
-            base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
+        if i > 0:
+            clip["transition"] = {"in": "zoom"}
 
-            clip: Dict[str, Any] = {
-                "asset": {
-                    "type": "video",
-                    "src": video_url,
-                    "trim": seg["src_start"],
-                    "volume": _orig_volume,
+        if seg_zooms:
+            z = seg_zooms[0]
+            clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
+            clip["transform"] = {
+                "rotate": {
+                    "angle": [
+                        {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
+                         "interpolation": "bezier", "easing": "easeOutBack"},
+                        {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
+                         "interpolation": "bezier", "easing": "easeOutCubic"},
+                    ]
                 },
-                "start": round(timeline_pos, 3),
-                "length": round(seg_dur, 3),
-                "fit": "cover",
-                "effect": base_effect,
+                "skew": {
+                    "x": [
+                        {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
+                         "interpolation": "bezier", "easing": "easeOutCubic"},
+                    ]
+                },
             }
 
-            if i > 0:
-                clip["transition"] = {"in": "zoom"}
-
-            if seg_zooms:
-                z = seg_zooms[0]
-                clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-                clip["transform"] = {
-                    "rotate": {
-                        "angle": [
-                            {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
-                             "interpolation": "bezier", "easing": "easeOutBack"},
-                            {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
-                             "interpolation": "bezier", "easing": "easeOutCubic"},
-                        ]
-                    },
-                    "skew": {
-                        "x": [
-                            {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
-                             "interpolation": "bezier", "easing": "easeOutCubic"},
-                        ]
-                    },
-                }
-
-            video_clips.append(clip)
-            timeline_pos += seg_dur
+        video_clips.append(clip)
+        timeline_pos += seg_dur
 
     # ── Caption track — 4 style types ────────────────────────────────────────
     # Each SRT entry is routed to exactly one type (standard / emphasis / metric / cta).
@@ -1594,8 +1478,8 @@ def build_shotstack_timeline(
     # ── Pass 1: map every SRT entry to timeline positions ────────────────────
     _mapped: List[tuple] = []   # (tl_start, tl_end, entry)
     for entry in srt_entries:
-        ts = _original_to_timeline(entry["start"], keep_segments, transition_dur=transition_dur)
-        te = _original_to_timeline(entry["end"],   keep_segments, clamp=True, transition_dur=transition_dur)
+        ts = _original_to_timeline(entry["start"], keep_segments)
+        te = _original_to_timeline(entry["end"],   keep_segments, clamp=True)
         if ts is None or te is None:
             continue
         ts = max(0.0, ts)
@@ -1736,7 +1620,7 @@ def build_shotstack_timeline(
             orig_at = float(sfx.get("at", -1))
             if orig_at < 0 or orig_at > video_duration:
                 continue
-            tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+            tl_at = _original_to_timeline(orig_at, keep_segments)
             if tl_at is None:
                 continue
             sfx_clips.append({
@@ -1775,7 +1659,7 @@ def build_shotstack_timeline(
         conf    = float(change.get("confidence", 1.0))
         if orig_at < 0 or orig_at >= video_duration or conf < _CONFIDENCE_THRESHOLD:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        tl_at = _original_to_timeline(orig_at, keep_segments)
         if tl_at is None:
             continue
         clip_start  = max(0.0, round(tl_at - _tc_dur / 2, 3))
@@ -1814,11 +1698,11 @@ def build_shotstack_timeline(
         ov_dur  = float(ov.get("duration", 1.5))
         if orig_at < 0 or orig_at >= video_duration:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        tl_at = _original_to_timeline(orig_at, keep_segments)
         if tl_at is None:
             # Timestamp landed in a cut — try up to 3s later to find a kept segment
             for nudge in (1.0, 2.0, 3.0):
-                tl_at = _original_to_timeline(min(orig_at + nudge, video_duration - 0.1), keep_segments, transition_dur=transition_dur)
+                tl_at = _original_to_timeline(min(orig_at + nudge, video_duration - 0.1), keep_segments)
                 if tl_at is not None:
                     break
         if tl_at is None:
@@ -1859,7 +1743,7 @@ def build_shotstack_timeline(
         br_dur = min(float(br.get("duration", 3.0)), 4.0)
         if orig_at < 0 or orig_at >= video_duration:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        tl_at = _original_to_timeline(orig_at, keep_segments)
         if tl_at is None:
             continue
         # Clamp duration so b-roll doesn't run past the timeline end
@@ -1915,8 +1799,8 @@ def build_shotstack_timeline(
     hook_clips: List[Dict] = []
     if hook_text:
         _hook_upper = hook_text.upper()
-        # Full-width colored banner with CSS word-wrap — works regardless of whether
-        # Cloudinary handles cuts. Width=720 matches Shotstack hd 9:16 canvas.
+        # Full-width colored banner with CSS word-wrap. Width=720 matches Shotstack
+        # hd 9:16 canvas.
         _hook_html = (
             "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
             "<style>"
@@ -2457,40 +2341,8 @@ async def run_production_job(
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
 
-        # Build Cloudinary cut URL — hard cuts (no luma-matte) so both segment audio
-        # tracks never overlap, and transition_dur=0.0 keeps caption timestamps exact.
-        # Shotstack topic-change flash/swipe overlays provide visual polish at cut points.
-        luma_pid       = None   # hard cuts
-        transition_dur = 0.0
-        cloudinary_cut_url = ""
-        if "res.cloudinary.com" in (clean_video_url or ""):
-            cld_pid = _cloudinary_public_id(clean_video_url)
-            if cld_pid:
-                keep_segs_preview = _build_keep_segments(cuts, duration)
-                if len(keep_segs_preview) > 1:
-                    cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs_preview, luma_pid, transition_dur,
-                        hook_text=hook_text,
-                        primary_color=primary_color,
-                    )
-                    # Compute where each cut appears in the OUTPUT video.
-                    # With custom luma-matte transitions, total duration = sum(seg_durs).
-                    # (Transitions are overlaid, not additive — cuts happen at segment ends.)
-                    _cum = 0.0
-                    _marks = []
-                    for _seg in keep_segs_preview[:-1]:
-                        _cum += _seg["src_end"] - _seg["src_start"]
-                        _marks.append(f"{int(_cum // 60)}:{int(_cum % 60):02d}")
-                    print(
-                        f"[CloudinaryEdit] {len(keep_segs_preview)} segments → "
-                        f"luma-matte {luma_pid.split('/')[-1]} ({transition_dur}s) | "
-                        f"cuts at {', '.join(_marks)} in output | "
-                        f"{cloudinary_cut_url[:70]}…",
-                        flush=True,
-                    )
-
         timeline = build_shotstack_timeline(
-            video_url=clean_video_url,      # cleaned voice track (fallback path)
+            video_url=clean_video_url,      # cleaned voice track
             video_duration=duration,
             cuts=cuts,
             zooms=zooms,
@@ -2502,8 +2354,6 @@ async def run_production_job(
             music_url=music_url,
             music_volume=music_volume,
             hook_text=hook_text,
-            cloudinary_cut_url=cloudinary_cut_url,
-            transition_dur=transition_dur if cloudinary_cut_url else 0.0,
             logo_url=logo_url,
             brand_name=brand_name,
             primary_color=primary_color,
@@ -2650,36 +2500,8 @@ async def run_render_phase(job_id: str, db) -> None:
                 await update(62, "Selecting background music…")
                 music_url = _pick_music_url(music_mood)
 
-        # ── Stage 5: Build Cloudinary cut URL + Shotstack timeline ───────────────
+        # ── Stage 5: Build Shotstack timeline ─────────────────────────────────────
         await update(65, "Building edit timeline…")
-
-        # Resolve luma-matte PID from transition_style.
-        # Default "auto" uses hard cuts — no audio overlap and perfect caption sync.
-        # Luma-matte styles are still available on explicit request but require the
-        # transition_dur value to exactly match the uploaded luma-matte video's length.
-        _LUMA_BY_STYLE: Dict[str, Optional[str]] = {
-            "auto":          None,   # hard cuts by default — no audio overlap
-            "circle_wipe":   "uri-transitions/circle-wipe",
-            "diagonal_wipe": "uri-transitions/diagonal-wipe",
-            "flash":         None,
-            "swipe":         None,
-            "hard_cut":      None,
-            "none":          None,
-        }
-        luma_pid       = _LUMA_BY_STYLE.get(transition_style, None)
-        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR) if luma_pid else 0.0
-
-        cloudinary_cut_url = ""
-        if "res.cloudinary.com" in (clean_video_url or ""):
-            cld_pid = _cloudinary_public_id(clean_video_url)
-            if cld_pid:
-                keep_segs = _build_keep_segments(cuts, duration)
-                if len(keep_segs) > 1:
-                    cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs, luma_pid, transition_dur,
-                        hook_text=hook_text,
-                        primary_color=primary_color,
-                    )
 
         # ── Resolve icon overlays — fetch Lottie JSON (or build emoji HTML) ────────
         resolved_icon_overlays: List[Dict[str, Any]] = []
@@ -2708,8 +2530,6 @@ async def run_render_phase(job_id: str, db) -> None:
             job_id=job_id,
             music_url=music_url,
             hook_text=hook_text,
-            cloudinary_cut_url=cloudinary_cut_url,
-            transition_dur=transition_dur if cloudinary_cut_url else 0.0,
             logo_url=logo_url,
             brand_name=brand_name,
             primary_color=primary_color,

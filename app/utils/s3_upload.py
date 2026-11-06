@@ -55,6 +55,37 @@ def _public_url(key: str) -> str:
     return f"https://{_S3_BUCKET}.s3.{_S3_REGION}.amazonaws.com/{key}"
 
 
+def key_from_public_url(url: str) -> str:
+    """The inverse of _public_url — returns "" for anything that isn't actually
+    one of our own objects (a bucket this process didn't upload to), so a caller
+    can refuse to sign a URL it doesn't recognise rather than quietly SSRF-ing an
+    arbitrary host through generate_presigned_url."""
+    prefix = _public_url("")
+    return url[len(prefix):] if url.startswith(prefix) else ""
+
+
+def presigned_download_url(url: str, filename: str, expires_in: int = 300) -> str:
+    """A short-lived presigned GET for `url` that forces the browser to save it as
+    `filename` instead of whatever name the S3 key happens to have — the
+    replacement for Cloudinary's fl_attachment delivery-URL flag
+    (cloudinaryDownload.util.ts), which doesn't exist for a plain S3 URL. Returns
+    "" if `url` isn't one of our own S3 objects, so the caller can fall back to
+    the plain URL — signing never touches the network, so an object that
+    doesn't exist just 404s when fetched, same as any other broken link."""
+    key = key_from_public_url(url)
+    if not key:
+        return ""
+    safe_name = re.sub(r'[^A-Za-z0-9 ._-]', '', filename).strip() or "download"
+    return _s3_client.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": _S3_BUCKET, "Key": key,
+            "ResponseContentDisposition": f'attachment; filename="{safe_name}"',
+        },
+        ExpiresIn=expires_in,
+    )
+
+
 def _sniff_extension(file_bytes: bytes, resource_type: str) -> str:
     """Cloudinary auto-detects format from the bytes and needs no extension
     in its URLs; S3 needs a real extension in the key (for the right

@@ -12,7 +12,15 @@ import os
 import tempfile
 from unittest.mock import MagicMock, patch
 
-from app.utils.s3_upload import _sniff_extension, upload_base64, upload_bytes, upload_file_path
+from app.utils.s3_upload import (
+    _sniff_extension,
+    key_from_public_url,
+    presigned_download_url,
+    presigned_put_url,
+    upload_base64,
+    upload_bytes,
+    upload_file_path,
+)
 
 # Minimal real magic-byte prefixes for each format, not full valid files —
 # _sniff_extension only ever looks at the header, so a truncated-but-correct
@@ -197,3 +205,97 @@ class TestUploadBase64:
         assert url.endswith(".png")
         _, kwargs = mock_s3.put_object.call_args
         assert kwargs["Body"] == _PNG_HEAD
+
+
+class TestPresignedPutUrl:
+    """The browser-direct-upload replacement for Cloudinary's signed chunked
+    upload (CampaignService.ts's uploadVideoDirect)."""
+
+    def test_returns_a_put_url_and_the_matching_public_url(self):
+        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+             patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            mock_s3.generate_presigned_url.return_value = "https://signed.example/put"
+            signed = presigned_put_url("uri-ads", "upload-abc123", ext="mov")
+
+        assert signed == {
+            "put_url": "https://signed.example/put",
+            "public_url": "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-ads/upload-abc123.mov",
+        }
+        _, kwargs = mock_s3.generate_presigned_url.call_args
+        assert kwargs["Params"] == {"Bucket": "uri-social-media-dev", "Key": "uri-ads/upload-abc123.mov"}
+
+    def test_content_type_is_never_bound_into_the_signature(self):
+        """A presigned URL signed with a specific ContentType rejects any PUT
+        whose header doesn't match it byte-for-byte — and the browser's real
+        file.type varies by source (video/mp4, video/quicktime, ...), so this
+        must never be part of the signed Params."""
+        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+             patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            mock_s3.generate_presigned_url.return_value = "https://signed.example/put"
+            presigned_put_url("uri-ads", "upload-abc123")
+
+        _, kwargs = mock_s3.generate_presigned_url.call_args
+        assert "ContentType" not in kwargs["Params"]
+
+
+class TestKeyFromPublicUrl:
+    def test_extracts_the_key_from_one_of_our_own_urls(self):
+        with patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            key = key_from_public_url(
+                "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-ads/clip.mp4"
+            )
+        assert key == "uri-ads/clip.mp4"
+
+    def test_returns_empty_for_a_url_that_is_not_our_bucket(self):
+        """Refuses to sign a URL it doesn't recognise rather than quietly
+        SSRF-ing an arbitrary host through generate_presigned_url."""
+        with patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            assert key_from_public_url("https://evil.example.com/uri-ads/clip.mp4") == ""
+            assert key_from_public_url("") == ""
+
+
+class TestPresignedDownloadUrl:
+    """The replacement for Cloudinary's fl_attachment delivery-URL flag
+    (cloudinaryDownload.util.ts) — forces a clean Content-Disposition filename
+    on download via a presigned GET instead of a delivery-URL trick."""
+
+    def test_signs_with_the_given_filename_as_an_attachment(self):
+        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+             patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            mock_s3.generate_presigned_url.return_value = "https://signed.example/get"
+            url = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-ads/clip.mp4"
+            signed = presigned_download_url(url, "Uri-Video-abc123.mp4")
+
+        assert signed == "https://signed.example/get"
+        _, kwargs = mock_s3.generate_presigned_url.call_args
+        assert kwargs["Params"]["Key"] == "uri-ads/clip.mp4"
+        assert kwargs["Params"]["ResponseContentDisposition"] == 'attachment; filename="Uri-Video-abc123.mp4"'
+
+    def test_sanitizes_an_unsafe_filename(self):
+        """A filename with a quote or slash must never reach the header raw — a
+        stray quote could break out of the quoted filename value, and a slash
+        makes it look like a path rather than a plain name."""
+        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+             patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            mock_s3.generate_presigned_url.return_value = "https://signed.example/get"
+            url = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-ads/clip.mp4"
+            presigned_download_url(url, 'weird"; name/../etc.mp4')
+
+        _, kwargs = mock_s3.generate_presigned_url.call_args
+        disposition = kwargs["Params"]["ResponseContentDisposition"]
+        assert disposition == 'attachment; filename="weird name..etc.mp4"'
+
+    def test_returns_empty_string_for_a_url_that_is_not_our_bucket(self):
+        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+             patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+             patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+            signed = presigned_download_url("https://evil.example.com/clip.mp4", "clip.mp4")
+
+        assert signed == ""
+        mock_s3.generate_presigned_url.assert_not_called()

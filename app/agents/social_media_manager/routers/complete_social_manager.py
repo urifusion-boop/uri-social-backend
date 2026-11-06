@@ -1530,6 +1530,25 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
         raise HTTPException(status_code=500, detail=error_detail)
 
 
+@router.get("/download-url")
+async def get_download_url(
+    url: str = Query(..., description="The media URL to download (must be one of our own S3 objects)"),
+    filename: str = Query(..., description="Filename the browser should save the download as"),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Replacement for Cloudinary's fl_attachment delivery-URL flag
+    (cloudinaryDownload.util.ts) — a plain S3 URL has no equivalent query-string
+    trick, so a short-lived presigned GET with ResponseContentDisposition is the
+    S3-native way to make the browser save a download under a clean name instead
+    of the raw object key. Falls back to the original URL (unsigned) if it isn't
+    one of our own S3 objects, so a caller can always just use whatever this
+    returns without a special case for "not an S3 URL"."""
+    from app.utils.s3_upload import presigned_download_url
+
+    signed = presigned_download_url(url, filename)
+    return UriResponse.get_single_data_response("download_url", {"url": signed or url})
+
+
 # ==============================================================================
 # SOCIAL ACCOUNT CONNECTION ENDPOINTS
 # ==============================================================================
