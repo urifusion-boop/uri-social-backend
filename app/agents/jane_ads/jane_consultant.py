@@ -327,7 +327,8 @@ async def consult(message: str, business_name: str = "", category: str = "",
                   known_budget: Optional[float] = None,
                   history: Optional[list[dict]] = None,
                   offering: str = "",
-                  stated_audience: str = "") -> ConsultantBrief:
+                  stated_audience: str = "",
+                  objective_label: str = "") -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
@@ -341,7 +342,25 @@ async def consult(message: str, business_name: str = "", category: str = "",
             return ConsultantBrief(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
         return ConsultantBrief(business_name=business_name, category=category)
 
+    # A budget the client typed anywhere in this thread settles it. The remembered spend
+    # from a PAST campaign is then withheld from the model entirely: offered alongside a
+    # stated figure, it asked "last time you spent ₦130,000, want to do the same?" of a
+    # client who had just said ₦30,000. Live-reported, repeatedly.
+    settled_budget = client_stated_budget(message, history)
+    if settled_budget:
+        known_budget = None
+
     known_bits = []
+    if objective_label:
+        known_bits.append(
+            f"the client already chose this campaign's objective: {objective_label} — that "
+            f"IS the goal, decided. Do not ask what the goal is or offer other goals"
+        )
+    if settled_budget:
+        known_bits.append(
+            f"the client's budget for THIS campaign is ₦{settled_budget:,.0f} — decided. "
+            f"Set budget_ngn to {int(settled_budget)} and never ask about the budget"
+        )
     if business_name:
         known_bits.append(f"business name: {business_name}")
     if category:
@@ -438,6 +457,13 @@ async def consult(message: str, business_name: str = "", category: str = "",
         raise NlUnavailableError(str(e)) from e
 
     brief = _coerce(data, business_name, category)
+    if settled_budget:
+        brief = brief.model_copy(update={"budget_ngn": settled_budget})
+        if brief.clarify and _is_about_budget(brief.clarify):
+            brief = brief.model_copy(update={
+                "clarify": _without_budget_questions(brief.clarify),
+                "missing": [m for m in (brief.missing or []) if not _is_about_budget(m)],
+            })
     return _enforce_hard_requirements(brief, message, history or [], known_budget)
 
 
@@ -494,7 +520,9 @@ _NUM = r"\d[\d,]*(?:\.\d+)?"
 _STATED_AMOUNT = re.compile(
     rf"(?:₦|\bngn\b|\bn(?=\d))\s*({_NUM})\s*([km])?"   # ₦20,000 / N20k / NGN 50000
     rf"|\b({_NUM})\s*([km])\b"                            # 20k / 5k / 1.5m
-    r"|\b(\d{4,})\b",                                     # bare 20000
+    r"|\b(\d{4,})\b"                                      # bare 20000
+    r"|\b(\d{1,3}(?:,\d{3})+)\b(?!\s*(?:customers|people|leads|followers|clients"
+    r"|sales|orders|views|messages|users|visitors|likes))",  # bare 30,000
     re.I,
 )
 
@@ -510,7 +538,7 @@ def stated_budget_ngn(reply: str) -> Optional[float]:
 
     found: list[float] = []
     for m in _STATED_AMOUNT.finditer(reply or ""):
-        digits = m.group(1) or m.group(3) or m.group(5)
+        digits = m.group(1) or m.group(3) or m.group(5) or m.group(6)
         suffix = m.group(2) or m.group(4) or ""
         if not digits:
             continue
@@ -519,6 +547,36 @@ def stated_budget_ngn(reply: str) -> Optional[float]:
             found.append(v)
     uniq = sorted(set(found))
     return uniq[0] if len(uniq) == 1 else None
+
+
+def client_stated_budget(message: str, history: Optional[list[dict]] = None) -> Optional[float]:
+    """The newest budget the client typed anywhere in this conversation.
+
+    Reads the client's own words only — each reply in the brief-so-far, newest first,
+    then their saved turns — so a figure Jane mentioned (a past campaign's spend) is
+    never mistaken for one the client gave.
+    """
+    pieces = [p for p in re.split(r"\.(?:\s+|$)", message or "") if p.strip()]
+    texts = list(reversed(pieces)) + [
+        t.get("content", "") for t in reversed(history or []) if t.get("role") == "user"
+    ]
+    for text in texts:
+        found = stated_budget_ngn(text)
+        if found:
+            return found
+    return stated_budget_ngn(message)
+
+
+_SENTENCE = re.compile(r"[^.?!]*(?:[.?!]+|$)")
+
+
+def _without_budget_questions(clarify: str) -> str:
+    """`clarify` with every sentence that asks about the budget removed, or "" when no
+    question is left. The budget is already settled when this is called."""
+    kept = [s.strip() for s in _SENTENCE.findall(clarify or "")
+            if s.strip() and not (_is_about_budget(s) or "spent" in s.lower()
+                                  or "allocat" in s.lower())]
+    return " ".join(kept) if any("?" in s for s in kept) else ""
 
 
 def _build_budget_confirmation_note(known_budget: Optional[float], message: str,

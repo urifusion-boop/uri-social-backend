@@ -2613,6 +2613,12 @@ async def _resolve_creative_path(body: MetaLaunchFromMessageBody, brand_ctx: dic
     return cp.provenance("ugc", ugc_kind=body.ugc_kind, rights_confirmed=body.ugc_rights_confirmed)
 
 
+def _objective_label(value: Optional[str]) -> str:
+    """The plain label of the objective the client picked, or "" if they haven't."""
+    from .objectives import CHOICES
+    return next((c["label"] for c in CHOICES if c["value"] == (value or "").strip()), "")
+
+
 async def _build_campaign_plan(
     body: MetaLaunchFromMessageBody, brand_ctx: dict, db: AsyncIOMotorDatabase,
 ) -> "_PlanBuildResult | dict":
@@ -2765,7 +2771,8 @@ async def _build_campaign_plan(
     try:
         parsed = await consult(body.message, known_business_name, known_category,
                                known_budget, thread_turns, offering=known_offering,
-                               stated_audience=own_audience)
+                               stated_audience=own_audience,
+                               objective_label=_objective_label(body.objective))
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
