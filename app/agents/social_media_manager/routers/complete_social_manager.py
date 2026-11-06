@@ -1524,10 +1524,37 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
 
     except HTTPException:
         raise
+    except ValueError as e:
+        # UserMediaStorageService.upload_user_media deliberately raises
+        # ValueError with plain-English, already-user-safe messages (e.g.
+        # "Unsupported file type: image/heic. Use PNG, JPG, WEBP, MP4, MOV.")
+        # — written to be shown, not internal detail. A bare
+        # HTTPException(detail=...) returns FastAPI's default {"detail": ...}
+        # shape, but the frontend reads this app's own {"responseMessage": ...}
+        # envelope (already used by the 402 branch above), so this message was
+        # silently invisible to the user — always the generic fallback toast
+        # instead, with no way to tell what to actually fix.
+        print(f"⚠️ upload_user_content validation error for user={user_id}: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"status": False, "responseCode": 400, "responseMessage": str(e)},
+        )
     except Exception as e:
+        # Anything NOT one of the known, deliberately-user-facing ValueErrors
+        # above is an unexpected failure (a bug, S3/DB/dependency error, ...)
+        # whose message was never written with an end user in mind and may
+        # describe internals — log it in full server-side, but never forward
+        # it to the response.
         error_detail = str(e) or repr(e)
         print(f"❌ upload_user_content error for user={user_id}: {error_detail}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=error_detail)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": False,
+                "responseCode": 500,
+                "responseMessage": "Something went wrong — if the issue persists, contact support.",
+            },
+        )
 
 
 @router.get("/download-url")
