@@ -3079,6 +3079,47 @@ Answer with exactly one word: "yes" or "no"."""
 
         return {"top": top_pct, "bottom": bottom_pct, "left_right": left_right_pct}
 
+    # The pixel count of gpt-image-2's fixed 1024x1536 / 1536x1024 buckets: asking for the target's own
+    # ratio at this size costs the same as the bucket it replaces.
+    _GPT2_PIXEL_BUDGET = 1024 * 1536
+
+    @staticmethod
+    def _gpt2_exact_size(target_w: int, target_h: int) -> Optional[str]:
+        """A gpt-image-2 `size` with the target's own aspect ratio (both edges a multiple of 16, the
+        ratio at most 3:1), so the picture comes back already the right shape and nothing has to be
+        cropped off it. A crop is what cut posts off at the edge: the model's 2:3 portrait bucket
+        cropped to TikTok's / Stories' 9:16 loses ~8% off each side, and text the model set near the
+        side was sliced through.
+
+        None when the fixed bucket is already the right shape (square, 3:2, 2:3), or the target is
+        too long and thin for the model to draw (banners): those keep using the bucket.
+        """
+        ratio = target_w / target_h
+        bucket_w, bucket_h = (1536, 1024) if target_w > target_h else (1024, 1536) if target_h > target_w else (1024, 1024)
+        if abs(bucket_w / bucket_h - ratio) / ratio < 0.02:
+            return None
+        w = max(16, round((ImageContentService._GPT2_PIXEL_BUDGET * ratio) ** 0.5 / 16) * 16)
+        h = max(16, round(w / ratio / 16) * 16)
+        if max(w, h) / min(w, h) > 3:
+            return None
+        return f"{w}x{h}"
+
+    @staticmethod
+    def _gpt2_call(fn: Any, size: str, fallback_size: str, **kwargs: Any) -> Any:
+        """Call an OpenAI image endpoint at `size`; if OpenAI refuses that size, once more at
+        `fallback_size`, one of the fixed buckets every gpt-image model accepts."""
+        try:
+            return fn(size=size, **kwargs)
+        except Exception as err:
+            if size == fallback_size or getattr(err, "status_code", None) != 400 or "size" not in str(err).lower():
+                raise
+            print(f"⚠️ GPT-Image-2 refused size {size} ({err}) — retrying at {fallback_size}")
+            uploads = kwargs.get("image")
+            for upload in (uploads if isinstance(uploads, list) else [uploads]):
+                if isinstance(upload, tuple) and hasattr(upload[1], "seek"):
+                    upload[1].seek(0)
+            return fn(size=fallback_size, **kwargs)
+
     @staticmethod
     async def crop_and_reupload_for_tiktok(image_url: str, user_id: str) -> str:
         """Center-crop a user-uploaded image to TikTok's Photo Mode spec
@@ -3287,11 +3328,13 @@ Answer with exactly one word: "yes" or "no"."""
                     import io as _io
 
                     if target_w > target_h:
-                        _gpt2_size = "1536x1024"
+                        _gpt2_bucket = "1536x1024"
                     elif target_h > target_w:
-                        _gpt2_size = "1024x1536"
+                        _gpt2_bucket = "1024x1536"
                     else:
-                        _gpt2_size = "1024x1024"
+                        _gpt2_bucket = "1024x1024"
+                    # The target's own shape where the bucket isn't it, so there is no crop to cut the post.
+                    _gpt2_size = ImageContentService._gpt2_exact_size(target_w, target_h) or _gpt2_bucket
 
                     if all_refs:
                         # image_model is force-set to "openai/gpt-image-2" by every
@@ -3333,12 +3376,12 @@ Answer with exactly one word: "yes" or "no"."""
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
-                                lambda: _oai_client.images.edit(
+                                lambda: ImageContentService._gpt2_call(
+                                    _oai_client.images.edit, _gpt2_size, _gpt2_bucket,
                                     model="gpt-image-2",
                                     image=_gpt2_edit_image_arg,
                                     prompt=prompt,
                                     n=1,
-                                    size=_gpt2_size,
                                     quality="medium",
                                     output_format="webp",
                                     # NOTE: gpt-image-2 does NOT support input_fidelity at all
@@ -3360,11 +3403,11 @@ Answer with exactly one word: "yes" or "no"."""
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
-                                lambda: _oai_client.images.generate(
+                                lambda: ImageContentService._gpt2_call(
+                                    _oai_client.images.generate, _gpt2_size, _gpt2_bucket,
                                     model="gpt-image-2",
                                     prompt=prompt,
                                     n=1,
-                                    size=_gpt2_size,
                                     quality="medium",
                                     output_format="webp",
                                 ),
