@@ -715,13 +715,25 @@ async def creative_upload(
     return {"url": url, "is_video": is_video}
 
 
+_VIDEO_MIME_EXT = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+    "video/x-matroska": "mkv", "video/x-msvideo": "avi", "video/3gpp": "3gp",
+}
+
+
 @router.post("/creative/upload-signature")
-async def creative_upload_signature(brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
-    """Signed Cloudinary params so the browser uploads a video directly, in chunks. A phone
-    video relayed through /creative/upload on a slow connection outlasts the request timeout."""
-    from .creative import cloudinary_upload_signature
+async def creative_upload_signature(
+    content_type: str = "video/mp4",
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """A presigned S3 PUT URL so the browser uploads a video straight to S3. A phone
+    video relayed through /creative/upload on a slow connection outlasts the request
+    timeout — this keeps our own backend out of the transfer path entirely, same as
+    the Cloudinary signed-upload flow this replaced."""
+    from .creative import s3_upload_signature
     import uuid as _uuid
-    signed = cloudinary_upload_signature(f"upload-{_uuid.uuid4().hex[:12]}")
+    ext = _VIDEO_MIME_EXT.get(content_type, "mp4")
+    signed = s3_upload_signature(f"upload-{_uuid.uuid4().hex[:12]}", ext=ext)
     if not signed:
         raise HTTPException(status_code=503, detail="Uploads aren't available right now.")
     return signed
@@ -3953,12 +3965,12 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
 
     campaign_collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
                            else "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns")
-    # TikTok-only (see _video_thumbnail_url docstring): for a video ad,
+    # TikTok-only (see tiktok_media.extract_poster_frame docstring): for a video ad,
     # plan.creative.image_url IS the raw .mp4 URL, which the campaign list's
-    # plain <img> tag can't render — swap in a Cloudinary-derived poster frame
+    # plain <img> tag can't render — swap in a locally-extracted poster frame
     # for display only, purely additive, leaves Meta's own image_url untouched.
     display_image_url = (
-        _video_thumbnail_url(plan.creative.image_url)
+        await _video_thumbnail_url(plan.creative.image_url)
         if is_tiktok and plan.creative.is_video
         else plan.creative.image_url
     )

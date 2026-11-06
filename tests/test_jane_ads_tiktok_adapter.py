@@ -18,8 +18,6 @@ import pytest
 from app.agents.jane_ads.adapters.tiktok import (
     TikTokAdsAdapter,
     TikTokAdsAPIError,
-    _force_jpg_delivery,
-    _force_tiktok_video_ratio,
     _resolve_tiktok_interests,
     _resolve_tiktok_locations,
     _tiktok_age_groups_for,
@@ -31,7 +29,6 @@ from app.agents.jane_ads.adapters.tiktok import (
     _tiktok_location_names,
     _tiktok_schedule_days,
     _tiktok_schedule_has_ended,
-    _video_thumbnail_url,
 )
 from app.agents.jane_ads.models import (
     ABTestScope,
@@ -131,6 +128,20 @@ def _mock_client(responses):
 
 def _adapter(db=None) -> TikTokAdsAdapter:
     return TikTokAdsAdapter(db or FakeDb(), advertiser_id="adv123", access_token="tok")
+
+
+@pytest.fixture(autouse=True)
+def _media_normalization_passthrough():
+    """ensure_jpg/ensure_tiktok_video do a real download + ffmpeg/PIL pass + S3
+    re-upload (see tiktok_media.py) — none of that belongs in these adapter tests,
+    which mock httpx.AsyncClient for the TikTok API calls only (and would otherwise
+    have that same mock's queued responses consumed by the media functions' own
+    internal .get() calls, corrupting the sequence). Default every test to an
+    identity pass-through; the handful of tests about media normalization itself
+    override this with their own patch, which takes precedence for their duration."""
+    with patch("app.agents.jane_ads.adapters.tiktok.ensure_jpg", new=AsyncMock(side_effect=lambda url: url)), \
+         patch("app.agents.jane_ads.adapters.tiktok.ensure_tiktok_video", new=AsyncMock(side_effect=lambda url: url)):
+        yield
 
 
 # campaign(POST), video upload(POST), cover image upload(POST), ad group(POST),
@@ -567,137 +578,63 @@ def test_launch_campaign_carousel_happy_path():
     assert "video_id" not in creative
 
 
-def test_launch_campaign_carousel_forces_jpg_on_cloudinary_urls():
-    # Live-caught 2026-09-22: a real WEBP upload got "Invalid params: image cannot
-    # be decoded" from TikTok, which only accepts JPG/PNG for Carousel Ads. Every
-    # slide's URL sent to TikTok must carry Cloudinary's f_jpg delivery
-    # transformation, regardless of the stored file's real format.
+def test_launch_campaign_carousel_sends_ensure_jpgs_normalized_urls():
+    # ensure_jpg (tiktok_media.py) replaced the old Cloudinary f_jpg delivery-URL
+    # trick with a real local WEBP->JPEG conversion + S3 re-upload — this just
+    # proves the adapter calls it per slide and sends TikTok whatever URL it hands
+    # back, not the original. Real conversion behavior is covered in
+    # test_jane_ads_tiktok_media.py.
     adapter = _adapter()
     plan = _carousel_plan(
         creative=AdCreative(
             image_url="",
             is_video=False,
             carousel_image_urls=[
-                "https://res.cloudinary.com/demo/image/upload/v1700000000/uri-ads/a.webp",
-                "https://res.cloudinary.com/demo/image/upload/v1700000000/uri-ads/b.webp",
+                "https://cdn.example.com/a.webp",
+                "https://cdn.example.com/b.webp",
             ],
         )
     )
-    with patch("httpx.AsyncClient") as MockClient:
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.tiktok.ensure_jpg",
+               new=AsyncMock(side_effect=lambda url: url.replace(".webp", ".jpg"))) as mock_ensure_jpg:
         mock_client = _mock_client(list(_CAROUSEL_RESPONSES))
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(plan, _auth()))
 
+    assert mock_ensure_jpg.call_args_list[0].args[0] == "https://cdn.example.com/a.webp"
+    assert mock_ensure_jpg.call_args_list[1].args[0] == "https://cdn.example.com/b.webp"
     img1_json = mock_client.post.call_args_list[2].kwargs["json"]
-    assert img1_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/a.webp"
+    assert img1_json["image_url"] == "https://cdn.example.com/a.jpg"
     img2_json = mock_client.post.call_args_list[3].kwargs["json"]
-    assert img2_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/b.webp"
+    assert img2_json["image_url"] == "https://cdn.example.com/b.jpg"
 
 
-def test_force_jpg_delivery_inserts_transformation_on_cloudinary_urls():
-    assert _force_jpg_delivery("https://res.cloudinary.com/demo/image/upload/v1/uri-ads/x.webp") == (
-        "https://res.cloudinary.com/demo/image/upload/f_jpg/v1/uri-ads/x.webp"
-    )
-
-
-def test_force_jpg_delivery_is_a_noop_on_non_cloudinary_urls():
-    # Must never raise or mangle a URL shape it doesn't recognise.
-    assert _force_jpg_delivery("https://cdn.example.com/a.jpg") == "https://cdn.example.com/a.jpg"
-    assert _force_jpg_delivery("") == ""
-
-
-def test_force_tiktok_video_ratio_inserts_transformation_on_cloudinary_urls():
-    assert _force_tiktok_video_ratio("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.mp4") == (
-        "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1/uri-ads/clip.mp4"
-    )
-
-
-def test_force_tiktok_video_ratio_is_a_noop_on_non_cloudinary_urls():
-    # Must never raise or mangle a URL shape it doesn't recognise.
-    assert _force_tiktok_video_ratio("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
-    assert _force_tiktok_video_ratio("") == ""
-
-
-def test_video_thumbnail_url_swaps_extension_to_jpg_on_cloudinary_urls():
-    assert _video_thumbnail_url("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.mp4") == (
-        "https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.jpg"
-    )
-
-
-def test_video_thumbnail_url_is_a_noop_on_non_cloudinary_or_extensionless_urls():
-    # Must never raise or mangle a URL shape it doesn't recognise.
-    assert _video_thumbnail_url("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
-    assert _video_thumbnail_url("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip") == (
-        "https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip"
-    )
-    assert _video_thumbnail_url("") == ""
-
-
-def test_launch_campaign_forces_tiktok_ratio_on_cloudinary_video():
-    # Live-caught 2026-09-22: a real uploaded video (480x848 - close to but not
-    # exactly 9:16) got "Cannot be delivered to TikTok: Video ratio must be
-    # 16:9/1:1/9:16" in TikTok Ads Manager, even though the ad itself was created
-    # successfully. The video URL sent to TikTok must carry Cloudinary's
-    # c_fill,ar_9:16,g_auto delivery transformation, regardless of the source
-    # file's real dimensions.
+def test_launch_campaign_video_sends_ensure_tiktok_videos_normalized_url():
+    # ensure_tiktok_video (tiktok_media.py) replaced the old Cloudinary
+    # c_fill,ar_9:16,g_auto + HEVC->MP4 delivery-URL tricks with a real local
+    # ffmpeg crop/transcode + S3 re-upload. This just proves the adapter calls it
+    # with the plan's source URL and sends TikTok whatever URL comes back — no
+    # warm-up wait needed any more since the normalized file is already sitting on
+    # S3 by the time we return it (unlike Cloudinary's on-demand transcode, which
+    # needed the old _wait_for_cloudinary_video poll). Real crop/transcode
+    # behavior is covered in test_jane_ads_tiktok_media.py.
     adapter = _adapter()
     plan = _plan(creative=AdCreative(
-        image_url="https://res.cloudinary.com/demo/video/upload/v1700000000/uri-ads/clip.mp4",
+        image_url="https://cdn.example.com/clip.mov",
         is_video=True, headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
     ))
-    with patch("httpx.AsyncClient") as MockClient:
+    normalized_url = "https://s3.example.com/uri-ads/tiktok-normalized/vid-abc123.mp4"
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.tiktok.ensure_tiktok_video",
+               new=AsyncMock(return_value=normalized_url)) as mock_ensure_video:
         mock_client = _mock_client(list(_HAPPY_RESPONSES))
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(plan, _auth()))
 
-    # Live-caught 2026-09-22, part 2: TikTok's own fetch then failed with "video
-    # upload: Failed to fetch url data" — Cloudinary transcodes a video
-    # transformation on its first request, which can outrun TikTok's fetch
-    # timeout for a derivative nobody has requested before. The adapter must warm
-    # the EXACT SAME transformed URL itself first, before TikTok ever sees it.
-    assert mock_client.head.call_count == 1
-    warmed_url = mock_client.head.call_args_list[0].args[0]
-    assert warmed_url == "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
-
+    assert mock_ensure_video.call_args_list[0].args[0] == "https://cdn.example.com/clip.mov"
     video_json = mock_client.post.call_args_list[2].kwargs["json"]
-    assert video_json["video_url"] == (
-        "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
-    )
-
-
-def test_launch_campaign_video_warm_up_timeout_does_not_block_the_launch():
-    # Best-effort: a slow/failed warm-up must not sink an otherwise-real launch —
-    # TikTok's own fetch may still land on a transcode that finished moments later.
-    import httpx as httpx_module
-
-    adapter = _adapter()
-    plan = _plan(creative=AdCreative(
-        image_url="https://res.cloudinary.com/demo/video/upload/v1700000000/uri-ads/clip.mp4",
-        is_video=True, headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
-    ))
-    with patch("httpx.AsyncClient") as MockClient:
-        mock_client = _mock_client(list(_HAPPY_RESPONSES))
-        mock_client.head = AsyncMock(side_effect=httpx_module.TimeoutException("timed out"))
-        MockClient.return_value.__aenter__.return_value = mock_client
-        with patch("app.agents.jane_ads.adapters.tiktok._VIDEO_READY_PAUSE_S", 0):
-            result = _run(adapter.launch_campaign(plan, _auth()))
-
-    assert result.campaign_id == "111"
-    from app.agents.jane_ads.adapters.tiktok import _VIDEO_READY_ATTEMPTS
-    assert mock_client.head.call_count == _VIDEO_READY_ATTEMPTS
-
-
-def test_a_video_still_transcoding_is_waited_for_and_sent_as_mp4():
-    # Live 2026-10-30: a 55MB iPhone .MOV was still transcoding (Cloudinary 423) when
-    # TikTok fetched it — "video upload: Failed to fetch url data".
-    from app.agents.jane_ads.adapters.tiktok import _as_mp4, _wait_for_cloudinary_video
-    client = MagicMock()
-    client.head = AsyncMock(side_effect=[MagicMock(status_code=423), MagicMock(status_code=200)])
-    with patch("app.agents.jane_ads.adapters.tiktok._VIDEO_READY_PAUSE_S", 0):
-        _run(_wait_for_cloudinary_video(client, "u"))
-    assert client.head.call_count == 2
-    assert _as_mp4("https://res.cloudinary.com/d/video/upload/c_fill/v1/uri-ads/clip.MOV").endswith("/clip.mp4")
-    assert _as_mp4("https://cdn.example.com/clip.mov") == "https://cdn.example.com/clip.mov"
+    assert video_json["video_url"] == normalized_url
 
 
 def test_launch_campaign_carousel_raises_clearly_when_no_music_found():
