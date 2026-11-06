@@ -42,7 +42,6 @@ missing/present "error" key. _raise_for_error below checks that, not "error".
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import uuid
@@ -688,102 +687,14 @@ def _raise_for_error(data: dict, context: str) -> None:
         raise TikTokAdsAPIError(f"{context}: {data.get('message', 'unknown error')}", code=code)
 
 
-def _force_jpg_delivery(image_url: str) -> str:
-    """Live-caught 2026-09-22: TikTok's file/image/ad/upload/ rejected a real photo
-    with "Invalid params: image cannot be decoded" — the user had uploaded a WEBP,
-    which TikTok's own Carousel Ads spec explicitly excludes (JPG/PNG only; Meta and
-    our own upload picker both happily accept WEBP, so this mismatch is invisible
-    everywhere except TikTok's decoder). Rather than reject the upload upstream (a
-    WEBP dropped in from drafts/reuse would hit the same wall later), force Cloudinary
-    to deliver JPG regardless of the stored format via its f_jpg transformation —
-    standard Cloudinary delivery-URL syntax, inserted right after '/upload/'. A no-op,
-    unchanged URL for anything not hosted on Cloudinary (nothing else is, today, but
-    this must never raise on an unexpected shape)."""
-    marker = "/image/upload/"
-    idx = image_url.find(marker)
-    if idx == -1:
-        return image_url
-    insert_at = idx + len(marker)
-    return image_url[:insert_at] + "f_jpg/" + image_url[insert_at:]
-
-
-def _force_tiktok_video_ratio(video_url: str) -> str:
-    """Live-caught 2026-09-22: TikTok flagged an uploaded video ("WhatsApp Video
-    2026-0...") with "Cannot be delivered to TikTok: Video ratio must be
-    16:9/1:1/9:16" — its real dimensions (480x848) are close to but not exactly
-    9:16, which is enough for TikTok to reject delivery outright even though the ad
-    itself was created successfully. Our own upload endpoint (creative_upload in
-    router.py) applies zero video transformation — whatever the source file's real
-    dimensions are is exactly what gets sent to TikTok, and phone/WhatsApp-exported
-    video is routinely a few pixels off a clean ratio.
-
-    Rather than reject uploads with the wrong ratio (most user-shot vertical video
-    for a mobile-first platform like TikTok is ALREADY close to 9:16, just not
-    exact — asking the user to re-export is real friction for something we can fix
-    transparently), force Cloudinary to deliver a clean 9:16 crop via its standard
-    c_fill,ar_9:16,g_auto transformation — g_auto is Cloudinary's content-aware
-    gravity, so it crops toward the visually important part of the frame rather
-    than a blind centre-crop. A no-op, unchanged URL for anything not hosted on
-    Cloudinary (nothing else is, today, but this must never raise on an unexpected
-    shape). Applied unconditionally rather than only when the ratio is already
-    wrong — re-encoding an already-9:16 video through this transformation is a
-    harmless no-op, and detecting the source ratio first would mean an extra
-    Cloudinary metadata call for no real benefit."""
-    marker = "/video/upload/"
-    idx = video_url.find(marker)
-    if idx == -1:
-        return video_url
-    insert_at = idx + len(marker)
-    return video_url[:insert_at] + "c_fill,ar_9:16,g_auto/" + video_url[insert_at:]
-
-
-def _as_mp4(video_url: str) -> str:
-    """Ask Cloudinary for an H.264 .mp4. An iPhone .MOV is HEVC in a QuickTime box,
-    which TikTok's fetch doesn't reliably take."""
-    if "/video/upload/" not in video_url:
-        return video_url
-    return re.sub(r"\.(mov|webm|m4v|mkv|avi)$", ".mp4", video_url, flags=re.I)
-
-
-_VIDEO_READY_ATTEMPTS = 12
-_VIDEO_READY_PAUSE_S = 15
-
-
-async def _wait_for_cloudinary_video(client: httpx.AsyncClient, url: str) -> None:
-    """Request the transformed video until Cloudinary serves it. A large file is
-    transcoded asynchronously and answers 423 meanwhile; the old single HEAD ignored
-    the status, so TikTok was sent a URL that wasn't ready yet and failed with
-    "Failed to fetch url data" (live, a 55MB iPhone .MOV, 2026-10-30)."""
-    for attempt in range(1, _VIDEO_READY_ATTEMPTS + 1):
-        try:
-            r = await client.head(url, timeout=90)
-            if r.status_code == 200:
-                return
-            print(f"[TikTokAdsAdapter] video not ready ({r.status_code}, attempt {attempt})", flush=True)
-        except Exception as e:
-            print(f"[TikTokAdsAdapter] video warm-up attempt {attempt} failed: {e}", flush=True)
-        await asyncio.sleep(_VIDEO_READY_PAUSE_S)
-    print("[TikTokAdsAdapter] video still not ready — trying the upload anyway", flush=True)
-
-
-def _video_thumbnail_url(video_url: str) -> str:
-    """Live-caught 2026-09-23: TikTok video campaigns showed no thumbnail at all in
-    Jane's own Campaign Manager list (unlike carousel/Meta cards, which render
-    fine) — router.py's campaign-record write stores plan.creative.image_url
-    verbatim as the display image_url, but for a video ad that field IS the raw
-    .mp4 URL, and a plain <img> tag silently renders nothing for a video file.
-    Cloudinary can derive a JPG poster frame straight from a hosted video by
-    requesting the exact same delivery URL with its extension swapped to .jpg —
-    no separate upload, no extra API call, same "delivery-URL trick" pattern as
-    _force_jpg_delivery/_force_tiktok_video_ratio above. A no-op, unchanged URL
-    for anything not hosted on Cloudinary or with no file extension to swap."""
-    if "/video/upload/" not in video_url:
-        return video_url
-    head, slash, last_segment = video_url.rpartition("/")
-    if not slash or "." not in last_segment:
-        return video_url
-    stem, _, _ext = last_segment.rpartition(".")
-    return f"{head}/{stem}.jpg"
+# The four Cloudinary-delivery-URL tricks that used to live here (WEBP→JPG,
+# 9:16 crop, HEVC→MP4, poster-frame-via-extension-swap) were all "no-op for
+# anything not hosted on Cloudinary" — once creative storage moved to S3 they'd
+# have silently stopped firing and reopened four already-fixed, live-caught
+# TikTok rejection bugs. tiktok_media.py replaces them with real local
+# processing (ffmpeg/PIL) that works the same regardless of where the asset
+# lives; see that module's docstring for the full story.
+from .tiktok_media import ensure_jpg, ensure_tiktok_video, extract_poster_frame as _video_thumbnail_url
 
 
 class TikTokAdsAdapter(AdPlatformAdapter):
@@ -1104,26 +1015,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # 2. Video upload — UPLOAD_BY_URL lets TikTok fetch the hosted file
                     # directly (same "server fetches it, no re-streaming needed here"
                     # shape as Meta's /advideos file_url).
-                    tiktok_video_url = _as_mp4(_force_tiktok_video_ratio(plan.creative.image_url))
-                    # Live-caught 2026-09-22: "video upload: Failed to fetch url data."
-                    # Cloudinary generates a video transformation ON DEMAND on its
-                    # first request — unlike images this is a real transcode, which
-                    # can take longer than TikTok's own URL-fetch timeout for a
-                    # derivative nobody has ever requested before (every brand-new
-                    # upload's first launch attempt). Warm the EXACT SAME transformed
-                    # URL ourselves first (generous timeout — a real transcode, not a
-                    # quick API call) so Cloudinary already has it cached by the time
-                    # TikTok's own fetch hits it moments later. Best-effort: if the
-                    # warm-up itself times out, still attempt the real upload — the
-                    # transcode may finish server-side moments after our request gives
-                    # up, and TikTok's own fetch could still land on the now-cached
-                    # result.
-                    if tiktok_video_url != plan.creative.image_url:
-                        # Only when a transformation was actually applied (a real
-                        # Cloudinary derivative to warm) — for anything not hosted on
-                        # Cloudinary, the URL is unchanged and there's no cold-cache
-                        # concern to pre-empt.
-                        await _wait_for_cloudinary_video(client, tiktok_video_url)
+                    #
+                    # tiktok_media.ensure_tiktok_video does the ratio-fix + codec-fix
+                    # ourselves (ffmpeg) and uploads the result before we ever call
+                    # TikTok — unlike the old Cloudinary delivery-URL trick this
+                    # replaced, the file is already sitting on S3 ready to fetch by
+                    # the time we hand TikTok the URL, so there's no on-demand-transcode
+                    # cold-cache race to warm up first (see tiktok_media.py's docstring).
+                    tiktok_video_url = await ensure_tiktok_video(plan.creative.image_url)
                     video_resp = await client.post(
                         f"{self._api_base}/file/video/ad/upload/",
                         headers=self._headers(),
@@ -1181,7 +1080,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             json={
                                 "advertiser_id": self._advertiser_id,
                                 "upload_type": "UPLOAD_BY_URL",
-                                "image_url": _force_jpg_delivery(url),
+                                "image_url": await ensure_jpg(url),
                                 "file_name": f"jane-ads-{plan.business_id}-carousel-{i}-{uuid.uuid4().hex[:8]}.jpg",
                             },
                         )

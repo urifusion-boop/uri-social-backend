@@ -19,11 +19,17 @@ import uuid
 from functools import partial
 
 import boto3
+from botocore.config import Config as _BotoConfig
 
 _S3_BUCKET = os.environ.get("S3_MEDIA_BUCKET", "")
 _S3_REGION = os.environ.get("AWS_REGION", "eu-west-1")
 
-_s3_client = boto3.client("s3", region_name=_S3_REGION)
+# Explicit SigV4 — botocore's default for this account/region otherwise fell back to
+# legacy SigV2 presigned URLs, which (unlike SigV4's query-string scheme) bind
+# Content-Type into the signature even when it's left out of Params, breaking
+# presigned_put_url() the moment the browser's real file.type didn't match the
+# (absent) signed value. SigV4 only binds headers actually listed as signed.
+_s3_client = boto3.client("s3", region_name=_S3_REGION, config=_BotoConfig(signature_version="s3v4"))
 
 _EXT_TO_CONTENT_TYPE = {
     "png": "image/png",
@@ -142,6 +148,32 @@ async def upload_bytes(
         ),
     )
     return _public_url(key)
+
+
+def presigned_put_url(folder: str, public_id: str, ext: str = "mp4", expires_in: int = 900) -> dict:
+    """A presigned PUT URL + the final public URL, for a browser to upload a large
+    file straight to S3 — the replacement for Cloudinary's signed-chunked-upload
+    params (cloudinary_upload_signature, now removed). Where that flow chunked the
+    upload specifically to survive a slow mobile connection, going straight to S3
+    at all already removes the one thing actually at risk of timing out (our own
+    backend's request handler sits out of the path entirely either way) — a single
+    PUT is simpler and is what this replaces it with; a real resumable multipart
+    upload would need three round trips (create/part-urls/complete) instead of
+    one, which isn't worth it unless dropped-connection resume on a large upload
+    turns out to matter in practice.
+
+    ContentType is deliberately left out of the signed params — a presigned URL
+    signed with a specific ContentType rejects a PUT whose header doesn't match it
+    byte-for-byte (SignatureDoesNotMatch), and the browser's real file.type varies
+    by source (video/mp4, video/quicktime for a .mov, video/webm, ...). Leaving it
+    unsigned lets the PUT declare whatever Content-Type the file actually is."""
+    key = f"{folder}/{public_id}.{ext}"
+    url = _s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": _S3_BUCKET, "Key": key},
+        ExpiresIn=expires_in,
+    )
+    return {"put_url": url, "public_url": _public_url(key)}
 
 
 async def upload_file_path(

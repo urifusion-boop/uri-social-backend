@@ -33,13 +33,10 @@ and the draft-summary mapping are pure and unit-tested.
 """
 from __future__ import annotations
 
-import hashlib
 import json
-import time
 import uuid
 from typing import Any, Optional
 
-import aiohttp
 import openai
 
 from app.core.config import settings
@@ -680,47 +677,32 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
 
 # ── Source 1: GENERATE — brand data, direct controlled image call ────────────
 
-def cloudinary_upload_signature(public_id: str) -> Optional[dict]:
-    """Signed params for one upload into the uri-ads folder — used server-side and handed
-    to the browser so a large video goes straight to Cloudinary instead of through us."""
-    cloud, api_key, api_secret = (settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY,
-                                   settings.CLOUDINARY_API_SECRET)
-    if not all([cloud, api_key, api_secret]):
+def s3_upload_signature(public_id: str, ext: str = "mp4") -> Optional[dict]:
+    """A presigned S3 PUT URL for one upload into the uri-ads folder — used
+    server-side and handed to the browser so a large video goes straight to S3
+    instead of through us."""
+    from app.utils.s3_upload import presigned_put_url
+    try:
+        return presigned_put_url("uri-ads", public_id, ext=ext)
+    except Exception as e:
+        print(f"[Creative] presigned PUT error: {e}", flush=True)
         return None
-    ts = int(time.time())
-    sig = hashlib.sha1(f"folder=uri-ads&public_id={public_id}&timestamp={ts}{api_secret}".encode()).hexdigest()
-    return {"cloud_name": cloud, "api_key": api_key, "timestamp": ts, "signature": sig,
-            "public_id": public_id, "folder": "uri-ads"}
 
 
 async def _upload_bytes_to_cloudinary(
     file_bytes: bytes, public_id: str,
     resource_type: str = "image", ext: str = "png", content_type: str = "image/png",
 ) -> Optional[str]:
-    """Signed REST upload straight from `settings` (not the `cloudinary` SDK, which
-    reads raw os.environ and silently no-ops when credentials only live in .env via
-    pydantic Settings). Matches the pattern already proven in this package's b-roll
-    generation — self-contained, no extra package coupling. Works for both images
-    (GENERATE's gpt-image-1 stills) and videos (a user's own uploaded ad video)."""
-    signed = cloudinary_upload_signature(public_id)
-    if not signed:
-        return None
-    cloud = signed["cloud_name"]
-    form = aiohttp.FormData()
-    form.add_field("file", file_bytes, filename=f"{public_id}.{ext}", content_type=content_type)
-    for k in ("api_key", "timestamp", "signature", "public_id", "folder"):
-        form.add_field(k, str(signed[k]))
-    form.add_field("resource_type", resource_type)
-    # Video files are much larger than a generated still — allow more time to upload.
-    timeout = 180 if resource_type == "video" else 60
+    """Upload to S3 under uri-ads/. Works for both images (GENERATE's gpt-image-1
+    stills) and videos (a user's own uploaded ad video) — name kept for its two
+    existing call sites, same drop-in-replacement convention established across the
+    rest of this migration (ext/content_type are unused now; S3 sniffs its own
+    extension from the bytes)."""
+    from app.utils.s3_upload import upload_bytes
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://api.cloudinary.com/v1_1/{cloud}/{resource_type}/upload",
-                              data=form, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                body = json.loads(await r.text())
-                return body.get("secure_url") if r.ok else None
+        return await upload_bytes(file_bytes, folder="uri-ads", resource_type=resource_type, public_id=public_id)
     except Exception as e:
-        print(f"[Creative] Cloudinary upload error: {e}", flush=True)
+        print(f"[Creative] S3 upload error: {e}", flush=True)
         return None
 
 

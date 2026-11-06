@@ -5,7 +5,6 @@ Pipeline: Upload → FFmpeg audio cleanup → Reap transcription → GPT-4o edit
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -170,8 +169,8 @@ async def _clean_audio(video_bytes: bytes) -> bytes:
 
 
 # ── SFX library ───────────────────────────────────────────────────────────────
-# SFX files hosted on Cloudinary — permanent CDN URLs, no container dependency
-_SFX_CDN = "https://res.cloudinary.com/df8ckaeam/video/upload/uri-sfx"
+# SFX files hosted on S3 — permanent CDN URLs, no container dependency
+_SFX_CDN = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-sfx"
 SFX_LIBRARY: Dict[str, str] = {
     "whoosh":   f"{_SFX_CDN}/whoosh.mp3",    # fast cuts / transitions
     "impact":   f"{_SFX_CDN}/impact.mp3",    # emphasis zooms / key claims
@@ -184,148 +183,50 @@ SFX_LIBRARY: Dict[str, str] = {
 }
 
 
-# ── Cloudinary upload ─────────────────────────────────────────────────────────
+# ── S3 upload ──────────────────────────────────────────────────────────────
+# Was three hand-rolled signed-REST calls to Cloudinary: direct byte upload
+# capped at 95MB, a separate raw-resource path for audio, and a third
+# function (_cloudinary_fetch_url, removed) that had Cloudinary fetch a video
+# from our own static file server purely to dodge that same 95MB cap. S3 has
+# no such cap (a single put_object goes up to 5GB), so the one remaining
+# caller of that third function now just uploads the bytes directly instead —
+# the fetch-a-URL indirection served no purpose once the limit it was
+# dodging stopped existing. The two functions that remain are the chokepoint
+# 14+ call sites across this file, multi_clip_service.py and
+# voiceover_service.py already funnel through — names kept identical so none
+# of those call sites needed to change, same convention s3_upload.py's own
+# module docstring already established for the drop-in swap.
 
 async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[str]:
-    """
-    Upload video bytes to Cloudinary (direct byte upload).
-    Only suitable for files under ~95MB. For larger files use _cloudinary_fetch_url.
-    """
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return None
-
-    if len(video_bytes) > 95 * 1024 * 1024:
-        print(f"[Cloudinary] file {len(video_bytes)//1024//1024}MB > 95MB limit — skipping direct upload", flush=True)
-        return None
-
-    folder = "uri-video-production"
-    ts = int(time.time())
-    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
-    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-
-    form = aiohttp.FormData()
-    form.add_field("file", video_bytes, filename=f"{public_id}.mp4", content_type="video/mp4")
-    form.add_field("api_key", api_key)
-    form.add_field("timestamp", str(ts))
-    form.add_field("signature", signature)
-    form.add_field("public_id", public_id)
-    form.add_field("folder", folder)
-    form.add_field("resource_type", "video")
+    """Upload video bytes to S3. No size cap (unlike the old 95MB Cloudinary
+    ceiling this used to check for) — safe to call directly regardless of
+    size."""
+    from app.utils.s3_upload import upload_bytes
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/video/upload",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=180),
-            ) as resp:
-                text = await resp.text()
-                if not text.strip():
-                    print(f"[Cloudinary] empty response status={resp.status}", flush=True)
-                    return None
-                body = json.loads(text)
-                if not resp.ok:
-                    print(f"[Cloudinary] upload failed {resp.status}: {body}", flush=True)
-                    return None
-                url = body.get("secure_url", "")
-                print(f"[Cloudinary] uploaded {len(video_bytes)//1024}KB → {url}", flush=True)
-                return url
+        url = await upload_bytes(video_bytes, folder="uri-video-production", resource_type="video", public_id=public_id)
+        print(f"[S3] uploaded {len(video_bytes)//1024}KB → {url}", flush=True)
+        return url
     except Exception as e:
-        print(f"[Cloudinary] error: {e}", flush=True)
+        print(f"[S3] upload error: {e}", flush=True)
         return None
 
 
 async def _upload_audio_to_cloudinary(audio_bytes: bytes, public_id: str) -> Optional[str]:
-    """
-    Upload an MP3 to Cloudinary under uri-music/custom/ using resource_type=raw.
-    Raw resources are served byte-for-byte as uploaded (no transcoding), which is
-    required for Shotstack to receive a valid audio/mpeg stream.
-    """
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return None
-    folder = "uri-music/custom"
-    ts = int(time.time())
-    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
-    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-    form = aiohttp.FormData()
-    form.add_field("file", audio_bytes, filename=f"{public_id}.mp3", content_type="audio/mpeg")
-    form.add_field("api_key", api_key)
-    form.add_field("timestamp", str(ts))
-    form.add_field("signature", signature)
-    form.add_field("public_id", public_id)
-    form.add_field("folder", folder)
-    form.add_field("resource_type", "raw")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/raw/upload",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                body = json.loads(await resp.text())
-                if not resp.ok:
-                    print(f"[CustomMusic] Cloudinary upload failed {resp.status}: {body}", flush=True)
-                    return None
-                url = body.get("secure_url", "")
-                print(f"[CustomMusic] Cloudinary → {url}", flush=True)
-                return url
-    except Exception as e:
-        print(f"[CustomMusic] Cloudinary error: {e}", flush=True)
-        return None
-
-
-async def _cloudinary_fetch_url(source_url: str, public_id: str) -> Optional[str]:
-    """
-    Tell Cloudinary to fetch a video from source_url — avoids file size limits entirely.
-    Cloudinary downloads from the URL server-side; we never transfer bytes.
-    """
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return None
-
-    folder = "uri-video-production"
-    ts = int(time.time())
-    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
-    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-
-    form = aiohttp.FormData()
-    form.add_field("file", source_url)   # URL string — Cloudinary fetches it
-    form.add_field("api_key", api_key)
-    form.add_field("timestamp", str(ts))
-    form.add_field("signature", signature)
-    form.add_field("public_id", public_id)
-    form.add_field("folder", folder)
-    form.add_field("resource_type", "video")
+    """Upload an MP3 to S3 under uri-music/custom/. Served byte-for-byte as
+    uploaded (S3 never transcodes), same as the old Cloudinary raw resource
+    type — required for Shotstack to receive a valid audio/mpeg stream."""
+    from app.utils.s3_upload import upload_bytes
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/video/upload",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                text = await resp.text()
-                if not text.strip():
-                    print(f"[Cloudinary] fetch-url empty response status={resp.status}", flush=True)
-                    return None
-                body = json.loads(text)
-                if not resp.ok:
-                    print(f"[Cloudinary] fetch-url failed {resp.status}: {body}", flush=True)
-                    return None
-                url = body.get("secure_url", "")
-                print(f"[Cloudinary] fetch-url → {url}", flush=True)
-                return url
+        url = await upload_bytes(audio_bytes, folder="uri-music/custom", resource_type="raw", public_id=public_id)
+        print(f"[CustomMusic] S3 → {url}", flush=True)
+        return url
     except Exception as e:
-        print(f"[Cloudinary] fetch-url error: {e}", flush=True)
+        print(f"[CustomMusic] S3 error: {e}", flush=True)
         return None
+
+
 
 
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
@@ -368,8 +269,8 @@ _DEFAULT_TRANSITION_STYLE: Dict[str, Any] = {
 # ── Icon overlay asset library ────────────────────────────────────────────────
 # Each category has an emoji fallback and an optional Lottie JSON URL.
 # Set LOTTIEFILES_API_KEY env var to enable dynamic search (free account suffices).
-# Lottie URLs can also be replaced with Cloudinary-hosted .json raw assets.
-_CDN = "https://res.cloudinary.com/df8ckaeam/raw/upload"
+# Lottie URLs can also be replaced with S3-hosted .json raw assets.
+_CDN = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com"
 _ICON_OVERLAY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "fire":      {"emoji": "🔥", "lottie": f"{_CDN}/uri-lottie/fire.json", "position": "topRight",     "size": 150},
     "star":      {"emoji": "⭐", "lottie": f"{_CDN}/uri-lottie/star.json", "position": "topRight",     "size": 140},
@@ -687,37 +588,12 @@ async def _fal_generate(description: str) -> Optional[str]:
 
 
 async def _upload_image_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optional[str]:
-    """Upload raw image bytes to Cloudinary and return the secure_url."""
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return None
-    folder = "uri-broll"
-    ts = int(time.time())
-    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
-    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-    form = aiohttp.FormData()
-    form.add_field("file", img_bytes, filename=f"{public_id}.png", content_type="image/png")
-    form.add_field("api_key", api_key)
-    form.add_field("timestamp", str(ts))
-    form.add_field("signature", signature)
-    form.add_field("public_id", public_id)
-    form.add_field("folder", folder)
-    form.add_field("resource_type", "image")
+    """Upload raw B-roll image bytes to S3 under uri-broll/ and return the URL."""
+    from app.utils.s3_upload import upload_bytes
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/image/upload",
-                data=form, timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                body = json.loads(await resp.text())
-                if not resp.ok:
-                    print(f"[Cloudinary:gen] upload failed {resp.status}: {body}", flush=True)
-                    return None
-                return body.get("secure_url", "") or None
+        return await upload_bytes(img_bytes, folder="uri-broll", resource_type="image", public_id=public_id)
     except Exception as e:
-        print(f"[Cloudinary:gen] error: {e}", flush=True)
+        print(f"[S3:gen] error: {e}", flush=True)
         return None
 
 
@@ -780,36 +656,38 @@ async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
 
 
 # ── Background music ──────────────────────────────────────────────────────────
-# Curated CC0 instrumentals uploaded to Cloudinary from archive.org.
-# To add more tracks: download a CC0 MP3, upload via cloudinary.uploader.upload(resource_type="video"),
-# then append the secure_url to the appropriate mood list below.
+# Curated CC0 instrumentals, re-hosted on S3 from archive.org (originally via Cloudinary).
+# To add more tracks: download a CC0 MP3, upload to the uri-music/<mood>/ S3 prefix,
+# then append the URL to the appropriate mood list below.
 
 import random as _random
 
+_MUSIC_CDN = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-music"
+
 _MUSIC_BY_MOOD: Dict[str, List[str]] = {
     "upbeat": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851582/uri-music/upbeat/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851597/uri-music/upbeat/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851609/uri-music/upbeat/track-2.mp3",
+        f"{_MUSIC_CDN}/upbeat/track-0.mp3",
+        f"{_MUSIC_CDN}/upbeat/track-1.mp3",
+        f"{_MUSIC_CDN}/upbeat/track-2.mp3",
     ],
     "chill": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851623/uri-music/chill/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851634/uri-music/chill/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851652/uri-music/chill/track-2.mp3",
+        f"{_MUSIC_CDN}/chill/track-0.mp3",
+        f"{_MUSIC_CDN}/chill/track-1.mp3",
+        f"{_MUSIC_CDN}/chill/track-2.mp3",
     ],
     "cinematic": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851665/uri-music/cinematic/track-0.mp3",
+        f"{_MUSIC_CDN}/cinematic/track-0.mp3",
     ],
     "dramatic": [],  # falls back to cinematic
     "acoustic": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851680/uri-music/acoustic/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851690/uri-music/acoustic/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851704/uri-music/acoustic/track-2.mp3",
+        f"{_MUSIC_CDN}/acoustic/track-0.mp3",
+        f"{_MUSIC_CDN}/acoustic/track-1.mp3",
+        f"{_MUSIC_CDN}/acoustic/track-2.mp3",
     ],
     "electronic": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851717/uri-music/electronic/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851729/uri-music/electronic/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851740/uri-music/electronic/track-2.mp3",
+        f"{_MUSIC_CDN}/electronic/track-0.mp3",
+        f"{_MUSIC_CDN}/electronic/track-1.mp3",
+        f"{_MUSIC_CDN}/electronic/track-2.mp3",
     ],
 }
 
@@ -2414,9 +2292,12 @@ async def run_production_job(
         await update(30, "Cleaning audio…")
         cleaned_bytes = await _clean_audio(video_bytes)
 
-        # Step 1: always write to static server (reliable, no size limit).
-        # Step 2: tell Cloudinary to fetch from that URL — avoids direct byte upload
-        #         and Cloudinary's 100MB per-request limit entirely.
+        # Also write to the static server regardless of S3 outcome below — a
+        # real, independent fallback if the S3 upload fails for any reason,
+        # not a workaround for a size cap S3 doesn't have (unlike the old
+        # Cloudinary direct-upload path, which capped at 95MB and was why
+        # this used to go through a URL-fetch indirection instead of just
+        # uploading cleaned_bytes directly, as it does now).
         await update(38, "Uploading clean video…")
         video_static_dir = "/app/static/videos"
         os.makedirs(video_static_dir, exist_ok=True)
@@ -2430,11 +2311,8 @@ async def run_production_job(
         except Exception as e:
             print(f"[VideoProduction] static write failed: {e}", flush=True)
 
-        # Now try to register on Cloudinary via URL fetch (no byte transfer).
-        clean_video_url = None
-        if static_url:
-            clean_video_url = await _cloudinary_fetch_url(static_url, job_id)
-        # Fallback chain: Cloudinary → static → Reap source
+        clean_video_url = await _upload_to_cloudinary(cleaned_bytes, job_id)
+        # Fallback chain: S3 -> static -> Reap source
         if not clean_video_url:
             clean_video_url = static_url or _reap_video_url
 

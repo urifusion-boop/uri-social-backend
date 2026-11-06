@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import os
 import re
 import subprocess
 import tempfile
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,11 +37,6 @@ _MAX_CLIPS = 10
 _CROSSFADE_DURATION = 0.6  # seconds overlap between clips in Shotstack
 _STILL_DEFAULT_DURATION = 2.5  # seconds a still image holds on screen
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
-_IMAGE_CONTENT_TYPES = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".png": "image/png", ".webp": "image/webp",
-    ".gif": "image/gif", ".bmp": "image/bmp",
-}
 
 
 # ── FFprobe ───────────────────────────────────────────────────────────────────
@@ -495,70 +488,26 @@ Rules:
         return [c["clip_id"] for c in clips]
 
 
-# ── Cloudinary upload (clip) ──────────────────────────────────────────────────
-
-_CONTENT_TYPE_MAP = {
-    ".mp4": "video/mp4",
-    ".mov": "video/quicktime",
-    ".avi": "video/x-msvideo",
-    ".mkv": "video/x-matroska",
-    ".webm": "video/webm",
-    ".m4v": "video/x-m4v",
-}
-
+# ── S3 upload (clip) ──────────────────────────────────────────────────────────
 
 async def _upload_clip_to_cloudinary(
     video_bytes: bytes, clip_id: str, original_filename: str = ""
 ) -> Optional[str]:
-    """Upload a single clip to Cloudinary under the multi-clip folder."""
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return None
+    """Upload a single clip to S3 under the multi-clip folder."""
+    from app.utils.s3_upload import upload_bytes
 
     ext = os.path.splitext(original_filename)[1].lower() if original_filename else ".mp4"
     if not ext:
         ext = ".mp4"
-
-    is_image = ext in _IMAGE_EXTS
-    if is_image:
-        content_type = _IMAGE_CONTENT_TYPES.get(ext, "image/jpeg")
-        resource_type = "image"
-    else:
-        content_type = _CONTENT_TYPE_MAP.get(ext, "video/mp4")
-        resource_type = "video"
-
+    resource_type = "image" if ext in _IMAGE_EXTS else "video"
     public_id = f"clip_{clip_id}"
-    ts = int(time.time())
-    params_str = f"folder={_CLOUDINARY_FOLDER}&public_id={public_id}&timestamp={ts}"
-    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-
-    form = aiohttp.FormData()
-    form.add_field("file", video_bytes, filename=f"{public_id}{ext}", content_type=content_type)
-    form.add_field("api_key", api_key)
-    form.add_field("timestamp", str(ts))
-    form.add_field("signature", signature)
-    form.add_field("public_id", public_id)
-    form.add_field("folder", _CLOUDINARY_FOLDER)
-    form.add_field("resource_type", "video")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/{resource_type}/upload",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                body = json.loads(await resp.text())
-                if not resp.ok:
-                    print(f"[MultiClip] Cloudinary upload failed: {body}", flush=True)
-                    return None
-                url = body.get("secure_url", "")
-                print(f"[MultiClip] uploaded clip {clip_id} → {url}", flush=True)
-                return url
+        url = await upload_bytes(video_bytes, folder=_CLOUDINARY_FOLDER, resource_type=resource_type, public_id=public_id)
+        print(f"[MultiClip] uploaded clip {clip_id} → {url}", flush=True)
+        return url
     except Exception as e:
-        print(f"[MultiClip] Cloudinary error: {e}", flush=True)
+        print(f"[MultiClip] S3 error: {e}", flush=True)
         return None
 
 
