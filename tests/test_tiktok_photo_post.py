@@ -183,12 +183,23 @@ def _png_data_url(size):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def test_render_converts_png_to_jpeg_and_caps_at_1080():
-    draft = {"image_url": _png_data_url((2400, 1600))}
-    jpeg = _run(proxy.render_jpeg(draft, 0))
+def _rendered_size(size):
+    jpeg = _run(proxy.render_jpeg({"image_url": _png_data_url(size)}, 0))
     img = Image.open(io.BytesIO(jpeg))
     assert img.format == "JPEG"
-    assert max(img.size) == 1080
+    return img.size
+
+
+def test_render_converts_png_to_jpeg_and_fits_the_1080p_frame():
+    assert _rendered_size((2400, 1600)) == (1620, 1080)  # landscape: 1920 x 1080 frame
+    assert _rendered_size((2000, 2000)) == (1080, 1080)  # square
+    assert _rendered_size((2160, 3840)) == (1080, 1920)  # portrait
+
+
+@pytest.mark.parametrize("size", [(1080, 1920), (1024, 1792), (1080, 1350), (800, 800), (1920, 1080)])
+def test_an_image_already_inside_the_frame_is_posted_at_its_own_size(size):
+    # The approved image must not be shrunk: a 1080 x 1920 TikTok image was going out at 608 x 1080.
+    assert _rendered_size(size) == size
 
 
 def test_render_returns_none_for_missing_index():

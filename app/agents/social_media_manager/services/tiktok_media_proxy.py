@@ -33,8 +33,12 @@ MEDIA_PATH = "/social-media/tiktok-media/"
 # TikTok fetches within seconds-to-minutes of the init call.
 _LINK_TTL_SECONDS = 60 * 60
 
-# TikTok's photo requirements (Media Transfer Guide): JPEG/WebP, max 1080p, max 20MB.
-_MAX_DIMENSION = 1080
+# TikTok's photo requirements (Media Transfer Guide): JPEG/WebP, max 1080p, max 20MB. "1080p" is a
+# 1080 x 1920 frame (1920 x 1080 for a landscape image) — the size TikTok's own app makes photos at, and
+# the size the app generates TikTok images at (IMAGE_SPECS) — so an image is only shrunk to fit that
+# frame, never below it. Shrinking the long side to 1080 sent a 1080 x 1920 image at 608 x 1080.
+_PORTRAIT_FRAME = (1080, 1920)
+_LANDSCAPE_FRAME = (1920, 1080)
 _MAX_BYTES = 20 * 1024 * 1024
 
 
@@ -87,8 +91,9 @@ def _to_tiktok_jpeg(raw: bytes) -> bytes:
     from PIL import Image
 
     img = Image.open(io.BytesIO(raw))
-    if max(img.size) > _MAX_DIMENSION:
-        scale = _MAX_DIMENSION / max(img.size)
+    max_w, max_h = _PORTRAIT_FRAME if img.height >= img.width else _LANDSCAPE_FRAME
+    scale = min(1.0, max_w / img.width, max_h / img.height)
+    if scale < 1.0:
         img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
     img = img.convert("RGB")
     for quality in (90, 70):
