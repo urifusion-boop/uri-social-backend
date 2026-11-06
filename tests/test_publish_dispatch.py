@@ -75,7 +75,7 @@ def test_a_busy_account_defers_without_publishing():
     publish = AsyncMock()
     out = _run(pd.dispatch(db, "tiktok", TIKTOK_CONN, publish, wait_max_s=0.0))
     assert out.deferred and out.result is None and out.resume_at > rl.utcnow()
-    assert "going out first" in out.message
+    assert "one post at a time" in out.message and "UTC" not in out.message
     publish.assert_not_called()
 
 
