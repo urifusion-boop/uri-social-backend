@@ -64,11 +64,13 @@ def limit_info_of(result: Optional[Dict[str, Any]], platform: str) -> Optional["
 
 
 def queued_message(info: Optional["rl.RateLimitInfo"], resume_at: Optional[datetime], reason: str = "") -> str:
-    when = f" around {resume_at.astimezone(timezone.utc).strftime('%H:%M UTC')}" if resume_at else " shortly"
-    name = rl._label(info.platform) if info else "the platform"
+    # For "busy" the resume time is only when the other post's lock would run out (up to 15 minutes), and
+    # for "spaced" the scheduler picks the post up on its next 5-minute run, so neither gets a clock time.
     if reason in ("busy", "spaced"):
-        return f"Queued: another post to this account is going out first, so this will post{when}."
-    return f"Queued: {name} is limiting how fast we can post, so this will post{when}."
+        return "We send one post at a time to each account, so this one is next and will go out within a few minutes."
+    when = f"after {resume_at.astimezone(timezone.utc).strftime('%H:%M UTC')}" if resume_at else "in a few minutes"
+    name = rl._label(info.platform) if info else "The platform"
+    return f"{name} asked us to slow down, so this one will go out on its own {when}. You don't need to do anything."
 
 
 async def dispatch(db, platform: str, connection: Optional[Dict[str, Any]],
