@@ -216,6 +216,111 @@ def test_clear_logo_region_falls_back_to_original_image_on_download_failure():
     assert result is base_img
 
 
+# ── _call_edit_api — the AI edit path now actually uses the two functions
+# above, instead of sending the old-logo-still-baked-in image straight to
+# images.edit() and blindly re-pasting at a fixed corner afterward ─────────
+
+def _fake_openai_edit_response(w, h, color):
+    response = MagicMock()
+    data_item = MagicMock()
+    data_item.b64_json = base64.b64encode(_png_bytes(w, h, color)).decode()
+    response.data = [data_item]
+    return response
+
+
+def test_call_edit_api_clears_old_logo_before_editing_and_resaves_placement():
+    """With a brand logo present, _call_edit_api must (1) mask the old logo
+    out of the image it sends to images.edit(), (2) re-composite with the
+    smart/CV-ranked overlay afterward instead of the blind fixed-corner
+    paste, and (3) hand back a logo-free background + the exact placement —
+    the same shape generation/regeneration save — so the caller can keep
+    Move Logo alive instead of nulling it out."""
+    from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+    from app.agents.social_media_manager.services.image_content_service import ImageContentService
+
+    original_bytes = _png_bytes(256, 256, (200, 200, 200, 255))
+    edited_response = _fake_openai_edit_response(256, 256, (210, 210, 210))
+    relogo_png_b64 = base64.b64encode(_png_bytes(256, 256, (220, 220, 220))).decode()
+
+    with patch(
+        "app.agents.social_media_manager.services.image_editing_service.openai_client"
+    ) as mock_openai, patch(
+        "app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.webp")
+    ), patch(
+        "app.utils.s3_upload.upload_base64", new=AsyncMock(return_value="https://cdn.example/background.png")
+    ), patch.object(
+        ImageContentService, "clear_logo_region", wraps=ImageContentService.clear_logo_region
+    ) as mock_clear, patch.object(
+        ImageContentService,
+        "overlay_logo_smart",
+        new=AsyncMock(return_value=(relogo_png_b64, "top_left", {"x": 5, "y": 5, "width": 40, "height": 20})),
+    ) as mock_overlay, patch("requests.get") as mock_get:
+        mock_openai.images.edit.return_value = edited_response
+        fake_logo_response = MagicMock()
+        fake_logo_response.content = _png_bytes(80, 40, (0, 0, 0, 255))
+        fake_logo_response.raise_for_status = MagicMock()
+        mock_get.return_value = fake_logo_response
+
+        result = _run(ImageEditingService._call_edit_api(
+            image_bytes=original_bytes,
+            prompt="make the headline say Friday",
+            size="256x256",
+            logo_url="https://example.com/logo.png",
+            logo_position="bottom_right",
+            logo_size="small",
+        ))
+
+    # clear_logo_region ran BEFORE the edit call — nothing left of the old
+    # logo for the edit model to preserve/duplicate.
+    assert mock_clear.called
+    assert mock_openai.images.edit.called
+    clear_call_order = mock_clear.call_args
+    assert clear_call_order.args[2] == "bottom_right"  # position passed through
+
+    # overlay_logo_smart (CV-ranked) ran afterward, not the blind corner paste.
+    assert mock_overlay.called
+    assert mock_overlay.call_args.kwargs["return_placement"] is True
+
+    assert result["image_url"] == "https://cdn.example/final.webp"
+    assert result["background_image_url"] == "https://cdn.example/background.png"
+    assert result["logo_placement"] == {
+        "x": 5, "y": 5, "width": 40, "height": 20, "position": "top_left", "logo_size": "small",
+    }
+
+
+def test_call_edit_api_skips_logo_handling_entirely_when_draft_has_no_logo():
+    """No logo_url (brand has no logo) — no clear/overlay call, and the
+    returned background/placement stay None instead of pointing at nothing."""
+    from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+    from app.agents.social_media_manager.services.image_content_service import ImageContentService
+
+    original_bytes = _png_bytes(128, 128, (200, 200, 200, 255))
+    edited_response = _fake_openai_edit_response(128, 128, (210, 210, 210))
+
+    with patch(
+        "app.agents.social_media_manager.services.image_editing_service.openai_client"
+    ) as mock_openai, patch(
+        "app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.webp")
+    ), patch.object(
+        ImageContentService, "clear_logo_region"
+    ) as mock_clear, patch.object(
+        ImageContentService, "overlay_logo_smart", new=AsyncMock()
+    ) as mock_overlay:
+        mock_openai.images.edit.return_value = edited_response
+
+        result = _run(ImageEditingService._call_edit_api(
+            image_bytes=original_bytes,
+            prompt="make the headline say Friday",
+            size="128x128",
+        ))
+
+    assert not mock_clear.called
+    assert not mock_overlay.called
+    assert result["image_url"] == "https://cdn.example/final.webp"
+    assert result["background_image_url"] is None
+    assert result["logo_placement"] is None
+
+
 if __name__ == "__main__":
     import sys
     import pytest
