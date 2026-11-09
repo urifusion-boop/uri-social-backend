@@ -507,10 +507,13 @@ class VideoCreativeService:
                 f"{video_prompt} "
                 f"Camera movement: {motion}. "
                 + (f"Continuity with the surrounding scenes: {continuity}. " if continuity else "")
-                + (f'On-screen text: "{text}". ' if text else "")
+                # The scene's on-screen text is drawn onto the finished clip by ffmpeg (video_text_overlay.py): an
+                # image model's lettering is misspelt and the clip model then smears it. So none goes in the picture.
+                + ("The on-screen text is added in editing, so draw NO text, captions, titles or lettering of your own in the "
+                "picture, and keep the lower third of the frame calm and uncluttered. " if text else "")
                 + "Photorealistic, dramatic lighting. Vertical 9:16 composition. "
                 # The picture model draws only what it is told: without this it invents a brand on every box.
-                + VideoCreativeService._frame_branding(brand_context, text)
+                + VideoCreativeService._frame_branding(brand_context, "")
             )
 
             loop = asyncio.get_running_loop()

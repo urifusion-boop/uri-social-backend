@@ -7578,12 +7578,14 @@ async def merge_video_job(
     if job.get("status") != "complete":
         raise HTTPException(status_code=400, detail="Job is not complete yet")
 
-    clip_urls = [c["video_url"] for c in job.get("clips", []) if c.get("video_url")]
+    done = [c for c in job.get("clips", []) if c.get("video_url")]
+    clip_urls = [c["video_url"] for c in done]
     if not clip_urls:
         raise HTTPException(status_code=400, detail="No completed clips to merge")
 
     try:
-        merged_url = await VideoMergeService.merge_clips(clip_urls)
+        # Each scene's on-screen text is drawn onto its clip here, sharply, rather than baked into the picture.
+        merged_url = await VideoMergeService.merge_clips(clip_urls, [c.get("text_overlay") for c in done])
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"ffmpeg merge failed: {e.stderr.decode()[:300]}")
 

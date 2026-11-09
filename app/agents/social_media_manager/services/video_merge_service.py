@@ -3,11 +3,12 @@ import json
 import os
 import subprocess
 import tempfile
-from typing import List
+from typing import List, Optional
 
 import httpx
 
 from app.utils.s3_upload import upload_bytes
+from . import video_text_overlay as overlay
 
 # Canonical shape every clip gets normalized to before concatenation. The
 # outcome-routed fal.ai models in this pipeline do NOT return uniform clips:
@@ -29,8 +30,9 @@ _TARGET_FPS = 30
 class VideoMergeService:
 
     @staticmethod
-    async def merge_clips(clip_urls: List[str]) -> str:
-        """Download clips, normalize to one common format, concatenate, upload. Returns Cloudinary URL."""
+    async def merge_clips(clip_urls: List[str], overlay_texts: Optional[List[Optional[str]]] = None) -> str:
+        """Download clips, normalize to one common format, concatenate, upload. Returns Cloudinary URL.
+        overlay_texts, if given, is one on-screen caption (or None) per clip, drawn sharply onto that clip."""
         async with httpx.AsyncClient(timeout=120) as client:
             responses = await asyncio.gather(*[client.get(url) for url in clip_urls])
 
@@ -39,7 +41,7 @@ class VideoMergeService:
         loop = asyncio.get_running_loop()
         merged_bytes = await loop.run_in_executor(
             None,
-            lambda: VideoMergeService._normalize_and_concat(clip_bytes_list),
+            lambda: VideoMergeService._normalize_and_concat(clip_bytes_list, overlay_texts),
         )
 
         return await upload_bytes(
@@ -62,7 +64,18 @@ class VideoMergeService:
         return len(streams) > 0
 
     @staticmethod
-    def _normalize_and_concat(clips: List[bytes]) -> bytes:
+    def _duration_seconds(path: str) -> Optional[float]:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+        )
+        try:
+            return float((result.stdout or "").strip())
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _normalize_and_concat(clips: List[bytes], overlay_texts: Optional[List[Optional[str]]] = None) -> bytes:
         with tempfile.TemporaryDirectory() as tmp:
             raw_paths = []
             for i, data in enumerate(clips):
@@ -82,27 +95,46 @@ class VideoMergeService:
                 norm_path = os.path.join(tmp, f"norm_{i}.mp4")
                 has_audio = VideoMergeService._has_audio_stream(raw_path)
 
-                cmd = ["ffmpeg", "-y", "-i", raw_path]
-                if has_audio:
+                def normalize(video_filter: str) -> None:
+                    cmd = ["ffmpeg", "-y", "-i", raw_path]
+                    if has_audio:
+                        cmd += [
+                            "-vf", video_filter, "-r", str(_TARGET_FPS),
+                            "-map", "0:v:0", "-map", "0:a:0",
+                        ]
+                    else:
+                        # Synthesize a silent track so every normalized clip has
+                        # an audio stream — concat with some clips silent and some
+                        # not is its own source of desync/glitching.
+                        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+                        cmd += [
+                            "-vf", video_filter, "-r", str(_TARGET_FPS),
+                            "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+                        ]
                     cmd += [
-                        "-vf", vf, "-r", str(_TARGET_FPS),
-                        "-map", "0:v:0", "-map", "0:a:0",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                        norm_path,
                     ]
+                    subprocess.run(cmd, check=True, capture_output=True)
+
+                # On-screen text is drawn AFTER the scale to 1080x1920 so it is crisp at the final size.
+                wrapped, fontsize = overlay.wrap_overlay_text(
+                    overlay_texts[i] if overlay_texts and i < len(overlay_texts) else "", _TARGET_WIDTH)
+                if wrapped:
+                    text_path = os.path.join(tmp, f"text_{i}.txt")
+                    with open(text_path, "w", encoding="utf-8") as tf:
+                        tf.write(wrapped)
+                    drawtext = overlay.drawtext_filter(text_path, fontsize, VideoMergeService._duration_seconds(raw_path))
+                    try:
+                        normalize(f"{vf},{drawtext}")
+                    except subprocess.CalledProcessError as e:
+                        # Never lose the clip over its caption (e.g. the font is missing on this host).
+                        print(f"[VideoMerge] clip {i}: text overlay failed, merging without it: "
+                              f"{(e.stderr or b'').decode(errors='replace')[-300:]}", flush=True)
+                        normalize(vf)
                 else:
-                    # Synthesize a silent track so every normalized clip has
-                    # an audio stream — concat with some clips silent and some
-                    # not is its own source of desync/glitching.
-                    cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
-                    cmd += [
-                        "-vf", vf, "-r", str(_TARGET_FPS),
-                        "-map", "0:v:0", "-map", "1:a:0", "-shortest",
-                    ]
-                cmd += [
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-ar", "44100", "-ac", "2",
-                    norm_path,
-                ]
-                subprocess.run(cmd, check=True, capture_output=True)
+                    normalize(vf)
                 normalized_paths.append(norm_path)
 
             list_path = os.path.join(tmp, "list.txt")
