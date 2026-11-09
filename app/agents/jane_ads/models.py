@@ -250,6 +250,14 @@ class CampaignPlan(BaseModel):
                                              # {} — broad on this axis — when nothing resolved;
                                              # merged with geo.meta_targeting_from_geo() at
                                              # launch, never replaces it.
+    campaign_group_id: Optional[str] = None # Set only for a multi-platform campaign — ties
+                                             # this plan to its sibling plans launched for the
+                                             # SAME brief on other platforms (frontend generates
+                                             # one id, sends it on each platform's own
+                                             # single-platform request). Pure passthrough tag,
+                                             # stored on this plan's record and the adapter's
+                                             # campaign doc — never read by any planning/launch
+                                             # decision. None on every ordinary single-platform plan.
 
 
 class SpendAuthorization(BaseModel):

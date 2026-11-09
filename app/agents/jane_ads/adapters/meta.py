@@ -835,6 +835,8 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 "concepts": [c.concept for c in [plan.creative, *plan.concepts]],
                 "business_id": plan.business_id,
                 "platform": "meta",
+                # Set only for a multi-platform campaign — see CampaignPlan.campaign_group_id.
+                "campaign_group_id": plan.campaign_group_id,
                 "last_conversation_count": 0,
                 # The billing basis this campaign was SOLD under, frozen here so the
                 # meter can never re-base a live campaign onto a later fee change
