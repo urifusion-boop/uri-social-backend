@@ -702,7 +702,23 @@ RULES FOR THIS EDIT:
             except Exception as e:
                 print(f"[EDIT] Could not fetch brand logo for re-composite: {e}")
 
-            edited_image_url = await ImageEditingService._call_edit_api(
+            # The logo may not actually be sitting at the brand's default spot
+            # any more — generation's own smart placement or a manual Move
+            # Logo drag can have moved it elsewhere. Clearing the DEFAULT
+            # corner when the logo is really somewhere else leaves the real
+            # one untouched for the edit model to redraw/duplicate, while a
+            # fresh one gets pasted at the new corner afterward — two logos.
+            # The draft's own saved placement (set by generation or the last
+            # edit/move) is the source of truth for where it actually is now.
+            current_logo_placement = (
+                slides[slide_index].get("logo_placement") if slide_index is not None
+                else draft.get("logo_placement")
+            )
+            if current_logo_placement:
+                logo_position = current_logo_placement.get("position") or logo_position
+                logo_size = current_logo_placement.get("logo_size") or logo_size
+
+            edit_result = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
                 prompt=edit_prompt,
                 size=size,
@@ -712,8 +728,12 @@ RULES FOR THIS EDIT:
                 logo_size=logo_size,
             )
 
-            if not edited_image_url:
+            if not edit_result:
                 return UriResponse.error_response("Image edit API call failed")
+
+            edited_image_url = edit_result["image_url"]
+            new_background_url = edit_result.get("background_image_url")
+            new_logo_placement = edit_result.get("logo_placement")
 
             # Step 9: Save NEW version to history
             new_version = current_version + 1
@@ -728,18 +748,19 @@ RULES FOR THIS EDIT:
             )
 
             # Step 10: Update draft with new image
-            # This edit redraws the WHOLE image via the AI edit API and
-            # re-pastes the logo at the brand's fixed default spot — it
-            # doesn't produce a logo-free background the way generation does.
-            # Clearing these means Move Logo correctly becomes unavailable
-            # ("regenerate to enable") instead of silently recompositing onto
-            # a background that predates this edit and discarding it.
+            # _call_edit_api now returns a logo-free background + the exact
+            # placement the logo landed in (same shape generation saves),
+            # the same way a regeneration does — so Move Logo keeps working
+            # after a text/style/content edit instead of going dark. Only
+            # fall back to clearing them (no brand logo on this draft, or
+            # the re-composite step failed) rather than pointing Move Logo
+            # at a background that predates this edit.
             if slide_index is not None:
                 update_data = {
                     f"slides.{slide_index}.image_url": edited_image_url,
                     f"slides.{slide_index}.image_version": new_version,
-                    f"slides.{slide_index}.background_image_url": None,
-                    f"slides.{slide_index}.logo_placement": None,
+                    f"slides.{slide_index}.background_image_url": new_background_url if new_logo_placement else None,
+                    f"slides.{slide_index}.logo_placement": new_logo_placement,
                     "updated_at": datetime.utcnow()
                 }
                 count_field = f"slides.{slide_index}.content_edit_count"
@@ -747,8 +768,8 @@ RULES FOR THIS EDIT:
                 update_data = {
                     "image_url": edited_image_url,
                     "image_version": new_version,
-                    "background_image_url": None,
-                    "logo_placement": None,
+                    "background_image_url": new_background_url if new_logo_placement else None,
+                    "logo_placement": new_logo_placement,
                     "updated_at": datetime.utcnow()
                 }
                 count_field = "content_edit_count"
@@ -833,10 +854,16 @@ RULES FOR THIS EDIT:
         logo_url: Optional[str] = None,
         logo_position: Optional[str] = None,
         logo_size: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         """
         Call OpenAI images.edit API with GPT-Image-2
         PRD Section 4.3 Step 7: Call GPT Image 2 Edit API
+
+        Returns {"image_url", "background_image_url", "logo_placement"} — the
+        same shape generation/regeneration save, so a caller can keep Move
+        Logo working after an edit instead of discarding it. background_url
+        and logo_placement are None when there's no brand logo involved.
+        None (not a dict) on outright failure.
         """
         try:
             from PIL import Image
@@ -849,6 +876,28 @@ RULES FOR THIS EDIT:
             target_w, target_h = map(int, size.split("x"))
             image = image.resize((target_w, target_h), Image.LANCZOS)
 
+            loop = asyncio.get_running_loop()
+
+            # Inpaint away whatever is currently in the logo's badge rectangle
+            # (almost always the brand logo baked in by the original
+            # generation or a prior edit) BEFORE this image goes to the edit
+            # model. Sending it with the old logo still in the pixels means
+            # the edit model treats that logo as real content to preserve or
+            # redraw — which is how an edit ends up distorting or duplicating
+            # it instead of the deterministic re-paste below cleanly
+            # replacing it. (clear_logo_region/overlay_logo_smart already
+            # existed in this file for the manual-upload/CV-ranked-placement
+            # flow; this is the first time the AI edit path actually calls
+            # them instead of the blind fixed-corner paste.)
+            if logo_url:
+                from app.agents.social_media_manager.services.image_content_service import ImageContentService
+                image = await loop.run_in_executor(
+                    None,
+                    lambda: ImageContentService.clear_logo_region(
+                        image, logo_url, logo_position or "bottom_right", logo_size or "small"
+                    )
+                )
+
             # Save to PNG buffer
             png_buffer = io.BytesIO()
             image.save(png_buffer, format="PNG")
@@ -857,7 +906,6 @@ RULES FOR THIS EDIT:
             print(f"[EDIT] Calling OpenAI images.edit (size={size})")
 
             # Call edit API in executor (blocking call)
-            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: openai_client.images.edit(
@@ -882,7 +930,7 @@ RULES FOR THIS EDIT:
                 return None
 
             # Upload to Cloudinary for permanent CDN storage
-            from app.utils.cloudinary_upload import upload_bytes
+            from app.utils.cloudinary_upload import upload_bytes, upload_base64
 
             print(f"🔄 Uploading EDITED image to Cloudinary...")
             # Convert to WebP bytes for efficient storage
@@ -900,18 +948,37 @@ RULES FOR THIS EDIT:
             # Deterministically re-composite the REAL brand logo on top, exactly
             # like the original generation path does — never trust the edit model
             # to have preserved (or correctly redrawn) it. See the caller for why.
+            # Uses the CV-busyness-ranked smart overlay (not a blind fixed
+            # corner) since the edit may have moved text/content around from
+            # where it was on the pre-edit image, and hands back exactly where
+            # it landed plus the logo-free background, so the caller can save
+            # both the same way generation does and keep Move Logo alive.
+            background_url = None
+            logo_placement = None
             if logo_url:
                 from app.agents.social_media_manager.services.image_content_service import ImageContentService
                 pre_logo_buffer = io.BytesIO()
                 edited_image.save(pre_logo_buffer, format="PNG")
                 pre_logo_b64 = base64.b64encode(pre_logo_buffer.getvalue()).decode()
-                relogo_b64 = await loop.run_in_executor(
-                    None,
-                    lambda: ImageContentService._overlay_logo(
-                        pre_logo_b64, logo_url, logo_position or "bottom_right", logo_size or "small"
+
+                try:
+                    background_url = await upload_base64(
+                        f"data:image/png;base64,{pre_logo_b64}", folder="uri-social/content-draft-backgrounds"
                     )
+                except Exception as _bg_e:
+                    print(f"⚠️  background image upload failed for edited image: {_bg_e}")
+                    background_url = None
+
+                relogo_b64, chosen_position, chosen_geometry = await ImageContentService.overlay_logo_smart(
+                    pre_logo_b64, logo_url, logo_size or "small",
+                    preferred_position=logo_position or "bottom_right",
+                    return_placement=True,
                 )
                 edited_image = Image.open(io.BytesIO(base64.b64decode(relogo_b64))).convert("RGB")
+                if chosen_geometry and background_url:
+                    logo_placement = {**chosen_geometry, "position": chosen_position, "logo_size": logo_size or "small"}
+                else:
+                    background_url = None
 
             webp_buffer = io.BytesIO()
             edited_image.save(webp_buffer, format="WEBP", quality=95, method=6)
@@ -921,7 +988,11 @@ RULES FOR THIS EDIT:
             print(f"☁️  ✅ CLOUDINARY EDIT UPLOAD SUCCESS!")
             print(f"   🔗 URL: {stored_url}")
 
-            return stored_url
+            return {
+                "image_url": stored_url,
+                "background_image_url": background_url,
+                "logo_placement": logo_placement,
+            }
 
         except Exception as e:
             print(f"[EDIT] Edit API call failed: {e}")

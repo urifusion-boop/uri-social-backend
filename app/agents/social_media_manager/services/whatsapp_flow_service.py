@@ -2216,11 +2216,12 @@ class WhatsAppFlowService:
                 await _safe_set_state(phone, "idle", ctx, db)
                 return
 
-            edited_url = await ImageEditingService._call_edit_api(
+            edit_result = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
                 prompt=edit_prompt,
                 size="1024x1024",
             )
+            edited_url = edit_result.get("image_url") if edit_result else None
 
             if not edited_url:
                 await _send(phone, "⚠️ Image edit failed. Please try again or describe what you want differently.")
