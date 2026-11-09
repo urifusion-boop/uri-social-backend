@@ -116,7 +116,7 @@ def test_a_failed_high_quality_scene_is_recorded_as_failed_with_no_second_model(
     clip = col.clips[0]
     assert clip["video_url"] is None and clip["routed_model"] is None and clip["fallback_used"] is False
     assert "exploded" in clip["error"]
-    assert {"status": "complete", "current_scene": 1} in col.sets
+    assert {"dispatch_done": True, "current_scene": 1} in col.sets and {"status": "complete"} in col.sets
 
 
 def test_a_successful_high_quality_scene_is_delivered_by_omni_flash(monkeypatch):

@@ -26,6 +26,7 @@ NotificationType = Literal[
     "campaign_update",     # Jane + Ads: a running campaign needs attention (PRD §7.2)
     "campaign_ended",      # Jane + Ads: a campaign's window finished (PRD §8)
     "connection_disconnected",  # A connected account needs the owner to reconnect it
+    "video_clip_ready",    # A slow video clip finished rendering (or could not be finished): come back and merge
 ]
 
 NotificationChannel = Literal["email", "whatsapp"]

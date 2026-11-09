@@ -234,6 +234,23 @@ def _public(record: Optional[dict]) -> Optional[dict]:
     }
 
 
+# A clip still rendering on the provider is waited for (and delivered, with the customer told) for this long; after it
+# the scene counts as not delivered and is refunded like any other.
+PENDING_CLIP_MAX_AGE = timedelta(minutes=75)
+
+
+def has_live_pending_clip(job: dict, now: Optional[datetime] = None) -> bool:
+    """True if a clip of this job is still rendering at the provider and has not yet been waited for too long."""
+    now = now or datetime.utcnow()
+    for clip in (job or {}).get("clips") or []:
+        if not clip.get("pending"):
+            continue
+        since = clip.get("pending_since")
+        if not isinstance(since, datetime) or now - since < PENDING_CLIP_MAX_AGE:
+            return True
+    return False
+
+
 async def settle(job_id: str, job: Optional[dict] = None, credits=None, trials=None, col=None) -> Optional[dict]:
     """Close the books on a finished job: refund scenes that were not delivered. Safe to call twice.
 
@@ -243,6 +260,10 @@ async def settle(job_id: str, job: Optional[dict] = None, credits=None, trials=N
     record = await col.find_one({"job_id": job_id})
     if not record or record.get("status") not in ("charged", "shadow"):
         return _public(record)
+    if job is None:
+        job = await get_db()["video_generation_jobs"].find_one({"job_id": job_id}) or {}
+    if has_live_pending_clip(job):
+        return _public(record)      # a slow clip is still rendering on the provider: settle once it lands
     claimed = await col.find_one_and_update(
         {"job_id": job_id, "status": record["status"]}, {"$set": {"status": "settling"}},
     )
@@ -250,8 +271,6 @@ async def settle(job_id: str, job: Optional[dict] = None, credits=None, trials=N
         return _public(await col.find_one({"job_id": job_id}))
 
     try:
-        if job is None:
-            job = await get_db()["video_generation_jobs"].find_one({"job_id": job_id}) or {}
         clips = job.get("clips") or []
         total = int(job.get("total_scenes") or record.get("scenes") or 0)
         delivered = sum(1 for clip in clips if clip.get("video_url"))
