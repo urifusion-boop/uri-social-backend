@@ -44,11 +44,11 @@ Your job: invent a complete creative concept, then produce a JSON script that fu
 
 Rules:
 - creative_direction: 2-4 sentences stating the overall concept — the story being told, the mood, the strategy, why it will work for this brief. Write this BEFORE the scenes, as the thing the scenes exist to serve.
-- The brand color palette MUST dominate every scene — no other colors allowed.
+- Brand colours are an accent, not a filter. Use them where they make sense: the logo, the product and its packaging, uniforms, signage, on-screen text, graphics, text cards and the closing call to action. Everything else — locations, skin, food, sky, nature, furniture, backgrounds — takes natural, realistic colours chosen for the mood of that scene, and the colour world should change from scene to scene. Never wash a whole scene in the brand colours.
 - video_prompt fields must be a COMPLETE, self-sufficient visual description an image generator can draw from scratch — specify subject, setting, framing, lighting, and motion in full; never assume prior context.
 - APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
 - reference_image_index: 0 if reference images were supplied and this scene draws on them, otherwise 0 (unused placeholder — frame generation for this flow chains scene-to-scene for consistency instead of picking by index).
-- text_overlay is a short on-screen caption/tagline string, or null.
+- text_overlay is a short on-screen caption/tagline string (8 words or fewer), or null. The editor draws it, sharply, onto the finished video: NEVER describe lettering, captions, titles or text cards inside a video_prompt (a text_card shot is a clean, plain or brand-coloured backdrop that the caption is laid over).
 - shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
 
 CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
@@ -209,7 +209,7 @@ class VideoCreativeService:
             "Aspect ratio: 9:16 vertical",
         ]
         if color_str:
-            preamble_lines.append(f"Brand colors (STRICT — must dominate every scene): {color_str}")
+            preamble_lines.append(f"Brand colors (accents where they make sense — logo, product, packaging, graphics, text; NOT the colour of every scene): {color_str}")
         if voice:
             preamble_lines.append(f"Brand voice: {voice}")
         if region:

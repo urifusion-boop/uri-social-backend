@@ -287,6 +287,31 @@ def test_frame_rules_carry_the_palette_and_forbid_invented_lettering():
     assert "there is no lettering at all" in bb.frame_branding_rules({}, "")
 
 
+def test_brand_colours_are_accents_not_a_filter_on_every_scene(monkeypatch):
+    """The script writer used to be told the palette must dominate every scene and no other colour was allowed,
+    which dyed whole videos in the brand colour. Colours go where they make sense; the rest stays natural."""
+    _, fake = _describe_it(monkeypatch, _bc())
+    system = fake.calls[0]["messages"][0]["content"]
+    prompt = _user_prompt(fake)
+    assert "#FF6A00" in prompt                                            # the palette is still passed along
+    for text in (system, prompt):
+        assert "must dominate" not in text and "no other colors" not in text and "STRICT" not in text
+    assert "accent, not a filter" in system
+    assert "Never wash a whole scene in the brand colours" in system
+
+
+def test_the_photo_storyboard_prompt_treats_brand_colours_the_same_way():
+    assert "no other colors" not in vss._SYSTEM_PROMPT and "MUST dominate" not in vss._SYSTEM_PROMPT
+    assert "accent, not a filter" in vss._SYSTEM_PROMPT
+
+
+def test_frame_rules_keep_the_palette_off_the_whole_frame():
+    text = bb.frame_branding_rules(_bc(), "")
+    assert "#FF6A00" in text and "dominate the clothing" not in text
+    assert "do not tint the whole frame" in text
+    assert "belong on the brand's own product" in text
+
+
 class _FakeImages:
     def __init__(self):
         self.prompts = []

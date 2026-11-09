@@ -666,7 +666,11 @@ def frame_branding_rules(bc: Optional[Dict[str, Any]], allowed_text: str = "") -
     colors = ", ".join(str(c) for c in ((bc or {}).get("brand_colors") or [])[:4])
     parts = []
     if colors:
-        parts.append(f"Colour palette to dominate the clothing, props and graphics: {colors}.")
+        parts.append(
+            f"Brand colours ({colors}) belong on the brand's own product, packaging, uniforms, signage and graphics. "
+            "The rest of the frame — setting, skin, food, sky, nature, backgrounds — uses natural colours that suit "
+            "the mood; do not tint the whole frame in the brand palette."
+        )
     only = f'any lettering is exactly "{name}"' if name else "there is no lettering at all"
     parts.append(
         "Do NOT invent or show any brand, shop, company or product name, logo or slogan. Packaging, uniforms, "
