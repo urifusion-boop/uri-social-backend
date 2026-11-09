@@ -1,7 +1,7 @@
 """
 EXPERIMENT: Complex / Cinematic (Wan 3.0) and Advanced References (Seedance 2.0) are given a scene's spoken line in
 the clip prompt, so they can be tried on a script with dialogue. Only the talking avatar reads `dialogue` otherwise.
-The clip carries a warning saying the words and voice are not guaranteed.
+The customer sees a normal finished clip (no warning); the scene is only logged.
 """
 import asyncio
 import sys
@@ -58,20 +58,22 @@ def _clip(model, dialogue, notes):
 
 
 @pytest.mark.parametrize("model", [V._WAN_3, V._SEEDANCE_FAST])
-def test_cinematic_and_references_models_get_the_line_and_flag_the_clip(sent, model):
+def test_cinematic_and_references_models_get_the_line_but_the_clip_carries_no_warning(sent, model, capsys):
     notes = {}
     _clip(model, "Jane has got this", notes)
     prompt = sent[-1][1]["prompt"]
     assert 'saying exactly: "Jane has got this"' in prompt
     assert prompt.startswith("A woman at her desk") and "same face" in prompt      # face guidance is still there
-    assert notes["speech_in_prompt"] == V.SPEECH_IN_PROMPT_NOTE
+    assert notes == {}                                                              # nothing for the customer to see
+    assert "SPEECH-IN-PROMPT experiment" in capsys.readouterr().out                 # ...but the log records it
 
 
 @pytest.mark.parametrize("model", [V._WAN_3, V._SEEDANCE_FAST])
-def test_a_scene_with_no_dialogue_is_sent_without_speech(sent, model):
+def test_a_scene_with_no_dialogue_is_sent_without_speech(sent, model, capsys):
     notes = {}
     _clip(model, None, notes)
     assert "saying exactly" not in sent[-1][1]["prompt"] and notes == {}
+    assert "SPEECH-IN-PROMPT" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("model", [V._H3_MAX, V._KLING_STANDARD, V._OMNI_FLASH])
@@ -81,7 +83,7 @@ def test_other_models_are_left_alone(sent, model):
     assert "saying exactly" not in sent[-1][1]["prompt"] and notes == {}
 
 
-def test_the_note_reaches_the_clip_as_its_warning(monkeypatch):
+def test_a_finished_clip_on_the_experiment_models_has_no_warning(monkeypatch):
     clips = []
 
     class Col:
@@ -90,7 +92,6 @@ def test_the_note_reaches_the_clip_as_its_warning(monkeypatch):
                 clips.append(update["$push"]["clips"])
 
     async def fake_scene(scene, model, voice, job_id, notes=None):
-        notes["speech_in_prompt"] = V.SPEECH_IN_PROMPT_NOTE
         return "https://cdn/clip.mp4", 0.5
 
     monkeypatch.setattr(V, "_jobs_collection", lambda: Col())
