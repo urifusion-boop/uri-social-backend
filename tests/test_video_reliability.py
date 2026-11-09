@@ -82,6 +82,7 @@ class _Handle:
     def __init__(self, statuses, get_failures=0):
         self.statuses, self.get_failures = list(statuses), get_failures
         self.status_calls = self.get_calls = self.cancelled = 0
+        self.request_id = "req-1"
 
     async def status(self, with_logs=False):
         self.status_calls += 1
@@ -152,11 +153,55 @@ def test_a_clip_that_finished_but_cannot_be_fetched_is_not_sent_again(fal):
         _run(V.VideoGenerationService._submit_and_poll("m", {}, 900, 1))
 
 
-def test_a_timeout_asks_fal_to_cancel_the_request(fal):
-    fal.handle = _Handle([InProgress])
-    with pytest.raises(TimeoutError):
-        _run(V.VideoGenerationService._submit_and_poll("m", {}, -1, 1))
-    assert fal.handle.cancelled == 1
+@pytest.fixture
+def clock(monkeypatch):
+    """A fake clock that only moves when the code sleeps, so waiting minutes takes no time."""
+    now = [0.0]
+
+    async def sleep(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(V.asyncio, "sleep", sleep)
+    monkeypatch.setattr(V.time, "monotonic", lambda: now[0])
+    return now
+
+
+def test_a_request_still_queued_at_the_ceiling_is_cancelled_free_and_can_fall_back(fal, clock):
+    fal.handle = _Handle([Queued] * 50)
+    with pytest.raises(TimeoutError) as e:
+        _run(V.VideoGenerationService._submit_and_poll("m", {}, 10, 1))
+    assert fal.handle.cancelled == 1 and e.value.request_id == "req-1"
+
+
+def test_a_clip_that_is_already_rendering_is_waited_for_past_the_ceiling_not_abandoned(fal, clock):
+    """Seedance: still InProgress at 300s, finished at 311s and 346s. It is billed either way, so wait for it."""
+    fal.handle = _Handle([InProgress] * 5 + [Completed])
+    out = _run(V.VideoGenerationService._submit_and_poll("m", {}, 10, 1))      # ceiling 10s, finishes at 25s
+    assert out["video"]["url"] == "https://v/1.mp4"
+    assert fal.handle.cancelled == 0 and fal.submitted == ["m"]
+
+
+def test_a_clip_still_rendering_after_the_recovery_window_is_cancelled_and_its_id_kept(fal, clock, monkeypatch):
+    monkeypatch.setattr(V, "_RECOVERY_WAIT_SECONDS", 10)
+    fal.handle = _Handle([InProgress] * 100)
+    with pytest.raises(TimeoutError) as e:
+        _run(V.VideoGenerationService._submit_and_poll("m", {}, 10, 1))
+    assert fal.handle.cancelled == 1 and e.value.request_id == "req-1"
+    assert clock[0] > 20
+
+
+def test_the_fal_request_id_is_saved_on_the_job_so_a_late_clip_can_be_found(fal, monkeypatch):
+    pushed = []
+
+    class Col:
+        async def update_one(self, flt, update):
+            if "$push" in update:
+                pushed.append(update["$push"])
+
+    monkeypatch.setattr(V, "_jobs_collection", lambda: Col())
+    fal.handle = _Handle([Completed])
+    _run(V.VideoGenerationService._submit_and_poll("m", {}, 900, 2, "J1"))
+    assert pushed == [{"fal_requests": {"scene_number": 2, "model": "m", "request_id": "req-1"}}]
 
 
 # ── run_job: retry the same model, never pay twice ───────────────────────────
@@ -203,9 +248,10 @@ def test_a_refused_prompt_is_not_retried_on_the_same_model_but_does_fall_back(mo
 
 
 def test_a_request_that_may_have_finished_is_never_re_rendered_elsewhere(monkeypatch):
-    clip, used = _job(monkeypatch, "quick_video", lambda model, n: V.NoResubmit("lost contact"))
+    clip, used = _job(monkeypatch, "quick_video", lambda model, n: V.NoResubmit("lost contact", "req-9"))
     assert used == [V._H3_TURBO]                           # not retried, and the fallback was not used
     assert clip["video_url"] is None and "not made twice" in clip["error"] and clip["fallback_used"] is False
+    assert clip["fal_request_id"] == "req-9"               # so the finished clip can still be found on fal
 
 
 # ── a scene's picture gets a second try, because without it there is no clip ─

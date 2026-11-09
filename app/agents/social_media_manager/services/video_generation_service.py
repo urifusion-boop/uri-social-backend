@@ -300,7 +300,12 @@ async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
 
 class NoResubmit(RuntimeError):
     """A request that may already have finished (and been billed) on fal's side, e.g. we lost contact while it ran.
-    It must NOT be sent again or re-rendered on another model, or the customer's clip is paid for twice."""
+    It must NOT be sent again or re-rendered on another model, or the customer's clip is paid for twice.
+    `request_id` is fal's id for it, so the finished clip can still be found on fal's side."""
+
+    def __init__(self, message: str, request_id: Optional[str] = None):
+        super().__init__(message)
+        self.request_id = request_id
 
 
 # A failure that retrying cannot fix: the content was refused or the request itself is wrong.
@@ -338,6 +343,11 @@ async def _retry_transient(call, what: str, attempts: int = 4, base_delay: float
 # Consecutive failed progress checks tolerated before we stop trying to reach fal. Each check backs off up to 30s, so
 # this is several minutes: the request keeps running on fal's side the whole time.
 _MAX_CONSECUTIVE_POLL_FAILURES = 20
+
+# How much longer a clip that is ALREADY RENDERING on fal (and so billed) is waited for after its model's normal
+# ceiling, instead of being abandoned and re-rendered. A request still queued at the ceiling has not started and is
+# cancelled free of charge.
+_RECOVERY_WAIT_SECONDS = 900
 
 
 def _jobs_collection():
@@ -468,6 +478,7 @@ class VideoGenerationService:
                         "routed_model": None,
                         "fallback_used": False,
                         "latency_seconds": latency,
+                        "fal_request_id": getattr(primary_error, "request_id", None),
                         "error": (
                             "This scene is taking longer than expected — talking videos "
                             "routinely take several minutes. We did not retry it with a different "
@@ -488,6 +499,7 @@ class VideoGenerationService:
                         "routed_model": None,
                         "fallback_used": False,
                         "latency_seconds": round(time.monotonic() - started, 2),
+                        "fal_request_id": getattr(primary_error, "request_id", None),
                         "error": (
                             "We lost contact with the video service while this scene was rendering. It was not "
                             "sent again, so it is not made twice. Regenerate this scene in a few minutes."
@@ -505,6 +517,7 @@ class VideoGenerationService:
                         "routed_model": None,
                         "fallback_used": False,
                         "latency_seconds": round(time.monotonic() - started, 2),
+                        "fal_request_id": getattr(primary_error, "request_id", None),
                         "error": f"{primary_model}: {primary_error}",
                     }}})
                     continue
@@ -617,24 +630,18 @@ class VideoGenerationService:
         handle = await _retry_transient(lambda: fal_client.submit_async(model, arguments=arguments), f"{model} submit")
         started = time.monotonic()
         poll_failures = 0
+        request_id = getattr(handle, "request_id", None)
         last_state = None
         col = _jobs_collection() if job_id else None
         model_label = MODEL_REGISTRY.get(model, {}).get("label", model)
+        if col is not None and request_id:
+            # So a clip that finishes after we stopped waiting can still be traced and fetched from fal.
+            await col.update_one({"job_id": job_id}, {"$push": {"fal_requests": {
+                "scene_number": scene_num, "model": model, "request_id": request_id,
+            }}})
 
         while True:
             elapsed = time.monotonic() - started
-            if elapsed > timeout_seconds:
-                if col is not None:
-                    await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
-                # Stop fal working on (and billing for) a request nobody is waiting for. Best effort: a request
-                # already rendering may not be cancellable.
-                try:
-                    await handle.cancel()
-                except Exception as cancel_err:
-                    print(f"[VideoGen] Scene {scene_num}: could not cancel {model} after timeout ({cancel_err})", flush=True)
-                raise TimeoutError(
-                    f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
-                )
 
             try:
                 status = await handle.status(with_logs=False)
@@ -646,7 +653,8 @@ class VideoGenerationService:
                 if poll_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
                     raise NoResubmit(
                         f"lost contact with {model} after {poll_failures} failed checks ({poll_err}); "
-                        "the request may have finished, so it was not re-sent"
+                        "the request may have finished, so it was not re-sent",
+                        request_id,
                     )
                 print(f"[VideoGen] Scene {scene_num}: {model} progress check failed ({type(poll_err).__name__}: "
                       f"{str(poll_err)[:120]}); still waiting ({poll_failures}/{_MAX_CONSECUTIVE_POLL_FAILURES})", flush=True)
@@ -673,7 +681,28 @@ class VideoGenerationService:
                     return await _retry_transient(lambda: handle.get(), f"{model} fetch result", attempts=5)
                 except Exception as fetch_err:
                     # It finished, so it was billed: do not send it again.
-                    raise NoResubmit(f"{model} finished but its result could not be fetched ({fetch_err})")
+                    raise NoResubmit(f"{model} finished but its result could not be fetched ({fetch_err})", request_id)
+
+            if elapsed > timeout_seconds:
+                # Not finished at the model's normal ceiling. A request still QUEUED has not started, so it is
+                # cancelled free of charge and the scene can safely move to a fallback. One already RENDERING is
+                # being billed and will finish, so keep waiting for it instead of abandoning it (and paying again
+                # for a re-render): only cancel after the extra recovery window.
+                if state == "Queued" or elapsed > timeout_seconds + _RECOVERY_WAIT_SECONDS:
+                    if col is not None:
+                        await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
+                    try:
+                        await handle.cancel()
+                    except Exception as cancel_err:
+                        print(f"[VideoGen] Scene {scene_num}: could not cancel {model} ({cancel_err})", flush=True)
+                    err = TimeoutError(
+                        f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
+                    )
+                    err.request_id = request_id
+                    raise err
+                if elapsed - 5 <= timeout_seconds:   # log once, as it crosses the ceiling
+                    print(f"[VideoGen] Scene {scene_num}: {model} still rendering past {timeout_seconds}s; "
+                          f"waiting up to {_RECOVERY_WAIT_SECONDS}s more rather than re-rendering it", flush=True)
 
             if col is not None:
                 await col.update_one({"job_id": job_id}, {"$set": {
