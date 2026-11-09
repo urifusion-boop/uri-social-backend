@@ -298,6 +298,48 @@ async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
     return await upload_bytes(padded, folder="uri-social/generated-audio", resource_type="audio")
 
 
+class NoResubmit(RuntimeError):
+    """A request that may already have finished (and been billed) on fal's side, e.g. we lost contact while it ran.
+    It must NOT be sent again or re-rendered on another model, or the customer's clip is paid for twice."""
+
+
+# A failure that retrying cannot fix: the content was refused or the request itself is wrong.
+_NOT_RETRYABLE_HINTS = (
+    "content_policy", "sensitive", "safety", "nsfw", "moderation", "violat", "not allowed",
+    "invalid", "validation", "unprocessable", "unsupported", "too large", "unauthorized", "forbidden", "not found",
+)
+_RETRY_PAUSE_SECONDS = 3.0
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """True for a failure worth one more try on the same model: a network blip, a 5xx, an overloaded queue, a model
+    that errored once. False for a timeout (the request may still complete), a request that may already be paid
+    for, our own validation errors, and anything the model or its safety filter refused."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, NoResubmit, ValueError)):
+        return False
+    msg = str(exc).lower()
+    return not any(hint in msg for hint in _NOT_RETRYABLE_HINTS)
+
+
+async def _retry_transient(call, what: str, attempts: int = 4, base_delay: float = 2.0):
+    """Run `call()` (a no-argument coroutine factory), retrying transient failures with a growing pause."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call()
+        except Exception as e:
+            if attempt == attempts or not is_retryable(e):
+                raise
+            delay = min(base_delay * 2 ** (attempt - 1), 20.0)
+            print(f"[VideoGen] {what} failed ({type(e).__name__}: {str(e)[:160]}); retry {attempt}/{attempts - 1} in {delay:.0f}s",
+                  flush=True)
+            await asyncio.sleep(delay)
+
+
+# Consecutive failed progress checks tolerated before we stop trying to reach fal. Each check backs off up to 30s, so
+# this is several minutes: the request keeps running on fal's side the whole time.
+_MAX_CONSECUTIVE_POLL_FAILURES = 20
+
+
 def _jobs_collection():
     return get_db()["video_generation_jobs"]
 
@@ -396,7 +438,7 @@ class VideoGenerationService:
             fallback_warning = None
             scene_notes: dict = {}
             try:
-                video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
+                video_url, cost_usd = await VideoGenerationService._generate_scene_with_retry(
                     scene, primary_model, avatar_voice, job_id, notes=scene_notes
                 )
                 routed_model = primary_model
@@ -433,6 +475,25 @@ class VideoGenerationService:
                         ),
                     }}})
                     continue
+                if isinstance(primary_error, NoResubmit):
+                    # We lost contact with a request that may have finished: sending it again, to this model or a
+                    # fallback, would bill the customer's clip twice.
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_error} — not retrying or falling back",
+                          flush=True)
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": False,
+                        "latency_seconds": round(time.monotonic() - started, 2),
+                        "error": (
+                            "We lost contact with the video service while this scene was rendering. It was not "
+                            "sent again, so it is not made twice. Regenerate this scene in a few minutes."
+                        ),
+                    }}})
+                    continue
                 if fallback_model is None:
                     print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
                           f"({primary_error}); this outcome has no fallback")
@@ -457,7 +518,7 @@ class VideoGenerationService:
                 # that mismatch from the caller entirely.
                 fallback_warning = f"Fell back to {MODEL_REGISTRY.get(fallback_model, {}).get('label', fallback_model)}: {primary_model} failed ({primary_error})"
                 try:
-                    video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
+                    video_url, cost_usd = await VideoGenerationService._generate_scene_with_retry(
                         scene, fallback_model, avatar_voice, job_id, notes=scene_notes
                     )
                     routed_model = fallback_model
@@ -505,6 +566,24 @@ class VideoGenerationService:
     #    rather than pretending they share one shape. ───────────────────────
 
     @staticmethod
+    async def _generate_scene_with_retry(
+        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE, job_id: Optional[str] = None,
+        notes: Optional[dict] = None, attempts: int = 2,
+    ) -> tuple[str, Optional[float]]:
+        """One scene on one model, with one more try on the SAME model when it failed in a way that can be fixed by
+        trying again (see is_retryable) — before anyone falls back to a lesser model or loses the scene. A failed
+        request is not billed by fal, so the second try costs nothing extra."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return await VideoGenerationService._generate_scene_fal(scene, model, avatar_voice, job_id, notes=notes)
+            except Exception as e:
+                if attempt == attempts or not is_retryable(e):
+                    raise
+                print(f"[VideoGenJob {job_id}] Scene {scene.get('scene_number')}: {model} failed ({e}); "
+                      f"trying it once more", flush=True)
+                await asyncio.sleep(_RETRY_PAUSE_SECONDS)
+
+    @staticmethod
     async def _submit_and_poll(
         model: str, arguments: Dict[str, Any], timeout_seconds: int, scene_num: Any, job_id: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -534,8 +613,10 @@ class VideoGenerationService:
         """
         import fal_client
 
-        handle = await fal_client.submit_async(model, arguments=arguments)
+        # A failed SUBMIT sent nothing, so retrying it cannot double-bill.
+        handle = await _retry_transient(lambda: fal_client.submit_async(model, arguments=arguments), f"{model} submit")
         started = time.monotonic()
+        poll_failures = 0
         last_state = None
         col = _jobs_collection() if job_id else None
         model_label = MODEL_REGISTRY.get(model, {}).get("label", model)
@@ -545,11 +626,32 @@ class VideoGenerationService:
             if elapsed > timeout_seconds:
                 if col is not None:
                     await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
+                # Stop fal working on (and billing for) a request nobody is waiting for. Best effort: a request
+                # already rendering may not be cancellable.
+                try:
+                    await handle.cancel()
+                except Exception as cancel_err:
+                    print(f"[VideoGen] Scene {scene_num}: could not cancel {model} after timeout ({cancel_err})", flush=True)
                 raise TimeoutError(
                     f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
                 )
 
-            status = await handle.status(with_logs=False)
+            try:
+                status = await handle.status(with_logs=False)
+                poll_failures = 0
+            except Exception as poll_err:
+                # A failed progress check says nothing about the request, which is still running (and billed) on
+                # fal. Giving up here and re-rendering elsewhere is what double-billed Seedance, so keep checking.
+                poll_failures += 1
+                if poll_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                    raise NoResubmit(
+                        f"lost contact with {model} after {poll_failures} failed checks ({poll_err}); "
+                        "the request may have finished, so it was not re-sent"
+                    )
+                print(f"[VideoGen] Scene {scene_num}: {model} progress check failed ({type(poll_err).__name__}: "
+                      f"{str(poll_err)[:120]}); still waiting ({poll_failures}/{_MAX_CONSECUTIVE_POLL_FAILURES})", flush=True)
+                await asyncio.sleep(min(5 * poll_failures, 30))
+                continue
             state = type(status).__name__  # "Queued" | "InProgress" | "Completed"
             position = getattr(status, "position", None) if state == "Queued" else None
             if state != last_state:
@@ -567,7 +669,11 @@ class VideoGenerationService:
                 error = getattr(status, "error", None)
                 if error:
                     raise RuntimeError(f"{model} failed: {error}")
-                return await handle.get()
+                try:
+                    return await _retry_transient(lambda: handle.get(), f"{model} fetch result", attempts=5)
+                except Exception as fetch_err:
+                    # It finished, so it was billed: do not send it again.
+                    raise NoResubmit(f"{model} finished but its result could not be fetched ({fetch_err})")
 
             if col is not None:
                 await col.update_one({"job_id": job_id}, {"$set": {
