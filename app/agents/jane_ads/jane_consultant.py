@@ -328,13 +328,23 @@ async def consult(message: str, business_name: str = "", category: str = "",
                   history: Optional[list[dict]] = None,
                   offering: str = "",
                   stated_audience: str = "",
-                  objective_label: str = "") -> ConsultantBrief:
+                  objective_label: str = "",
+                  budget_override: Optional[float] = None) -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
     time. Raises NlUnavailableError if the model call fails — same contract as
     nl.py's parse_message, so an outage never masquerades as a 'need more info'
-    follow-up (the caller surfaces it as a clear 503 instead)."""
+    follow-up (the caller surfaces it as a clear 503 instead).
+
+    budget_override — a multi-platform campaign's per-platform budget split,
+    computed by the frontend and never typed into `message` as text (see
+    router.py's budget_ngn_override). Live-confirmed: without this, the
+    consultant has no way to see that figure (client_stated_budget only reads
+    `message`/`history`) and asks the client for a budget on every platform's
+    plan anyway, even though it was already decided and sent as a real
+    number — defeating the whole point of planning several platforms from
+    one brief. Settles the budget exactly like a client-typed figure does."""
     if not settings.jane_ads_openai_key:
         raise NlUnavailableError("OPENAI_API_KEY is not configured")
     if not (message or "").strip():
@@ -346,7 +356,7 @@ async def consult(message: str, business_name: str = "", category: str = "",
     # from a PAST campaign is then withheld from the model entirely: offered alongside a
     # stated figure, it asked "last time you spent ₦130,000, want to do the same?" of a
     # client who had just said ₦30,000. Live-reported, repeatedly.
-    settled_budget = client_stated_budget(message, history)
+    settled_budget = budget_override or client_stated_budget(message, history)
     if settled_budget:
         known_budget = None
 
