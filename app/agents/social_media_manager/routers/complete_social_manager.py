@@ -3838,6 +3838,44 @@ async def unschedule_draft(
     return UriResponse.get_single_data_response("unschedule", {"draft_id": draft_id, "status": "draft"})
 
 
+@router.post("/drafts/{draft_id}/restore")
+async def restore_draft(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Move an archived draft (denied / replaced / publish_failed) back to draft status, clearing the error/denial state that put it there."""
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
+    draft = await db["content_drafts"].find_one({**scope, "id": draft_id})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("status") not in ("denied", "replaced", "publish_failed"):
+        raise HTTPException(status_code=400, detail="Only archived drafts can be restored")
+
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {
+            "$set": {
+                "status": "draft",
+                "user_id": user_id,  # ensure user_id is on the doc so fetchDrafts finds it
+                "updated_at": datetime.utcnow(),
+            },
+            "$unset": {
+                "error_message": "",
+                "publish_error_kind": "",
+                "publish_retry_count": "",
+                "denial_reason": "",
+                "platform_post_id": "",
+                "scheduled_date": "",
+            },
+        },
+    )
+    from app.domain.responses.uri_response import UriResponse
+    return UriResponse.get_single_data_response("restore", {"draft_id": draft_id, "status": "draft"})
+
+
 @router.put("/refine")
 async def refine_content(
     request: RefinementRequest,
