@@ -317,6 +317,19 @@ _NOT_RETRYABLE_HINTS = (
 _RETRY_PAUSE_SECONDS = 3.0
 
 
+def _is_image_flag(text: str) -> bool:
+    """True when the model refused the START IMAGE as possibly showing a real person (ByteDance's likeness check,
+    which rejects our photoreal AI faces some of the time and accepts the same image the next time). fal: 422
+    "image_url: The images or videos provided may contain likenesses of real people or other private information
+    that cannot be processed", billed $0.00. Nothing to do with the audio."""
+    return "likenesses of real people" in text.lower()
+
+
+def _is_content_flag(text: str) -> bool:
+    """True when a model's safety check refused the request (the input image or the generated audio)."""
+    return "content_policy_violation" in text or "sensitive content" in text.lower() or _is_image_flag(text)
+
+
 def is_retryable(exc: BaseException) -> bool:
     """True for a failure worth one more try on the same model: a network blip, a 5xx, an overloaded queue, a model
     that errored once. False for a timeout (the request may still complete), a request that may already be paid
@@ -324,6 +337,8 @@ def is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, NoResubmit, ValueError)):
         return False
     msg = str(exc).lower()
+    if _is_image_flag(msg):
+        return True          # an inconsistent filter: the same image often passes on the next try
     return not any(hint in msg for hint in _NOT_RETRYABLE_HINTS)
 
 
@@ -1166,15 +1181,40 @@ class VideoGenerationService:
                 raise
             err_str = str(e)
             has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
-            if has_audio_toggle and (
-                "content_policy_violation" in err_str or "sensitive content" in err_str.lower()
-            ):
-                print(f"[VideoGen] Scene {scene_num}: audio flagged, retrying without audio")
+            if has_audio_toggle and _is_content_flag(err_str):
                 toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
-                arguments = {**arguments, toggle_key: False}
-                result = await VideoGenerationService._submit_and_poll(
-                    model, arguments, model_timeout, scene_num, job_id
-                )
+                image_refused = _is_image_flag(err_str)
+                print(f"[VideoGen] Scene {scene_num}: {model} refused the request "
+                      f"({'start image taken for a real person' if image_refused else 'audio flagged'}): "
+                      f"{err_str[:300]}", flush=True)
+                # Dropping the sound is the LAST resort, not the first. A refused start image has nothing to do with
+                # the audio (staging 2026-11-09: scene 1 was refused for "likenesses of real people", the retry with
+                # the sound off passed, and the clip came out silent). And the checks are not consistent: the same
+                # request often passes on the next try. So retry it unchanged first: twice for a refused image, once
+                # for a flagged audio track on a spoken scene (silence defeats a talking scene).
+                same_args_retries = 2 if image_refused else (1 if spoken and model in _SPEECH_IN_PROMPT_MODELS else 0)
+                result = None
+                for attempt in range(1, same_args_retries + 1):
+                    print(f"[VideoGen] Scene {scene_num}: trying the same request again, audio on "
+                          f"({attempt}/{same_args_retries})", flush=True)
+                    try:
+                        result = await VideoGenerationService._submit_and_poll(
+                            model, arguments, model_timeout, scene_num, job_id
+                        )
+                        break
+                    except Exception as again:
+                        if isinstance(again, ClipStillRendering):
+                            again.actual_seconds = actual_seconds
+                            raise
+                        if not _is_content_flag(str(again)):
+                            raise
+                        print(f"[VideoGen] Scene {scene_num}: refused again: {str(again)[:300]}", flush=True)
+                if result is None:
+                    print(f"[VideoGen] Scene {scene_num}: retrying without audio", flush=True)
+                    arguments = {**arguments, toggle_key: False}
+                    result = await VideoGenerationService._submit_and_poll(
+                        model, arguments, model_timeout, scene_num, job_id
+                    )
             elif model == _NG_LIPSYNC:
                 # Cloned+padded audio still got rejected (some other validation
                 # issue _pad_wav_silence didn't cover) — degrade to the normal
