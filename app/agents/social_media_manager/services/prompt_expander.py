@@ -77,43 +77,58 @@ Hard rules:
 - Don't write the post itself — write the brief for it. Don't list hashtags; Jane adds them."""
 
 
-# Same job as SYSTEM above, for the "Describe it" video flow's own brief box
-# (DescribeVideoGenerator.tsx) instead of a social post — a short video idea in,
-# a fuller creative brief out. Kept as its own prompt rather than reusing SYSTEM
-# because that one is written explicitly around a social post's shape: "concept —
-# image generation reads mainly this sentence", carousel/story format notes, "no
-# hashtags". A video brief needs a narrative arc and a hook instead, and nothing
-# about captions/hashtags/post format applies at all.
-VIDEO_SYSTEM = """You turn a short video idea into a clear, specific creative brief for Jane, an AI that writes a
-short-form video script AND generates the footage for this brand. Write what an excellent video creative director
-would write.
+# The "Describe it" video flow's own brief box (DescribeVideoGenerator.tsx). A video brief is not a paragraph: the
+# script writer, the picture model and the video model each need different things from it, and a loose paragraph left
+# them guessing (faces that changed between scenes, brand colour washed over every scene, lines the speaker never said).
+# So this one is STRUCTURED: fixed fields the model fills in, laid out under fixed headings by compose_video() below.
+# The structure is exactly what the video pipeline already rewards (see video_creative_service.py): people described once
+# and repeated, one scene per ~5 seconds, exact spoken lines, short captions, brand colours as accents.
+VIDEO_SYSTEM = """You turn a short video idea into a structured production brief for Jane, an AI that writes a
+short-form video script and then generates the pictures and footage, scene by scene, for this brand. Write what an
+excellent video director would hand to a crew. Fill every field below; the app lays them out under fixed headings.
 
-Return two parts:
-1. concept — ONE sentence that opens the brief: the core story or message and the opening visual (who/what is on
-   screen first, setting, mood). Video generation reads this as the opening scene, so make it concrete. Do not
-   start with "Jane", "Create", "Craft" or "Write".
-2. details — plain instructions that continue from the concept without repeating it (no headings, markdown or
-   bullet symbols), covering only what helps:
-   - the narrative arc: what happens across the video, in order — a short-form story a creative director would
-     give, not a numbered shot list
-   - the hook in the first couple of seconds, and how it closes (the call to action)
-   - tone, voice and pacing (from the brand voice), words to avoid
-   - visual direction: setting, people appropriate to the brand's market, brand colours
-   - uploaded photos: if photos are listed, say how to feature them (they are real products/people — use, don't
-     reinvent them)
-   - the call to action: if a CTA is given, use it exactly; otherwise match the brand's goal
+- concept: ONE sentence: the core story or message and the opening picture (who or what is on screen first, where,
+  the mood). Do not start with "Jane", "Create", "Craft" or "Write".
+- people: ONLY if people appear. At most two. One entry per person: approximate age, gender, skin tone, face shape,
+  hair (style, length, colour), facial hair, build, and ONE fixed outfit with its colours, fitting the brand's market.
+  Every scene is drawn separately, so a person described once here must look identical in every scene: never
+  change their outfit or look between scenes. Empty if no one is on screen.
+- setting: where and when (one place, or a clear progression), time of day, key props, how it is lit. Realistic and
+  culturally accurate for the brand's market. Packaging, uniforms, signs and screens are plain and unbranded, except
+  the brand's own name.
+- look: framing, movement and colour. Faces are large, sharp and well lit (medium shot or close-up, facing the camera
+  or three-quarter view). Movement is gentle: slow push-ins, small gestures, no fast spins, whip-pans, running or
+  crowds of faces, which distort. Brand colours go on the logo, product, packaging, graphics and on-screen text; the
+  rest of every scene (skin, food, sky, rooms, backgrounds) keeps natural colours, so scenes do not all look dyed.
+- scenes: EXACTLY the number of scenes you are told, in order, one per 5 seconds. Scene 1 is the hook, the middle
+  builds or shows, the last pays off and carries the call to action. Each scene continues straight from the one
+  before (same people, same place). Per scene:
+    action: what happens on screen, concrete and visual, one or two sentences (about 25 words at most).
+    says: the exact words a person speaks to camera in this scene, or empty. Use this ONLY when the idea calls for
+      someone speaking to camera (a testimonial, a founder, a how-to). Then write ONE continuous spoken script
+      split across the scenes like one take cut into pieces, in natural spoken language (a Lagos customer sounds
+      like one), short enough to say in 5 seconds (about 12 words at most). No spoken lines if nobody speaks.
+    caption: the on-screen text for this scene, 8 words or fewer, or empty. It is drawn onto the video afterwards.
+- sound: the voice (tone, and accent if the market implies one), the music style or none, the key sound effects.
+  Never name a copyrighted song.
+- call_to_action: if a CTA is given, use it exactly; otherwise match the brand's goal. Say where it appears (the
+  last scene's caption, spoken, or both).
+- avoid: the brand's words to avoid and guardrails, and anything else this video must not show or say. Empty if none.
+- used: which brand facts or settings shaped it, 2-4 words each.
 
 Hard rules:
-- Keep the owner's idea and intent central. If the idea is already detailed, refine it lightly — don't rewrite it.
+- Keep the owner's idea and intent central. If the idea is already detailed or already has scenes and spoken lines,
+  refine it lightly: keep their scenes and keep every line they wrote in quotes WORD FOR WORD.
 - Use ONLY the brand facts given. Never invent products, prices, offers, discounts, events, dates, statistics or
   results. No medical, financial or guaranteed-result claims. Respect the guardrails.
-- Greeting / occasion videos (Mother's Day, Independence Day, Eid, Christmas, New Year…): celebrate the occasion
-  and the people; the brand is simply the warm sender, signing off at most. Never compare the occasion to the
-  product or the brand ("just like a mother nurtures…, we nurture…") and no sales message.
-- Vague ideas ("tips video", "engagement video"): choose ONE specific, useful angle from the customers' pain
-  points, desires or common questions, and name it concretely.
+- Greeting / occasion videos (Mother's Day, Independence Day, Eid, Christmas, New Year…): celebrate the occasion and
+  the people; the brand is simply the warm sender, signing off at most. Never compare the occasion to the product or
+  the brand and no sales message.
+- Vague ideas ("tips video", "engagement video"): choose ONE specific, useful angle from the customers' pain points,
+  desires or common questions, and name it concretely.
 - Occasions: culturally accurate and respectful; never state a date unless the owner gave it.
-- Don't write the script itself — write the brief for it."""
+- Plain text only: no markdown, no headings, no bullet symbols inside the fields.
+- Don't write the final script, write the brief for it."""
 
 
 def _style_lines(slugs: list[str]) -> list[str]:
@@ -240,14 +255,126 @@ async def expand(idea: str, bc: dict, platforms: list[str], post_type: str = "fe
             "prompt_version": PROMPT_VERSION}
 
 
+class _VideoScene(BaseModel):
+    action: str = Field(description="What happens on screen: concrete and visual, one or two sentences.")
+    says: str = Field(default="", description="The exact words spoken to camera in this scene, or empty.")
+    caption: str = Field(default="", description="On-screen text for this scene, 8 words or fewer, or empty.")
+
+
+class _ExpandedVideo(BaseModel):
+    concept: str = Field(description="ONE sentence: the core story and the opening picture.")
+    people: list[str] = Field(default_factory=list, description="One fixed description per person on screen (max 2).")
+    setting: str = Field(default="", description="Where, when, key props, how it is lit.")
+    look: str = Field(default="", description="Framing, gentle movement, and where brand colours go.")
+    scenes: list[_VideoScene] = Field(default_factory=list, description="Exactly the number of scenes asked for.")
+    sound: str = Field(default="", description="Voice, music, sound effects.")
+    call_to_action: str = Field(default="", description="The call to action and where it appears.")
+    avoid: str = Field(default="", description="Words and things this video must avoid.")
+    used: list[str] = Field(default_factory=list, description="Which brand facts shaped it, 2-4 words each.")
+
+
+VIDEO_PROMPT_VERSION = "video-prompt-expander-v2"
+VIDEO_MAX_CHARS = 1900            # the brief box holds 2000
+SECONDS_PER_SCENE = 5             # the pipeline cuts a script into scenes of about this length
+CAPTION_MAX_WORDS = 8
+_ONE_LINE = re.compile(r"\s+")
+
+
+def scene_count(duration_seconds: Optional[int]) -> int:
+    """How many scenes the video pipeline will cut this length into (the same sum the script writer uses)."""
+    return max(1, round((duration_seconds or 15) / SECONDS_PER_SCENE))
+
+
+def _line(text: Any) -> str:
+    """One tidy line of plain text: no markdown, no line breaks."""
+    return _ONE_LINE.sub(" ", _clean(str(text or ""))).strip()
+
+
+def _sentence(text: Any) -> str:
+    t = _line(text)
+    return t if not t or t[-1] in ".!?" else t + "."
+
+
+def _scene_line(index: int, total: int, duration_seconds: Optional[int], scene: Any, action_max: Optional[int] = None) -> str:
+    start = index * SECONDS_PER_SCENE
+    end = (index + 1) * SECONDS_PER_SCENE
+    if index == total - 1 and duration_seconds:
+        end = max(end, int(duration_seconds))
+    action = _sentence(getattr(scene, "action", ""))
+    if action_max and len(action) > action_max:
+        cut = action[:action_max]
+        action = (cut[: cut.rfind(" ")] if " " in cut else cut).rstrip(",;:") + "."
+    parts = [f"SCENE {index + 1} ({start}-{end}s): {action}"]
+    says = _line(getattr(scene, "says", "")).replace('"', "'")
+    if says:
+        parts.append(f'Says exactly: "{says}"')
+    caption = " ".join(_line(getattr(scene, "caption", "")).replace('"', "'").split()[:CAPTION_MAX_WORDS])
+    if caption:
+        parts.append(f'Caption: "{caption}"')
+    return " ".join(parts)
+
+
+def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
+    """The structured fields laid out under fixed headings, one per line, for the video brief box:
+
+        CONCEPT: ...
+        PERSON 1: ...            (only if people appear)
+        SETTING: ...
+        LOOK: ...
+        SCENE 1 (0-5s): action. Says exactly: "..." Caption: "..."
+        ...
+        SOUND: ...
+        CLOSE: ...
+        AVOID: ...
+
+    Fits the 2000-character box: the optional lines go first (avoid, sound, look, setting), then each scene's action is
+    shortened, but a spoken line is never cut."""
+    total = scene_count(duration_seconds)
+    scenes = list(getattr(parsed, "scenes", None) or [])[:total]
+    concept = _sentence(_LEAD_IN.sub("", _line(getattr(parsed, "concept", ""))))
+    if concept:
+        concept = concept[:1].upper() + concept[1:]
+    people = [_sentence(p) for p in (getattr(parsed, "people", None) or []) if _line(p)][:2]
+
+    def build(drop: tuple = (), action_max: Optional[int] = None) -> str:
+        lines = []
+        if concept:
+            lines.append(f"CONCEPT: {concept}")
+        for i, person in enumerate(people):
+            lines.append(f"PERSON {i + 1}: {person}" if len(people) > 1 else f"PERSON: {person}")
+        for key, label in (("setting", "SETTING"), ("look", "LOOK")):
+            text = _sentence(getattr(parsed, key, ""))
+            if text and key not in drop:
+                lines.append(f"{label}: {text}")
+        for i, scene in enumerate(scenes):
+            lines.append(_scene_line(i, total, duration_seconds, scene, action_max))
+        for key, label in (("sound", "SOUND"), ("call_to_action", "CLOSE"), ("avoid", "AVOID")):
+            text = _sentence(getattr(parsed, key, ""))
+            if text and key not in drop:
+                lines.append(f"{label}: {text}")
+        return "\n".join(lines)
+
+    text = build()
+    for drop in (("avoid",), ("avoid", "sound"), ("avoid", "sound", "look"), ("avoid", "sound", "look", "setting")):
+        if len(text) <= VIDEO_MAX_CHARS:
+            return text
+        text = build(drop)
+    for action_max in (140, 100, 70, 50):
+        if len(text) <= VIDEO_MAX_CHARS:
+            break
+        text = build(("avoid", "sound", "look", "setting"), action_max)
+    return text[:VIDEO_MAX_CHARS].rsplit("\n", 1)[0] if len(text) > VIDEO_MAX_CHARS else text
+
+
 def build_video_messages(idea: str, bc: dict, platform: str, duration_seconds: Optional[int],
                          today: datetime) -> list[dict]:
     facts = brand_facts(bc, styles=[])
     facts_text = "\n".join(f"- {k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in facts.items())
-    lines = [f"Platform: {platform or 'not chosen yet'}"]
-    if duration_seconds:
-        lines.append(f"Target length: about {duration_seconds} seconds")
-    lines.append(f"Today: {today.strftime('%A %d %B %Y')}")
+    total = scene_count(duration_seconds)
+    lines = [f"Platform: {platform or 'not chosen yet'}",
+             f"Target length: about {duration_seconds or 15} seconds",
+             f"Scenes: EXACTLY {total} (one per {SECONDS_PER_SCENE} seconds)",
+             f"Today: {today.strftime('%A %d %B %Y')}"]
     return [
         {"role": "system", "content": VIDEO_SYSTEM},
         {"role": "user", "content": f"BRAND FACTS\n{facts_text or '- (the Playbook is mostly empty)'}\n\n"
@@ -257,20 +384,21 @@ def build_video_messages(idea: str, bc: dict, platform: str, duration_seconds: O
 
 
 async def expand_video(idea: str, bc: dict, platform: str = "", duration_seconds: Optional[int] = None) -> Optional[dict]:
-    """Same contract as expand() above, for the "Describe it" video flow's brief box."""
+    """The "Describe it" video flow's brief box: a short video idea in, a structured production brief out (see
+    compose_video for the layout). {"expanded_prompt", "used", "prompt_version"} or None if the AI call failed."""
     today = datetime.now(timezone(timedelta(hours=1)))  # Lagos time
     req = AIService.build_ai_model(model=MODEL, temperature=0.6,
                                    messages=build_video_messages(idea, bc, platform, duration_seconds, today))
     try:
-        completion = await AIService.structured_chat_completion(req, response_model=_Expanded)
+        completion = await AIService.structured_chat_completion(req, response_model=_ExpandedVideo)
         if isinstance(completion, dict) and "error" in completion:
             print(f"[PromptExpander] video expand failed: {completion['error']}")
             return None
-        parsed: Optional[_Expanded] = completion.choices[0].message.parsed
+        parsed: Optional[_ExpandedVideo] = completion.choices[0].message.parsed
     except Exception as e:
         print(f"[PromptExpander] video expand raised: {e}")
         return None
-    if not parsed or not (parsed.concept.strip() or parsed.details.strip()):
+    if not parsed or not (parsed.concept.strip() or parsed.scenes):
         return None
-    return {"expanded_prompt": compose(parsed.concept, parsed.details), "used": parsed.used[:6],
-            "prompt_version": PROMPT_VERSION}
+    return {"expanded_prompt": compose_video(parsed, duration_seconds), "used": parsed.used[:6],
+            "prompt_version": VIDEO_PROMPT_VERSION}
