@@ -77,6 +77,45 @@ Hard rules:
 - Don't write the post itself — write the brief for it. Don't list hashtags; Jane adds them."""
 
 
+# Same job as SYSTEM above, for the "Describe it" video flow's own brief box
+# (DescribeVideoGenerator.tsx) instead of a social post — a short video idea in,
+# a fuller creative brief out. Kept as its own prompt rather than reusing SYSTEM
+# because that one is written explicitly around a social post's shape: "concept —
+# image generation reads mainly this sentence", carousel/story format notes, "no
+# hashtags". A video brief needs a narrative arc and a hook instead, and nothing
+# about captions/hashtags/post format applies at all.
+VIDEO_SYSTEM = """You turn a short video idea into a clear, specific creative brief for Jane, an AI that writes a
+short-form video script AND generates the footage for this brand. Write what an excellent video creative director
+would write.
+
+Return two parts:
+1. concept — ONE sentence that opens the brief: the core story or message and the opening visual (who/what is on
+   screen first, setting, mood). Video generation reads this as the opening scene, so make it concrete. Do not
+   start with "Jane", "Create", "Craft" or "Write".
+2. details — plain instructions that continue from the concept without repeating it (no headings, markdown or
+   bullet symbols), covering only what helps:
+   - the narrative arc: what happens across the video, in order — a short-form story a creative director would
+     give, not a numbered shot list
+   - the hook in the first couple of seconds, and how it closes (the call to action)
+   - tone, voice and pacing (from the brand voice), words to avoid
+   - visual direction: setting, people appropriate to the brand's market, brand colours
+   - uploaded photos: if photos are listed, say how to feature them (they are real products/people — use, don't
+     reinvent them)
+   - the call to action: if a CTA is given, use it exactly; otherwise match the brand's goal
+
+Hard rules:
+- Keep the owner's idea and intent central. If the idea is already detailed, refine it lightly — don't rewrite it.
+- Use ONLY the brand facts given. Never invent products, prices, offers, discounts, events, dates, statistics or
+  results. No medical, financial or guaranteed-result claims. Respect the guardrails.
+- Greeting / occasion videos (Mother's Day, Independence Day, Eid, Christmas, New Year…): celebrate the occasion
+  and the people; the brand is simply the warm sender, signing off at most. Never compare the occasion to the
+  product or the brand ("just like a mother nurtures…, we nurture…") and no sales message.
+- Vague ideas ("tips video", "engagement video"): choose ONE specific, useful angle from the customers' pain
+  points, desires or common questions, and name it concretely.
+- Occasions: culturally accurate and respectful; never state a date unless the owner gave it.
+- Don't write the script itself — write the brief for it."""
+
+
 def _style_lines(slugs: list[str]) -> list[str]:
     try:
         from app.agents.social_media_manager.services.v3_style_library import V3_STYLES
@@ -194,6 +233,42 @@ async def expand(idea: str, bc: dict, platforms: list[str], post_type: str = "fe
         parsed: Optional[_Expanded] = completion.choices[0].message.parsed
     except Exception as e:
         print(f"[PromptExpander] raised: {e}")
+        return None
+    if not parsed or not (parsed.concept.strip() or parsed.details.strip()):
+        return None
+    return {"expanded_prompt": compose(parsed.concept, parsed.details), "used": parsed.used[:6],
+            "prompt_version": PROMPT_VERSION}
+
+
+def build_video_messages(idea: str, bc: dict, platform: str, duration_seconds: Optional[int],
+                         today: datetime) -> list[dict]:
+    facts = brand_facts(bc, styles=[])
+    facts_text = "\n".join(f"- {k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in facts.items())
+    lines = [f"Platform: {platform or 'not chosen yet'}"]
+    if duration_seconds:
+        lines.append(f"Target length: about {duration_seconds} seconds")
+    lines.append(f"Today: {today.strftime('%A %d %B %Y')}")
+    return [
+        {"role": "system", "content": VIDEO_SYSTEM},
+        {"role": "user", "content": f"BRAND FACTS\n{facts_text or '- (the Playbook is mostly empty)'}\n\n"
+                                    f"VIDEO SETTINGS\n" + "\n".join(lines) +
+                                    f"\n\nOWNER'S IDEA\n{idea.strip()}\n\nWrite the brief."},
+    ]
+
+
+async def expand_video(idea: str, bc: dict, platform: str = "", duration_seconds: Optional[int] = None) -> Optional[dict]:
+    """Same contract as expand() above, for the "Describe it" video flow's brief box."""
+    today = datetime.now(timezone(timedelta(hours=1)))  # Lagos time
+    req = AIService.build_ai_model(model=MODEL, temperature=0.6,
+                                   messages=build_video_messages(idea, bc, platform, duration_seconds, today))
+    try:
+        completion = await AIService.structured_chat_completion(req, response_model=_Expanded)
+        if isinstance(completion, dict) and "error" in completion:
+            print(f"[PromptExpander] video expand failed: {completion['error']}")
+            return None
+        parsed: Optional[_Expanded] = completion.choices[0].message.parsed
+    except Exception as e:
+        print(f"[PromptExpander] video expand raised: {e}")
         return None
     if not parsed or not (parsed.concept.strip() or parsed.details.strip()):
         return None

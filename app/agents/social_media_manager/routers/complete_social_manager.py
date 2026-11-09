@@ -487,6 +487,37 @@ async def expand_prompt(
     return UriResponse.get_single_data_response("expanded_prompt", result)
 
 
+class ExpandVideoPromptRequest(BaseModel):
+    idea: str
+    platform: str = ""
+    duration_seconds: Optional[int] = None
+
+
+@router.post("/expand-video-prompt")
+async def expand_video_prompt(
+    request: ExpandVideoPromptRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Same job as /expand-prompt above, for the "Describe it" video flow's own brief
+    box — a short video idea in, a fuller creative brief out, guided by the brand's
+    Playbook. Returned for the owner to review/edit — nothing is generated or charged."""
+    from app.agents.social_media_manager.services import prompt_expander
+
+    idea = (request.idea or "").strip()
+    if len(idea) < 3:
+        raise HTTPException(status_code=400, detail="Describe the video first.")
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+    result = await prompt_expander.expand_video(
+        idea[:5000], brand_context, request.platform, request.duration_seconds,
+    )
+    if not result:
+        raise HTTPException(status_code=502, detail="Jane couldn't expand that right now — try again in a moment.")
+    return UriResponse.get_single_data_response("expanded_prompt", result)
+
+
 @router.post("/generate-content")
 async def generate_content(
     request: ContentGenerationRequest,
