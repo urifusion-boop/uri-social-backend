@@ -41,11 +41,11 @@ You receive:
 Your job: study the brand images carefully, then produce a JSON video storyboard that fully embodies the selected video style.
 
 Rules:
-- The brand color palette MUST dominate every scene — no other colors allowed.
+- Brand colours are an accent, not a filter. Use them where they make sense: the logo, the product and its packaging, uniforms, signage, on-screen text, graphics, text cards and the closing call to action. Everything else — locations, skin, food, sky, nature, furniture, backgrounds — takes natural, realistic colours chosen for the mood of that scene, and the colour world should change from scene to scene. Never wash a whole scene in the brand colours.
 - video_prompt fields must be motion-aware: describe exactly what moves, camera direction, speed, and lighting.
 - APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
 - reference_image_index tells which supplied image becomes the first frame of that clip (0-based).
-- text_overlay is a short on-screen caption/tagline string, or null.
+- text_overlay is a short on-screen caption/tagline string (8 words or fewer), or null. The editor draws it, sharply, onto the finished video: NEVER describe lettering, captions, titles or text cards inside a video_prompt (a text_card shot is a clean, plain or brand-coloured backdrop that the caption is laid over).
 - shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
 
 CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
@@ -121,7 +121,7 @@ Apply a cinematic, high-fashion luxury aesthetic throughout.
 Apply a high-energy, social-native fast-cut aesthetic throughout.
 • Camera: handheld energy, quick zoom-ins, snap pans, 360° spins around product; unpredictable angles keep it fresh.
 • Pacing: cut every 0.5–1.5 seconds; match cuts to a strong beat; first 2 seconds must hook immediately.
-• Color grading: saturated, punchy, high contrast; brand colors popped to maximum vibrancy.
+• Color grading: saturated, punchy, high contrast; brand-coloured elements (product, graphics, text) popped to maximum vibrancy.
 • Composition: product fills the frame; tight crops; exaggerated close-ups.
 • Text overlays: bold, large, center-frame; 1–3 words per scene; animated (pop-on or slide-in).
 • Transitions: whip pans, zoom transitions, glitch cuts — high kinetic energy.
@@ -180,7 +180,7 @@ Prioritise atmosphere and emotional resonance over product information.
 Use dynamic, physics-defying visuals to make the product look spectacular.
 • Camera: orbiting 360° rotation around the hero product; extreme close-up fly-throughs along product surface; dramatic upward reveal from below; slow-motion splashes or bursts of brand-colored particles.
 • Pacing: fast movement with sudden freeze-frames on the most dramatic angles.
-• Color grading: high contrast, deep blacks, hyper-saturated brand colors; light trails and glow effects.
+• Color grading: high contrast, deep blacks, hyper-saturated brand-coloured product and glow accents; light trails and glow effects.
 • Composition: product isolated against solid dark or gradient backgrounds; multiple product angles layered.
 • Text overlays: product name in bold as a climactic reveal; key feature callouts with short animated labels.
 • Transitions: instant cut at peak energy moments; burst/flash transitions.
@@ -215,7 +215,7 @@ Make every scene look so good the viewer gets hungry.
 Build urgency and excitement that escalates scene by scene.
 • Camera: each scene zooms in slightly tighter than the last — start wide, end extreme close-up on product; quick snap zooms on key moments.
 • Pacing: deliberately increase cut speed across scenes (scene 1: 4s, scene 2: 3s, scene 3: 2s, final: 1s flash); final scene holds on product.
-• Color grading: pumped saturation; brand colors pushed to max; subtle red/warm vignette to signal urgency.
+• Color grading: pumped saturation; brand-coloured elements pushed to max; subtle red/warm vignette to signal urgency.
 • Composition: countdown number or timer element visible in corner; product dominant in frame.
 • Text overlays: bold countdown numbers each scene ("3…", "2…", "1…"); CTA on final frame ("Available now", "Limited drop", "Shop today").
 • Transitions: fast whip cuts, flash frames between countdown moments.
@@ -418,7 +418,7 @@ class VideoStoryboardService:
             f"Aspect ratio: 9:16 vertical",
         ]
         if color_str:
-            preamble_lines.append(f"Brand colors (STRICT — must dominate every scene): {color_str}")
+            preamble_lines.append(f"Brand colors (accents where they make sense — logo, product, packaging, graphics, text; NOT the colour of every scene): {color_str}")
         if voice:
             preamble_lines.append(f"Brand voice: {voice}")
         if region:
