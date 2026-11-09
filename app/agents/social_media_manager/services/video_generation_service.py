@@ -222,10 +222,10 @@ _MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
 
 
 # Models that are given a scene's spoken line inside the prompt and asked to say it themselves (they generate their
-# own lip-synced audio). EXPERIMENT: this lets "Complex / Cinematic" and "Advanced References" be tried on a script
-# with dialogue. Unlike the talking avatar the exact words, the voice and the accent are not guaranteed. The
+# own lip-synced audio). EXPERIMENT: this lets "Complex / Cinematic", "Advanced References" and "High Quality" be tried
+# on a script with dialogue. Unlike the talking avatar the exact words, the voice and the accent are not guaranteed. The
 # customer is not told (the clip just says Done); each such scene is logged as "SPEECH-IN-PROMPT".
-_SPEECH_IN_PROMPT_MODELS = (_WAN_3, _SEEDANCE_FAST)
+_SPEECH_IN_PROMPT_MODELS = (_WAN_3, _SEEDANCE_FAST, _OMNI_FLASH)
 
 
 def with_spoken_line(prompt: str, line: str) -> str:
