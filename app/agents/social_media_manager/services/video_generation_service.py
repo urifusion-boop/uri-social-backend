@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.database import get_db
 from app.utils.s3_upload import upload_bytes, upload_file_path
 from app.agents.social_media_manager.services import yarngpt_tts_service
+from app.agents.social_media_manager.services.people_consistency import with_face_stability
 
 # Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
 # (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
@@ -551,6 +552,10 @@ class VideoGenerationService:
             raise ValueError(f"Unknown video model: {model}")
 
         prompt = scene.get("video_prompt", "")
+        if model not in (_AVATAR_TALKING, _NG_LIPSYNC):
+            # Faces melt and morph in image-to-video unless told to hold still; the talking models are driven by
+            # the voice, not this prompt.
+            prompt = with_face_stability(prompt)
         duration_req = scene.get("duration_seconds", 5)
         scene_num = scene.get("scene_number")
         actual_seconds: float

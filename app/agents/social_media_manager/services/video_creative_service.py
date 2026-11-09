@@ -11,6 +11,12 @@ import httpx
 from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.s3_upload import upload_bytes
+from app.agents.social_media_manager.services.people_consistency import (
+    IDENTITY_LOCK,
+    PEOPLE_ON_SCREEN_RULES,
+    PEOPLE_RULES_PLACEHOLDER,
+    scene_has_people,
+)
 from app.agents.social_media_manager.services.video_storyboard_service import (
     VideoStoryboardService,
     VIDEO_STYLE_DIRECTIVES,
@@ -80,6 +86,8 @@ continuous story and must read that way end to end:
     scene 1 dialogue: "Welcome to my shop!"
     scene 2 dialogue: "Buy now and save 20%."
 
+{{PEOPLE_RULES}}
+
 OUTCOME — also choose which kind of video will render this concept best (suggested_outcome, ONE slug from the list)
 and say why in outcome_reason: one short plain sentence a customer can read, naming no AI models or tools. Choose
 the CHEAPEST type that fully delivers the creative direction; step up only when the concept truly needs it.
@@ -114,7 +122,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
       "dialogue": <string spoken on camera this scene, or null>
     }
   ]
-}"""
+}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES)
 
 
 VIDEO_OUTCOMES = (
@@ -456,11 +464,17 @@ class VideoCreativeService:
         col = _frame_jobs_collection()
         reference_images = reference_images or []
         prev_image_url: Optional[str] = None
+        # The first frame that shows a person. Every later frame with people copies their faces from it as
+        # well as from the previous frame: chaining only off the previous frame re-draws a face from a
+        # re-drawn copy each time, and by scene 4 it is a different person.
+        identity_url: Optional[str] = None
         for scene in scenes:
             url = await VideoCreativeService._generate_scene_frame(
-                scene, reference_images, prev_image_url, brand_context)
+                scene, reference_images, prev_image_url, brand_context, identity_url)
             if url:
                 prev_image_url = url
+                if identity_url is None and scene_has_people(scene):
+                    identity_url = url
                 await col.update_one(
                     {"job_id": job_id},
                     {"$push": {"frames": {
@@ -479,6 +493,7 @@ class VideoCreativeService:
     async def _generate_scene_frame(
         scene: dict, reference_images: List[str], prev_image_url: Optional[str],
         brand_context: Optional[Dict[str, Any]] = None,
+        identity_url: Optional[str] = None,
     ) -> Optional[str]:
         try:
             shot = scene.get("shot_type", "").replace("_", " ")
@@ -509,17 +524,48 @@ class VideoCreativeService:
                     "Keep the same subject, setting, and visual style as this image — "
                     "this is the next moment in the same continuous scene. " + prompt
                 )
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda: openai_client.images.edit(
-                        image=VideoCreativeService._as_file(img_bytes),
-                        model="gpt-image-2",
-                        prompt=chained_prompt,
-                        n=1,
-                        size="1024x1536",
-                        quality="medium",
-                    ),
-                )
+                # A frame with people also gets the first frame they appeared in (and the owner's own photo),
+                # so faces are copied from the source, not from a copy of a copy.
+                identity_images: List[bytes] = []
+                if scene_has_people(scene):
+                    if identity_url and identity_url != prev_image_url:
+                        identity_images.append(await VideoCreativeService._download_image_bytes(identity_url))
+                    if reference_images:
+                        try:
+                            identity_images.append(VideoStoryboardService._decode_brand_image(reference_images[0]))
+                        except Exception as e:
+                            print(f"[CreativeFrame] owner photo not usable as an identity reference: {e}")
+
+                async def _chain_edit(images: List[bytes], text: str):
+                    files = [VideoCreativeService._as_file(b) for b in images]
+                    return await loop.run_in_executor(
+                        None,
+                        lambda: openai_client.images.edit(
+                            image=files if len(files) > 1 else files[0],
+                            model="gpt-image-2",
+                            prompt=text,
+                            n=1,
+                            size="1024x1536",
+                            quality="medium",
+                        ),
+                    )
+
+                if identity_images:
+                    try:
+                        resp = await _chain_edit(
+                            [img_bytes] + identity_images,
+                            "Image 1 is the previous moment of this same continuous scene: keep its setting and "
+                            "visual style. The other image(s) show the people who must look identical here "
+                            "(the first frame they appeared in, and/or the owner's own photo). "
+                            + IDENTITY_LOCK + " " + prompt,
+                        )
+                    except Exception as e:
+                        # The extra references are a bonus; never lose the frame over them.
+                        print(f"[CreativeFrame] Scene {scene.get('scene_number')}: identity references "
+                              f"failed ({e}); redrawing from the previous frame only")
+                        resp = await _chain_edit([img_bytes], chained_prompt)
+                else:
+                    resp = await _chain_edit([img_bytes], chained_prompt)
             elif reference_images:
                 img_bytes = VideoStoryboardService._decode_brand_image(reference_images[0])
                 grounded_prompt = (
