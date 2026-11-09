@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -344,10 +345,22 @@ async def _retry_transient(call, what: str, attempts: int = 4, base_delay: float
 # this is several minutes: the request keeps running on fal's side the whole time.
 _MAX_CONSECUTIVE_POLL_FAILURES = 20
 
-# How much longer a clip that is ALREADY RENDERING on fal (and so billed) is waited for after its model's normal
-# ceiling, instead of being abandoned and re-rendered. A request still queued at the ceiling has not started and is
-# cancelled free of charge.
-_RECOVERY_WAIT_SECONDS = 900
+class ClipStillRendering(TimeoutError):
+    """A clip passed its model's normal ceiling but fal is STILL RENDERING it (and billing for it), so it will arrive.
+    It is neither failed nor re-rendered: the job moves on to the next scene and a watcher delivers this clip when fal
+    finishes it, then tells the customer. Carries what the watcher needs."""
+
+    def __init__(self, message: str, request_id: Optional[str] = None, handle: Any = None, model: Optional[str] = None):
+        super().__init__(message)
+        self.request_id, self.handle, self.model = request_id, handle, model
+        self.actual_seconds: Optional[float] = None
+
+
+# A late clip is watched for this long before it is given up on (and its credits returned by the settle sweep).
+_LATE_CLIP_MAX_SECONDS = 3600
+_LATE_CLIP_POLL_SECONDS = 15
+# Late-clip watchers live in this process; keep a reference so they are not garbage-collected mid-wait.
+_late_clip_tasks: set = set()
 
 
 def _jobs_collection():
@@ -453,6 +466,11 @@ class VideoGenerationService:
                 )
                 routed_model = primary_model
             except Exception as primary_error:
+                if isinstance(primary_error, ClipStillRendering):
+                    # Still rendering on fal (and billed): deliver it when it lands; don't fail it or re-render it.
+                    await VideoGenerationService._hand_off_late_clip(job_id, col, scene, base_fields, outcome,
+                                                                     primary_error, started)
+                    continue
                 # The talking-avatar model routinely takes 3-12+ minutes to
                 # complete even on success (fal.ai's own request history,
                 # live-confirmed 2026-10-06) — a client-side timeout there
@@ -536,6 +554,10 @@ class VideoGenerationService:
                     )
                     routed_model = fallback_model
                     fallback_used = True
+                except ClipStillRendering as late:
+                    await VideoGenerationService._hand_off_late_clip(job_id, col, scene, base_fields, outcome,
+                                                                     late, started)
+                    continue
                 except Exception as fallback_error:
                     latency = round(time.monotonic() - started, 2)
                     print(f"[VideoGenJob {job_id}] Scene {scene_num}: fallback {fallback_model} "
@@ -564,10 +586,10 @@ class VideoGenerationService:
                 "latency_seconds": latency,
             }}})
 
-        await col.update_one(
-            {"job_id": job_id},
-            {"$set": {"status": "complete", "current_scene": len(scenes)}},
-        )
+        # Every scene has been dispatched. Complete the job now, unless a clip is still rendering on fal: then it stays
+        # "generating" (so the page keeps polling and nothing can be merged early) until the last late clip lands.
+        await col.update_one({"job_id": job_id}, {"$set": {"dispatch_done": True, "current_scene": len(scenes)}})
+        await VideoGenerationService._complete_if_done(job_id)
 
     # ── fal.ai — every model in MODEL_REGISTRY goes through this one entry
     #    point. Each model's request shape genuinely differs (confirmed from
@@ -577,6 +599,169 @@ class VideoGenerationService:
     #    models have no resolution/audio toggle beyond a 480P/768P/1080P enum
     #    (audio is automatic, not optional) — so this dispatches per model id
     #    rather than pretending they share one shape. ───────────────────────
+
+    @staticmethod
+    async def _store_clip(result: Dict[str, Any], model: str, actual_seconds: float) -> tuple[str, Optional[float]]:
+        """Download a finished clip from fal and save it to our own storage. Returns (our url, what it cost)."""
+        info = MODEL_REGISTRY[model]
+        video_url = result["video"]["url"]
+
+        # Stream the download straight to a temp file and upload FROM that
+        # file (upload_file_path streams it in chunks too) — never holds the
+        # whole clip in memory at once, unlike the old `.content` + bytes
+        # upload. Confirmed live: that pattern was large and frequent enough,
+        # combined with glibc not returning freed memory to the OS inside
+        # the container, to ratchet process memory up until the kernel
+        # OOM-killed a uvicorn worker. See upload_file_path's docstring.
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp4")
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream("GET", video_url) as video_resp:
+                    video_resp.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in video_resp.aiter_bytes():
+                            f.write(chunk)
+
+            stored_url = await upload_file_path(
+                tmp_path,
+                folder="uri-social/generated-videos",
+                resource_type="video",
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        cost_usd = round(actual_seconds * info["cost_per_second"], 3)
+        return stored_url, cost_usd
+
+    @staticmethod
+    async def _hand_off_late_clip(job_id: str, col, scene: dict, base_fields: dict, outcome: str,
+                                  late: "ClipStillRendering", started: float) -> None:
+        """A clip is still rendering on fal. Record it as pending, start a watcher that delivers it when it lands, and
+        let the job carry on with the other scenes."""
+        scene_num = scene.get("scene_number")
+        await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+            **base_fields,
+            "video_url": None,
+            "cost_usd": None,
+            "outcome": outcome,
+            "routed_model": late.model,
+            "fallback_used": False,
+            "pending": True,
+            "pending_since": datetime.utcnow(),
+            "fal_request_id": late.request_id,
+            "latency_seconds": round(time.monotonic() - started, 2),
+        }}})
+        print(f"[VideoGenJob {job_id}] Scene {scene_num}: {late.model} is still rendering (request {late.request_id}); "
+              f"moving on, it will be delivered and the user told when it finishes", flush=True)
+        task = asyncio.create_task(VideoGenerationService._watch_late_clip(job_id, scene_num, late))
+        _late_clip_tasks.add(task)
+        task.add_done_callback(_late_clip_tasks.discard)
+
+    @staticmethod
+    async def _watch_late_clip(job_id: str, scene_num: Any, late: "ClipStillRendering") -> None:
+        """Wait for a clip fal is still rendering, save it, tell the customer. Never raises."""
+        model, handle = late.model, late.handle
+        started = time.monotonic()
+        result, error, failures = None, None, 0
+        try:
+            while True:
+                if time.monotonic() - started > _LATE_CLIP_MAX_SECONDS:
+                    error = f"still not finished after {_LATE_CLIP_MAX_SECONDS // 60} minutes"
+                    break
+                try:
+                    status = await handle.status(with_logs=False)
+                    failures = 0
+                except Exception as e:
+                    failures += 1
+                    if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                        error = f"lost contact with {model} ({e})"
+                        break
+                    await asyncio.sleep(min(_LATE_CLIP_POLL_SECONDS * failures, 60))
+                    continue
+                if type(status).__name__ == "Completed":
+                    if getattr(status, "error", None):
+                        error = f"{model} failed: {status.error}"
+                        break
+                    try:
+                        result = await _retry_transient(lambda: handle.get(), f"{model} fetch late result", attempts=5)
+                    except Exception as e:
+                        error = f"{model} finished but its result could not be fetched ({e})"
+                    break
+                await asyncio.sleep(_LATE_CLIP_POLL_SECONDS)
+
+            stored_url = cost = None
+            if result is not None:
+                try:
+                    stored_url, cost = await VideoGenerationService._store_clip(
+                        result, model, late.actual_seconds or 5)
+                except Exception as e:
+                    error = f"{model} finished but the clip could not be saved ({e})"
+            col = _jobs_collection()
+            if stored_url:
+                await col.update_one({"job_id": job_id, "clips.scene_number": scene_num}, {"$set": {
+                    "clips.$.video_url": stored_url, "clips.$.cost_usd": cost, "clips.$.pending": False,
+                    "clips.$.late": True, "clips.$.error": None,
+                }})
+                print(f"[VideoGenJob {job_id}] Scene {scene_num}: late clip delivered after "
+                      f"{time.monotonic() - started:.0f}s more", flush=True)
+            else:
+                await col.update_one({"job_id": job_id, "clips.scene_number": scene_num}, {"$set": {
+                    "clips.$.pending": False, "clips.$.error": f"{error or 'the clip did not arrive'}. "
+                    "Your credits for this scene are returned; you can regenerate it.",
+                }})
+                print(f"[VideoGenJob {job_id}] Scene {scene_num}: late clip lost: {error}", flush=True)
+            await VideoGenerationService._complete_if_done(job_id)
+            await VideoGenerationService._notify_late_clip(job_id, scene_num, delivered=bool(stored_url))
+        except Exception as e:  # a watcher must never take the server down
+            print(f"[VideoGenJob {job_id}] late-clip watcher for scene {scene_num} crashed: {type(e).__name__}: {e}", flush=True)
+
+    @staticmethod
+    async def _complete_if_done(job_id: str) -> None:
+        """Mark the job complete once every scene has been dispatched and none is still pending. Atomic, so whichever
+        of the job loop and the late-clip watchers finishes last is the one that completes it."""
+        await _jobs_collection().update_one(
+            {"job_id": job_id, "dispatch_done": True, "status": "generating",
+             "clips": {"$not": {"$elemMatch": {"pending": True}}}},
+            {"$set": {"status": "complete"}},
+        )
+        await VideoGenerationService._settle_when_finished(job_id)
+
+    @staticmethod
+    async def _settle_when_finished(job_id: str) -> None:
+        """Close the credits once the job is truly over (billing itself holds back while a clip is pending)."""
+        try:
+            from app.agents.social_media_manager.services import video_generation_billing as billing
+            job = await _jobs_collection().find_one({"job_id": job_id}, {"status": 1, "dispatch_done": 1})
+            if job and job.get("dispatch_done") and job.get("status") in ("complete", "failed"):
+                await billing.settle(job_id)
+        except Exception as e:
+            print(f"[VideoGenJob {job_id}] settlement after a late clip failed: {type(e).__name__}: {e}", flush=True)
+
+    @staticmethod
+    async def _notify_late_clip(job_id: str, scene_num: Any, delivered: bool) -> None:
+        """Tell the customer in-app (the bell) that a slow clip is ready. Best effort."""
+        try:
+            job = await _jobs_collection().find_one({"job_id": job_id}, {"user_id": 1, "status": 1}) or {}
+            user_id = job.get("user_id")
+            if not user_id:
+                return
+            from app.services.NotificationService import notification_service
+            if delivered:
+                message = (f"Scene {scene_num} of your video has finished rendering. "
+                           + ("All your clips are ready, so you can merge them now." if job.get("status") == "complete"
+                              else "Open the video page to see it."))
+                subject = "Your video clip is ready"
+            else:
+                message = (f"Scene {scene_num} of your video could not be finished. Your credits for it were returned, "
+                           "and you can regenerate that scene.")
+                subject = "A video clip could not be finished"
+            await notification_service._log_notification(
+                user_id=user_id, notification_type="video_clip_ready", channel="email", subject=subject,
+                status="sent", metadata={"job_id": job_id, "scene_number": scene_num, "message": message,
+                                         "delivered": delivered},
+            )
+        except Exception as e:
+            print(f"[VideoGenJob {job_id}] could not send the clip-ready notification: {type(e).__name__}: {e}", flush=True)
 
     @staticmethod
     async def _generate_scene_with_retry(
@@ -686,23 +871,22 @@ class VideoGenerationService:
             if elapsed > timeout_seconds:
                 # Not finished at the model's normal ceiling. A request still QUEUED has not started, so it is
                 # cancelled free of charge and the scene can safely move to a fallback. One already RENDERING is
-                # being billed and will finish, so keep waiting for it instead of abandoning it (and paying again
-                # for a re-render): only cancel after the extra recovery window.
-                if state == "Queued" or elapsed > timeout_seconds + _RECOVERY_WAIT_SECONDS:
-                    if col is not None:
-                        await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
-                    try:
-                        await handle.cancel()
-                    except Exception as cancel_err:
-                        print(f"[VideoGen] Scene {scene_num}: could not cancel {model} ({cancel_err})", flush=True)
-                    err = TimeoutError(
-                        f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
-                    )
-                    err.request_id = request_id
-                    raise err
-                if elapsed - 5 <= timeout_seconds:   # log once, as it crosses the ceiling
-                    print(f"[VideoGen] Scene {scene_num}: {model} still rendering past {timeout_seconds}s; "
-                          f"waiting up to {_RECOVERY_WAIT_SECONDS}s more rather than re-rendering it", flush=True)
+                # being billed and will finish: hand it off to be delivered when it does, instead of abandoning it
+                # (and paying again for a re-render) or holding up the other scenes.
+                if col is not None:
+                    await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
+                if state != "Queued":
+                    raise ClipStillRendering(
+                        f"{model} is still rendering after {timeout_seconds}s", request_id, handle, model)
+                try:
+                    await handle.cancel()
+                except Exception as cancel_err:
+                    print(f"[VideoGen] Scene {scene_num}: could not cancel {model} ({cancel_err})", flush=True)
+                err = TimeoutError(
+                    f"{model} did not start within {timeout_seconds}s (last known state: {last_state})"
+                )
+                err.request_id = request_id
+                raise err
 
             if col is not None:
                 await col.update_one({"job_id": job_id}, {"$set": {
@@ -977,6 +1161,9 @@ class VideoGenerationService:
                 model, arguments, model_timeout, scene_num, job_id
             )
         except Exception as e:
+            if isinstance(e, ClipStillRendering):
+                e.actual_seconds = actual_seconds
+                raise
             err_str = str(e)
             has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
             if has_audio_toggle and (
@@ -1015,31 +1202,4 @@ class VideoGenerationService:
         if model == _NG_LIPSYNC and isinstance(result.get("duration"), (int, float)):
             actual_seconds = result["duration"]  # real figure, replacing the word-count estimate above
 
-        video_url = result["video"]["url"]
-
-        # Stream the download straight to a temp file and upload FROM that
-        # file (upload_file_path streams it in chunks too) — never holds the
-        # whole clip in memory at once, unlike the old `.content` + bytes
-        # upload. Confirmed live: that pattern was large and frequent enough,
-        # combined with glibc not returning freed memory to the OS inside
-        # the container, to ratchet process memory up until the kernel
-        # OOM-killed a uvicorn worker. See upload_file_path's docstring.
-        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp4")
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                async with client.stream("GET", video_url) as video_resp:
-                    video_resp.raise_for_status()
-                    with open(tmp_path, "wb") as f:
-                        async for chunk in video_resp.aiter_bytes():
-                            f.write(chunk)
-
-            stored_url = await upload_file_path(
-                tmp_path,
-                folder="uri-social/generated-videos",
-                resource_type="video",
-            )
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        cost_usd = round(actual_seconds * info["cost_per_second"], 3)
-        return stored_url, cost_usd
+        return await VideoGenerationService._store_clip(result, model, actual_seconds)

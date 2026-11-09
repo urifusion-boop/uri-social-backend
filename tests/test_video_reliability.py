@@ -173,21 +173,19 @@ def test_a_request_still_queued_at_the_ceiling_is_cancelled_free_and_can_fall_ba
     assert fal.handle.cancelled == 1 and e.value.request_id == "req-1"
 
 
-def test_a_clip_that_is_already_rendering_is_waited_for_past_the_ceiling_not_abandoned(fal, clock):
-    """Seedance: still InProgress at 300s, finished at 311s and 346s. It is billed either way, so wait for it."""
-    fal.handle = _Handle([InProgress] * 5 + [Completed])
-    out = _run(V.VideoGenerationService._submit_and_poll("m", {}, 10, 1))      # ceiling 10s, finishes at 25s
-    assert out["video"]["url"] == "https://v/1.mp4"
-    assert fal.handle.cancelled == 0 and fal.submitted == ["m"]
-
-
-def test_a_clip_still_rendering_after_the_recovery_window_is_cancelled_and_its_id_kept(fal, clock, monkeypatch):
-    monkeypatch.setattr(V, "_RECOVERY_WAIT_SECONDS", 10)
+def test_a_clip_that_is_already_rendering_at_the_ceiling_is_handed_off_not_abandoned(fal, clock):
+    """Seedance sat InProgress at 300s and finished at 311s and 346s. It is billed either way, so it is neither failed
+    nor re-rendered: the job moves on and the clip is delivered when it lands (see test_video_late_clips.py)."""
     fal.handle = _Handle([InProgress] * 100)
-    with pytest.raises(TimeoutError) as e:
+    with pytest.raises(V.ClipStillRendering) as e:
         _run(V.VideoGenerationService._submit_and_poll("m", {}, 10, 1))
-    assert fal.handle.cancelled == 1 and e.value.request_id == "req-1"
-    assert clock[0] > 20
+    assert e.value.request_id == "req-1" and e.value.handle is fal.handle and e.value.model == "m"
+    assert fal.handle.cancelled == 0 and fal.submitted == ["m"]          # not cancelled, not sent again
+
+
+def test_a_clip_that_finishes_before_the_ceiling_is_unaffected(fal, clock):
+    fal.handle = _Handle([InProgress, InProgress, Completed])
+    assert _run(V.VideoGenerationService._submit_and_poll("m", {}, 100, 1))["video"]
 
 
 def test_the_fal_request_id_is_saved_on_the_job_so_a_late_clip_can_be_found(fal, monkeypatch):
