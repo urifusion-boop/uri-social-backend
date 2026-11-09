@@ -3778,7 +3778,14 @@ async def _build_campaign_plan(
     if _runs_on_meta(plan):
         from .preflight import meta_warnings
         warnings = await meta_warnings(plan)
-    elif plan.geo and (plan.geo.city or plan.geo.pins):
+    elif _runs_on_tiktok(plan) and plan.geo and (plan.geo.city or plan.geo.pins):
+        # Was `elif plan.geo and (...)` with no platform check at all — "not
+        # Meta" also matches Google, so a Google plan fell straight into this
+        # branch and got TikTok's own location-targeting caveat attached to
+        # it (confirmed live: a tester's Lagos-targeted plan landed on Google
+        # Search and still showed "TikTok can only target all of Nigeria...
+        # choose Instagram & Facebook instead" — nonsensical on a plan that
+        # was never TikTok).
         from .preflight import tiktok_location_warning
         warnings = [tiktok_location_warning(plan.geo)]
 
@@ -3794,6 +3801,10 @@ async def _build_campaign_plan(
 
 def _runs_on_meta(plan: CampaignPlan) -> bool:
     return bool(plan.platforms) and plan.platforms[0].platform == Platform.META
+
+
+def _runs_on_tiktok(plan: CampaignPlan) -> bool:
+    return bool(plan.platforms) and plan.platforms[0].platform == Platform.TIKTOK
 
 
 def _tiktok_budget_too_low_message(budget_ngn: float) -> str:
