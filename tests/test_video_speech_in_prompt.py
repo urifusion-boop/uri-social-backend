@@ -98,4 +98,9 @@ def test_the_note_reaches_the_clip_as_its_warning(monkeypatch):
     story = {"scenes": [{"scene_number": 1, "duration_seconds": 5, "video_prompt": "x", "dialogue": "Hi",
                          "frame_image_url": "u"}]}
     _run(V.VideoGenerationService.run_job("J1", story, [], "advanced_references"))
-    assert clips[0]["warning"] == V.SPEECH_IN_PROMPT_NOTE and clips[0]["routed_model"] == V._SEEDANCE_FAST
+    assert clips[0]["warning"] is None and clips[0]["routed_model"] == V._SEEDANCE_FAST
+    assert clips[0]["fallback_used"] is False
+
+
+def test_seedance_is_given_longer_than_the_default_to_finish():
+    assert V._MODEL_TIMEOUT_OVERRIDES[V._SEEDANCE_FAST] == 900 > V._FAL_SUBSCRIBE_TIMEOUT_SECONDS

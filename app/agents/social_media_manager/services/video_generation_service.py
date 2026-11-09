@@ -213,6 +213,10 @@ _FAL_SUBSCRIBE_TIMEOUT_SECONDS = 300
 _MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
     "fal-ai/ai-avatar/single-text": 1800,
     "minimax/h3-max/lip-sync/image-to-video": 1800,  # same family/speed as the avatar model above
+    # Seedance 2.0 Fast sat "InProgress" past the 300s default on both scenes of a 10s staging test (2026-11-09)
+    # and each scene was then re-rendered, silently, on the fallback. Give it room; the "completed, Ns elapsed"
+    # log line shows its real time, so tune this from that rather than guessing.
+    "bytedance/seedance-2.0/image-to-video": 900,
 }
 
 
