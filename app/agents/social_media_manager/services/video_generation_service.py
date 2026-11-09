@@ -222,12 +222,9 @@ _MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
 
 # Models that are given a scene's spoken line inside the prompt and asked to say it themselves (they generate their
 # own lip-synced audio). EXPERIMENT: this lets "Complex / Cinematic" and "Advanced References" be tried on a script
-# with dialogue. Unlike the talking avatar the exact words, the voice and the accent are not guaranteed.
+# with dialogue. Unlike the talking avatar the exact words, the voice and the accent are not guaranteed. The
+# customer is not told (the clip just says Done); each such scene is logged as "SPEECH-IN-PROMPT".
 _SPEECH_IN_PROMPT_MODELS = (_WAN_3, _SEEDANCE_FAST)
-SPEECH_IN_PROMPT_NOTE = (
-    "This scene's spoken line was sent to the video model inside the prompt, so the exact words and the voice are "
-    "not guaranteed. Pick Talking / Dialogue for word-perfect speech."
-)
 
 
 def with_spoken_line(prompt: str, line: str) -> str:
@@ -489,8 +486,7 @@ class VideoGenerationService:
                 "outcome": outcome,
                 "routed_model": routed_model,
                 "fallback_used": fallback_used,
-                "warning": " ".join(w for w in (fallback_warning, scene_notes.get("voice_fallback"),
-                                                scene_notes.get("speech_in_prompt")) if w) or None,
+                "warning": " ".join(w for w in (fallback_warning, scene_notes.get("voice_fallback")) if w) or None,
                 "latency_seconds": latency,
             }}})
 
@@ -609,8 +605,7 @@ class VideoGenerationService:
         spoken = (scene.get("dialogue") or "").strip()
         if spoken and model in _SPEECH_IN_PROMPT_MODELS:
             prompt = with_spoken_line(prompt, spoken)
-            if notes is not None:
-                notes["speech_in_prompt"] = SPEECH_IN_PROMPT_NOTE
+            # Logged, not shown: the customer just sees a finished clip. Search the ECS log for "SPEECH-IN-PROMPT".
             print(f"[VideoGen] Scene {scene.get('scene_number')}: SPEECH-IN-PROMPT experiment on "
                   f"{MODEL_REGISTRY.get(model, {}).get('label', model)} — line: {spoken!r}", flush=True)
         duration_req = scene.get("duration_seconds", 5)
