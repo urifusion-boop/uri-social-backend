@@ -2799,7 +2799,8 @@ async def _build_campaign_plan(
         parsed = await consult(body.message, known_business_name, known_category,
                                known_budget, thread_turns, offering=known_offering,
                                stated_audience=own_audience,
-                               objective_label=_objective_label(body.objective))
+                               objective_label=_objective_label(body.objective),
+                               budget_override=body.budget_ngn_override)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
