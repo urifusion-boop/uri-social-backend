@@ -354,9 +354,14 @@ class VideoStoryboardService:
         last_frame_by_subject: Dict[int, str] = {}
         for scene in scenes:
             ref_idx = scene.get("reference_image_index", 0)
-            url = await VideoStoryboardService._generate_scene_frame(
-                scene, brand_images, chained_frame_url=last_frame_by_subject.get(ref_idx)
-            )
+            # A scene with no frame cannot become a clip at all, so a failed picture gets one more try.
+            url = None
+            for _attempt in range(2):
+                url = await VideoStoryboardService._generate_scene_frame(
+                    scene, brand_images, chained_frame_url=last_frame_by_subject.get(ref_idx)
+                )
+                if url:
+                    break
             if url:
                 last_frame_by_subject[ref_idx] = url
                 await col.update_one(

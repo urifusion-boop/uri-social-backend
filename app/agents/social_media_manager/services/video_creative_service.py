@@ -469,8 +469,13 @@ class VideoCreativeService:
         # re-drawn copy each time, and by scene 4 it is a different person.
         identity_url: Optional[str] = None
         for scene in scenes:
-            url = await VideoCreativeService._generate_scene_frame(
-                scene, reference_images, prev_image_url, brand_context, identity_url)
+            # A scene with no frame cannot become a clip at all, so a failed picture gets one more try.
+            url = None
+            for _attempt in range(2):
+                url = await VideoCreativeService._generate_scene_frame(
+                    scene, reference_images, prev_image_url, brand_context, identity_url)
+                if url:
+                    break
             if url:
                 prev_image_url = url
                 if identity_url is None and scene_has_people(scene):

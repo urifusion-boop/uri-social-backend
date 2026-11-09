@@ -95,6 +95,7 @@ class _Col:
 
 def _run_job(monkeypatch, outcome, failing):
     col, used = _Col(), []
+    monkeypatch.setattr(V, "_RETRY_PAUSE_SECONDS", 0)
 
     async def fake_scene(scene, model, voice, job_id, notes=None):
         used.append(model)
@@ -111,7 +112,7 @@ def _run_job(monkeypatch, outcome, failing):
 
 def test_a_failed_high_quality_scene_is_recorded_as_failed_with_no_second_model(monkeypatch):
     col, used = _run_job(monkeypatch, "high_quality", failing={OMNI})
-    assert used == [OMNI]                                    # no other model was tried
+    assert used == [OMNI, OMNI]                              # one more try on the SAME model, then nothing else
     clip = col.clips[0]
     assert clip["video_url"] is None and clip["routed_model"] is None and clip["fallback_used"] is False
     assert "exploded" in clip["error"]
@@ -126,5 +127,5 @@ def test_a_successful_high_quality_scene_is_delivered_by_omni_flash(monkeypatch)
 
 def test_other_outcomes_still_fall_back_when_the_first_model_fails(monkeypatch):
     col, used = _run_job(monkeypatch, "quick_video", failing={V._H3_TURBO})
-    assert used == [V._H3_TURBO, V._PIXVERSE]
+    assert used == [V._H3_TURBO, V._H3_TURBO, V._PIXVERSE]      # the first model gets a second try before the fallback
     assert col.clips[0]["fallback_used"] is True and col.clips[0]["routed_model"] == V._PIXVERSE
