@@ -20,6 +20,8 @@ from app.utils.s3_upload import upload_bytes
 # at roughly 1/8th the per-token cost — see video_generation_service.py's
 # identical fail-soft client-init pattern, reused here rather than duplicated
 # differently.
+from .people_consistency import PEOPLE_ON_SCREEN_RULES, PEOPLE_RULES_PLACEHOLDER
+
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -76,6 +78,8 @@ continuous story and must read that way end to end:
     scene 1 dialogue: "Welcome to my shop!"
     scene 2 dialogue: "Buy now and save 20%."
 
+{{PEOPLE_RULES}}
+
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
   "total_duration_seconds": <int>,
@@ -94,7 +98,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
       "dialogue": <string spoken on camera this scene, or null>
     }
   ]
-}"""
+}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES)
 
 VIDEO_STYLE_DIRECTIVES: Dict[str, str] = {
     "clean_commercial": """VIDEO STYLE — CLEAN COMMERCIAL:
