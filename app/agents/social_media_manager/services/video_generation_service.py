@@ -65,6 +65,13 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "label": "Veo 3.1 Fast",
         "cost_per_second": 0.1499,
     },
+    # Google's current multimodal video model (the successor line to Veo; fal's Veo 3 is retired and Veo 3.1 is
+    # being removed on 2026-11-17). The "High Quality" outcome's model. Price is fal's published 720p rate
+    # (2026-11-09: $0.0819/s, native audio included); not yet checked against a real billed call.
+    "google/gemini-omni-flash/v1.2/image-to-video": {
+        "label": "Gemini Omni Flash",
+        "cost_per_second": 0.0819,
+    },
     "bytedance/seedance-2.0/image-to-video": {
         "label": "Seedance 2.0 Fast",
         "cost_per_second": 0.2419,
@@ -102,6 +109,7 @@ _H3_MAX = "minimax/h3-max/image-to-video"
 _WAN_3 = "alibaba/wan-3.0/image-to-video"
 _VEO_FAST = "fal-ai/veo3.1/fast/image-to-video"
 _SEEDANCE_FAST = "bytedance/seedance-2.0/image-to-video"
+_OMNI_FLASH = "google/gemini-omni-flash/v1.2/image-to-video"
 _AVATAR_TALKING = "fal-ai/ai-avatar/single-text"
 _NG_LIPSYNC = "minimax/h3-max/lip-sync/image-to-video"
 
@@ -155,8 +163,10 @@ OUTCOME_ROUTES: Dict[str, Dict[str, Any]] = {
     "high_quality": {
         "label": "High Quality",
         "description": "Premium brand shots and hero creative.",
-        "primary": _H3_MAX,
-        "fallback": _WAN_3,
+        "primary": _OMNI_FLASH,
+        # No fallback, on purpose and for now: a High Quality scene that fails is reported as failed (and refunded)
+        # rather than quietly re-rendered on a lesser model the customer did not pick.
+        "fallback": None,
     },
     "complex_cinematic": {
         "label": "Complex / Cinematic",
@@ -401,6 +411,20 @@ class VideoGenerationService:
                         ),
                     }}})
                     continue
+                if fallback_model is None:
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
+                          f"({primary_error}); this outcome has no fallback")
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": False,
+                        "latency_seconds": round(time.monotonic() - started, 2),
+                        "error": f"{primary_model}: {primary_error}",
+                    }}})
+                    continue
                 print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
                       f"({primary_error}), falling back to {fallback_model}")
                 # Record WHY it fell back even when the fallback itself succeeds —
@@ -629,6 +653,18 @@ class VideoGenerationService:
                 "generate_audio": True,  # brief's own ₦199/sec figure is priced "Fast + audio"
             }
             print(f"[VideoGen] Scene {scene_num}: Veo 3.1 Fast, {seconds}s")
+
+        elif model == _OMNI_FLASH:
+            seconds = max(3, min(15, int(duration_req)))  # 3-15s, an integer (not "5s" like Veo)
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+                "aspect_ratio": "9:16",
+                "resolution": "720p",  # audio is built in; this schema has no audio, negative-prompt or seed switch
+            }
+            print(f"[VideoGen] Scene {scene_num}: Gemini Omni Flash, {seconds}s")
 
         elif model == _SEEDANCE_FAST:
             seconds = max(4, min(15, duration_req))
