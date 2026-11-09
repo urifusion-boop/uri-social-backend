@@ -294,7 +294,9 @@ class VideoStoryboardService:
                 f"{video_prompt} "
                 f"Camera movement: {motion}. "
                 + (f"Continuity with the surrounding scenes: {continuity}. " if continuity else "")
-                + (f'On-screen text: "{text}". ' if text else "")
+                # Drawn onto the finished clip by ffmpeg (video_text_overlay.py), not by the image model.
+                + ("The on-screen text is added in editing, so draw NO text, captions, titles or lettering of your own in the "
+                "picture, and keep the lower third of the frame calm and uncluttered. " if text else "")
                 + "Keep the brand product, colors, and visual identity exactly as shown. "
                 "Photorealistic, dramatic lighting. Vertical 9:16 composition."
             )
