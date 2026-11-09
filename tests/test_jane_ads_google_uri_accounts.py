@@ -55,10 +55,19 @@ class Coll:
 
 class Db:
     def __init__(self):
+        # self.c is the URI-accounts collection specifically — every existing
+        # test pokes it directly via db.c.docs. TestTheTwoWays also exercises
+        # google_flow's own "jane_ads_google_settings" collection (set_mode/
+        # get_mode); that needs real per-name isolation, not the single shared
+        # collection this fake used to hand back for every name, or a mode doc
+        # and a URI-account doc sharing one brand_id collide with each other.
         self.c = Coll()
+        self._colls = {ua.COLLECTION: self.c}
 
     def __getitem__(self, name):
-        return self.c
+        if name not in self._colls:
+            self._colls[name] = Coll()
+        return self._colls[name]
 
 
 def account(cid, brand=None, billing=True, currency="NGN"):
@@ -139,8 +148,10 @@ class TestLaunchingThere:
 
     def test_no_free_account_is_a_plain_message(self, monkeypatch):
         monkeypatch.setattr(gf.settings, "GOOGLE_ADS_DEVELOPER_TOKEN", "dev", raising=False)
+        db = Db()
+        run(gf.set_mode(db, "b1", "uri"))
         with pytest.raises(HTTPException) as e:
-            run(gf.adapter_for_launch(Db(), {"brand_id": "b1"}))
+            run(gf.adapter_for_launch(db, {"brand_id": "b1"}))
         assert e.value.status_code == 409 and "aren't available just yet" in e.value.detail
 
 
@@ -148,11 +159,14 @@ class TestTheTwoWays:
     """'uri': URI's account, nothing to connect, wallet pays all.
     'own': the brand's account, Google bills them the spend, wallet pays the fee."""
 
-    def test_uri_is_the_default_and_the_choice_is_kept(self):
+    def test_own_is_the_default_and_the_choice_is_kept(self):
+        # URI's own account pool is small and first-come-first-served, so "own"
+        # (works for any brand) is the default; "uri" only applies once a brand
+        # explicitly opts in (and actually has a free account — see below).
         db = Db()
-        assert run(gf.get_mode(db, "b1")) == "uri"
-        run(gf.set_mode(db, "b1", "own"))
-        assert run(gf.get_mode(db, "b1")) == "own" and run(gf.get_mode(db, "b2")) == "uri"
+        assert run(gf.get_mode(db, "b1")) == "own"
+        run(gf.set_mode(db, "b1", "uri"))
+        assert run(gf.get_mode(db, "b1")) == "uri" and run(gf.get_mode(db, "b2")) == "own"
         with pytest.raises(ValueError):
             run(gf.set_mode(db, "b1", "tv"))
 
@@ -163,6 +177,7 @@ class TestTheTwoWays:
     def test_uri_way_is_ready_with_a_free_account_and_says_so_without(self, monkeypatch):
         self._configured(monkeypatch)
         db = Db()
+        run(gf.set_mode(db, "b1", "uri"))
         ready, reason = run(gf.readiness(db, "u1", "b1"))
         assert not ready and "connect your own Google Ads account" in reason
         db.c.docs.append(account("1111111111"))

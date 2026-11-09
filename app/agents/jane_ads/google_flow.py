@@ -58,18 +58,21 @@ def configured() -> bool:
 
 # How a brand's Google ads run — its own choice, in Connected Accounts:
 #   "uri" — in URI's own Google Ads account. Nothing to connect; the whole budget
-#           comes from the URI wallet and URI pays Google. The default.
+#           comes from the URI wallet and URI pays Google. URI's own account pool
+#           is small and first-come-first-served (see google_uri_accounts.py), so
+#           most brands won't have a free one — not the default.
 #   "own" — in the brand's own Google Ads account. Google bills the brand's card
-#           for the ad spend; the URI wallet pays only URI's fee.
+#           for the ad spend; the URI wallet pays only URI's fee. Works for any
+#           brand regardless of URI's own pool, so this is the default.
 SETTINGS = "jane_ads_google_settings"
 MODES = ("uri", "own")
 
 
 async def get_mode(db, brand_id: Optional[str]) -> str:
     if not brand_id:
-        return "uri"
+        return "own"
     doc = await db[SETTINGS].find_one({"brand_id": brand_id, "kind": "google_mode"})
-    return (doc or {}).get("mode") if (doc or {}).get("mode") in MODES else "uri"
+    return (doc or {}).get("mode") if (doc or {}).get("mode") in MODES else "own"
 
 
 async def set_mode(db, brand_id: str, mode: str) -> str:
