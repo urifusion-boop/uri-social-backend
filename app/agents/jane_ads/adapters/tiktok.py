@@ -1173,6 +1173,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 "business_id": plan.business_id,
                 "advertiser_id": self._advertiser_id,
                 "platform": "tiktok",
+                # Set only for a multi-platform campaign — see CampaignPlan.campaign_group_id.
+                "campaign_group_id": plan.campaign_group_id,
                 "last_click_count": 0,
                 "created_at": datetime.now(timezone.utc),
             }},

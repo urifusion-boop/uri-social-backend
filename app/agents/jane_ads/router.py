@@ -2513,6 +2513,21 @@ class MetaLaunchFromMessageBody(BaseModel):
     video_job_id: str = ""
     ugc_kind: str = ""                    # creative_paths.UGC_KINDS
     ugc_rights_confirmed: bool = False
+    # Multi-platform campaigns (one brief, run separately on several platforms at
+    # once): the frontend already knows the exact per-platform budget/day split it
+    # wants — set here instead of folded into `message` and left for the NL layer
+    # to re-parse, which would risk misreading an injected number. Applied
+    # deterministically to `parsed.budget_ngn`/`parsed.days` right after the NL
+    # parse, before anything downstream (fee markup, wallet gate, PlatformPlan)
+    # reads them. "" preferred_platform + these overrides is still a normal,
+    # single-platform plan — nothing else about this request changes.
+    budget_ngn_override: Optional[float] = None
+    days_override: Optional[int] = None
+    # Ties this plan to its sibling plans launched for the SAME brief on other
+    # platforms, so they can later be queried/reported on together. Purely a
+    # passthrough tag — stored on CampaignPlan and each adapter's campaign
+    # record, never read by any planning/launch decision.
+    campaign_group_id: Optional[str] = None
 
 
 class _PlanBuildResult(BaseModel):
@@ -2800,6 +2815,15 @@ async def _build_campaign_plan(
                   "desired_conversions", "city", "geo_mode"):
         if not getattr(parsed, field, None) and prior_understood.get(field):
             setattr(parsed, field, prior_understood[field])
+
+    # Multi-platform campaigns: the frontend already knows the exact per-platform
+    # budget it wants (it did the split itself, across however many platforms the
+    # client picked) and sends it as a real number instead of folding it into
+    # `message` for the AI parse to pick back up — safer for a money-critical
+    # field than hoping the NL layer reads an injected phrase correctly. Applied
+    # before every fallback below so it always wins.
+    if body.budget_ngn_override:
+        parsed.budget_ngn = body.budget_ngn_override
 
     # Live-confirmed separate bug: a client answered a budget question with a bare
     # number and the model's own budget_ngn field came back None on that SAME turn
@@ -3233,8 +3257,10 @@ async def _build_campaign_plan(
 
     # The duration the client asked for, wherever they said it. The planner otherwise
     # picks one from the budget alone, so "for 2 days" was silently ignored.
+    # Same multi-platform override reasoning as budget_ngn_override above — an
+    # explicit number from the frontend wins over the text-parsed guess.
     from . import concepts as concepts_mod
-    asked_days = concepts_mod.stated_days(body.message)
+    asked_days = body.days_override or concepts_mod.stated_days(body.message)
     if asked_days:
         for p in plan.platforms:
             floor = (max(C.HARD_FLOOR_DAILY_NGN.get(p.platform.value, 0), C.MIN_DAILY_SPEND_NGN)
@@ -3669,6 +3695,7 @@ async def _build_campaign_plan(
     plan.destination_type = destination_type.value
     plan.destination_link = destination_link
     plan.destination_cta = destination_cta
+    plan.campaign_group_id = body.campaign_group_id
     plan.creative = creative
     if creative.video_recommendation:
         # Path C (PRD §4.1): gpt-image-1 can't shoot the recommended video itself, so

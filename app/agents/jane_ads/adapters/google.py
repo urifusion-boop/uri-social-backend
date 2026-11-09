@@ -582,6 +582,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "placement": "search",
                 "days": days,
                 "platform": "google",
+                # Set only for a multi-platform campaign — see CampaignPlan.campaign_group_id.
+                "campaign_group_id": plan.campaign_group_id,
                 "last_click_count": 0,
                 "created_at": datetime.now(timezone.utc),
             }},
@@ -656,6 +658,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "budget_resource_name": made.get("campaignBudget", ""),
                 "geo_target": geo_constant,
                 "platform": "google",
+                # Set only for a multi-platform campaign — see CampaignPlan.campaign_group_id.
+                "campaign_group_id": plan.campaign_group_id,
                 "last_click_count": 0,
                 "created_at": datetime.now(timezone.utc),
             }},
