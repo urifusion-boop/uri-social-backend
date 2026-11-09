@@ -1,5 +1,5 @@
 """
-EXPERIMENT: Complex / Cinematic (Wan 3.0) and Advanced References (Seedance 2.0) are given a scene's spoken line in
+EXPERIMENT: Complex / Cinematic (Wan 3.0), Advanced References (Seedance 2.0) and High Quality (Gemini Omni Flash) are given a scene's spoken line in
 the clip prompt, so they can be tried on a script with dialogue. Only the talking avatar reads `dialogue` otherwise.
 The customer sees a normal finished clip (no warning); the scene is only logged.
 """
@@ -57,8 +57,8 @@ def _clip(model, dialogue, notes):
         _run(V.VideoGenerationService._generate_scene_fal(scene, model, V.DEFAULT_AVATAR_VOICE, "job1", notes=notes))
 
 
-@pytest.mark.parametrize("model", [V._WAN_3, V._SEEDANCE_FAST])
-def test_cinematic_and_references_models_get_the_line_but_the_clip_carries_no_warning(sent, model, capsys):
+@pytest.mark.parametrize("model", [V._WAN_3, V._SEEDANCE_FAST, V._OMNI_FLASH])
+def test_the_speech_models_get_the_line_but_the_clip_carries_no_warning(sent, model, capsys):
     notes = {}
     _clip(model, "Jane has got this", notes)
     prompt = sent[-1][1]["prompt"]
@@ -68,7 +68,7 @@ def test_cinematic_and_references_models_get_the_line_but_the_clip_carries_no_wa
     assert "SPEECH-IN-PROMPT experiment" in capsys.readouterr().out                 # ...but the log records it
 
 
-@pytest.mark.parametrize("model", [V._WAN_3, V._SEEDANCE_FAST])
+@pytest.mark.parametrize("model", [V._WAN_3, V._SEEDANCE_FAST, V._OMNI_FLASH])
 def test_a_scene_with_no_dialogue_is_sent_without_speech(sent, model, capsys):
     notes = {}
     _clip(model, None, notes)
@@ -76,7 +76,7 @@ def test_a_scene_with_no_dialogue_is_sent_without_speech(sent, model, capsys):
     assert "SPEECH-IN-PROMPT" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("model", [V._H3_MAX, V._KLING_STANDARD, V._OMNI_FLASH])
+@pytest.mark.parametrize("model", [V._H3_MAX, V._KLING_STANDARD, V._PIXVERSE])
 def test_other_models_are_left_alone(sent, model):
     notes = {}
     _clip(model, "Jane has got this", notes)
