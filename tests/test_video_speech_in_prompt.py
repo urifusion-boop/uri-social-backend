@@ -105,3 +105,85 @@ def test_a_finished_clip_on_the_experiment_models_has_no_warning(monkeypatch):
 
 def test_seedance_is_given_longer_than_the_default_to_finish():
     assert V._MODEL_TIMEOUT_OVERRIDES[V._SEEDANCE_FAST] == 900 > V._FAL_SUBSCRIBE_TIMEOUT_SECONDS
+
+
+# ── a refused clip is retried unchanged before its sound is ever dropped ─────
+
+AUDIO = "content_policy_violation: the generated audio was flagged as sensitive content"
+IMAGE = ("content_policy_violation: image_url: The images or videos provided may contain likenesses of real people "
+         "or other private information that cannot be processed.")
+
+
+@pytest.fixture
+def refusals(monkeypatch):
+    """_submit_and_poll answers in order from `plan`: a refusal message, or None for success. Returns the generate_audio
+    value of each request actually sent."""
+    calls = []
+
+    def configure(plan):
+        plan = list(plan)
+
+        async def fake_submit(model, arguments, timeout, scene_num, job_id=None):
+            calls.append(arguments.get("generate_audio"))
+            refusal = plan.pop(0)
+            if refusal:
+                raise RuntimeError(refusal)
+            return {"video": {"url": "https://fal/clip.mp4"}}
+
+        async def fake_store(result, model, seconds):
+            return "https://cdn/clip.mp4", 0.1
+
+        monkeypatch.setitem(sys.modules, "fal_client", types.ModuleType("fal_client"))
+        monkeypatch.setattr(V.VideoGenerationService, "_submit_and_poll", staticmethod(fake_submit))
+        monkeypatch.setattr(V.VideoGenerationService, "_store_clip", staticmethod(fake_store))
+        monkeypatch.setattr(settings, "FAL_API_KEY", "k", raising=False)
+        return calls
+    return configure
+
+
+def _scene_clip(model, dialogue):
+    scene = {"scene_number": 1, "frame_image_url": "https://img/f.png", "duration_seconds": 5,
+             "video_prompt": "A woman at her desk", "dialogue": dialogue}
+    return _run(V.VideoGenerationService._generate_scene_fal(scene, model, V.DEFAULT_AVATAR_VOICE, "job1"))
+
+
+def test_a_refused_start_image_is_retried_with_the_sound_on_not_made_silent(refusals):
+    """The staging case: 'likenesses of real people' on image_url, then it passed on the retry."""
+    calls = refusals([IMAGE, None])
+    assert _scene_clip(V._SEEDANCE_FAST, "Jane has got this")[0] == "https://cdn/clip.mp4"
+    assert calls == [True, True]
+
+
+def test_a_refused_start_image_is_retried_even_when_nobody_speaks_in_the_scene(refusals):
+    calls = refusals([IMAGE, None])
+    _scene_clip(V._SEEDANCE_FAST, None)
+    assert calls == [True, True]                      # the audio is not the problem, so it is not touched
+
+
+def test_a_start_image_refused_three_times_finally_goes_ahead_without_sound(refusals):
+    calls = refusals([IMAGE, IMAGE, IMAGE, None])
+    _scene_clip(V._SEEDANCE_FAST, "Jane has got this")
+    assert calls == [True, True, True, False]         # initial + 2 unchanged retries, then sound off as a last resort
+
+
+def test_a_flagged_audio_track_on_a_spoken_scene_gets_one_unchanged_retry_first(refusals):
+    calls = refusals([AUDIO, None])
+    _scene_clip(V._SEEDANCE_FAST, "Jane has got this")
+    assert calls == [True, True]
+
+
+def test_a_flagged_audio_track_on_a_scene_nobody_speaks_in_drops_the_sound_straight_away(refusals):
+    calls = refusals([AUDIO, None])
+    _scene_clip(V._SEEDANCE_FAST, None)
+    assert calls == [True, False]                     # unchanged behaviour
+
+
+def test_a_retry_that_fails_for_another_reason_is_not_swallowed(refusals):
+    refusals([IMAGE, "503 service unavailable"])
+    with pytest.raises(RuntimeError):
+        _scene_clip(V._SEEDANCE_FAST, "Jane has got this")
+
+
+def test_a_refused_start_image_counts_as_worth_retrying_on_any_model():
+    assert V.is_retryable(RuntimeError(IMAGE))
+    assert not V.is_retryable(RuntimeError("content_policy_violation: prompt refused"))
