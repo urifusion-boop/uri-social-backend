@@ -25,7 +25,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
-from .geo import place_named_in, regions_named_in, whole_area_answer
+from .geo import place_named_in, places_named_in, regions_named_in, whole_area_answer
 from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
@@ -477,7 +477,10 @@ async def consult(message: str, business_name: str = "", category: str = "",
                 "clarify": _without_budget_questions(brief.clarify),
                 "missing": [m for m in (brief.missing or []) if not _is_about_budget(m)],
             })
-    return _enforce_hard_requirements(brief, message, history or [], known_budget, broad)
+    brief = _enforce_hard_requirements(brief, message, history or [], known_budget, broad)
+    if not brief.clarify and not brief.whole_area:
+        brief = _named_areas_only(brief, client_words)
+    return brief
 
 
 _AFFIRMATIVE_WORDS = {
@@ -620,6 +623,50 @@ def _without_budget_questions(clarify: str) -> str:
             if s.strip() and not (_is_about_budget(s) or "spent" in s.lower()
                                   or "allocat" in s.lower())]
     return " ".join(kept) if any("?" in s for s in kept) else ""
+
+
+def _without_geography_questions(clarify: str) -> str:
+    """`clarify` minus every sentence about WHERE, or "" when no question is left.
+    Called once the client has already named their area."""
+    kept = [s.strip() for s in _SENTENCE.findall(clarify or "")
+            if s.strip() and not _is_about_geography(s)]
+    return " ".join(kept) if any("?" in s for s in kept) else ""
+
+
+def _whole_area_sentence(stated_plan: str, whole: str) -> str:
+    """Jane's own line, minus any sentence naming neighbourhoods, led by the whole area.
+
+    The plan covered all of Lagos while her message said "focusing on areas like
+    Lekki, Ikeja and Surulere" — the client reads the sentence, not the targeting.
+    """
+    kept = [s.strip() for s in _SENTENCE.findall(stated_plan or "")
+            if s.strip() and not place_named_in(s) and "areas like" not in s.lower()
+            and "?" not in s]
+    lead = f"I'll cover all of {whole}."
+    if any("all of" in s.lower() for s in kept):
+        return " ".join(kept)
+    return " ".join([lead, *kept])
+
+
+def _named_areas_only(brief: "ConsultantBrief", client_words: str) -> "ConsultantBrief":
+    """The neighbourhoods the client named, and only those.
+
+    Asked for Lekki and Ikeja, Jane planned Lekki Phase 1, Ikeja GRA and Victoria
+    Island; asked for Lekki, she added Admiralty Way and Victoria Island. A place the
+    client named is the brief, not a starting point to widen from.
+    """
+    named = places_named_in(client_words)
+    if not named:
+        return brief
+    areas = [{"name": n, "reason": "the area you named"} for n in named]
+    plan = f"I'll target {_listed(named)}, as you asked."
+    kept = [s.strip() for s in _SENTENCE.findall(brief.stated_plan or "")
+            if s.strip() and "?" not in s and not place_named_in(s)]
+    return brief.model_copy(update={"geo_areas": areas, "stated_plan": " ".join([plan, *kept])})
+
+
+def _listed(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
@@ -822,13 +869,26 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
             "geo_areas": [],
             "geo_mode": _geographic_mode(brief.geo_mode),
             "whole_area": True,
+            "stated_plan": _whole_area_sentence(brief.stated_plan, whole),
             "clarify": "",
             "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
         })
     elif whole:
         brief = brief.model_copy(update={"city": whole, "geo_areas": [],
                                          "geo_mode": _geographic_mode(brief.geo_mode),
-                                         "whole_area": True})
+                                         "whole_area": True,
+                                         "stated_plan": _whole_area_sentence(brief.stated_plan, whole)})
+    elif brief.clarify and _is_about_geography(brief.clarify) and place_named_in(message):
+        # The client already named their neighbourhood ("lekki"). Asking which
+        # pockets within it they mean is the same question again. Live-reported.
+        place = place_named_in(message)
+        brief = brief.model_copy(update={
+            "clarify": _without_geography_questions(brief.clarify),
+            "city": brief.city or "Lagos",
+            "geo_mode": _geographic_mode(brief.geo_mode),
+            "geo_areas": brief.geo_areas or [{"name": place, "reason": "the area you named"}],
+            "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
+        })
 
     # The same loop, for the budget. A figure the client has already given does not
     # become unknown because the model asked again — and the existing loop-breaker

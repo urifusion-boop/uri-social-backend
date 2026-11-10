@@ -546,6 +546,18 @@ async def build_geo_plan(
                    explanation=_explain(mode, city, pins))
 
 
+def places_named_in(text: str) -> list[str]:
+    """Every known neighbourhood named in `text`, in the order named, longest match
+    first so "lekki phase 1" is one place, not "lekki" too."""
+    hay = f" {(text or '').lower()} "
+    found: list[tuple[int, str]] = []
+    for name in sorted(_LAGOS_PLACES, key=len, reverse=True):
+        for m in re.finditer(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", hay):
+            found.append((m.start(), name.title()))
+            hay = hay[:m.start()] + " " * len(name) + hay[m.end():]
+    return list(dict.fromkeys(n for _, n in sorted(found)))
+
+
 def place_named_in(text: str) -> Optional[str]:
     """The known place a free-text audience names, or None.
 
