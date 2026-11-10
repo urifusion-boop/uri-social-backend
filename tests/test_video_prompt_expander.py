@@ -23,6 +23,7 @@ def scene(action, says="", caption=""):
 def brief(**kw):
     base = dict(
         concept="A Lagos customer shows how fast her jollof arrived.",
+        style="testimonial_style",
         people=["A woman in her 30s, medium-dark brown skin, oval face, short natural black hair, wearing a solid yellow top"],
         setting="A modest modern Lagos kitchen in daylight, a plain takeaway box on the table.",
         look="Close-up on her face, slow push-in, brand orange only on the logo and the box.",
@@ -50,6 +51,7 @@ def test_the_brief_is_laid_out_under_fixed_headings_one_per_line():
     text = pe.compose_video(brief(), 10)
     assert text.split("\n") == [
         "CONCEPT: A Lagos customer shows how fast her jollof arrived.",
+        "STYLE: Testimonial Style.",
         "PERSON: A woman in her 30s, medium-dark brown skin, oval face, short natural black hair, wearing a solid yellow top.",
         "SETTING: A modest modern Lagos kitchen in daylight, a plain takeaway box on the table.",
         "LOOK: Close-up on her face, slow push-in, brand orange only on the logo and the box.",
@@ -157,7 +159,7 @@ def test_expand_video_returns_the_structured_brief_and_its_version(ai):
     seen = ai(parsed=brief())
     out = _run(pe.expand_video("A testimonial for our jollof", {"brand_name": "Bukka Express"}, "instagram_reels", 10))
     assert out["expanded_prompt"].startswith("CONCEPT: ") and "SCENE 2 (5-10s)" in out["expanded_prompt"]
-    assert out["prompt_version"] == "video-prompt-expander-v2" and out["used"] == ["brand voice"]
+    assert out["prompt_version"] == "video-prompt-expander-v3" and out["used"] == ["brand voice"]
     assert seen["response_model"] is pe._ExpandedVideo
 
 
@@ -166,3 +168,41 @@ def test_expand_video_returns_the_structured_brief_and_its_version(ai):
 def test_a_failed_or_empty_answer_returns_none_so_the_box_is_left_alone(ai, kwargs):
     ai(**kwargs)
     assert _run(pe.expand_video("A testimonial", {}, "instagram_reels", 10)) is None
+
+
+# ── styles ───────────────────────────────────────────────────────────────────
+
+def test_the_style_is_named_in_the_brief_so_the_script_writer_follows_it():
+    assert "STYLE: Viral Fast Cut." in pe.compose_video(brief(style="viral_fast_cut", people=[]), 10)
+
+
+@pytest.mark.parametrize("style", ["", "not_a_style", None, "  VIRAL_FAST_CUT "])
+def test_an_unknown_or_missing_style_is_left_out_not_invented(style):
+    text = pe.compose_video(brief(style=style), 10)
+    if style and style.strip().lower() == "viral_fast_cut":
+        assert "STYLE: Viral Fast Cut." in text
+    else:
+        assert "STYLE:" not in text
+
+
+def test_the_style_table_matches_the_styles_the_script_writer_actually_has():
+    """Read the slugs out of the storyboard service's source, so this holds without importing its heavy dependencies."""
+    import ast
+    import pathlib
+    src = pathlib.Path(pe.__file__).with_name("video_storyboard_service.py").read_text()
+    keys = None
+    for node in ast.parse(src).body:
+        target = node.target if isinstance(node, ast.AnnAssign) else (node.targets[0] if isinstance(node, ast.Assign) else None)
+        if getattr(target, "id", "") == "VIDEO_STYLE_DIRECTIVES":
+            keys = set(ast.literal_eval(node.value))
+    assert keys and keys == set(pe.VIDEO_STYLES)
+
+
+def test_the_model_is_offered_every_style_and_told_fast_styles_move_the_camera_not_the_face():
+    system = " ".join(pe.build_video_messages("x", {}, "tiktok", 10, datetime(2026, 11, 9))[0]["content"].split())
+    for slug in pe.VIDEO_STYLES:
+        assert f"{slug}:" in system, slug
+    assert "{STYLE_MENU}" not in system
+    assert "fast, dramatic CAMERA and PRODUCT movement" in system
+    assert "Put the energy in the camera and the product, not in a face" in system
+    assert "no face at all (or only hands)" in system

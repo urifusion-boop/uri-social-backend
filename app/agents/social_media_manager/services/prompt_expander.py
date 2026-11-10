@@ -83,23 +83,53 @@ Hard rules:
 # So this one is STRUCTURED: fixed fields the model fills in, laid out under fixed headings by compose_video() below.
 # The structure is exactly what the video pipeline already rewards (see video_creative_service.py): people described once
 # and repeated, one scene per ~5 seconds, exact spoken lines, short captions, brand colours as accents.
+# The 12 video styles the script writer can follow (VIDEO_STYLE_DIRECTIVES in video_storyboard_service.py has the full
+# directive for each; a test keeps these slugs in step). Kept here as short gists so this module does not import the
+# heavy storyboard service. The expander picks ONE for the idea and names it in the brief, so the script writer follows it.
+VIDEO_STYLES: dict[str, tuple[str, str]] = {
+    "clean_commercial": ("Clean Commercial", "polished brand commercial: smooth dolly moves, hero product shots, clean cuts"),
+    "luxury_slow_burn": ("Luxury Slow Burn", "premium and cinematic: macro close-ups, very slow push-ins, long unhurried scenes"),
+    "viral_fast_cut": ("Viral Fast Cut", "high-energy and social-native: handheld, snap zooms, very fast cuts, an instant hook"),
+    "ingredient_reveal": ("Ingredient Reveal", "a sensory reveal of raw ingredients in macro texture, building to the hero product"),
+    "street_style": ("Street Style", "authentic urban documentary: handheld, natural rhythm, real-life moments"),
+    "unboxing_drama": ("Unboxing Drama", "a theatrical build-up and reveal of a product and its packaging, hands in close-up"),
+    "before_after": ("Before / After", "a problem then its transformation: matched angles, muted first half, bright second half"),
+    "mood_film": ("Mood Film", "atmosphere and emotion over product information: wide, slow, golden-hour feel"),
+    "product_explosion": ("Product Explosion", "dynamic, physics-defying product visuals: orbits, particles, freeze-frames"),
+    "testimonial_style": ("Testimonial Style", "an authentic person-to-camera testimonial or interview, conversational pacing"),
+    "menu_showcase": ("Menu Showcase", "food that looks irresistible: overhead and glamour angles, lingering on texture"),
+    "countdown_hype": ("Countdown Hype", "urgency that escalates scene by scene: each scene tighter and faster than the last"),
+}
+
+
+def _style_menu() -> str:
+    return "\n".join(f"    {slug}: {gist}" for slug, (_name, gist) in VIDEO_STYLES.items())
+
+
 VIDEO_SYSTEM = """You turn a short video idea into a structured production brief for Jane, an AI that writes a
 short-form video script and then generates the pictures and footage, scene by scene, for this brand. Write what an
 excellent video director would hand to a crew. Fill every field below; the app lays them out under fixed headings.
 
 - concept: ONE sentence: the core story or message and the opening picture (who or what is on screen first, where,
   the mood). Do not start with "Jane", "Create", "Craft" or "Write".
-- people: ONLY if people appear. At most two. One entry per person: approximate age, gender, skin tone, face shape,
+- style: the ONE video style that best fits the idea, as its slug. If the owner names a style, use it. The script
+  writer follows the style you name for camera, pacing and energy:
+{STYLE_MENU}
+- people: ONLY if people appear. Many styles are about the product, with no face at all (or only hands): then leave it
+  empty. At most two. One entry per person: approximate age, gender, skin tone, face shape,
   hair (style, length, colour), facial hair, build, and ONE fixed outfit with its colours, fitting the brand's market.
   Every scene is drawn separately, so a person described once here must look identical in every scene: never
   change their outfit or look between scenes. Empty if no one is on screen.
 - setting: where and when (one place, or a clear progression), time of day, key props, how it is lit. Realistic and
   culturally accurate for the brand's market. Packaging, uniforms, signs and screens are plain and unbranded, except
   the brand's own name.
-- look: framing, movement and colour. Faces are large, sharp and well lit (medium shot or close-up, facing the camera
-  or three-quarter view). Movement is gentle: slow push-ins, small gestures, no fast spins, whip-pans, running or
-  crowds of faces, which distort. Brand colours go on the logo, product, packaging, graphics and on-screen text; the
-  rest of every scene (skin, food, sky, rooms, backgrounds) keeps natural colours, so scenes do not all look dyed.
+- look: framing, camera movement and colour, written in the chosen style's own terms (its camera, energy and colour
+  grading). A fast or dramatic style gets fast, dramatic CAMERA and PRODUCT movement: snap zooms, orbits, quick cuts,
+  freeze-frames. But whenever a person's face is in shot it stays large, sharp and well lit (medium shot or
+  close-up), and the person moves gently (small gestures, a slow push-in): never fast spins, whip-pans, running or
+  crowds of faces on a person, which distort. Put the energy in the camera and the product, not in a face. Brand
+  colours go on the logo, product, packaging, graphics and on-screen text; the rest of every scene (skin, food, sky,
+  rooms, backgrounds) keeps natural colours, so scenes do not all look dyed.
 - scenes: EXACTLY the number of scenes you are told, in order, one per 5 seconds. Scene 1 is the hook, the middle
   builds or shows, the last pays off and carries the call to action. Each scene continues straight from the one
   before (same people, same place). Per scene:
@@ -263,6 +293,7 @@ class _VideoScene(BaseModel):
 
 class _ExpandedVideo(BaseModel):
     concept: str = Field(description="ONE sentence: the core story and the opening picture.")
+    style: str = Field(default="", description="The slug of the ONE video style that fits the idea.")
     people: list[str] = Field(default_factory=list, description="One fixed description per person on screen (max 2).")
     setting: str = Field(default="", description="Where, when, key props, how it is lit.")
     look: str = Field(default="", description="Framing, gentle movement, and where brand colours go.")
@@ -273,7 +304,7 @@ class _ExpandedVideo(BaseModel):
     used: list[str] = Field(default_factory=list, description="Which brand facts shaped it, 2-4 words each.")
 
 
-VIDEO_PROMPT_VERSION = "video-prompt-expander-v2"
+VIDEO_PROMPT_VERSION = "video-prompt-expander-v3"
 VIDEO_MAX_CHARS = 1900            # the brief box holds 2000
 SECONDS_PER_SCENE = 5             # the pipeline cuts a script into scenes of about this length
 CAPTION_MAX_WORDS = 8
@@ -318,6 +349,7 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
     """The structured fields laid out under fixed headings, one per line, for the video brief box:
 
         CONCEPT: ...
+        STYLE: Viral Fast Cut.
         PERSON 1: ...            (only if people appear)
         SETTING: ...
         LOOK: ...
@@ -335,11 +367,14 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
     if concept:
         concept = concept[:1].upper() + concept[1:]
     people = [_sentence(p) for p in (getattr(parsed, "people", None) or []) if _line(p)][:2]
+    style_name = (VIDEO_STYLES.get(_line(getattr(parsed, "style", "")).lower()) or ("",))[0]   # an unknown slug is dropped
 
     def build(drop: tuple = (), action_max: Optional[int] = None) -> str:
         lines = []
         if concept:
             lines.append(f"CONCEPT: {concept}")
+        if style_name:
+            lines.append(f"STYLE: {style_name}.")
         for i, person in enumerate(people):
             lines.append(f"PERSON {i + 1}: {person}" if len(people) > 1 else f"PERSON: {person}")
         for key, label in (("setting", "SETTING"), ("look", "LOOK")):
@@ -364,6 +399,9 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
             break
         text = build(("avoid", "sound", "look", "setting"), action_max)
     return text[:VIDEO_MAX_CHARS].rsplit("\n", 1)[0] if len(text) > VIDEO_MAX_CHARS else text
+
+
+VIDEO_SYSTEM = VIDEO_SYSTEM.replace("{STYLE_MENU}", _style_menu())
 
 
 def build_video_messages(idea: str, bc: dict, platform: str, duration_seconds: Optional[int],
