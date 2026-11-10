@@ -159,7 +159,7 @@ def test_expand_video_returns_the_structured_brief_and_its_version(ai):
     seen = ai(parsed=brief())
     out = _run(pe.expand_video("A testimonial for our jollof", {"brand_name": "Bukka Express"}, "instagram_reels", 10))
     assert out["expanded_prompt"].startswith("CONCEPT: ") and "SCENE 2 (5-10s)" in out["expanded_prompt"]
-    assert out["prompt_version"] == "video-prompt-expander-v3" and out["used"] == ["brand voice"]
+    assert out["prompt_version"] == "video-prompt-expander-v4" and out["used"] == ["brand voice"]
     assert seen["response_model"] is pe._ExpandedVideo
 
 

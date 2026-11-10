@@ -11,6 +11,7 @@ import httpx
 from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.s3_upload import upload_bytes
+from app.agents.social_media_manager.services.video_styles import style_from_brief
 from app.agents.social_media_manager.services.people_consistency import (
     IDENTITY_LOCK,
     PEOPLE_ON_SCREEN_RULES,
@@ -85,6 +86,19 @@ continuous story and must read that way end to end:
   BAD example (two unrelated statements, never do this):
     scene 1 dialogue: "Welcome to my shop!"
     scene 2 dialogue: "Buy now and save 20%."
+
+STRUCTURED BRIEF — when the brief has headed lines (CONCEPT, STYLE, PERSON, SETTING, LOOK, SCENE n, SOUND, CLOSE, AVOID),
+it was written for you; follow it exactly instead of re-inventing it:
+- Each "SCENE n (a-bs):" line is scene n, in that order. Its action is that scene's video_prompt, written out in full.
+- "Says exactly: "..."" is that scene's dialogue: use the words WORD FOR WORD. Do not shorten, paraphrase, correct or add to
+  them. A scene with no "Says exactly" has dialogue null.
+- "Caption: "..."" is that scene's text_overlay, word for word. A scene with no Caption has text_overlay null.
+- PERSON describes each person on screen: copy that description word for word into the video_prompt of every scene they
+  appear in. SETTING and LOOK apply to every scene: put them into every video_prompt.
+- STYLE names the video style. SOUND and CLOSE describe the voice, music and call to action. AVOID lists words and things
+  that must not appear in any scene, caption or spoken line.
+- Anything the brief does not say, you decide, following the rules above.
+If the brief has no such lines, treat it as a free-text idea.
 
 {{PEOPLE_RULES}}
 
@@ -241,6 +255,10 @@ class VideoCreativeService:
             )
         preamble_lines.append(f"\nGenerate exactly {num_scenes} scenes totalling {target_duration_seconds}s.")
 
+        # An explicit style (the customer swapped it) wins. Otherwise a structured brief that names one ("STYLE: Viral Fast
+        # Cut.", written by the prompt expander) is taken as given, in code, instead of leaving it to the model to guess.
+        if not video_style:
+            video_style = style_from_brief(brief)
         forced_style = VIDEO_STYLE_DIRECTIVES.get(video_style) if video_style else None
         if forced_style:
             system_prompt = f"{_SYSTEM_PROMPT}\n\n{forced_style}"
