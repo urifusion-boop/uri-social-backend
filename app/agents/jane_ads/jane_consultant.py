@@ -667,8 +667,11 @@ CLIENT_NAMED = "the area you named"
 # The model fills intermediary_note even when there is none ("No intermediary needed;
 # direct SME owners are the targets", "URI directly targets business owners, not
 # intermediaries") and it reaches the client's plan as noise.
-_NO_INTERMEDIARY = re.compile(r"\b(no|not|without)\b[^.]*\bintermediar|\bintermediar[^.]*\b(needed|required)\b[^.]*\bnot\b",
-                              re.IGNORECASE)
+_NO_INTERMEDIARY = re.compile(
+    r"\bintermediar\w*\b[^.]*\b(?:no|not|without|instead|rather|needed)\b"
+    r"|\b(?:no|not|without|instead of|rather than)\b[^.]*\bintermediar"
+    r"|^\s*target\w*\b[^.]*\bdirectly\b",
+    re.IGNORECASE)
 
 
 def _without_no_intermediary(text: str) -> str:

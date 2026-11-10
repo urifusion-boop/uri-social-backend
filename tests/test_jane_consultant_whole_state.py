@@ -76,3 +76,8 @@ def test_no_intermediary_filler_is_dropped():
         "I'll cover all of Lagos. URI directly targets business owners, not intermediaries.") == "I'll cover all of Lagos."
     assert jc._without_no_intermediary("Target estate managers — they buy for residents.") == \
         "Target estate managers — they buy for residents."
+
+
+def test_target_directly_filler_is_dropped():
+    assert jc._without_no_intermediary(
+        "I'll target all of Lagos. Targeting SME owners directly as they decide.") == "I'll target all of Lagos."
