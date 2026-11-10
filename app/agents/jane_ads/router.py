@@ -3202,7 +3202,11 @@ async def _build_campaign_plan(
     google_placement = normalize_placement(body.google_placement)
     jane_picked_google = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
     use_google = False
-    if wants_google or (google_only and not tiktok_preferred) or (jane_picked_google and google_ready and not tiktok_preferred):
+    # The client choosing Instagram & Facebook by name outranks Jane leaning to Search:
+    # the plan used to switch to Google under a selected Meta toggle. Live-reported.
+    meta_chosen = body.preferred_platform == "meta"
+    if wants_google or (google_only and not tiktok_preferred) or (
+            jane_picked_google and google_ready and not tiktok_preferred and not meta_chosen):
         if not google_ready:
             return {"early_return": {"stage": "google_not_connected", "understood": parsed.model_dump(),
                     "question": google_not_ready_reason}}
