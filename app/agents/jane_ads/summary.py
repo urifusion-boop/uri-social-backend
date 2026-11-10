@@ -119,6 +119,10 @@ def build_campaign_summary(
         # A whole-state plan has no pins by design; it still targets that state, not Nigeria.
         where = f"All of {plan.geo.fallback_area}"
     who = (audience_text or "").strip()
+    if "_" in who and " " not in who:
+        # A targeting label ("small_business_owners_in_marketing_overwhelm") is not
+        # something to show a client.
+        who = who.replace("_", " ").capitalize()
     interests = [
         i.get("name", "") for spec in (plan.audience_targeting.get("flexible_spec") or [])
         for i in (spec.get("interests") or []) if i.get("name")
