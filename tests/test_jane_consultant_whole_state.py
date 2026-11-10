@@ -69,3 +69,10 @@ def test_client_named_area_is_marked_so_plan_cards_keep_it(monkeypatch):
     brief, _ = _run(monkeypatch, "Uri for business owners in Lekki, Lagos. Budget: ₦40000 over 7 days.")
     assert jc.client_named_areas(brief) == ["Lekki"]
     assert "Let me know" not in brief.stated_plan
+
+
+def test_no_intermediary_filler_is_dropped():
+    assert jc._without_no_intermediary(
+        "I'll cover all of Lagos. URI directly targets business owners, not intermediaries.") == "I'll cover all of Lagos."
+    assert jc._without_no_intermediary("Target estate managers — they buy for residents.") == \
+        "Target estate managers — they buy for residents."

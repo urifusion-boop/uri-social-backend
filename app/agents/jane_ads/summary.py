@@ -115,6 +115,9 @@ def build_campaign_summary(
     # receives: the card must describe the ad that really ships.
     pins = plan.geo.pins if plan.geo else []
     where = ", ".join(p.name for p in pins)
+    if not where and plan.geo and plan.geo.fallback_area:
+        # A whole-state plan has no pins by design; it still targets that state, not Nigeria.
+        where = f"All of {plan.geo.fallback_area}"
     who = (audience_text or "").strip()
     interests = [
         i.get("name", "") for spec in (plan.audience_targeting.get("flexible_spec") or [])
