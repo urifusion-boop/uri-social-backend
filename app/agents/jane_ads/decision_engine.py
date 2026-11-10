@@ -314,6 +314,14 @@ def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> Campa
     return plan.model_copy(update={"platforms": platform_plans, "explanation": explanation})
 
 
+def as_client_choice(plan: CampaignPlan) -> CampaignPlan:
+    """The explanation says "I chose X because ..." — wrong when the client picked X
+    themselves, so it reads as their choice instead."""
+    where = _platform_names(plan.platforms)
+    explanation = plan.explanation.replace(f"I chose {where} because", f"You picked {where}, and it fits:")
+    return plan.model_copy(update={"explanation": explanation})
+
+
 _PLATFORM_DISPLAY_NAMES = {Platform.META: "Instagram + Facebook", Platform.GOOGLE: "Google Search",
                            Platform.TIKTOK: "TikTok"}
 

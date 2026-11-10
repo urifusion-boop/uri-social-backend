@@ -159,3 +159,14 @@ def test_logs_are_scoped_per_business():
     assert len(_run(svc.overrides_for("b1"))) == 1
     assert len(_run(svc.overrides_for("b2"))) == 1
     assert _run(svc.overrides_for("b1"))[0].user_platforms == [Platform.GOOGLE]
+
+
+def test_client_chosen_platform_is_not_described_as_janes_choice():
+    from app.agents.jane_ads.decision_engine import as_client_choice
+    res = choose_platform(_req(budget_ngn=20_000), 20_000, 20_000)
+    plan = res.plan.model_copy(update={
+        "explanation": "I chose Instagram + Facebook because your customers discover this by scrolling."
+    })
+
+    assert as_client_choice(plan).explanation == (
+        "You picked Instagram + Facebook, and it fits: your customers discover this by scrolling.")
