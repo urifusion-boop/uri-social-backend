@@ -2691,6 +2691,9 @@ async def _resolve_creative_path(body: MetaLaunchFromMessageBody, brand_ctx: dic
     return cp.provenance("ugc", ugc_kind=body.ugc_kind, rights_confirmed=body.ugc_rights_confirmed)
 
 
+_PLATFORM_LABELS = {"meta": "Instagram & Facebook", "tiktok": "TikTok", "google": "Google"}
+
+
 def _objective_label(value: Optional[str]) -> str:
     """The plain label of the objective the client picked, or "" if they haven't."""
     from .objectives import CHOICES
@@ -2860,7 +2863,8 @@ async def _build_campaign_plan(
                                known_budget, thread_turns, offering=known_offering,
                                stated_audience=own_audience,
                                objective_label=_objective_label(body.objective),
-                               budget_override=body.budget_ngn_override)
+                               budget_override=body.budget_ngn_override,
+                               platform_label=_PLATFORM_LABELS.get(body.preferred_platform or "", ""))
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 

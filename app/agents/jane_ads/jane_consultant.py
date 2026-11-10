@@ -329,7 +329,8 @@ async def consult(message: str, business_name: str = "", category: str = "",
                   offering: str = "",
                   stated_audience: str = "",
                   objective_label: str = "",
-                  budget_override: Optional[float] = None) -> ConsultantBrief:
+                  budget_override: Optional[float] = None,
+                  platform_label: str = "") -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
@@ -365,6 +366,11 @@ async def consult(message: str, business_name: str = "", category: str = "",
         known_bits.append(
             f"the client already chose this campaign's objective: {objective_label} — that "
             f"IS the goal, decided. Do not ask what the goal is or offer other goals"
+        )
+    if platform_label:
+        known_bits.append(
+            f"the client already chose to run this on {platform_label} — decided. "
+            f"Do not ask which platform or channel to use"
         )
     if settled_budget:
         known_bits.append(
@@ -410,6 +416,14 @@ async def consult(message: str, business_name: str = "", category: str = "",
             f"the client has asked to cover ALL of {whole_now} — that IS the geography, "
             f"already decided. Say so in stated_plan ('all of {whole_now}'), do not name "
             f"neighbourhoods or pockets inside it, and do not ask which areas to focus on"
+        )
+
+    named = [] if whole_now else places_named_in(client_words)
+    if named:
+        known_bits.append(
+            f"the client named the area(s) to target: {_listed(named)} — that IS the "
+            f"geography, already decided. Target exactly those, add no others, and do not "
+            f"ask which areas or pockets to focus on"
         )
 
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
