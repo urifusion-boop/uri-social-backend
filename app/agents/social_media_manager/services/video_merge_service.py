@@ -3,11 +3,12 @@ import json
 import os
 import subprocess
 import tempfile
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 
 from app.utils.s3_upload import upload_bytes
+from . import video_logo_overlay as logo_overlay
 from . import video_text_overlay as overlay
 
 # Canonical shape every clip gets normalized to before concatenation. The
@@ -30,18 +31,31 @@ _TARGET_FPS = 30
 class VideoMergeService:
 
     @staticmethod
-    async def merge_clips(clip_urls: List[str], overlay_texts: Optional[List[Optional[str]]] = None) -> str:
+    async def merge_clips(clip_urls: List[str], overlay_texts: Optional[List[Optional[str]]] = None,
+                          logo: Optional[Dict[str, str]] = None) -> str:
         """Download clips, normalize to one common format, concatenate, upload. Returns Cloudinary URL.
-        overlay_texts, if given, is one on-screen caption (or None) per clip, drawn sharply onto that clip."""
+        overlay_texts, if given, is one on-screen caption (or None) per clip, drawn sharply onto that clip.
+        logo, if given ({"url", "position", "size"} from the Brand Playbook), is laid over the whole video."""
         async with httpx.AsyncClient(timeout=120) as client:
             responses = await asyncio.gather(*[client.get(url) for url in clip_urls])
+            logo_bytes = None
+            if logo:
+                try:
+                    logo_response = await client.get(logo["url"])
+                    logo_response.raise_for_status()
+                    logo_bytes = logo_response.content
+                except Exception as e:
+                    # Never lose the video over its logo.
+                    print(f"[VideoMerge] logo could not be downloaded, merging without it: {e}", flush=True)
 
         clip_bytes_list = [r.content for r in responses]
 
         loop = asyncio.get_running_loop()
         merged_bytes = await loop.run_in_executor(
             None,
-            lambda: VideoMergeService._normalize_and_concat(clip_bytes_list, overlay_texts),
+            lambda: VideoMergeService._normalize_and_concat(
+                clip_bytes_list, overlay_texts, logo_bytes, (logo or {}).get("position", logo_overlay.DEFAULT_POSITION),
+                (logo or {}).get("size", logo_overlay.DEFAULT_SIZE)),
         )
 
         return await upload_bytes(
@@ -75,7 +89,31 @@ class VideoMergeService:
             return None
 
     @staticmethod
-    def _normalize_and_concat(clips: List[bytes], overlay_texts: Optional[List[Optional[str]]] = None) -> bytes:
+    def _stamp_logo(video_path: str, logo_bytes: bytes, position: str, size: str, tmp: str) -> Optional[str]:
+        """The video with the logo over it, or None if ffmpeg could not do it (e.g. the logo is not an image)."""
+        logo_path = os.path.join(tmp, "logo.img")
+        with open(logo_path, "wb") as f:
+            f.write(logo_bytes)
+        out = os.path.join(tmp, "merged_logo.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
+            "-filter_complex", logo_overlay.logo_filter(position, size, _TARGET_WIDTH, _TARGET_HEIGHT),
+            "-map", "[vout]", "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18",
+            "-c:a", "copy", "-movflags", "+faststart", out,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            return out
+        except subprocess.CalledProcessError as e:
+            print(f"[VideoMerge] logo overlay failed, merging without it: "
+                  f"{(e.stderr or b'').decode(errors='replace')[-300:]}", flush=True)
+            return None
+
+    @staticmethod
+    def _normalize_and_concat(clips: List[bytes], overlay_texts: Optional[List[Optional[str]]] = None,
+                              logo_bytes: Optional[bytes] = None, logo_position: str = logo_overlay.DEFAULT_POSITION,
+                              logo_size: str = logo_overlay.DEFAULT_SIZE) -> bytes:
         with tempfile.TemporaryDirectory() as tmp:
             raw_paths = []
             for i, data in enumerate(clips):
@@ -151,6 +189,11 @@ class VideoMergeService:
                 check=True,
                 capture_output=True,
             )
+
+            if logo_bytes:
+                with_logo = VideoMergeService._stamp_logo(out_path, logo_bytes, logo_position, logo_size, tmp)
+                if with_logo:
+                    out_path = with_logo
 
             with open(out_path, "rb") as f:
                 return f.read()
