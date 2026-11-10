@@ -25,7 +25,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
-from .geo import place_named_in, whole_area_answer
+from .geo import place_named_in, regions_named_in, whole_area_answer
 from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
@@ -403,7 +403,8 @@ async def consult(message: str, business_name: str = "", category: str = "",
     # Ikeja, Victoria Island and Surulere" over a plan card that correctly read "All of
     # Lagos". Live-caught in the UI. Telling the model up front is the only way the
     # sentence it writes agrees with the plan it produces.
-    whole_now = _whole_area_answered(message)
+    client_words = _client_words(message, history, stated_audience)
+    whole_now = _whole_area_answered(message) or _broad_area(client_words)
     if whole_now:
         known_bits.append(
             f"the client has asked to cover ALL of {whole_now} — that IS the geography, "
@@ -467,6 +468,8 @@ async def consult(message: str, business_name: str = "", category: str = "",
         raise NlUnavailableError(str(e)) from e
 
     brief = _coerce(data, business_name, category)
+    broad = "" if _hyper_local(client_words, brief.geo_areas) else (
+        _broad_area(client_words) or ", ".join(regions_named_in(brief.city)))
     if settled_budget:
         brief = brief.model_copy(update={"budget_ngn": settled_budget})
         if brief.clarify and _is_about_budget(brief.clarify):
@@ -474,7 +477,7 @@ async def consult(message: str, business_name: str = "", category: str = "",
                 "clarify": _without_budget_questions(brief.clarify),
                 "missing": [m for m in (brief.missing or []) if not _is_about_budget(m)],
             })
-    return _enforce_hard_requirements(brief, message, history or [], known_budget)
+    return _enforce_hard_requirements(brief, message, history or [], known_budget, broad)
 
 
 _AFFIRMATIVE_WORDS = {
@@ -493,6 +496,36 @@ def _latest_user_reply(message: str) -> str:
     # Sentence ends only — a full stop inside "urisocial.com" or "₦2.5k" isn't one.
     pieces = [p.strip() for p in re.split(r"\.(?:\s+|$)", (message or "").strip()) if p.strip()]
     return pieces[-1].lower() if pieces else ""
+
+
+def _client_words(message: str, history: Optional[list[dict]], stated_audience: str = "") -> str:
+    """Everything the client typed in this conversation, and nothing Jane wrote."""
+    turns = [t.get("content", "") for t in (history or []) if t.get("role") == "user"]
+    return " . ".join([message or "", stated_audience or "", *turns])
+
+
+def _hyper_local(client_words: str, areas: list[dict]) -> bool:
+    """True when the client named a neighbourhood themselves, not just a state or city."""
+    if place_named_in(client_words):
+        return True
+    low = (client_words or "").lower()
+    return any(
+        name and name in low and not regions_named_in(name)
+        for name in ((a.get("name") or "").strip().lower() for a in (areas or []))
+    )
+
+
+def _broad_area(client_words: str) -> str:
+    """The states or cities to cover whole, when the client named only those.
+
+    A client who says "Lagos, Abuja and Ibadan" has not asked for Victoria Island,
+    the CBD and Ring Road. Jane picked pockets anyway, every time, so a broad brief
+    came back narrowed to three neighbourhoods. Unless the client names a
+    neighbourhood, the whole state is the target. Live-reported, repeatedly.
+    """
+    if place_named_in(client_words):
+        return ""
+    return ", ".join(regions_named_in(client_words))
 
 
 def _whole_area_answered(message: str) -> str:
@@ -731,7 +764,7 @@ def _is_about_budget(text: str) -> bool:
 
 
 def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
-                               known_budget: Optional[float]) -> ConsultantBrief:
+                               known_budget: Optional[float], broad: str = "") -> ConsultantBrief:
     """A real media buyer never guesses or skips the budget and the area — enforced HERE,
     not just prompted, because prompting alone already let two failure modes through
     once: treating a remembered past-campaign spend as this campaign's confirmed budget,
@@ -780,12 +813,12 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     # own clarify, and everything past that guard only runs when there is no clarify
     # to begin with — so a check placed after it can never see the loop it exists to
     # break.
-    whole = _whole_area_answered(message)
+    whole = _whole_area_answered(message) or broad
     if whole and _is_about_geography(brief.clarify):
         print(f"[Consultant] client asked for all of {whole} — dropping the area "
               f"question and settling the geography", flush=True)
         brief = brief.model_copy(update={
-            "city": brief.city or whole,
+            "city": whole,
             "geo_areas": [],
             "geo_mode": _geographic_mode(brief.geo_mode),
             "whole_area": True,
@@ -793,7 +826,7 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
             "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
         })
     elif whole:
-        brief = brief.model_copy(update={"city": brief.city or whole, "geo_areas": [],
+        brief = brief.model_copy(update={"city": whole, "geo_areas": [],
                                          "geo_mode": _geographic_mode(brief.geo_mode),
                                          "whole_area": True})
 
