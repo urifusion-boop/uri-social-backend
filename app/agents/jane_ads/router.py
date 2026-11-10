@@ -620,6 +620,57 @@ async def creative_drafts(
     return {"drafts": drafts}
 
 
+def _wizard_draft_key(brand_ctx: dict) -> str:
+    # Personal accounts (no agency brand) still get a working slot of their own.
+    return brand_ctx.get("brand_id") or brand_ctx["user_id"]
+
+
+class WizardDraftBody(BaseModel):
+    # Opaque JSON blob — the Campaign Builder wizard's own in-progress state
+    # (objective, platform, audience, budget, creative, ...). Never read or
+    # interpreted here; stored and returned exactly as sent.
+    payload: dict
+
+
+@router.post("/wizard-draft")
+async def save_wizard_draft(
+    body: WizardDraftBody,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Autosave for an in-progress Campaign Builder wizard run — one slot per
+    brand, upserted on every save. See wizard_draft.py and the frontend's
+    campaign-wizard/wizardDraft.ts, which calls this as a backstop behind its
+    own (faster, free) localStorage copy."""
+    from .wizard_draft import save
+    await save(db, _wizard_draft_key(brand_ctx), body.payload)
+    return {"ok": True}
+
+
+@router.get("/wizard-draft")
+async def get_wizard_draft(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    from .wizard_draft import load
+    doc = await load(db, _wizard_draft_key(brand_ctx))
+    updated_at = doc.get("updated_at") if doc else None
+    return {
+        "payload": doc.get("payload") if doc else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+
+
+@router.delete("/wizard-draft")
+async def delete_wizard_draft(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    from .wizard_draft import clear
+    await clear(db, _wizard_draft_key(brand_ctx))
+    return {"ok": True}
+
+
 _UPLOAD_IMAGE_TYPES = {
     "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp",
 }
