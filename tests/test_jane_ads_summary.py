@@ -149,3 +149,8 @@ def test_whole_state_plan_names_the_state_not_nigeria():
     from app.agents.jane_ads.geo import whole_area_plan
     s = build_campaign_summary(_plan(geo=whole_area_plan("Lagos")), _req(), audience_text="Small business owners")
     assert s.audience.value == "Small business owners — All of Lagos"
+
+
+def test_snake_case_segment_label_is_shown_as_words():
+    s = build_campaign_summary(_plan(), _req(), audience_text="small_business_owners_in_marketing")
+    assert s.audience.value.startswith("Small business owners in marketing")

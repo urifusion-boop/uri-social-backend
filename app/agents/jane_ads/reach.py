@@ -90,6 +90,9 @@ def restate_geography(text: str, dropped: list[str], city: str) -> str:
     # "all of Lagos, all of Lagos and all of Lagos" if the names were scattered.
     out = re.sub(rf"{same}(?:\s*(?:,|,?\s*and)\s*{same})+", replacement, out,
                  flags=re.IGNORECASE)
+    # "I'll target all of Lagos, as you asked." — the client asked for the pockets,
+    # not this; the widening note right after says why it changed.
+    out = re.sub(rf"({same}),?\s+as you (?:asked|requested|specified)", r"\1", out, flags=re.IGNORECASE)
     # "the commercial hubs of all of Lagos in Lagos" — the city was already named.
     out = re.sub(rf"(?:the\s+(?:\w+\s+)?{_PLACE_NOUNS}\s+(?:of|in)\s+)?{same}"
                  rf"(?:\s*,?\s*(?:in|,)\s*{re.escape(city)}(?:\s+state)?)?(?![A-Za-z])",
