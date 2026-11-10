@@ -33,6 +33,8 @@ from pydantic import BaseModel, Field
 
 from app.services.AIService import AIService
 
+from .video_styles import VIDEO_STYLES  # the 12 styles, shared with the script writer
+
 PROMPT_VERSION = "content-prompt-expander-v4"
 MODEL = "gpt-4o"
 MAX_CHARS = 1800
@@ -83,25 +85,6 @@ Hard rules:
 # So this one is STRUCTURED: fixed fields the model fills in, laid out under fixed headings by compose_video() below.
 # The structure is exactly what the video pipeline already rewards (see video_creative_service.py): people described once
 # and repeated, one scene per ~5 seconds, exact spoken lines, short captions, brand colours as accents.
-# The 12 video styles the script writer can follow (VIDEO_STYLE_DIRECTIVES in video_storyboard_service.py has the full
-# directive for each; a test keeps these slugs in step). Kept here as short gists so this module does not import the
-# heavy storyboard service. The expander picks ONE for the idea and names it in the brief, so the script writer follows it.
-VIDEO_STYLES: dict[str, tuple[str, str]] = {
-    "clean_commercial": ("Clean Commercial", "polished brand commercial: smooth dolly moves, hero product shots, clean cuts"),
-    "luxury_slow_burn": ("Luxury Slow Burn", "premium and cinematic: macro close-ups, very slow push-ins, long unhurried scenes"),
-    "viral_fast_cut": ("Viral Fast Cut", "high-energy and social-native: handheld, snap zooms, very fast cuts, an instant hook"),
-    "ingredient_reveal": ("Ingredient Reveal", "a sensory reveal of raw ingredients in macro texture, building to the hero product"),
-    "street_style": ("Street Style", "authentic urban documentary: handheld, natural rhythm, real-life moments"),
-    "unboxing_drama": ("Unboxing Drama", "a theatrical build-up and reveal of a product and its packaging, hands in close-up"),
-    "before_after": ("Before / After", "a problem then its transformation: matched angles, muted first half, bright second half"),
-    "mood_film": ("Mood Film", "atmosphere and emotion over product information: wide, slow, golden-hour feel"),
-    "product_explosion": ("Product Explosion", "dynamic, physics-defying product visuals: orbits, particles, freeze-frames"),
-    "testimonial_style": ("Testimonial Style", "an authentic person-to-camera testimonial or interview, conversational pacing"),
-    "menu_showcase": ("Menu Showcase", "food that looks irresistible: overhead and glamour angles, lingering on texture"),
-    "countdown_hype": ("Countdown Hype", "urgency that escalates scene by scene: each scene tighter and faster than the last"),
-}
-
-
 def _style_menu() -> str:
     return "\n".join(f"    {slug}: {gist}" for slug, (_name, gist) in VIDEO_STYLES.items())
 
@@ -151,6 +134,13 @@ Hard rules:
   refine it lightly: keep their scenes and keep every line they wrote in quotes WORD FOR WORD.
 - Use ONLY the brand facts given. Never invent products, prices, offers, discounts, events, dates, statistics or
   results. No medical, financial or guaranteed-result claims. Respect the guardrails.
+- Captions and spoken lines carry only what the owner's idea or the brand facts say. Never add a promise or claim of
+  your own ("every time", "the best", "guaranteed", a number, a time), and never a call to action the brand did not
+  give. Sound effects are only the ambient sound of the setting (a kitchen, a street): never invent a story event
+  such as a knock on the door.
+- When someone speaks to camera, spread the spoken script across ALL the scenes as one continuous take, unless the
+  owner's own text leaves a scene silent. If the owner wrote the line, use it exactly and split it only at a natural
+  pause.
 - Greeting / occasion videos (Mother's Day, Independence Day, Eid, Christmas, New Year…): celebrate the occasion and
   the people; the brand is simply the warm sender, signing off at most. Never compare the occasion to the product or
   the brand and no sales message.
@@ -304,7 +294,7 @@ class _ExpandedVideo(BaseModel):
     used: list[str] = Field(default_factory=list, description="Which brand facts shaped it, 2-4 words each.")
 
 
-VIDEO_PROMPT_VERSION = "video-prompt-expander-v3"
+VIDEO_PROMPT_VERSION = "video-prompt-expander-v4"
 VIDEO_MAX_CHARS = 1900            # the brief box holds 2000
 SECONDS_PER_SCENE = 5             # the pipeline cuts a script into scenes of about this length
 CAPTION_MAX_WORDS = 8
@@ -384,7 +374,7 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
         for i, scene in enumerate(scenes):
             lines.append(_scene_line(i, total, duration_seconds, scene, action_max))
         for key, label in (("sound", "SOUND"), ("call_to_action", "CLOSE"), ("avoid", "AVOID")):
-            text = _sentence(getattr(parsed, key, ""))
+            text = _sentence(video_avoid(getattr(parsed, key, "")) if key == "avoid" else getattr(parsed, key, ""))
             if text and key not in drop:
                 lines.append(f"{label}: {text}")
         return "\n".join(lines)
@@ -404,9 +394,35 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
 VIDEO_SYSTEM = VIDEO_SYSTEM.replace("{STYLE_MENU}", _style_menu())
 
 
+# Playbook facts that exist for writing SOCIAL POSTS (post topics, link in the caption, per-platform caption tone) and
+# mean nothing to a video: left out of the video brief.
+_POST_ONLY_FACTS = ("content pillars", "default link", "platform tone")
+# A rule about posts, not video ("no more than 5 hashtags", "no emojis in captions"): dropped from what a video must avoid.
+_POST_ONLY_RULE = re.compile(r"hashtag|#|emoji|caption length|character limit", re.IGNORECASE)
+
+
+def video_avoid(text: Any) -> str:
+    """The AVOID line without the post-only rules. Guardrails are free text, "a; b, c", so it is cut into its parts and only
+    the parts about posts are dropped (a leaked "more than 5 hashtags" has no place in a video brief)."""
+    parts = [p.strip() for p in re.split(r"[;\n]|,(?![^()]*\))", _line(text)) if p.strip()]
+    return "; ".join(p for p in parts if not _POST_ONLY_RULE.search(p))
+
+
+def video_brand_facts(bc: dict) -> dict:
+    facts = {k: v for k, v in brand_facts(bc, styles=[]).items() if k not in _POST_ONLY_FACTS}
+    for key in ("guardrails", "words to avoid"):
+        if key in facts:
+            kept = video_avoid(", ".join(facts[key]) if isinstance(facts[key], list) else facts[key])
+            if kept:
+                facts[key] = kept
+            else:
+                del facts[key]
+    return facts
+
+
 def build_video_messages(idea: str, bc: dict, platform: str, duration_seconds: Optional[int],
                          today: datetime) -> list[dict]:
-    facts = brand_facts(bc, styles=[])
+    facts = video_brand_facts(bc)
     facts_text = "\n".join(f"- {k}: {', '.join(v) if isinstance(v, list) else v}" for k, v in facts.items())
     total = scene_count(duration_seconds)
     lines = [f"Platform: {platform or 'not chosen yet'}",
