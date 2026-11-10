@@ -159,7 +159,7 @@ def test_expand_video_returns_the_structured_brief_and_its_version(ai):
     seen = ai(parsed=brief())
     out = _run(pe.expand_video("A testimonial for our jollof", {"brand_name": "Bukka Express"}, "instagram_reels", 10))
     assert out["expanded_prompt"].startswith("CONCEPT: ") and "SCENE 2 (5-10s)" in out["expanded_prompt"]
-    assert out["prompt_version"] == "video-prompt-expander-v4" and out["used"] == ["brand voice"]
+    assert out["prompt_version"] == "video-prompt-expander-v5" and out["used"] == ["brand voice"]
     assert seen["response_model"] is pe._ExpandedVideo
 
 
@@ -206,3 +206,25 @@ def test_the_model_is_offered_every_style_and_told_fast_styles_move_the_camera_n
     assert "fast, dramatic CAMERA and PRODUCT movement" in system
     assert "Put the energy in the camera and the product, not in a face" in system
     assert "no face at all (or only hands)" in system
+
+
+# ── a caption the owner gave once is shown once ──────────────────────────────
+
+def test_a_caption_repeated_on_several_scenes_is_kept_only_on_the_last():
+    text = pe.compose_video(brief(people=[], scenes=[scene("Can snaps open.", caption="Fresh energy. Zero waiting."),
+                                                     scene("Orbit around the can.", caption="Fresh energy. Zero waiting.")]), 10)
+    assert text.count("Fresh energy. Zero waiting.") == 1
+    assert 'SCENE 2 (5-10s): Orbit around the can. Caption: "Fresh energy. Zero waiting."' in text
+    assert "SCENE 1 (0-5s): Can snaps open." in text and "SCENE 1 (0-5s): Can snaps open. Caption" not in text
+
+
+def test_the_same_caption_is_matched_regardless_of_case_and_punctuation():
+    text = pe.compose_video(brief(people=[], scenes=[scene("a", caption="Order today!"), scene("b", caption="order TODAY")]), 10)
+    lines = text.split("\n")
+    assert "Caption" not in lines[[i for i, l in enumerate(lines) if l.startswith("SCENE 1")][0]]
+    assert 'SCENE 2 (5-10s): b. Caption: "order TODAY"' in text
+
+
+def test_different_captions_are_all_kept():
+    text = pe.compose_video(brief(people=[], scenes=[scene("a", caption="Hot. Fresh."), scene("b", caption="Order today")]), 10)
+    assert 'Caption: "Hot. Fresh."' in text and 'Caption: "Order today"' in text
