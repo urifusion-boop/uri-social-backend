@@ -95,6 +95,9 @@ it was written for you; follow it exactly instead of re-inventing it:
 - "Caption: "..."" is that scene's text_overlay, word for word. A scene with no Caption has text_overlay null.
 - PERSON describes each person on screen: copy that description word for word into the video_prompt of every scene they
   appear in. SETTING and LOOK apply to every scene: put them into every video_prompt.
+- NO PERSON line means NO people on screen: show the product only (at most a hand holding it). Never add a person, face
+  or model the brief did not describe, and never give such a scene the "lifestyle" shot_type (use product_hero,
+  brand_close_up or transition), because that shot type makes the picture model add a person.
 - STYLE names the video style. SOUND and CLOSE describe the voice, music and call to action. AVOID lists words and things
   that must not appear in any scene, caption or spoken line.
 - Anything the brief does not say, you decide, following the rules above.

@@ -70,6 +70,8 @@ def test_the_writer_is_told_how_to_read_the_headed_lines():
                  "use the words WORD FOR WORD", "A scene with no \"Says exactly\" has dialogue null",
                  "is that scene's text_overlay, word for word",
                  "copy that description word for word into the video_prompt of every scene",
+                 "NO PERSON line means NO people on screen",
+                 'never give such a scene the "lifestyle" shot_type',
                  "STYLE names the video style", "treat it as a free-text idea"):
         assert rule in prompt, rule
 

@@ -294,7 +294,7 @@ class _ExpandedVideo(BaseModel):
     used: list[str] = Field(default_factory=list, description="Which brand facts shaped it, 2-4 words each.")
 
 
-VIDEO_PROMPT_VERSION = "video-prompt-expander-v4"
+VIDEO_PROMPT_VERSION = "video-prompt-expander-v5"
 VIDEO_MAX_CHARS = 1900            # the brief box holds 2000
 SECONDS_PER_SCENE = 5             # the pipeline cuts a script into scenes of about this length
 CAPTION_MAX_WORDS = 8
@@ -316,7 +316,32 @@ def _sentence(text: Any) -> str:
     return t if not t or t[-1] in ".!?" else t + "."
 
 
-def _scene_line(index: int, total: int, duration_seconds: Optional[int], scene: Any, action_max: Optional[int] = None) -> str:
+def _caption_of(scene: Any) -> str:
+    return " ".join(_line(getattr(scene, "caption", "")).replace('"', "'").split()[:CAPTION_MAX_WORDS])
+
+
+def _caption_key(caption: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", caption.lower()).strip()
+
+
+def _dedupe_captions(scenes: list) -> list[str]:
+    """One caption per scene, but a caption that repeats is shown ONCE, on the LAST scene that has it: text the owner gave
+    once ("ending on the can with the text X") is meant to appear once, at the close, not on every scene."""
+    captions = [_caption_of(sc) for sc in scenes]
+    seen: set[str] = set()
+    for i in range(len(captions) - 1, -1, -1):
+        key = _caption_key(captions[i])
+        if not key:
+            continue
+        if key in seen:
+            captions[i] = ""
+        else:
+            seen.add(key)
+    return captions
+
+
+def _scene_line(index: int, total: int, duration_seconds: Optional[int], scene: Any, action_max: Optional[int] = None,
+                caption: Optional[str] = None) -> str:
     start = index * SECONDS_PER_SCENE
     end = (index + 1) * SECONDS_PER_SCENE
     if index == total - 1 and duration_seconds:
@@ -329,7 +354,7 @@ def _scene_line(index: int, total: int, duration_seconds: Optional[int], scene: 
     says = _line(getattr(scene, "says", "")).replace('"', "'")
     if says:
         parts.append(f'Says exactly: "{says}"')
-    caption = " ".join(_line(getattr(scene, "caption", "")).replace('"', "'").split()[:CAPTION_MAX_WORDS])
+    caption = _caption_of(scene) if caption is None else caption
     if caption:
         parts.append(f'Caption: "{caption}"')
     return " ".join(parts)
@@ -353,6 +378,7 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
     shortened, but a spoken line is never cut."""
     total = scene_count(duration_seconds)
     scenes = list(getattr(parsed, "scenes", None) or [])[:total]
+    captions = _dedupe_captions(scenes)
     concept = _sentence(_LEAD_IN.sub("", _line(getattr(parsed, "concept", ""))))
     if concept:
         concept = concept[:1].upper() + concept[1:]
@@ -372,7 +398,7 @@ def compose_video(parsed: Any, duration_seconds: Optional[int] = None) -> str:
             if text and key not in drop:
                 lines.append(f"{label}: {text}")
         for i, scene in enumerate(scenes):
-            lines.append(_scene_line(i, total, duration_seconds, scene, action_max))
+            lines.append(_scene_line(i, total, duration_seconds, scene, action_max, captions[i]))
         for key, label in (("sound", "SOUND"), ("call_to_action", "CLOSE"), ("avoid", "AVOID")):
             text = _sentence(video_avoid(getattr(parsed, key, "")) if key == "avoid" else getattr(parsed, key, ""))
             if text and key not in drop:
