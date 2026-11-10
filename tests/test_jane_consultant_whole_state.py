@@ -63,3 +63,9 @@ def test_builder_message_tells_jane_the_platform_and_areas_are_decided(monkeypat
                    platform_label="Instagram & Facebook")
     assert "chose to run this on Instagram & Facebook" in seen[0]
     assert "Lekki and Ikeja — that IS the geography" in seen[0]
+
+
+def test_client_named_area_is_marked_so_plan_cards_keep_it(monkeypatch):
+    brief, _ = _run(monkeypatch, "Uri for business owners in Lekki, Lagos. Budget: ₦40000 over 7 days.")
+    assert jc.client_named_areas(brief) == ["Lekki"]
+    assert "Let me know" not in brief.stated_plan

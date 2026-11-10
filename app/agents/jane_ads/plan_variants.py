@@ -29,7 +29,7 @@ import openai
 from app.core.config import settings
 
 from . import constants as C
-from .jane_consultant import ConsultantBrief
+from .jane_consultant import ConsultantBrief, client_named_areas
 from .models import PlanVariant, PlanVariantSet, StrategyCitation
 from .retrieval import RetrievalResult
 
@@ -308,6 +308,9 @@ async def generate_plan_variants(
     # accounts are Nigerian), yet the cards offered "Nairobi, Johannesburg, Cairo" —
     # places the campaign would never run. Live, 2026-10-30.
     nationwide = not whole_area and (parsed.geo_mode or "").strip().lower() == "non_local"
+    # Asked for Lekki, the client was shown a Lekki plan, then picked an audience card
+    # whose own pockets (Admiralty Way, Ikate) replaced it on the final plan.
+    named = [] if whole_area else client_named_areas(parsed)
     variants: list[PlanVariant] = []
     for i, v in enumerate(raw_variants[:5], start=1):
         if not isinstance(v, dict):
@@ -318,7 +321,7 @@ async def generate_plan_variants(
             who_its_for=str(v.get("who_its_for", "")).strip(),
             audience_segment=str(v.get("audience_segment", "")).strip(),
             geo_pockets=([f"All of {parsed.city}"] if whole_area else ["All of Nigeria"] if nationwide else
-                         [str(g).strip() for g in (v.get("geo_pockets") or []) if str(g).strip()]),
+                         named or [str(g).strip() for g in (v.get("geo_pockets") or []) if str(g).strip()]),
             trigger=str(v.get("trigger", "")).strip(),
             why_this_could_work=str(v.get("why_this_could_work", "")).strip(),
             trade_off=str(v.get("trade_off", "")).strip(),
