@@ -2718,7 +2718,7 @@ async def _build_campaign_plan(
     from .decision_engine import apply_platform_override, as_client_choice, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import to_campaign_request, NlUnavailableError
-    from .jane_consultant import build_history_turns, consult
+    from .jane_consultant import build_history_turns, client_named_areas, consult
     from .threads import thread_history
     from .policy import Severity, review_ad_creative
 
@@ -3351,7 +3351,7 @@ async def _build_campaign_plan(
     # areas with the variant's when one was selected; the geo MODE (own_radius/
     # watering_hole/mixed) is still Jane's own read, not something a variant changes.
     geo_areas = parsed.geo_areas
-    if selected_variant and selected_variant.geo_pockets:
+    if selected_variant and selected_variant.geo_pockets and not client_named_areas(parsed):
         geo_areas = [{"name": name, "reason": selected_variant.trigger} for name in selected_variant.geo_pockets]
     # A place the client named inside their OWN audience outranks everything above it:
     # they typed it as the answer to "who should this target", so it is this campaign's
@@ -3545,7 +3545,8 @@ async def _build_campaign_plan(
     # geo_areas above — equally forbidden from appearing in copy. Live-confirmed leak:
     # these reached Meta's real targeting but were never passed into the creative
     # functions at all, so the leakage check had no way to catch them.
-    variant_geo_pockets = selected_variant.geo_pockets if selected_variant else None
+    variant_geo_pockets = ((client_named_areas(parsed) or selected_variant.geo_pockets)
+                           if selected_variant else None)
 
     # By this point plan.platforms has already been narrowed to a single platform
     # above (either forced to [Platform.TIKTOK] or [Platform.META] — never mixed,
@@ -3687,6 +3688,8 @@ async def _build_campaign_plan(
             .replace("you have photos", "you have video")
             .replace("no creative is needed for search", "you have video")
         )
+    elif not creative.is_video:
+        plan.explanation = plan.explanation.replace("you have video", "you have photos")
 
     # TikTok's real video-or-not requirement, checked here (not up at the
     # platform-decision point) for the exact same reason the explanation-text

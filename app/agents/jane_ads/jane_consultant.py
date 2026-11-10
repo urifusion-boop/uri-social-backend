@@ -662,6 +662,13 @@ def _whole_area_sentence(stated_plan: str, whole: str) -> str:
     return " ".join([lead, *kept])
 
 
+CLIENT_NAMED = "the area you named"
+
+
+def client_named_areas(brief: "ConsultantBrief") -> list[str]:
+    return [a["name"] for a in brief.geo_areas or [] if a.get("reason") == CLIENT_NAMED]
+
+
 def _named_areas_only(brief: "ConsultantBrief", client_words: str) -> "ConsultantBrief":
     """The neighbourhoods the client named, and only those.
 
@@ -672,10 +679,11 @@ def _named_areas_only(brief: "ConsultantBrief", client_words: str) -> "Consultan
     named = places_named_in(client_words)
     if not named:
         return brief
-    areas = [{"name": n, "reason": "the area you named"} for n in named]
+    areas = [{"name": n, "reason": CLIENT_NAMED} for n in named]
     plan = f"I'll target {_listed(named)}, as you asked."
     kept = [s.strip() for s in _SENTENCE.findall(brief.stated_plan or "")
-            if s.strip() and "?" not in s and not place_named_in(s)]
+            if s.strip() and "?" not in s and not place_named_in(s)
+            and not s.strip().lower().startswith("let me know")]
     return brief.model_copy(update={"geo_areas": areas, "stated_plan": " ".join([plan, *kept])})
 
 
