@@ -13,7 +13,7 @@ READY = {
 }
 
 
-def _run(monkeypatch, message, data=READY):
+def _run(monkeypatch, message, data=READY, **kw_consult):
     seen: list[str] = []
 
     class _Completions:
@@ -27,7 +27,7 @@ def _run(monkeypatch, message, data=READY):
 
     monkeypatch.setattr(jc.openai, "AsyncOpenAI", _Client)
     monkeypatch.setattr(jc, "settings", SimpleNamespace(jane_ads_openai_key="test"))
-    return asyncio.run(jc.consult(message, "Uri", "Marketing", history=[])), seen
+    return asyncio.run(jc.consult(message, "Uri", "Marketing", history=[], **kw_consult)), seen
 
 
 def test_states_only_means_the_whole_states(monkeypatch):
@@ -56,3 +56,10 @@ def test_whole_area_message_never_names_pockets(monkeypatch):
     data = {**READY, "stated_plan": "I'll cover all of Lagos, focusing on areas like Lekki and Ikeja."}
     brief, _ = _run(monkeypatch, "Promote Uri to small business owners in Lagos. 40,000", data)
     assert brief.stated_plan == "I'll cover all of Lagos."
+
+
+def test_builder_message_tells_jane_the_platform_and_areas_are_decided(monkeypatch):
+    _, seen = _run(monkeypatch, "Uri for business owners in Lekki and Ikeja. Budget: ₦40000 over 7 days.",
+                   platform_label="Instagram & Facebook")
+    assert "chose to run this on Instagram & Facebook" in seen[0]
+    assert "Lekki and Ikeja — that IS the geography" in seen[0]
