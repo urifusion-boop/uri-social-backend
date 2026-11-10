@@ -12,6 +12,7 @@ from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.s3_upload import upload_bytes
 from app.agents.social_media_manager.services.video_styles import style_from_brief
+from app.agents.social_media_manager.services.video_text_overlay import SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES
 from app.agents.social_media_manager.services.people_consistency import (
     IDENTITY_LOCK,
     PEOPLE_ON_SCREEN_RULES,
@@ -56,6 +57,7 @@ Rules:
 - APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
 - reference_image_index: 0 if reference images were supplied and this scene draws on them, otherwise 0 (unused placeholder — frame generation for this flow chains scene-to-scene for consistency instead of picking by index).
 - text_overlay is a short on-screen caption/tagline string (8 words or fewer), or null. The editor draws it, sharply, onto the finished video: NEVER describe lettering, captions, titles or text cards inside a video_prompt (a text_card shot is a clean, plain or brand-coloured backdrop that the caption is laid over).
+{{SCREEN_TEXT_RULES}}
 - shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
 
 CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
@@ -139,7 +141,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
       "dialogue": <string spoken on camera this scene, or null>
     }
   ]
-}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES)
+}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES).replace(SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES)
 
 
 VIDEO_OUTCOMES = (

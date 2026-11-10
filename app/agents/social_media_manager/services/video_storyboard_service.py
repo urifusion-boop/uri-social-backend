@@ -21,6 +21,7 @@ from app.utils.s3_upload import upload_bytes
 # identical fail-soft client-init pattern, reused here rather than duplicated
 # differently.
 from .people_consistency import PEOPLE_ON_SCREEN_RULES, PEOPLE_RULES_PLACEHOLDER
+from .video_text_overlay import SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES
 
 try:
     from google import genai
@@ -48,6 +49,7 @@ Rules:
 - APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
 - reference_image_index tells which supplied image becomes the first frame of that clip (0-based).
 - text_overlay is a short on-screen caption/tagline string (8 words or fewer), or null. The editor draws it, sharply, onto the finished video: NEVER describe lettering, captions, titles or text cards inside a video_prompt (a text_card shot is a clean, plain or brand-coloured backdrop that the caption is laid over).
+{{SCREEN_TEXT_RULES}}
 - shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
 
 CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
@@ -98,7 +100,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
       "dialogue": <string spoken on camera this scene, or null>
     }
   ]
-}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES)
+}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES).replace(SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES)
 
 VIDEO_STYLE_DIRECTIVES: Dict[str, str] = {
     "clean_commercial": """VIDEO STYLE — CLEAN COMMERCIAL:
