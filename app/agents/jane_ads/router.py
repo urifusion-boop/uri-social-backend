@@ -2704,6 +2704,10 @@ async def _resolve_creative_path(body: MetaLaunchFromMessageBody, brand_ctx: dic
     return cp.provenance("ugc", ugc_kind=body.ugc_kind, rights_confirmed=body.ugc_rights_confirmed)
 
 
+def _listed_areas(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 _PLATFORM_LABELS = {"meta": "Instagram & Facebook", "tiktok": "TikTok", "google": "Google"}
 
 
@@ -3339,6 +3343,10 @@ async def _build_campaign_plan(
 
     if body.preferred_platform in ("meta", "tiktok", "google"):
         plan = as_client_choice(plan)
+    named_areas = client_named_areas(parsed)
+    if named_areas:
+        plan.explanation = re.sub(r"you're targeting [^.]*\.",
+                                  f"you're targeting {_listed_areas(named_areas)}.", plan.explanation)
 
     # The duration the client asked for, wherever they said it. The planner otherwise
     # picks one from the budget alone, so "for 2 days" was silently ignored.
