@@ -627,47 +627,60 @@ def _wizard_draft_key(brand_ctx: dict) -> str:
 
 class WizardDraftBody(BaseModel):
     # Opaque JSON blob — the Campaign Builder wizard's own in-progress state
-    # (objective, platform, audience, budget, creative, ...). Never read or
-    # interpreted here; stored and returned exactly as sent.
+    # (objective, platform, audience, budget, creative, the last plan/creative
+    # seen for each platform, ...). Never read or interpreted here; stored and
+    # returned exactly as sent.
     payload: dict
 
 
-@router.post("/wizard-draft")
+@router.get("/wizard-drafts")
+async def list_wizard_drafts(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Every in-progress Campaign Builder run for this brand, most recent
+    first — the backstop behind the frontend's own (faster, free) localStorage
+    list (campaign-wizard/wizardDraft.ts). Live-reported: a single slot per
+    brand silently discarded an earlier unfinished run the moment a second one
+    was started, so each draft now keeps its own slot by draft_id."""
+    from .wizard_draft import list_drafts
+    docs = await list_drafts(db, _wizard_draft_key(brand_ctx))
+    return {
+        "drafts": [
+            {
+                "draft_id": d["draft_id"],
+                "payload": d.get("payload"),
+                "updated_at": d["updated_at"].isoformat() if d.get("updated_at") else None,
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.post("/wizard-draft/{draft_id}")
 async def save_wizard_draft(
+    draft_id: str,
     body: WizardDraftBody,
     brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ) -> dict:
-    """Autosave for an in-progress Campaign Builder wizard run — one slot per
-    brand, upserted on every save. See wizard_draft.py and the frontend's
-    campaign-wizard/wizardDraft.ts, which calls this as a backstop behind its
-    own (faster, free) localStorage copy."""
-    from .wizard_draft import save
-    await save(db, _wizard_draft_key(brand_ctx), body.payload)
+    """Autosave for one in-progress Campaign Builder run, upserted on every
+    save. See wizard_draft.py and the frontend's campaign-wizard/
+    wizardDraft.ts, which calls this as a backstop behind its own (faster,
+    free) localStorage copy."""
+    from .wizard_draft import save_draft
+    await save_draft(db, _wizard_draft_key(brand_ctx), draft_id, body.payload)
     return {"ok": True}
 
 
-@router.get("/wizard-draft")
-async def get_wizard_draft(
-    brand_ctx: dict = Depends(get_active_brand_context),
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-) -> dict:
-    from .wizard_draft import load
-    doc = await load(db, _wizard_draft_key(brand_ctx))
-    updated_at = doc.get("updated_at") if doc else None
-    return {
-        "payload": doc.get("payload") if doc else None,
-        "updated_at": updated_at.isoformat() if updated_at else None,
-    }
-
-
-@router.delete("/wizard-draft")
+@router.delete("/wizard-draft/{draft_id}")
 async def delete_wizard_draft(
+    draft_id: str,
     brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ) -> dict:
-    from .wizard_draft import clear
-    await clear(db, _wizard_draft_key(brand_ctx))
+    from .wizard_draft import delete_draft
+    await delete_draft(db, _wizard_draft_key(brand_ctx), draft_id)
     return {"ok": True}
 
 
