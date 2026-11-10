@@ -122,7 +122,7 @@ def test_the_merge_route_passes_each_finished_clips_text(monkeypatch):
             {"scene_number": 3, "video_url": "u3", "text_overlay": None},
         ]}
 
-    async def fake_merge(urls, texts=None):
+    async def fake_merge(urls, texts=None, logo=None):
         seen["args"] = (urls, texts)
         return "https://cdn/merged.mp4"
 
@@ -130,6 +130,50 @@ def test_the_merge_route_passes_each_finished_clips_text(monkeypatch):
     monkeypatch.setattr(vms.VideoMergeService, "merge_clips", staticmethod(fake_merge))
     _run(R.merge_video_job("J1", TOKEN))
     assert seen["args"] == (["u1", "u3"], ["Fresh today", None])         # the failed scene's text is dropped with it
+
+
+def test_the_merge_route_hands_over_the_brands_logo_when_the_playbook_has_one(monkeypatch):
+    seen = {}
+
+    async def fake_get_job(job_id):
+        return {"status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
+
+    async def fake_context(ctx, db):
+        return {"logo_url": "https://cdn/logo.png", "logo_position": "top_left", "logo_size": "medium"}
+
+    async def fake_merge(urls, texts=None, logo=None):
+        seen["logo"] = logo
+        return "https://cdn/merged.mp4"
+
+    monkeypatch.setattr(vgs, "get_job", fake_get_job)
+    monkeypatch.setattr(R, "_video_brand_context", fake_context)
+    monkeypatch.setattr(vms.VideoMergeService, "merge_clips", staticmethod(fake_merge))
+    _run(R.merge_video_job("J1", TOKEN, None, {"user_id": "u1", "brand_id": "b1"}))
+    assert seen["logo"] == {"url": "https://cdn/logo.png", "position": "top_left", "size": "medium"}
+
+
+def test_the_merge_route_merges_without_a_logo_when_the_playbook_has_none_or_cannot_be_read(monkeypatch):
+    seen = []
+
+    async def fake_get_job(job_id):
+        return {"status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
+
+    async def merge(urls, texts=None, logo=None):
+        seen.append(logo)
+        return "https://cdn/merged.mp4"
+
+    async def no_logo(ctx, db):
+        return {"logo_url": None}
+
+    async def broken(ctx, db):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(vgs, "get_job", fake_get_job)
+    monkeypatch.setattr(vms.VideoMergeService, "merge_clips", staticmethod(merge))
+    for reader in (no_logo, broken):
+        monkeypatch.setattr(R, "_video_brand_context", reader)
+        _run(R.merge_video_job("J1", TOKEN, None, {"user_id": "u1", "brand_id": "b1"}))
+    assert seen == [None, None]
 
 
 # ── the pictures no longer carry the text ────────────────────────────────────
