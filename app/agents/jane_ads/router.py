@@ -2715,7 +2715,7 @@ async def _build_campaign_plan(
     from app.core.config import settings
     from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
     from .creative import creative_from_draft, creative_from_recomposite, creative_from_upload, generate_ad_creative, get_brand_context, service_area_from_geo, write_shoot_script
-    from .decision_engine import apply_platform_override, plan_campaign
+    from .decision_engine import apply_platform_override, as_client_choice, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import to_campaign_request, NlUnavailableError
     from .jane_consultant import build_history_turns, consult
@@ -3323,6 +3323,9 @@ async def _build_campaign_plan(
                 plan = apply_platform_override(plan, [Platform.META])
             else:
                 plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+
+    if body.preferred_platform in ("meta", "tiktok", "google"):
+        plan = as_client_choice(plan)
 
     # The duration the client asked for, wherever they said it. The planner otherwise
     # picks one from the budget alone, so "for 2 days" was silently ignored.
