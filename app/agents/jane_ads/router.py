@@ -2706,7 +2706,16 @@ async def _build_campaign_plan(
                 db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
             )
         except AdsConnectionRequired as e:
-            if not google_ready:
+            # Live-reported: a client with Instagram & Facebook picked BY NAME
+            # (preferred_platform == "meta") but a broken/unapproved Meta
+            # connection, and a working Google Ads account, got a silent
+            # Google plan instead — "It's picking Google automatically" no
+            # matter what they selected. google_ready alone isn't enough to
+            # swallow this error: the google_only fallback below is for when
+            # Jane is the one choosing between platforms, not for a client
+            # who explicitly asked for Meta. Surface the real problem instead
+            # of substituting a platform they never asked for.
+            if not google_ready or body.preferred_platform == "meta":
                 return {"early_return": {
                     "stage": f"meta_connection_{e.state.value}",
                     "understood": {},
