@@ -218,3 +218,17 @@ def test_generate_plan_variants_never_a_measured_number_hard_check():
     numeric_fields = {name for name, field in PlanVariant.model_fields.items()
                       if field.annotation in (int, float, Optional[float])}
     assert numeric_fields <= {"rank", "budget_alone_ngn", "budget_shared_ngn"}
+
+
+def test_recommendation_names_the_plan_number_shown():
+    payload = {"variants": [
+        {"who_its_for": "retail shop owners losing foot traffic", "audience_segment": "a", "trigger": "t",
+         "why_this_could_work": "w", "trade_off": "x", "rank": 1, "recommended": True},
+        {"who_its_for": "new founders", "audience_segment": "b", "trigger": "t",
+         "why_this_could_work": "w", "trade_off": "x", "rank": 2, "recommended": False},
+    ], "recommendation_reason": "I'd go with the second one, aimed at retail shop owners."}
+    mock_create = AsyncMock(return_value=_mock_openai_response(payload))
+    with patch("openai.AsyncOpenAI") as mock_client_cls:
+        mock_client_cls.return_value.chat.completions.create = mock_create
+        result = _run(generate_plan_variants(_brief()))
+    assert result.recommendation_reason == "I'd go with Plan 1, aimed at retail shop owners."
