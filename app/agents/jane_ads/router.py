@@ -3309,7 +3309,13 @@ async def _build_campaign_plan(
                           "reason": "the area you named in the audience you specified"}]
     geo_dump = None
     try:
-        if parsed.geo_mode:
+        if getattr(parsed, "whole_area", False) and parsed.city and not (
+                own_audience and geo_areas is not parsed.geo_areas):
+            from .geo import GeoMode, whole_area_plan
+            mode = parsed.geo_mode if parsed.geo_mode in {m.value for m in GeoMode} else "watering_hole"
+            plan.geo = whole_area_plan(parsed.city, GeoMode(mode))
+            geo_dump = plan.geo.model_dump()
+        elif parsed.geo_mode:
             from .geo import geo_plan_from_named_areas
             geo_plan = await geo_plan_from_named_areas(
                 parsed.geo_mode, parsed.city, geo_areas, parsed.geo_explanation,

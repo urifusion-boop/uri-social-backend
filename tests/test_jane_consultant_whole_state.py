@@ -44,3 +44,15 @@ def test_no_place_named_covers_the_whole_city_jane_picked(monkeypatch):
 def test_a_named_neighbourhood_keeps_the_pockets(monkeypatch):
     brief, _ = _run(monkeypatch, "Webinar for business owners in Victoria Island, Lagos. 50,000")
     assert not brief.whole_area and brief.geo_areas
+
+
+def test_named_neighbourhoods_are_the_only_areas(monkeypatch):
+    brief, _ = _run(monkeypatch, "Promote Uri to small business owners in Lekki and Ikeja. 40,000")
+    assert [a["name"] for a in brief.geo_areas] == ["Lekki", "Ikeja"]
+    assert "Victoria Island" not in brief.stated_plan
+
+
+def test_whole_area_message_never_names_pockets(monkeypatch):
+    data = {**READY, "stated_plan": "I'll cover all of Lagos, focusing on areas like Lekki and Ikeja."}
+    brief, _ = _run(monkeypatch, "Promote Uri to small business owners in Lagos. 40,000", data)
+    assert brief.stated_plan == "I'll cover all of Lagos."
