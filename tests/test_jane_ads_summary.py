@@ -143,3 +143,9 @@ def test_google_search_small_budget_is_called_a_test_not_enough():
 def test_google_search_enough_budget_says_so():
     s = build_campaign_summary(_search_plan(35_000, 7), _req(budget_ngn=35_000))
     assert "enough for Google to learn" in s.duration.reason
+
+
+def test_whole_state_plan_names_the_state_not_nigeria():
+    from app.agents.jane_ads.geo import whole_area_plan
+    s = build_campaign_summary(_plan(geo=whole_area_plan("Lagos")), _req(), audience_text="Small business owners")
+    assert s.audience.value == "Small business owners — All of Lagos"

@@ -664,6 +664,16 @@ def _whole_area_sentence(stated_plan: str, whole: str) -> str:
 
 CLIENT_NAMED = "the area you named"
 
+# The model fills intermediary_note even when there is none ("No intermediary needed;
+# direct SME owners are the targets", "URI directly targets business owners, not
+# intermediaries") and it reaches the client's plan as noise.
+_NO_INTERMEDIARY = re.compile(r"\b(no|not|without)\b[^.]*\bintermediar|\bintermediar[^.]*\b(needed|required)\b[^.]*\bnot\b",
+                              re.IGNORECASE)
+
+
+def _without_no_intermediary(text: str) -> str:
+    return " ".join(s.strip() for s in _SENTENCE.findall(text) if s.strip() and not _NO_INTERMEDIARY.search(s))
+
 
 def client_named_areas(brief: "ConsultantBrief") -> list[str]:
     return [a["name"] for a in brief.geo_areas or [] if a.get("reason") == CLIENT_NAMED]
@@ -1008,7 +1018,7 @@ def _coerce(data: dict, business_name: str, category: str) -> ConsultantBrief:
         geo_mode=geo_mode if geo_mode in _GEO_MODES else None,
         geo_areas=geo_areas,
         geo_explanation=str(data.get("geo_explanation") or "").strip(),
-        intermediary_note=str(data.get("intermediary_note") or "").strip(),
+        intermediary_note=_without_no_intermediary(str(data.get("intermediary_note") or "").strip()),
         creative_fit_warning=str(data.get("creative_fit_warning") or "").strip(),
-        stated_plan=str(data.get("stated_plan") or "").strip(),
+        stated_plan=_without_no_intermediary(str(data.get("stated_plan") or "").strip()),
     )
