@@ -40,6 +40,12 @@ class PlanVariantsUnavailableError(Exception):
     finding the client should be able to trust."""
 
 
+
+# The model numbers its pick by its own draft order ("I'd go with the second one"),
+# but the cards are re-sorted by rank, so the pick always shows as Plan 1.
+_ORDINAL_PICK = re.compile(r"\bthe (first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th) (one|option|plan)\b",
+                           re.IGNORECASE)
+
 def max_selectable_plans(budget_ngn: float) -> tuple[int, str]:
     """How many audience variants this budget can actually support without
     starving any of them (spec §6.1) — pure arithmetic off the SAME useful-minimum
@@ -106,7 +112,7 @@ def _variant_fields_block() -> str:
         "what they have).\n"
         "recommendation_reason: argue for the top-ranked variant using ITS OWN "
         "trade_off and why_this_could_work, in the voice of a media buyer talking "
-        "to the client directly — e.g. \"I'd go with the second one. Bigger jobs, "
+        "to the client directly — e.g. \"I'd go with the homeowners planning new builds. Bigger jobs, "
         "and you said the new builds are where your good work comes from.\" Never "
         "just assert it's best without a reason tied to their actual business.\n"
         "Never invent a specific number (no \"est. 58 conversions\", no \"₦380 per "
@@ -329,6 +335,10 @@ async def generate_plan_variants(
                 v.recommended = False
             variants[0].recommended = True
 
+    reason = str(data.get("recommendation_reason", "")).strip()
+    top = next((i for i, v in enumerate(variants, start=1) if v.recommended), 1)
+    reason = _ORDINAL_PICK.sub(f"Plan {top}", reason)
+
     budget = parsed.budget_ngn or 0.0
     max_selectable, selection_rule_reason = max_selectable_plans(budget)
     if variants:
@@ -340,7 +350,7 @@ async def generate_plan_variants(
 
     return PlanVariantSet(
         variants=variants,
-        recommendation_reason=str(data.get("recommendation_reason", "")).strip(),
+        recommendation_reason=reason,
         max_selectable=max_selectable,
         selection_rule_reason=selection_rule_reason,
         corpus_coverage=(corpus.coverage if corpus else "none"),
