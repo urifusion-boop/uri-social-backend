@@ -60,7 +60,10 @@ def test_the_style_table_matches_the_styles_the_script_writer_actually_has():
 def _writer_prompt():
     for node in ast.parse((SERVICES / "video_creative_service.py").read_text()).body:
         if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "_SYSTEM_PROMPT":
-            return " ".join(ast.literal_eval(node.value.func.value).split())     # a .replace(...) call; the literal inside
+            literal = node.value
+            while isinstance(literal, ast.Call):                                  # .replace(...).replace(...): the literal inside
+                literal = literal.func.value
+            return " ".join(ast.literal_eval(literal).split())
     raise AssertionError("no _SYSTEM_PROMPT")
 
 

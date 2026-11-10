@@ -71,3 +71,19 @@ def drawtext_filter(textfile: str, fontsize: int, clip_seconds: Optional[float] 
         "box=1:boxcolor=black@0.45:boxborderw=26"
         + enable
     )
+
+
+# Spliced into the script writers' system prompts by .replace(), like the people rules.
+SCREEN_TEXT_PLACEHOLDER = "{{SCREEN_TEXT_RULES}}"
+
+# Text that is part of an object in the scene (a dashboard on a laptop, a phone screen, a sign, a menu) is drawn by the
+# picture model and animated by the clip model, and it is only readable when it is large in the frame: the same
+# dashboard is sharp in a push-in close-up and soft in a wide shot. So the writers frame such a scene for big text.
+SCREEN_TEXT_RULES = (
+    "- TEXT INSIDE THE SCENE (a dashboard, phone or laptop screen, sign, menu, label): AI video only draws text that is "
+    "LARGE in the frame; small text blurs. Only include it if the story needs it, and then: (a) about three short words "
+    "or figures at most, written out exactly in that scene's video_prompt; (b) frame the scene so that text fills a large "
+    "share of the picture: a close-up, or a slow push-in on the screen, never a wide shot with small print; (c) in any "
+    "wide or medium shot show screens, signs and menus as soft shapes, colours and simple charts with no readable words. "
+    "Never ask for paragraphs, tables, tiny labels or a screen full of figures."
+)
