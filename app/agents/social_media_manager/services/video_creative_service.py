@@ -515,6 +515,28 @@ class VideoCreativeService:
         from . import brand_brief
         return brand_brief.frame_branding_rules(brand_context, on_screen_text)
 
+    # What the picture model is told to do with the owner's photos. A frame need not show the product, so this
+    # only governs where it does appear.
+    _REFERENCE_FIDELITY = (
+        "Wherever the product, packaging, place or person from the owner's photos appears in this frame, it must "
+        "look exactly like the photo: the same shape, colours, label, proportions and details. Do not redesign "
+        "or substitute it."
+    )
+    MAX_OWNER_PHOTOS = 3   # photos handed to each frame (the writer still sees all of them)
+
+    @staticmethod
+    def _owner_photos(reference_images: Optional[List[str]]) -> List[bytes]:
+        """The owner's uploaded photos as image bytes, at most MAX_OWNER_PHOTOS; one that cannot be read is skipped."""
+        photos: List[bytes] = []
+        for ref in (reference_images or []):
+            if len(photos) >= VideoCreativeService.MAX_OWNER_PHOTOS:
+                break
+            try:
+                photos.append(VideoStoryboardService._decode_brand_image(ref))
+            except Exception as e:
+                print(f"[CreativeFrame] a supplied photo could not be read and was skipped: {e}")
+        return photos
+
     @staticmethod
     async def _generate_scene_frame(
         scene: dict, reference_images: List[str], prev_image_url: Optional[str],
@@ -544,74 +566,70 @@ class VideoCreativeService:
 
             loop = asyncio.get_running_loop()
 
-            if prev_image_url:
-                # Chain off the previous scene's own output — this is what
-                # keeps subject/setting/style consistent scene-to-scene when
-                # there's no single real photo to anchor every edit to.
-                img_bytes = await VideoCreativeService._download_image_bytes(prev_image_url)
-                chained_prompt = (
-                    "Keep the same subject, setting, and visual style as this image — "
-                    "this is the next moment in the same continuous scene. " + prompt
-                )
-                # A frame with people also gets the first frame they appeared in (and the owner's own photo),
-                # so faces are copied from the source, not from a copy of a copy.
-                identity_images: List[bytes] = []
-                if scene_has_people(scene):
-                    if identity_url and identity_url != prev_image_url:
-                        identity_images.append(await VideoCreativeService._download_image_bytes(identity_url))
-                    if reference_images:
-                        try:
-                            identity_images.append(VideoStoryboardService._decode_brand_image(reference_images[0]))
-                        except Exception as e:
-                            print(f"[CreativeFrame] owner photo not usable as an identity reference: {e}")
-
-                async def _chain_edit(images: List[bytes], text: str):
-                    files = [VideoCreativeService._as_file(b) for b in images]
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: openai_client.images.edit(
-                            image=files if len(files) > 1 else files[0],
-                            model="gpt-image-2",
-                            prompt=text,
-                            n=1,
-                            size="1024x1536",
-                            quality="medium",
-                        ),
-                    )
-
-                if identity_images:
-                    try:
-                        resp = await _chain_edit(
-                            [img_bytes] + identity_images,
-                            "Image 1 is the previous moment of this same continuous scene: keep its setting and "
-                            "visual style. The other image(s) show the people who must look identical here "
-                            "(the first frame they appeared in, and/or the owner's own photo). "
-                            + IDENTITY_LOCK + " " + prompt,
-                        )
-                    except Exception as e:
-                        # The extra references are a bonus; never lose the frame over them.
-                        print(f"[CreativeFrame] Scene {scene.get('scene_number')}: identity references "
-                              f"failed ({e}); redrawing from the previous frame only")
-                        resp = await _chain_edit([img_bytes], chained_prompt)
-                else:
-                    resp = await _chain_edit([img_bytes], chained_prompt)
-            elif reference_images:
-                img_bytes = VideoStoryboardService._decode_brand_image(reference_images[0])
-                grounded_prompt = (
-                    "Keep the real subject, product, and visual identity from the reference "
-                    "image exactly as shown. " + prompt
-                )
-                resp = await loop.run_in_executor(
+            async def _edit(images: List[bytes], text: str):
+                files = [VideoCreativeService._as_file(b) for b in images]
+                return await loop.run_in_executor(
                     None,
                     lambda: openai_client.images.edit(
-                        image=VideoCreativeService._as_file(img_bytes),
+                        image=files if len(files) > 1 else files[0],
                         model="gpt-image-2",
-                        prompt=grounded_prompt,
+                        prompt=text,
                         n=1,
                         size="1024x1536",
                         quality="medium",
                     ),
                 )
+
+            # The owner's own photos (the product, the packaging, the place, themselves). EVERY frame is drawn
+            # with them in view, not just scene 1: a frame drawn only from the previous frame is a copy of a copy,
+            # and the product drifts away from the real photo by scene 2.
+            owner_photos = VideoCreativeService._owner_photos(reference_images)
+
+            if prev_image_url:
+                # Chain off the previous scene's own output — this is what
+                # keeps subject/setting/style consistent scene-to-scene.
+                img_bytes = await VideoCreativeService._download_image_bytes(prev_image_url)
+                chained_prompt = (
+                    "Keep the same subject, setting, and visual style as this image — "
+                    "this is the next moment in the same continuous scene. " + prompt
+                )
+                # Besides the previous frame: for a frame with people, the first frame they appeared in; and the
+                # owner's photos, so faces and the real product are copied from the source, not from a copy.
+                people = scene_has_people(scene)
+                extras: List[bytes] = []
+                if people and identity_url and identity_url != prev_image_url:
+                    extras.append(await VideoCreativeService._download_image_bytes(identity_url))
+                extras += owner_photos
+
+                if extras:
+                    try:
+                        resp = await _edit(
+                            [img_bytes] + extras,
+                            "Image 1 is the previous moment of this same continuous scene: keep its setting and "
+                            "visual style. The other image(s) are the real references: the owner's own photos "
+                            "and/or the first frame a person appeared in. " + VideoCreativeService._REFERENCE_FIDELITY
+                            + (" " + IDENTITY_LOCK if people else "") + " " + prompt,
+                        )
+                    except Exception as e:
+                        # The extra references are a bonus; never lose the frame over them.
+                        print(f"[CreativeFrame] Scene {scene.get('scene_number')}: references "
+                              f"failed ({e}); redrawing from the previous frame only")
+                        resp = await _edit([img_bytes], chained_prompt)
+                else:
+                    resp = await _edit([img_bytes], chained_prompt)
+            elif owner_photos:
+                grounded_prompt = (
+                    "The attached image(s) are the owner's real photos. Keep the real subject, product, and visual "
+                    "identity from them exactly as shown. " + VideoCreativeService._REFERENCE_FIDELITY + " " + prompt
+                )
+                try:
+                    resp = await _edit(owner_photos, grounded_prompt)
+                except Exception as e:
+                    if len(owner_photos) == 1:
+                        raise
+                    print(f"[CreativeFrame] Scene {scene.get('scene_number')}: {len(owner_photos)} photos "
+                          f"failed together ({e}); drawing from the first only")
+                    resp = await _edit(owner_photos[:1], grounded_prompt)
             else:
                 resp = await loop.run_in_executor(
                     None,
