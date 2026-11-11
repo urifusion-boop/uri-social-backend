@@ -5492,6 +5492,8 @@ async def meta_campaigns(
                     "delivery_display": summary.get("delivery_display") or summary["delivery"],
                     "ends_at": summary["ends_at"],
                 }
+                from .billing import refund_status
+                row["refund"] = refund_status(r, summary["spend_ngn"], summary["ends_at"])
             except Exception as e:
                 print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
                 if is_google:

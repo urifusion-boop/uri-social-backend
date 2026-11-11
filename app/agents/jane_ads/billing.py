@@ -68,19 +68,42 @@ def unspent_refund_ngn(record: dict, spend_ngn: float) -> float:
 
 # Meta's reported spend keeps settling for a while after a campaign stops, so the
 # refund waits this long past the end date before trusting the final figure.
-REFUND_SETTLE_HOURS = 24
+REFUND_SETTLE_HOURS = 1
 
 
-def _ended_long_enough(ends_at, now: datetime) -> bool:
+def _parse_end(ends_at) -> Optional[datetime]:
     if not ends_at:
-        return False
+        return None
     try:
         end = datetime.fromisoformat(str(ends_at).replace("Z", "+00:00"))
     except ValueError:
-        return False
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
-    return (now - end).total_seconds() >= REFUND_SETTLE_HOURS * 3600
+        return None
+    return end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+
+
+def _ended_long_enough(ends_at, now: datetime) -> bool:
+    end = _parse_end(ends_at)
+    return bool(end) and (now - end).total_seconds() >= REFUND_SETTLE_HOURS * 3600
+
+
+def refund_status(record: dict, spend_ngn: float, ends_at, now: Optional[datetime] = None) -> Optional[dict]:
+    """What the campaign card says about the budget it didn't spend.
+
+    done     — already back in the wallet
+    pending  — ended; the next hourly sweep returns it (about an hour)
+    on_end   — still scheduled; comes back about an hour after it ends
+    """
+    if record.get("unspent_refunded_at"):
+        amount = float(record.get("unspent_refunded_ngn") or 0)
+        return {"state": "done", "amount_ngn": amount} if amount > 0 else None
+    if not record.get("charged_upfront_ngn"):
+        return None
+    amount = unspent_refund_ngn(record, spend_ngn)
+    end = _parse_end(ends_at)
+    if amount <= 0 or not end:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return {"state": "pending" if end <= now else "on_end", "amount_ngn": amount, "ends_at": end.isoformat()}
 
 
 async def _refund_unspent_when_finished(db, collection, r, summary, wallet, notification_service,

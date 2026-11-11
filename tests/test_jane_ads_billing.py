@@ -421,7 +421,7 @@ def test_finished_campaign_gets_its_unspent_budget_back_once(monkeypatch):
 def test_no_refund_until_the_spend_has_settled(monkeypatch):
     store = InMemoryWalletStore()
     db, _, notifier = _setup(monkeypatch, [_prepaid_row()],
-                             {"c_done": _finished_summary(40_000, hours_ago=2)}, store)
+                             {"c_done": _finished_summary(40_000, hours_ago=0.5)}, store)
 
     _run(billing.reconcile_ad_spend_charges(db))
 
@@ -446,3 +446,14 @@ def test_delete_after_the_automatic_refund_gives_nothing_more():
 def test_total_due_lands_on_the_stated_budget_exactly():
     from app.agents.jane_ads.router import _total_due_ngn
     assert _total_due_ngn(C.ad_spend_from_budget(60_000)) == 60_000
+
+
+def test_refund_status_for_the_campaign_card():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
+    row = _prepaid_row()
+    assert billing.refund_status(row, 40_000, (now - timedelta(minutes=5)).isoformat(), now)["state"] == "pending"
+    assert billing.refund_status(row, 10_000, (now + timedelta(days=2)).isoformat(), now)["state"] == "on_end"
+    assert billing.refund_status(_prepaid_row(unspent_refunded_at=now, unspent_refunded_ngn=6_000),
+                                 40_000, now.isoformat(), now) == {"state": "done", "amount_ngn": 6_000}
+    assert billing.refund_status({"charged_upfront_ngn": 0}, 0, now.isoformat(), now) is None
