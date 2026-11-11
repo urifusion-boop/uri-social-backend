@@ -144,6 +144,16 @@ def _media_normalization_passthrough():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_behaviour_targeting_lookups():
+    """The video / creator / hashtag audience lookups are extra GETs, which would consume this file's fixed-order
+    queued responses. They have their own tests in test_jane_ads_tiktok_behavior_targeting.py."""
+    from app.agents.jane_ads.adapters.tiktok_behavior_targeting import BehaviorTargeting
+    with patch("app.agents.jane_ads.adapters.tiktok.resolve_behavior_targeting",
+               new=AsyncMock(return_value=BehaviorTargeting())):
+        yield
+
+
 # campaign(POST), video upload(POST), cover image upload(POST), ad group(POST),
 # identity lookup(GET), ad(POST) — 6 calls total. Identity lookup replaced the
 # old logo-upload+identity-create POST pair after TikTok deprecated Custom

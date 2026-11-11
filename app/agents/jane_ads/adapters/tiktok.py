@@ -694,6 +694,7 @@ def _raise_for_error(data: dict, context: str) -> None:
 # TikTok rejection bugs. tiktok_media.py replaces them with real local
 # processing (ffmpeg/PIL) that works the same regardless of where the asset
 # lives; see that module's docstring for the full story.
+from .tiktok_behavior_targeting import PURCHASE_INTENT_OBJECTIVES, resolve_behavior_targeting
 from .tiktok_media import ensure_jpg, ensure_tiktok_video, extract_poster_frame as _video_thumbnail_url
 
 
@@ -899,6 +900,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     print(f"[TikTokAdsAdapter] interests not resolved, dropped: {unresolved_interests}", flush=True)
                 interest_category_ids = [r["interest_category_id"] for r in resolved_interests]
 
+                # The other audience boxes in Ads Manager (Video / Creator / Hashtag interactions, and Purchase
+                # intention where the objective allows it), for the same topics. Best effort: no match means the
+                # box is simply left empty, and the ad group is retried without them if TikTok rejects them.
+                behavior = await resolve_behavior_targeting(
+                    interest_names, self._advertiser_id, self._access_token, _best_tiktok_interest,
+                    want_purchase_intent=_tiktok_objective_for_creative(plan.objective, is_carousel)
+                    in PURCHASE_INTENT_OBJECTIVES)
+
                 async def _create_campaign_and_adgroup(
                     objective_type: str, optimization_goal: str, billing_event: str,
                 ) -> tuple[str, str]:
@@ -927,10 +936,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # Ad group — the real budget + targeting + schedule live here.
                     # PAUSED via operation_status="DISABLE", same as every other create
                     # call in this method.
-                    adgroup_resp = await client.post(
-                        f"{self._api_base}/adgroup/create/",
-                        headers=self._headers(),
-                        json={
+                    adgroup_body = {
                             "advertiser_id": self._advertiser_id,
                             "campaign_id": new_campaign_id,
                             "adgroup_name": f"JaneAds-{plan.business_id}-adgroup",
@@ -975,9 +981,24 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             # no-manual-tuning campaign regardless of the error.
                             "pacing": "PACING_MODE_SMOOTH",
                             "operation_status": "DISABLE",
-                        },
-                    )
-                    adgroup_data = adgroup_resp.json()
+                    }
+
+                    async def _post_adgroup(body: dict) -> dict:
+                        resp = await client.post(
+                            f"{self._api_base}/adgroup/create/", headers=self._headers(), json=body)
+                        return resp.json()
+
+                    extra_targeting = behavior.fields_for(objective_type)
+                    adgroup_data = await _post_adgroup({**adgroup_body, **extra_targeting})
+                    if extra_targeting:
+                        try:
+                            _raise_for_error(adgroup_data, "ad group creation")
+                        except TikTokAdsAPIError as targeting_err:
+                            # These audiences are extras (their request shapes are from TikTok's SDK but not yet
+                            # confirmed live): never lose the launch over them.
+                            print(f"[TikTokAdsAdapter] ad group rejected with {sorted(extra_targeting)} "
+                                  f"({targeting_err}) — retrying without them", flush=True)
+                            adgroup_data = await _post_adgroup(adgroup_body)
                     try:
                         _raise_for_error(adgroup_data, "ad group creation")
                     except TikTokAdsAPIError:
