@@ -334,6 +334,7 @@ async def get_user_details(
             "brand_name": profile.get("brand_name"),
             "industry": profile.get("industry"),
             "created_at": profile.get("created_at"),
+            "ad_wallet_ngn": await _ad_wallet_balance(db, str(profile.get("_id"))),
         })
 
     # Get user's content count — content_drafts is the real collection name
@@ -468,6 +469,50 @@ async def _resolve_billing_id(user_id: str, db: AsyncIOMotorDatabase) -> str:
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return _billing_user_id(user)
+
+
+async def _ad_wallet_balance(db: AsyncIOMotorDatabase, brand_id: str) -> float:
+    from app.agents.jane_ads.store import MongoWalletStore
+    from app.agents.jane_ads.wallet import WalletService
+    return await WalletService(MongoWalletStore(db)).get_balance(brand_id)
+
+
+class AdWalletCreditRequest(BaseModel):
+    amount_ngn: float = Field(..., gt=0)
+    reason: Optional[str] = None
+
+
+@router.post("/users/{user_id}/brands/{brand_id}/ad-wallet/credit")
+async def credit_brand_ad_wallet(
+    user_id: str,
+    brand_id: str,
+    body: AdWalletCreditRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Add money to one of a user's brand ad wallets without a payment — goes through
+    WalletService.top_up so balance and ledger move together, with the admin on the
+    reference so it is never mistaken for a real payment."""
+    import uuid
+    from bson import ObjectId
+    from app.agents.jane_ads.store import MongoWalletStore
+    from app.agents.jane_ads.wallet import WalletService
+
+    billing_id = await _resolve_billing_id(user_id, db)
+    try:
+        brand = await db["brand_profiles"].find_one({"_id": ObjectId(brand_id), "user_id": billing_id})
+    except Exception:
+        brand = None
+    if not brand:
+        raise HTTPException(status_code=404, detail="That brand doesn't belong to this user")
+
+    actor = (admin_user.get("email") or (admin_user.get("claims") or {}).get("email") or "admin").lower()
+    wallet = WalletService(MongoWalletStore(db))
+    await wallet.top_up(brand_id, body.amount_ngn, reference=f"manual:{actor}:{uuid.uuid4().hex[:12]}",
+                        enforce_minimum=False)
+    print(f"[admin] {actor} added NGN{body.amount_ngn:,.0f} to ad wallet {brand_id} "
+          f"— {body.reason or 'no reason'}", flush=True)
+    return {"brand_id": brand_id, "ad_wallet_ngn": await wallet.get_balance(brand_id)}
 
 
 @router.post("/users/{user_id}/credits/adjust")
