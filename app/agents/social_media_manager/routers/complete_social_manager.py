@@ -7558,12 +7558,17 @@ async def generate_creative_frames(
     )
 
 
+class MergeVideoRequest(BaseModel):
+    use_logo: bool = True  # the owner can switch their Brand Playbook logo off for a video
+
+
 @router.post("/merge-video-job/{job_id}")
 async def merge_video_job(
     job_id: str,
     token: dict = Depends(JWTBearer()),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_active_brand_context),
+    request: Optional[MergeVideoRequest] = None,
 ):
     """
     Merge all completed clips from a finished video job into a single video.
@@ -7585,19 +7590,30 @@ async def merge_video_job(
     if not clip_urls:
         raise HTTPException(status_code=400, detail="No completed clips to merge")
 
-    # The owner's logo from the Brand Playbook goes on the finished video, whenever there is one.
+    # The owner's logo from the Brand Playbook goes on the finished video, unless they switched it off.
     from app.agents.social_media_manager.services.video_logo_overlay import logo_from_brand_context
-    try:
-        logo = logo_from_brand_context(await _video_brand_context(ctx, db))
-    except Exception as e:
-        print(f"[VideoMerge] could not read the brand's logo, merging without it: {e}")
-        logo = None
+    logo = None
+    if request is None or request.use_logo:
+        try:
+            logo = logo_from_brand_context(await _video_brand_context(ctx, db))
+        except Exception as e:
+            print(f"[VideoMerge] could not read the brand's logo, merging without it: {e}")
 
+    # Whatever goes wrong must leave as a proper error response. An exception that escapes here becomes a bare 500
+    # from outside the CORS layer, which the browser reports as a "CORS error" and hides the real reason.
+    from app.agents.social_media_manager.services.video_merge_service import VideoMergeError
     try:
         # Each scene's on-screen text is drawn onto its clip here, sharply, rather than baked into the picture.
         merged_url = await VideoMergeService.merge_clips(clip_urls, [c.get("text_overlay") for c in done], logo)
+    except VideoMergeError as e:
+        print(f"[VideoMerge] job {job_id}: {e}", flush=True)
+        raise HTTPException(status_code=502, detail=f"The video could not be merged: {e}. Please try again.")
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"ffmpeg merge failed: {e.stderr.decode()[:300]}")
+        print(f"[VideoMerge] job {job_id}: ffmpeg failed: {(e.stderr or b'').decode(errors='replace')[-600:]}", flush=True)
+        raise HTTPException(status_code=500, detail="The video could not be merged (the video tool failed). Please try again.")
+    except Exception as e:
+        print(f"[VideoMerge] job {job_id}: unexpected {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="The video could not be merged. Please try again.")
 
     return UriResponse.get_single_data_response("merged_video", {"merged_video_url": merged_url})
 

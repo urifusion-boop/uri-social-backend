@@ -28,7 +28,38 @@ _TARGET_HEIGHT = 1920
 _TARGET_FPS = 30
 
 
+_DOWNLOAD_ATTEMPTS = 3
+
+# Faster than ffmpeg's default (medium) at a visibly equal result for this content. The merge runs inside the web
+# request, so every second it saves is a second off the window where a deploy, a worker restart or a proxy timeout
+# can cut the request off. A high quality (low crf) keeps small text crisp.
+_ENCODE_PRESET = "veryfast"
+_NORMALIZE_CRF = "18"
+
+
+class VideoMergeError(Exception):
+    """A merge that failed for a reason worth telling the person (a clip that could not be fetched, etc.)."""
+
+
 class VideoMergeService:
+
+    @staticmethod
+    async def _fetch(client: "httpx.AsyncClient", url: str, what: str) -> bytes:
+        """The bytes at `url`, tried a few times: a dropped connection or a slow CDN is normal, an error page is not a video."""
+        last: Optional[Exception] = None
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                if not response.content:
+                    raise ValueError("empty response")
+                return response.content
+            except Exception as e:
+                last = e
+                print(f"[VideoMerge] {what}: download attempt {attempt}/{_DOWNLOAD_ATTEMPTS} failed: {e!r}", flush=True)
+                if attempt < _DOWNLOAD_ATTEMPTS:
+                    await asyncio.sleep(attempt)
+        raise VideoMergeError(f"{what} could not be downloaded ({type(last).__name__})")
 
     @staticmethod
     async def merge_clips(clip_urls: List[str], overlay_texts: Optional[List[Optional[str]]] = None,
@@ -37,18 +68,15 @@ class VideoMergeService:
         overlay_texts, if given, is one on-screen caption (or None) per clip, drawn sharply onto that clip.
         logo, if given ({"url", "position", "size"} from the Brand Playbook), is laid over the whole video."""
         async with httpx.AsyncClient(timeout=120) as client:
-            responses = await asyncio.gather(*[client.get(url) for url in clip_urls])
+            clip_bytes_list = await asyncio.gather(
+                *[VideoMergeService._fetch(client, url, f"clip {i + 1}") for i, url in enumerate(clip_urls)])
             logo_bytes = None
             if logo:
                 try:
-                    logo_response = await client.get(logo["url"])
-                    logo_response.raise_for_status()
-                    logo_bytes = logo_response.content
+                    logo_bytes = await VideoMergeService._fetch(client, logo["url"], "the logo")
                 except Exception as e:
                     # Never lose the video over its logo.
                     print(f"[VideoMerge] logo could not be downloaded, merging without it: {e}", flush=True)
-
-        clip_bytes_list = [r.content for r in responses]
 
         loop = asyncio.get_running_loop()
         merged_bytes = await loop.run_in_executor(
@@ -99,7 +127,7 @@ class VideoMergeService:
             "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
             "-filter_complex", logo_overlay.logo_filter(position, size, _TARGET_WIDTH, _TARGET_HEIGHT),
             "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", _ENCODE_PRESET, "-crf", "18",
             "-c:a", "copy", "-movflags", "+faststart", out,
         ]
         try:
@@ -150,7 +178,7 @@ class VideoMergeService:
                             "-map", "0:v:0", "-map", "1:a:0", "-shortest",
                         ]
                     cmd += [
-                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", _ENCODE_PRESET, "-crf", _NORMALIZE_CRF,
                         "-c:a", "aac", "-ar", "44100", "-ac", "2",
                         norm_path,
                     ]
