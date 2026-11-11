@@ -133,8 +133,9 @@ async def resolve_behavior_targeting(
     if data is not None:
         pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"))
         category_ids = _match(names, pool, best_match, MAX_ACTION_CATEGORIES)
-        print(f"[TikTokAdsAdapter] action categories: {len(pool)} read, e.g. {pool[:4]}; "
-              f"matched ids {category_ids} for {names}", flush=True)
+        by_id = {e["id"]: e["name"] for e in pool}
+        print(f"[TikTokAdsAdapter] action categories: {len(pool)} read; matched "
+              f"{[(i, by_id.get(i)) for i in category_ids]} for {names}", flush=True)
         if not category_ids:
             print(f"[TikTokAdsAdapter] no video/creator category matched {names} "
                   f"({len(pool)} categories read from TikTok)", flush=True)
@@ -153,7 +154,16 @@ async def resolve_behavior_targeting(
         "/tool/hashtag/recommend/",
         {"advertiser_id": advertiser_id, "keywords": json.dumps(keywords), "operator": "OR"}, access_token)
     if data is not None:
-        hashtags = _entries(data, ("hashtag_id", "keyword_id", "id"), ("hashtag_name", "keyword", "name"))
+        hashtag_keys = (("hashtag_id", "keyword_id", "id"), ("hashtag_name", "keyword", "name"))
+        hashtags = _entries(data, *hashtag_keys)
+        if not hashtags:
+            # Several keywords at once can come back empty where a single one does not.
+            for keyword in keywords[:3]:
+                one = await _lookup("/tool/hashtag/recommend/",
+                                    {"advertiser_id": advertiser_id, "keywords": json.dumps([keyword])}, access_token)
+                for entry in _entries(one or {}, *hashtag_keys)[:2]:
+                    if entry["id"] not in {h["id"] for h in hashtags}:
+                        hashtags.append(entry)
         if not hashtags:
             print(f"[TikTokAdsAdapter] no hashtags returned for {keywords}; TikTok answered {str(data)[:300]}",
                   flush=True)
