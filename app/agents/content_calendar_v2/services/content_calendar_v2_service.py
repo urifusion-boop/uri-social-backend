@@ -1446,6 +1446,19 @@ def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_asse
 # Labels with no calendar format (Poll, Live session) allow nothing extra.
 _PLAYBOOK_FORMATS: Dict[str, Tuple[str, ...]] = {
     "reels / short video": ("video", "product_video", "ai_video"),
+    # Live-reported (Gloria, staging): a brand's stored preferred_formats had
+    # a bare "video" entry — not a label the current Playbook UI even offers
+    # (ALL_FORMATS in WorkspaceDashboard.tsx only has "Reels / Short video"),
+    # almost certainly left over from an older version of that picker. With
+    # no matching key here it silently contributed nothing: _allowed_formats
+    # came back as if the brand had picked no formats at all, so instead of
+    # getting the "brand explicitly wants video" cap (3/week,
+    # MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN) it got the generic default
+    # (1/week) — exactly backwards for a brand whose one stored preference
+    # is video. Recognized as the same alias rather than only fixing it by
+    # migrating old data, since nothing stops another stray value like this
+    # from being written the same way again.
+    "video": ("video", "product_video", "ai_video"),
     "story": ("video", "product_video", "ai_video"),
     "carousel posts": ("carousel",),
     "static image": ("image",),
