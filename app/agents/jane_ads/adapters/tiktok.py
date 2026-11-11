@@ -694,7 +694,7 @@ def _raise_for_error(data: dict, context: str) -> None:
 # TikTok rejection bugs. tiktok_media.py replaces them with real local
 # processing (ffmpeg/PIL) that works the same regardless of where the asset
 # lives; see that module's docstring for the full story.
-from .tiktok_behavior_targeting import PURCHASE_INTENT_OBJECTIVES, resolve_behavior_targeting
+from .tiktok_behavior_targeting import resolve_behavior_targeting
 from .tiktok_media import ensure_jpg, ensure_tiktok_video, extract_poster_frame as _video_thumbnail_url
 
 
@@ -905,8 +905,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # box is simply left empty, and the ad group is retried without them if TikTok rejects them.
                 behavior = await resolve_behavior_targeting(
                     interest_names, self._advertiser_id, self._access_token, _best_tiktok_interest,
-                    want_purchase_intent=_tiktok_objective_for_creative(plan.objective, is_carousel)
-                    in PURCHASE_INTENT_OBJECTIVES)
+                    want_purchase_intent=True)
                 print(f"[TikTokAdsAdapter] audience boxes for this launch: interests={len(interest_category_ids)}, "
                       f"interactions={[a['action_scene'] for a in behavior.actions]}, "
                       f"purchase_intention={len(behavior.purchase_intention_keyword_ids)}", flush=True)
@@ -991,14 +990,9 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             f"{self._api_base}/adgroup/create/", headers=self._headers(), json=body)
                         return resp.json()
 
-                    # The extra audiences are tried whole, then one scene at a time (so one that TikTok does not
-                    # accept does not cost the others), then not at all. A rejected create leaves nothing behind.
-                    extra_targeting = behavior.fields_for(objective_type)
-                    attempts: list[dict] = [extra_targeting] if extra_targeting else []
-                    if len(extra_targeting.get("actions") or []) > 1:
-                        attempts += [{"actions": [a]} for a in extra_targeting["actions"]]
-                    attempts.append({})
-                    for extra in attempts:
+                    # The extra audiences are tried whole, then with fewer of them, then none (see
+                    # BehaviorTargeting.attempts). A rejected create leaves nothing behind.
+                    for extra in behavior.attempts():
                         adgroup_data = await _post_adgroup({**adgroup_body, **extra})
                         if not extra:
                             break
@@ -1006,9 +1000,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             _raise_for_error(adgroup_data, "ad group creation")
                             break
                         except TikTokAdsAPIError as targeting_err:
-                            scenes = [a.get("action_scene") for a in extra.get("actions", [])]
-                            ids = [a.get("action_category_ids") for a in extra.get("actions", [])]
-                            print(f"[TikTokAdsAdapter] ad group rejected with {sorted(extra)} {scenes} {ids} "
+                            print(f"[TikTokAdsAdapter] ad group rejected with {sorted(extra)} "
+                                  f"{[a.get('action_scene') for a in extra.get('actions', [])]} "
                                   f"({targeting_err})", flush=True)
                     try:
                         _raise_for_error(adgroup_data, "ad group creation")

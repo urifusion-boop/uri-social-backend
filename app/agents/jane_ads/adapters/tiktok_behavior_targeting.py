@@ -12,8 +12,9 @@ Field names and limits below are from TikTok's own Marketing API SDK (adgroup/cr
     Video ids come from GET /tool/action_category/, hashtag ids from GET /tool/hashtag/recommend/. Live on staging
     (2026-11-11): VIDEO_RELATED accepted; CREATOR_RELATED rejected with those same ids, so it is left out.
   * purchase_intention_keyword_ids, from GET /tool/interest_keyword/recommend/ with audience_type=PURCHASE_INTENTION.
-    TikTok accepts it ONLY for the App promotion, Conversions and Product sales objectives; a Traffic or Lead
-    generation ad group that carries it is rejected, so it is added only when the objective allows it.
+    The SDK says TikTok accepts it only for the App promotion, Conversions and Product sales objectives, but the
+    Ads Manager offers it on Jane's Traffic campaigns, so it is tried on every launch and dropped (see
+    BehaviorTargeting.attempts) if TikTok rejects it.
 
 None of it is allowed to cost a launch. Every lookup that fails or finds nothing just leaves its audience out, and the
 caller retries the ad group without these fields if TikTok rejects them. The RESPONSE shapes of the lookups are not in
@@ -35,7 +36,6 @@ MAX_ACTION_CATEGORIES = 3         # per scene; Jane's interests are already few,
 MAX_HASHTAGS = 5
 MAX_PURCHASE_INTENT = 5
 
-PURCHASE_INTENT_OBJECTIVES = frozenset({"APP_PROMOTION", "CONVERSIONS", "PRODUCT_SALES"})
 
 
 @dataclass
@@ -43,13 +43,32 @@ class BehaviorTargeting:
     actions: list = field(default_factory=list)
     purchase_intention_keyword_ids: list = field(default_factory=list)
 
-    def fields_for(self, objective_type: str) -> dict:
-        """The extra ad group fields for a campaign with this TikTok objective (empty when there are none)."""
+    def fields(self) -> dict:
+        """Every extra ad group field there is (empty when there are none)."""
         out: dict = {}
         if self.actions:
             out["actions"] = self.actions
-        if self.purchase_intention_keyword_ids and objective_type in PURCHASE_INTENT_OBJECTIVES:
+        if self.purchase_intention_keyword_ids:
             out["purchase_intention_keyword_ids"] = self.purchase_intention_keyword_ids
+        return out
+
+    def attempts(self) -> list:
+        """The field sets to try for the ad group, widest first, ending with none: everything, then the interactions
+        without purchase intention, then one interaction at a time, then purchase intention alone. A rejected create
+        leaves nothing behind, so one audience TikTok does not accept costs only the others' retries, not the launch."""
+        out: list = []
+
+        def add(d: dict) -> None:
+            if d and d not in out:
+                out.append(d)
+
+        add(self.fields())
+        add({"actions": self.actions} if self.actions else {})
+        for action in self.actions:
+            add({"actions": [action]})
+        add({"purchase_intention_keyword_ids": self.purchase_intention_keyword_ids}
+            if self.purchase_intention_keyword_ids else {})
+        out.append({})
         return out
 
 
