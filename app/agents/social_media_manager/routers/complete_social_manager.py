@@ -25,6 +25,7 @@ from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
 from ..services.outstand_service import OutstandService
+from ..services.meta_oauth import build_authorize_url as build_meta_authorize_url
 from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
@@ -1641,8 +1642,6 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
     directly (without Outstand). On completion, Facebook redirects to
     /connect/facebook-direct/callback.
     """
-    import urllib.parse
-
     app_id = settings.META_APP_ID
     if not app_id:
         raise HTTPException(status_code=500, detail="META_APP_ID not configured")
@@ -1660,15 +1659,9 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_manage_engagement",
         "pages_manage_metadata",
     ]
-    params = {
-        "client_id": app_id,
-        "redirect_uri": redirect_uri,
-        "scope": ",".join(scopes),
-        "response_type": "code",
-        "state": source or "settings",
-    }
-    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
-    return RedirectResponse(auth_url)
+    return RedirectResponse(
+        build_meta_authorize_url(app_id, redirect_uri, scopes, source or "settings", settings.FACEBOOK_API_VERSION)
+    )
 
 
 @router.get("/connect/facebook-direct/callback")
@@ -2287,8 +2280,6 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     /connect/instagram-direct/callback where we retrieve the linked Instagram
     Business Account from the user's Facebook Pages.
     """
-    import urllib.parse
-
     app_id = settings.META_APP_ID
     if not app_id:
         raise HTTPException(status_code=500, detail="META_APP_ID not configured")
@@ -2311,12 +2302,7 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_manage_engagement",
         "pages_manage_metadata",
     ]
-    params = {
-        "client_id": app_id,
-        "redirect_uri": redirect_uri,
-        "scope": ",".join(scopes),
-        "response_type": "code",
-        "state": source or "settings",
+    extra = {
         # Live-reported 2026-09-21: on mobile Chrome (not an embedded/in-app
         # browser), some users never reach our redirect_uri at all — this dialog
         # is Facebook's own (Instagram uses Facebook Login), so it's exposed to
@@ -2330,8 +2316,7 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         # native-app handoff. NOT yet confirmed against a live affected device.
         "display": "page",
     }
-    auth_url = "https://www.facebook.com/v20.0/dialog/oauth?" + urllib.parse.urlencode(params)
-    return RedirectResponse(auth_url)
+    return RedirectResponse(build_meta_authorize_url(app_id, redirect_uri, scopes, source or "settings", "v20.0", extra))
 
 
 @router.get("/connect/instagram-direct/callback")
