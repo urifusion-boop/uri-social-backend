@@ -334,7 +334,6 @@ async def get_user_details(
             "brand_name": profile.get("brand_name"),
             "industry": profile.get("industry"),
             "created_at": profile.get("created_at"),
-            "ad_wallet_ngn": await _ad_wallet_balance(db, str(profile.get("_id"))),
         })
 
     # Get user's content count — content_drafts is the real collection name
@@ -366,6 +365,7 @@ async def get_user_details(
         "trial_end": user.get("trial_end"),
         "credits_balance": credits_balance,
         "brand_profiles": brand_profiles,
+        "ad_wallets": await _ad_wallets(db, billing_id),
         "content_count": content_count,
         "workspaces": workspaces,
         "is_admin": bool(user.get("is_admin")),
@@ -471,10 +471,18 @@ async def _resolve_billing_id(user_id: str, db: AsyncIOMotorDatabase) -> str:
     return _billing_user_id(user)
 
 
-async def _ad_wallet_balance(db: AsyncIOMotorDatabase, brand_id: str) -> float:
+async def _ad_wallets(db: AsyncIOMotorDatabase, billing_id: str) -> list[dict]:
+    """The user's brand accounts and each one's ad wallet. Wallets are keyed by the
+    brand ACCOUNT id (brnd_…, what the app switches between), not the brand_profiles
+    _id — reading that showed ₦0 for a brand holding money."""
     from app.agents.jane_ads.store import MongoWalletStore
     from app.agents.jane_ads.wallet import WalletService
-    return await WalletService(MongoWalletStore(db)).get_balance(brand_id)
+    from app.services.BrandAccountService import BrandAccountService
+
+    wallet = WalletService(MongoWalletStore(db))
+    brands = await BrandAccountService.list_brands_for_user(billing_id, db)
+    return [{"brand_id": b.brand_id, "name": b.name, "ad_wallet_ngn": await wallet.get_balance(b.brand_id)}
+            for b in brands]
 
 
 class AdWalletCreditRequest(BaseModel):
@@ -494,16 +502,13 @@ async def credit_brand_ad_wallet(
     WalletService.top_up so balance and ledger move together, with the admin on the
     reference so it is never mistaken for a real payment."""
     import uuid
-    from bson import ObjectId
     from app.agents.jane_ads.store import MongoWalletStore
     from app.agents.jane_ads.wallet import WalletService
 
+    from app.services.AgencyService import AgencyService
+
     billing_id = await _resolve_billing_id(user_id, db)
-    try:
-        brand = await db["brand_profiles"].find_one({"_id": ObjectId(brand_id), "user_id": billing_id})
-    except Exception:
-        brand = None
-    if not brand:
+    if brand_id not in await AgencyService.accessible_brand_ids(billing_id, db):
         raise HTTPException(status_code=404, detail="That brand doesn't belong to this user")
 
     actor = (admin_user.get("email") or (admin_user.get("claims") or {}).get("email") or "admin").lower()
