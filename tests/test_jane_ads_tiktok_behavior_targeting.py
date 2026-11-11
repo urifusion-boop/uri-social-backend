@@ -1,0 +1,140 @@
+"""
+TikTok ad groups also target Video interactions, Creator interactions and Hashtag interactions (and Purchase
+intention where the objective allows it), not only Interests. All of it is best effort: it must never cost a launch.
+"""
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.agents.jane_ads.adapters import tiktok_behavior_targeting as bt
+from app.agents.jane_ads.adapters.tiktok import _best_tiktok_interest
+from tests.test_jane_ads_tiktok_adapter import _adapter, _auth, _plan, _run
+from tests.test_jane_ads_tiktok_launch_fixes import _RoutedClient
+
+ACTION_CATEGORIES = {"action_categories": [
+    {"action_category_id": "30", "action_category_name": "Education", "sub_category_ids": []},
+    {"action_category_id": "31", "action_category_name": "Food & Beverage", "sub_category_ids": []},
+]}
+HASHTAGS = {"hashtags": [{"hashtag_id": "h1", "hashtag_name": "learnontiktok"}, {"hashtag_id": "h2", "hashtag_name": "study"}]}
+
+
+def _lookups(**by_path):
+    async def fake(path, params, token):
+        value = by_path.get(path)
+        return value
+    return patch.object(bt, "_lookup", side_effect=fake)
+
+
+def _resolve(names, want_purchase_intent=False, **by_path):
+    with _lookups(**by_path):
+        return _run(bt.resolve_behavior_targeting(names, "adv1", "tok", _best_tiktok_interest, want_purchase_intent))
+
+
+# ── reading TikTok's lookups ──────────────────────────────────────────────────
+
+def test_entries_are_found_however_the_response_nests_them():
+    nested = {"action_categories": [{"action_category_id": 1, "action_category_name": "A",
+                                     "sub_categories": [{"id": "2", "name": "B"}]}]}
+    got = bt._entries(nested, ("action_category_id", "id"), ("action_category_name", "name"))
+    assert got == [{"id": "1", "name": "A"}, {"id": "2", "name": "B"}]
+    assert bt._entries({}, ("id",), ("name",)) == []
+    assert bt._entries(None, ("id",), ("name",)) == []
+
+
+# ── what gets targeted ────────────────────────────────────────────────────────
+
+def test_video_creator_and_hashtag_audiences_are_built_for_the_plans_topics():
+    got = _resolve(["Education"], **{"/tool/action_category/": ACTION_CATEGORIES, "/tool/hashtag/recommend/": HASHTAGS})
+    scenes = {a["action_scene"]: a for a in got.actions}
+    assert set(scenes) == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}
+    assert scenes["VIDEO_RELATED"]["action_category_ids"] == ["30"]
+    assert scenes["VIDEO_RELATED"]["video_user_actions"] == ["WATCHED_TO_END", "LIKED", "COMMENTED", "SHARED"]
+    assert scenes["VIDEO_RELATED"]["action_period"] == 15
+    assert scenes["CREATOR_RELATED"]["video_user_actions"] == ["FOLLOWING", "VIEW_HOMEPAGE"]
+    assert scenes["CREATOR_RELATED"]["action_category_ids"] == ["30"]
+    assert scenes["HASHTAG_RELATED"] == {"action_scene": "HASHTAG_RELATED", "action_period": 0,
+                                         "video_user_actions": ["VIEW_HASHTAG"], "action_category_ids": ["h1", "h2"]}
+
+
+def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience():
+    got = _resolve(["Quantum plumbing"], **{"/tool/action_category/": ACTION_CATEGORIES})
+    assert got.actions == []
+
+
+def test_no_topics_means_nothing_is_looked_up():
+    with patch.object(bt, "_lookup", new=AsyncMock()) as lookup:
+        got = _run(bt.resolve_behavior_targeting([], "adv1", "tok", _best_tiktok_interest, True))
+    assert got.fields_for("CONVERSIONS") == {} and lookup.await_count == 0
+
+
+def test_failed_lookups_just_leave_the_audiences_out():
+    got = _resolve(["Education"])                      # every lookup answers None
+    assert got.fields_for("TRAFFIC") == {}
+
+
+# ── purchase intention ────────────────────────────────────────────────────────
+
+PURCHASE = {"keywords": [{"keyword_id": "p1", "keyword": "online courses"}, {"keyword_id": "p2", "keyword": "tutors"}]}
+
+
+def test_purchase_intention_is_looked_up_only_when_asked_for():
+    asked = _resolve(["Education"], True, **{"/tool/interest_keyword/recommend/": PURCHASE})
+    assert asked.purchase_intention_keyword_ids == ["p1", "p2"]
+    assert _resolve(["Education"], False, **{"/tool/interest_keyword/recommend/": PURCHASE}).purchase_intention_keyword_ids == []
+
+
+@pytest.mark.parametrize("objective, included", [
+    ("TRAFFIC", False), ("LEAD_GENERATION", False), ("VIDEO_VIEWS", False),
+    ("CONVERSIONS", True), ("APP_PROMOTION", True), ("PRODUCT_SALES", True),
+])
+def test_tiktok_only_accepts_purchase_intention_on_conversion_style_objectives(objective, included):
+    t = bt.BehaviorTargeting(actions=[{"action_scene": "VIDEO_RELATED"}], purchase_intention_keyword_ids=["p1"])
+    fields = t.fields_for(objective)
+    assert ("purchase_intention_keyword_ids" in fields) is included
+    assert fields["actions"] == [{"action_scene": "VIDEO_RELATED"}]       # the interactions go on every objective
+
+
+# ── the launch ────────────────────────────────────────────────────────────────
+
+class _RejectingFirstAdGroup(_RoutedClient):
+    """Rejects the first ad group create that carries `actions`, accepts everything else."""
+    def _respond(self, method, url, kwargs):
+        resp = super()._respond(method, url, kwargs)
+        if url.endswith("/adgroup/create/") and "actions" in (kwargs.get("json") or {}) and self.reject:
+            self.reject = False
+            bad = {"code": 40002, "message": "actions not allowed", "data": {}}
+            resp.json = lambda: bad
+        return resp
+
+
+def _launch_with_interests(client):
+    plan = _plan(audience_targeting={"flexible_spec": [{"interests": [{"id": "m1", "name": "Education"}]}]})
+    client.answers.update({
+        "/tool/interest_category/": {"code": 0, "message": "OK", "data": {"interest_categories": [
+            {"interest_category_id": "10", "interest_category_name": "Education", "level": 1}]}},
+        "/tool/action_category/": {"code": 0, "message": "OK", "data": ACTION_CATEGORIES},
+        "/tool/hashtag/recommend/": {"code": 0, "message": "OK", "data": HASHTAGS},
+    })
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = client
+        return _run(_adapter().launch_campaign(plan, _auth()))
+
+
+def test_the_launched_ad_group_carries_the_interactions_next_to_the_interests():
+    client = _RoutedClient()
+    result = _launch_with_interests(client)
+    body = client.sent("/adgroup/create/")[0]
+    assert result.launched is True
+    assert body["interest_category_ids"] == ["10"]
+    assert {a["action_scene"] for a in body["actions"]} == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}
+    assert "purchase_intention_keyword_ids" not in body                      # Jane's objectives are Traffic / Lead gen
+
+
+def test_if_tiktok_rejects_the_extra_audiences_the_ad_group_is_made_without_them():
+    client = _RejectingFirstAdGroup()
+    client.reject = True
+    result = _launch_with_interests(client)
+    sent = client.sent("/adgroup/create/")
+    assert result.launched is True and len(sent) == 2
+    assert "actions" in sent[0] and "actions" not in sent[1]
+    assert sent[1]["interest_category_ids"] == ["10"]                        # the interests are kept
