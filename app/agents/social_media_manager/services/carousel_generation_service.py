@@ -441,7 +441,15 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 "slides": slides_with_specs,
                 "hashtags": carousel_data.get("hashtags", []),
                 "status": "draft",
-                "approval_status": "pending",
+                # Matches content_generation_service.py's own fix — "pending"
+                # here never reflected a real review step (nothing in this
+                # codebase ever moves a draft out of "pending" into some
+                # reviewed state), it just kept this draft out of the
+                # repurposing-candidate query's "approval_status": "approved"
+                # filter and inflated the agency dashboard's "pending
+                # approvals" count for a carousel nobody was ever going to
+                # approve.
+                "approval_status": "approved",
                 "has_image": False,
                 "image_retry_count": 0,
                 "created_at": datetime.utcnow(),
