@@ -96,13 +96,16 @@ def test_tiktok_only_accepts_purchase_intention_on_conversion_style_objectives(o
 
 # ── the launch ────────────────────────────────────────────────────────────────
 
-class _RejectingFirstAdGroup(_RoutedClient):
-    """Rejects the first ad group create that carries `actions`, accepts everything else."""
+class _PickyAdGroup(_RoutedClient):
+    """Rejects any ad group create whose body `rejects(body)` says TikTok would not accept."""
+    def __init__(self, rejects):
+        super().__init__()
+        self.rejects = rejects
+
     def _respond(self, method, url, kwargs):
         resp = super()._respond(method, url, kwargs)
-        if url.endswith("/adgroup/create/") and "actions" in (kwargs.get("json") or {}) and self.reject:
-            self.reject = False
-            bad = {"code": 40002, "message": "actions not allowed", "data": {}}
+        if url.endswith("/adgroup/create/") and self.rejects(kwargs.get("json") or {}):
+            bad = {"code": 40002, "message": "Invalid behavior targeting category.", "data": {}}
             resp.json = lambda: bad
         return resp
 
@@ -130,11 +133,25 @@ def test_the_launched_ad_group_carries_the_interactions_next_to_the_interests():
     assert "purchase_intention_keyword_ids" not in body                      # Jane's objectives are Traffic / Lead gen
 
 
-def test_if_tiktok_rejects_the_extra_audiences_the_ad_group_is_made_without_them():
-    client = _RejectingFirstAdGroup()
-    client.reject = True
+def test_if_tiktok_rejects_every_extra_audience_the_ad_group_is_made_without_them():
+    client = _PickyAdGroup(lambda body: "actions" in body)
     result = _launch_with_interests(client)
     sent = client.sent("/adgroup/create/")
-    assert result.launched is True and len(sent) == 2
-    assert "actions" in sent[0] and "actions" not in sent[1]
-    assert sent[1]["interest_category_ids"] == ["10"]                        # the interests are kept
+    assert result.launched is True
+    assert "actions" in sent[0] and "actions" not in sent[-1]
+    assert sent[-1]["interest_category_ids"] == ["10"]                       # the interests are kept
+
+
+def test_one_scene_tiktok_does_not_accept_does_not_cost_the_others():
+    # whole set rejected, and the creator scene is the bad one: the video scene alone is accepted
+    client = _PickyAdGroup(lambda body: any(a["action_scene"] == "CREATOR_RELATED" for a in body.get("actions", [])))
+    result = _launch_with_interests(client)
+    final = client.sent("/adgroup/create/")[-1]
+    assert result.launched is True
+    assert [a["action_scene"] for a in final["actions"]] == ["VIDEO_RELATED"]
+
+
+def test_hashtag_keywords_are_plain_words_not_metas_qualified_names():
+    assert bt._plain("Education (social concept)") == "Education"
+    assert bt._plain("Early childhood education (primary and secondary education)") == "Early childhood education"
+    assert bt._plain("Parents (All)") == "Parents"

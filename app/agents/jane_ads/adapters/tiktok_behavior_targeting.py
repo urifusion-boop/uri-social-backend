@@ -19,6 +19,7 @@ caller retries the ad group without these fields if TikTok rejects them. The RES
 the SDK, so they are read loosely (any {id, name} entries, however nested).
 """
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
@@ -50,6 +51,12 @@ class BehaviorTargeting:
         if self.purchase_intention_keyword_ids and objective_type in PURCHASE_INTENT_OBJECTIVES:
             out["purchase_intention_keyword_ids"] = self.purchase_intention_keyword_ids
         return out
+
+
+def _plain(name: str) -> str:
+    """A topic as plain words: Meta's names carry a qualifier ("Education (social concept)") that TikTok's
+    keyword search does not know."""
+    return re.sub(r"\s*\([^)]*\)", "", name or "").strip()
 
 
 def _entries(node: Any, id_keys: Iterable[str], name_keys: Iterable[str]) -> list[dict]:
@@ -126,6 +133,8 @@ async def resolve_behavior_targeting(
     if data is not None:
         pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"))
         category_ids = _match(names, pool, best_match, MAX_ACTION_CATEGORIES)
+        print(f"[TikTokAdsAdapter] action categories: {len(pool)} read, e.g. {pool[:4]}; "
+              f"matched ids {category_ids} for {names}", flush=True)
         if not category_ids:
             print(f"[TikTokAdsAdapter] no video/creator category matched {names} "
                   f"({len(pool)} categories read from TikTok)", flush=True)
@@ -139,13 +148,15 @@ async def resolve_behavior_targeting(
                 "video_user_actions": CREATOR_ACTIONS, "action_category_ids": category_ids,
             })
 
+    keywords = list(dict.fromkeys(k for k in (_plain(n) for n in names) if k))[:5]
     data = await _lookup(
         "/tool/hashtag/recommend/",
-        {"advertiser_id": advertiser_id, "keywords": json.dumps(names), "operator": "OR"}, access_token)
+        {"advertiser_id": advertiser_id, "keywords": json.dumps(keywords), "operator": "OR"}, access_token)
     if data is not None:
         hashtags = _entries(data, ("hashtag_id", "keyword_id", "id"), ("hashtag_name", "keyword", "name"))
         if not hashtags:
-            print(f"[TikTokAdsAdapter] no hashtags returned for {names}", flush=True)
+            print(f"[TikTokAdsAdapter] no hashtags returned for {keywords}; TikTok answered {str(data)[:300]}",
+                  flush=True)
         if hashtags:
             result.actions.append({
                 "action_scene": "HASHTAG_RELATED", "action_period": 0,
