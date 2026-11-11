@@ -38,3 +38,30 @@ def test_extra_parameters_are_added():
     q = _query(url)
     assert q["display"] == "page"
     assert q["auth_type"] == "reauthenticate"
+
+
+def test_facebook_reconnect_re_asks_for_a_switched_off_permission(monkeypatch):
+    import asyncio
+    from app.agents.social_media_manager.routers import complete_social_manager as csm
+    monkeypatch.setattr(csm.settings, "META_APP_ID", "app", raising=False)
+
+    resp = asyncio.get_event_loop().run_until_complete(csm.facebook_direct_initiate(source="inbox", rerequest=1))
+    q = _query(resp.headers["location"])
+    assert q["auth_type"] == "rerequest"
+    assert q["state"] == "inbox|rerequested"
+    assert "pages_manage_metadata" in q["scope"]
+
+
+def test_declined_scopes_reads_only_switched_off_permissions():
+    import asyncio
+    from types import SimpleNamespace
+    from app.agents.social_media_manager.routers.complete_social_manager import declined_scopes
+
+    class _Client:
+        async def get(self, url, params=None):
+            return SimpleNamespace(json=lambda: {"data": [
+                {"permission": "pages_messaging", "status": "granted"},
+                {"permission": "pages_manage_metadata", "status": "declined"}]})
+
+    out = asyncio.get_event_loop().run_until_complete(declined_scopes(_Client(), "g", "t"))
+    assert out == ["pages_manage_metadata"]

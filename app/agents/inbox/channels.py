@@ -291,6 +291,12 @@ def subscription_issue(error: str, page_name: str = "") -> dict:
             "won't deliver its messages. Ask the Page's owner to open Meta Business Settings → "
             "Accounts → Pages → the Page, and give your Facebook account Full control (turn on "
             "two-factor authentication if Meta asks). Then click Reconnect here.")}
+    if "pages_manage_metadata" in low:
+        return {"code": "missing_permission", "message": (
+            f"Meta didn't give Uri permission to manage {page}'s messages. Click Reconnect: Uri "
+            "will ask Meta for it again, so leave it switched on. If this message comes back "
+            "after that, the permission is still waiting on Meta's approval for Uri — contact "
+            "support.")}
     if "pages_messaging" in low or "pages_manage_metadata" in low or "permission" in low:
         return {"code": "missing_permission", "message": (
             f"This connection of {page} was made without the permissions needed to receive messages. "
