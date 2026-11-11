@@ -43,15 +43,13 @@ def test_entries_are_found_however_the_response_nests_them():
 
 # ── what gets targeted ────────────────────────────────────────────────────────
 
-def test_video_creator_and_hashtag_audiences_are_built_for_the_plans_topics():
+def test_video_and_hashtag_audiences_are_built_for_the_plans_topics():
     got = _resolve(["Education"], **{"/tool/action_category/": ACTION_CATEGORIES, "/tool/hashtag/recommend/": HASHTAGS})
     scenes = {a["action_scene"]: a for a in got.actions}
-    assert set(scenes) == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}
+    assert set(scenes) == {"VIDEO_RELATED", "HASHTAG_RELATED"}              # TikTok rejects creator ids, so none are sent
     assert scenes["VIDEO_RELATED"]["action_category_ids"] == ["30"]
     assert scenes["VIDEO_RELATED"]["video_user_actions"] == ["WATCHED_TO_END", "LIKED", "COMMENTED", "SHARED"]
     assert scenes["VIDEO_RELATED"]["action_period"] == 15
-    assert scenes["CREATOR_RELATED"]["video_user_actions"] == ["FOLLOWING", "VIEW_HOMEPAGE"]
-    assert scenes["CREATOR_RELATED"]["action_category_ids"] == ["30"]
     assert scenes["HASHTAG_RELATED"] == {"action_scene": "HASHTAG_RELATED", "action_period": 0,
                                          "video_user_actions": ["VIEW_HASHTAG"], "action_category_ids": ["h1", "h2"]}
 
@@ -129,7 +127,7 @@ def test_the_launched_ad_group_carries_the_interactions_next_to_the_interests():
     body = client.sent("/adgroup/create/")[0]
     assert result.launched is True
     assert body["interest_category_ids"] == ["10"]
-    assert {a["action_scene"] for a in body["actions"]} == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}
+    assert {a["action_scene"] for a in body["actions"]} == {"VIDEO_RELATED", "HASHTAG_RELATED"}
     assert "purchase_intention_keyword_ids" not in body                      # Jane's objectives are Traffic / Lead gen
 
 
@@ -143,8 +141,8 @@ def test_if_tiktok_rejects_every_extra_audience_the_ad_group_is_made_without_the
 
 
 def test_one_scene_tiktok_does_not_accept_does_not_cost_the_others():
-    # whole set rejected, and the creator scene is the bad one: the video scene alone is accepted
-    client = _PickyAdGroup(lambda body: any(a["action_scene"] == "CREATOR_RELATED" for a in body.get("actions", [])))
+    # whole set rejected, and the hashtag scene is the bad one: the video scene alone is accepted
+    client = _PickyAdGroup(lambda body: any(a["action_scene"] == "HASHTAG_RELATED" for a in body.get("actions", [])))
     result = _launch_with_interests(client)
     final = client.sent("/adgroup/create/")[-1]
     assert result.launched is True
