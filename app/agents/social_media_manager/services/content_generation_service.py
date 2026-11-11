@@ -777,7 +777,19 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                         **draft,
                         "request_id": request_id,
                         "user_id": user_id,
-                        "approval_status": "pending",
+                        # Live-reported: "pending" here put every freshly
+                        # generated draft straight into Content Library's
+                        # "Needs Review" bucket by default, with no actual
+                        # review step ever submitting it there (submit_for_approval
+                        # in approval_workflow_service.py is dead code — no
+                        # router ever calls it) and no way for a user to tell
+                        # "Needs Review" apart from "just generated, untouched".
+                        # "approved" is the value content_calendar_v2_service.py's
+                        # own repurposing-candidate query already treats as a
+                        # normal, usable draft — matches that existing
+                        # convention and lands in Content Library's "Draft"
+                        # bucket like every other normal draft does.
+                        "approval_status": "approved",
                         "created_at": generated_at,
                         "updated_at": generated_at,
                     }
