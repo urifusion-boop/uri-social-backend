@@ -991,17 +991,25 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             f"{self._api_base}/adgroup/create/", headers=self._headers(), json=body)
                         return resp.json()
 
+                    # The extra audiences are tried whole, then one scene at a time (so one that TikTok does not
+                    # accept does not cost the others), then not at all. A rejected create leaves nothing behind.
                     extra_targeting = behavior.fields_for(objective_type)
-                    adgroup_data = await _post_adgroup({**adgroup_body, **extra_targeting})
-                    if extra_targeting:
+                    attempts: list[dict] = [extra_targeting] if extra_targeting else []
+                    if len(extra_targeting.get("actions") or []) > 1:
+                        attempts += [{"actions": [a]} for a in extra_targeting["actions"]]
+                    attempts.append({})
+                    for extra in attempts:
+                        adgroup_data = await _post_adgroup({**adgroup_body, **extra})
+                        if not extra:
+                            break
                         try:
                             _raise_for_error(adgroup_data, "ad group creation")
+                            break
                         except TikTokAdsAPIError as targeting_err:
-                            # These audiences are extras (their request shapes are from TikTok's SDK but not yet
-                            # confirmed live): never lose the launch over them.
-                            print(f"[TikTokAdsAdapter] ad group rejected with {sorted(extra_targeting)} "
-                                  f"({targeting_err}) — retrying without them", flush=True)
-                            adgroup_data = await _post_adgroup(adgroup_body)
+                            scenes = [a.get("action_scene") for a in extra.get("actions", [])]
+                            ids = [a.get("action_category_ids") for a in extra.get("actions", [])]
+                            print(f"[TikTokAdsAdapter] ad group rejected with {sorted(extra)} {scenes} {ids} "
+                                  f"({targeting_err})", flush=True)
                     try:
                         _raise_for_error(adgroup_data, "ad group creation")
                     except TikTokAdsAPIError:
