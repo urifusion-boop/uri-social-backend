@@ -32,6 +32,18 @@ from app.dependencies import get_db_dependency, get_active_brand_context
 router = APIRouter(prefix="/linkedin", tags=["LinkedIn"])
 
 
+def linkedin_callback_url() -> str:
+    """Where LinkedIn sends the user back. The configured value wins when it is a real
+    URL; staging shipped with the placeholder "ADD_ME_MANUALLY_IN_CONSOLE", which LinkedIn
+    rejected as a redirect_uri mismatch, so anything else falls back to this API's own
+    address — the same base every Meta callback is built from."""
+    configured = (settings.LINKEDIN_OAUTH_CALLBACK_URL or "").strip()
+    if configured.startswith(("https://", "http://")):
+        return configured
+    base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL or "").rstrip("/")
+    return f"{base}/linkedin/callback" if base else ""
+
+
 async def _get_linkedin_connection(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Optional[dict]:
     """Return the active LinkedIn connection doc for the given brand, or None."""
     from app.models.brand_account import BrandAccount
@@ -72,7 +84,7 @@ async def connect_linkedin(
     Returns auth_url — open this in a browser so the user can authorise.
     After authorisation LinkedIn will redirect to GET /linkedin/callback.
     """
-    if not settings.LINKEDIN_OAUTH_CALLBACK_URL:
+    if not linkedin_callback_url():
         raise HTTPException(status_code=503, detail="LINKEDIN_OAUTH_CALLBACK_URL not configured.")
 
     user_id = ctx["user_id"]
@@ -93,7 +105,7 @@ async def connect_linkedin(
         upsert=True,
     )
 
-    auth_url = svc.get_authorization_url(state, settings.LINKEDIN_OAUTH_CALLBACK_URL)
+    auth_url = svc.get_authorization_url(state, linkedin_callback_url())
 
     return {
         "status": True,
@@ -140,7 +152,7 @@ async def linkedin_oauth_callback(
 
     try:
         svc = _linkedin_service()
-        token_data = await svc.exchange_code(code, settings.LINKEDIN_OAUTH_CALLBACK_URL)
+        token_data = await svc.exchange_code(code, linkedin_callback_url())
         access_token = token_data["access_token"]
         profile = await svc.get_profile(access_token)
         pages = await svc.get_admin_pages(access_token)
