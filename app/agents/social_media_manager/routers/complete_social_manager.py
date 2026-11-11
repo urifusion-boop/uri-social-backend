@@ -1636,7 +1636,7 @@ async def initiate_social_connections(
 
 
 @router.get("/connect/facebook-direct/initiate")
-async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
+async def facebook_direct_initiate(source: Optional[str] = Query("settings"), rerequest: int = Query(0)):
     """
     Redirect the user's browser to Facebook's OAuth page to connect a Facebook Page
     directly (without Outstand). On completion, Facebook redirects to
@@ -1659,9 +1659,31 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_manage_engagement",
         "pages_manage_metadata",
     ]
+    # Facebook never asks again for a permission the person once switched off, so a plain
+    # reconnect comes back without it every time. rerequest asks for exactly those again.
+    # The state carries it so the callback knows not to loop if they decline once more.
+    state = source or "settings"
+    extra = {"auth_type": "rerequest"} if rerequest else None
+    if rerequest:
+        state = f"{state}|rerequested"
     return RedirectResponse(
-        build_meta_authorize_url(app_id, redirect_uri, scopes, source or "settings", settings.FACEBOOK_API_VERSION)
+        build_meta_authorize_url(app_id, redirect_uri, scopes, state, settings.FACEBOOK_API_VERSION, extra)
     )
+
+
+# What the inbox cannot work without: Meta refuses to deliver a Page's events at all
+# unless the token has both.
+INBOX_SCOPES = ("pages_manage_metadata", "pages_messaging")
+
+
+async def declined_scopes(client, graph_base: str, token: str) -> list[str]:
+    """Permissions the person switched off in Meta's dialog. A permission Meta never
+    offered (the app isn't allowed it) doesn't appear at all, which is a different fix."""
+    try:
+        r = await client.get(f"{graph_base}/me/permissions", params={"access_token": token})
+        return [p["permission"] for p in r.json().get("data", []) if p.get("status") == "declined"]
+    except Exception:
+        return []
 
 
 @router.get("/connect/facebook-direct/callback")
@@ -1682,6 +1704,9 @@ async def facebook_direct_callback(
     from datetime import timezone
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
+    rerequested = bool(state and state.endswith("|rerequested"))
+    if rerequested:
+        state = state[: -len("|rerequested")]
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
     if state == "inbox":  # started from the inbox, which finishes the connection itself
         base_redirect = f"{web_app_url}/workspace/?tab=messages&view=connections"
@@ -1728,6 +1753,15 @@ async def facebook_direct_callback(
             )
             ll_data = ll_resp.json()
             long_token = ll_data.get("access_token", short_token)
+
+            declined = [p for p in await declined_scopes(client, graph_base, long_token) if p in INBOX_SCOPES]
+            if declined and not rerequested:
+                print(f"[FBDirectOAuth] inbox permission(s) declined earlier: {declined} — asking again", flush=True)
+                again = f"{_base}/social-media/connect/facebook-direct/initiate?" + urllib.parse.urlencode(
+                    {"source": state or "settings", "rerequest": 1})
+                return RedirectResponse(again)
+            if declined:
+                print(f"[FBDirectOAuth] inbox permission(s) still declined after re-asking: {declined}", flush=True)
 
             # Step 3: get the user's Facebook Pages
             pages_resp = await client.get(
