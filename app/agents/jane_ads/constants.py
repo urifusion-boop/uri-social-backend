@@ -80,7 +80,7 @@ SERVICE_FEE_RATE: float = 0.10
 # in full needs ÷ (1 - rate) — at a 10% rate, 18,000 × 1.1111 = the ₦20,000 stated.
 # Hard-coding 1.10 here instead would have collected 19,800 and quietly left ₦200 of
 # every ₦20,000 campaign uncollected.
-AD_SPEND_MARKUP: float = round(1.0 / (1.0 - SERVICE_FEE_RATE), 6)
+AD_SPEND_MARKUP: float = 1.0 / (1.0 - SERVICE_FEE_RATE)  # unrounded: 54,000 × 1.111111 came to ₦59,999.99
 
 
 # The markup campaigns launched BEFORE the fee moved inside the stated budget were
