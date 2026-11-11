@@ -162,7 +162,6 @@ Categories:
 PRESERVE THESE EXACTLY AS-IS:
 - All product photography and imagery
 - Background colors, gradients, and treatments
-- Overall composition and layout structure
 - All decorative elements and design details
 - Margins and spacing between elements
 
@@ -172,6 +171,18 @@ DO NOT PRESERVE TEXT - ALL TEXT MUST BE REPLACED:
 - Do not keep any old text visible anywhere in the image
 - The text content is being completely updated
 
+IF A LINE, BULLET, OR SECTION FROM THE ORIGINAL HAS NO MATCH BELOW, DELETE IT:
+- NEW TEXT CONTENT below is the complete, final text — nothing else belongs
+  in the image
+- If the original had a bullet point, line, or text block (its own icon,
+  wording, and spacing) that isn't present in the new text, remove that
+  whole element — the words, its icon or bullet mark, and the space it
+  occupied — not just blank out the words and leave the row behind
+- Close up the gap a removed line leaves, the same as if you'd laid the
+  design out fresh with only the text below
+- Never keep an old line "just in case" — if it has no match in the new
+  text, it is gone
+
 EXCEPTION — THE BRAND LOGO/BADGE IS NOT TEXT TO REPLACE:
 - If a brand logo or badge (a small graphic mark, often in a corner)
   appears in the image, leave it and any wordmark inside it completely
@@ -179,19 +190,24 @@ EXCEPTION — THE BRAND LOGO/BADGE IS NOT TEXT TO REPLACE:
 - Never invent, substitute, or draw a different logo, business name,
   or brand mark anywhere in the image
 
-NEW TEXT CONTENT (replace all existing text with this):
+NEW TEXT CONTENT (everything the image should say — replace all existing
+text with exactly this, adding nothing and keeping nothing else):
 
 {user_feedback}
 
 FORMATTING RULES:
 - Maintain the EXACT same font families, weights, and styles as the original
-- Keep text in the EXACT same positions and alignments as before
+- Keep surviving text in the same positions and alignments as before
 - Preserve text sizes relative to the original (large stays large, small stays small)
 - Keep the same text colors and styling from the original
-- If the new text has multiple lines/sections, position them where the old text was
-- The layout structure must remain identical - only the words change
+- If the new text has multiple lines/sections, position them where the
+  corresponding old text was, reflowing anything below a removed line to
+  fill the gap it left
+- Beyond closing that gap, the layout structure must remain identical - only
+  the words (and, where removed, the lines themselves) change
 
-The result should look like the original design with updated text content."""
+The result should look like the original design with updated text content,
+with no trace of any line that has no match in the new text above."""
 
     @staticmethod
     def build_style_edit_prompt(user_feedback: str) -> str:
