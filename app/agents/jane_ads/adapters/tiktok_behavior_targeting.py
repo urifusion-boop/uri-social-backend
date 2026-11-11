@@ -2,14 +2,15 @@
 TikTok audience targeting by what people DO, not only what they are into.
 
 Ads Manager's Audience > Interests & behaviors box has more than "Interests": Purchase intention, Video
-interactions, Creator interactions and Hashtag interactions. The ad group only ever set interest_category_ids, so a
+interactions, Creator interactions and Hashtag interactions (creator interactions are not sent, see below). The ad group only ever set interest_category_ids, so a
 Jane ad reached everyone interested in the topic and ignored the people who had just watched, followed or searched it.
 
 Field names and limits below are from TikTok's own Marketing API SDK (adgroup/create):
   * actions[]  {action_scene, action_period, video_user_actions, action_category_ids}. action_scene is VIDEO_RELATED
     (watched / liked / commented / shared, over 7 or 15 days), CREATOR_RELATED (follows / visits a creator's page) or
     HASHTAG_RELATED (viewed a hashtag). Valid only when TikTok is the only placement, which is how Jane launches.
-    Video and creator ids come from GET /tool/action_category/, hashtag ids from GET /tool/hashtag/recommend/.
+    Video ids come from GET /tool/action_category/, hashtag ids from GET /tool/hashtag/recommend/. Live on staging
+    (2026-11-11): VIDEO_RELATED accepted; CREATOR_RELATED rejected with those same ids, so it is left out.
   * purchase_intention_keyword_ids, from GET /tool/interest_keyword/recommend/ with audience_type=PURCHASE_INTENTION.
     TikTok accepts it ONLY for the App promotion, Conversions and Product sales objectives; a Traffic or Lead
     generation ad group that carries it is rejected, so it is added only when the objective allows it.
@@ -28,7 +29,6 @@ import httpx
 from app.core.config import settings
 
 VIDEO_ACTIONS = ["WATCHED_TO_END", "LIKED", "COMMENTED", "SHARED"]
-CREATOR_ACTIONS = ["FOLLOWING", "VIEW_HOMEPAGE"]
 HASHTAG_ACTIONS = ["VIEW_HASHTAG"]
 VIDEO_ACTION_DAYS = 15            # the longer of TikTok's 7 / 15 day windows: a wider, not a tighter, audience
 MAX_ACTION_CATEGORIES = 3         # per scene; Jane's interests are already few, and each one narrows the audience
@@ -128,7 +128,9 @@ async def resolve_behavior_targeting(
     if not names:
         return result
 
-    # Video and creator interactions share one category list (what the videos / creators are about).
+    # Video interactions use /tool/action_category/ (confirmed live: TikTok accepts them). CREATOR_RELATED is NOT sent:
+    # TikTok rejected it ("Invalid behavior targeting category") with the very same ids the video scene accepted, and
+    # its API has no separate creator-category list to take ids from.
     data = await _lookup("/tool/action_category/", {"advertiser_id": advertiser_id}, access_token)
     if data is not None:
         pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"))
@@ -143,10 +145,6 @@ async def resolve_behavior_targeting(
             result.actions.append({
                 "action_scene": "VIDEO_RELATED", "action_period": VIDEO_ACTION_DAYS,
                 "video_user_actions": VIDEO_ACTIONS, "action_category_ids": category_ids,
-            })
-            result.actions.append({
-                "action_scene": "CREATOR_RELATED", "action_period": 0,      # TikTok ignores the period here
-                "video_user_actions": CREATOR_ACTIONS, "action_category_ids": category_ids,
             })
 
     keywords = list(dict.fromkeys(k for k in (_plain(n) for n in names) if k))[:5]
