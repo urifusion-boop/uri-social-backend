@@ -13,7 +13,7 @@ from openai import OpenAI
 
 from app.core.config import settings
 from app.database import get_db
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 PLATFORM_TARGETS = {
     "instagram_reels": {"duration": 15, "width": 1080, "height": 1920},

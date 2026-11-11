@@ -712,8 +712,12 @@ async def creative_upload(
 
 @router.post("/creative/upload-signature")
 async def creative_upload_signature(brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
-    """Signed Cloudinary params so the browser uploads a video directly, in chunks. A phone
-    video relayed through /creative/upload on a slow connection outlasts the request timeout."""
+    """A presigned S3 PUT so the browser uploads a video directly, not relayed
+    through us. A phone video relayed through /creative/upload on a slow
+    connection outlasts the request timeout. Response is {put_url, public_url}
+    — the frontend does a plain PUT of the raw file body to put_url, then uses
+    public_url as the final creative URL (not a multipart POST with signed
+    form fields the way the old Cloudinary flow worked)."""
     from .creative import cloudinary_upload_signature
     import uuid as _uuid
     signed = cloudinary_upload_signature(f"upload-{_uuid.uuid4().hex[:12]}")

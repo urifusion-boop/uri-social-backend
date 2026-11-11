@@ -77,11 +77,7 @@ class LogoRepositionService:
         except Exception as e:
             return UriResponse.error_response(f"Could not composite the logo: {e}")
 
-        # cloudinary_upload, not s3_upload — prod hasn't migrated media
-        # storage off Cloudinary yet (unlike dev). Same upload_base64
-        # signature/contract either way, so this stays a one-line swap if
-        # that migration ever lands here.
-        from app.utils.cloudinary_upload import upload_base64
+        from app.utils.s3_upload import upload_base64
         new_image_url = await upload_base64(
             f"data:image/webp;base64,{new_b64}", folder="uri-social/content-drafts"
         )
