@@ -907,6 +907,9 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     interest_names, self._advertiser_id, self._access_token, _best_tiktok_interest,
                     want_purchase_intent=_tiktok_objective_for_creative(plan.objective, is_carousel)
                     in PURCHASE_INTENT_OBJECTIVES)
+                print(f"[TikTokAdsAdapter] audience boxes for this launch: interests={len(interest_category_ids)}, "
+                      f"interactions={[a['action_scene'] for a in behavior.actions]}, "
+                      f"purchase_intention={len(behavior.purchase_intention_keyword_ids)}", flush=True)
 
                 async def _create_campaign_and_adgroup(
                     objective_type: str, optimization_goal: str, billing_event: str,

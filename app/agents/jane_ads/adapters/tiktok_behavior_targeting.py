@@ -126,6 +126,9 @@ async def resolve_behavior_targeting(
     if data is not None:
         pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"))
         category_ids = _match(names, pool, best_match, MAX_ACTION_CATEGORIES)
+        if not category_ids:
+            print(f"[TikTokAdsAdapter] no video/creator category matched {names} "
+                  f"({len(pool)} categories read from TikTok)", flush=True)
         if category_ids:
             result.actions.append({
                 "action_scene": "VIDEO_RELATED", "action_period": VIDEO_ACTION_DAYS,
@@ -141,6 +144,8 @@ async def resolve_behavior_targeting(
         {"advertiser_id": advertiser_id, "keywords": json.dumps(names), "operator": "OR"}, access_token)
     if data is not None:
         hashtags = _entries(data, ("hashtag_id", "keyword_id", "id"), ("hashtag_name", "keyword", "name"))
+        if not hashtags:
+            print(f"[TikTokAdsAdapter] no hashtags returned for {names}", flush=True)
         if hashtags:
             result.actions.append({
                 "action_scene": "HASHTAG_RELATED", "action_period": 0,
