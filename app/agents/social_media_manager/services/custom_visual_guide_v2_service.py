@@ -976,16 +976,15 @@ Do NOT style it as a button or banner."""
 
                 # Upload final image with logo, and the pre-overlay background
                 # (needed to later re-paste the logo elsewhere without
-                # re-running generation), to Cloudinary.
-                import cloudinary.uploader
+                # re-running generation), to S3.
+                from app.utils.s3_upload import upload_bytes
 
                 final_image_bytes = base64.b64decode(logo_result_b64)
-                upload_result = cloudinary.uploader.upload(
+                final_image_url = await upload_bytes(
                     final_image_bytes,
                     folder="uri-social/generated-images",
                     resource_type="image",
                 )
-                final_image_url = upload_result['secure_url']
 
                 if geometry:
                     # A raw base64 data URL, not a pre-uploaded Cloudinary URL —

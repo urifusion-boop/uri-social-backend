@@ -20,8 +20,17 @@ REQUIRED = {
     "TIKTOK_ADS_APP_SECRET": f"{SSM_PREFIX}/TIKTOK_ADS_APP_SECRET",
 }
 
+# Plain, non-secret config — a literal value on the task definition's
+# `environment` list, not an SSM-backed `secrets` entry (nothing here is
+# sensitive: a bucket name and a region string). Added for the Cloudinary->S3
+# media migration — app/utils/s3_upload.py reads these via os.environ.
+REQUIRED_ENV = {
+    "S3_MEDIA_BUCKET": "uri-social-media-prod",
+    "AWS_REGION": "eu-west-1",
+}
 
-def ensure(task_definition: dict, container_name: str, required: dict) -> list[str]:
+
+def ensure(task_definition: dict, container_name: str, required: dict, required_env: dict) -> list[str]:
     container = next(
         (c for c in task_definition.get("containerDefinitions", [])
          if c.get("name") == container_name),
@@ -39,6 +48,12 @@ def ensure(task_definition: dict, container_name: str, required: dict) -> list[s
         if name not in present:
             secrets.append({"name": name, "valueFrom": arn})
             added.append(name)
+
+    env_present = {e.get("name") for e in environment}
+    for name, value in required_env.items():
+        if name not in env_present:
+            environment.append({"name": name, "value": value})
+            added.append(name)
     return added
 
 
@@ -46,7 +61,7 @@ def main(path: str) -> None:
     with open(path) as f:
         task_definition = json.load(f)
 
-    added = ensure(task_definition, CONTAINER, REQUIRED)
+    added = ensure(task_definition, CONTAINER, REQUIRED, REQUIRED_ENV)
 
     with open(path, "w") as f:
         json.dump(task_definition, f)

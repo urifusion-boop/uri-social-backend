@@ -392,7 +392,7 @@ async def generate_scene(
 
     image_url = result["url"]
     if image_url.startswith("data:"):
-        from app.utils.cloudinary_upload import upload_base64
+        from app.utils.s3_upload import upload_base64
         try:
             image_url = await upload_base64(image_url, folder="uri-social/jane-ads/vsg01")
         except Exception as e:

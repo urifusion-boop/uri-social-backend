@@ -6,7 +6,7 @@ import httpx
 
 from app.core.config import settings
 from app.database import get_db
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 try:
     from google import genai

@@ -33,13 +33,11 @@ and the draft-summary mapping are pure and unit-tested.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 import uuid
 from typing import Any, Optional
 
-import aiohttp
 import openai
 
 from app.core.config import settings
@@ -674,46 +672,28 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
 # ── Source 1: GENERATE — brand data, direct controlled image call ────────────
 
 def cloudinary_upload_signature(public_id: str) -> Optional[dict]:
-    """Signed params for one upload into the uri-ads folder — used server-side and handed
-    to the browser so a large video goes straight to Cloudinary instead of through us."""
-    cloud, api_key, api_secret = (settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY,
-                                   settings.CLOUDINARY_API_SECRET)
-    if not all([cloud, api_key, api_secret]):
-        return None
-    ts = int(time.time())
-    sig = hashlib.sha1(f"folder=uri-ads&public_id={public_id}&timestamp={ts}{api_secret}".encode()).hexdigest()
-    return {"cloud_name": cloud, "api_key": api_key, "timestamp": ts, "signature": sig,
-            "public_id": public_id, "folder": "uri-ads"}
+    """A presigned S3 PUT for one upload into the uri-ads folder — handed to the
+    browser so a large video goes straight to S3 instead of relayed through us.
+    Name kept for its one caller (router.py's /creative/upload-signature) —
+    response shape changed from Cloudinary's signed-form-fields to a single
+    {put_url, public_url} pair; the frontend's upload call needed updating to
+    match (a plain PUT of the raw file body to put_url, not a multipart POST)."""
+    from app.utils.s3_upload import presigned_put_url
+    result = presigned_put_url(folder="uri-ads", public_id=public_id, ext="mp4")
+    return {"put_url": result["put_url"], "public_url": result["public_url"]}
 
 
 async def _upload_bytes_to_cloudinary(
     file_bytes: bytes, public_id: str,
     resource_type: str = "image", ext: str = "png", content_type: str = "image/png",
 ) -> Optional[str]:
-    """Signed REST upload straight from `settings` (not the `cloudinary` SDK, which
-    reads raw os.environ and silently no-ops when credentials only live in .env via
-    pydantic Settings). Matches the pattern already proven in this package's b-roll
-    generation — self-contained, no extra package coupling. Works for both images
-    (GENERATE's gpt-image-1 stills) and videos (a user's own uploaded ad video)."""
-    signed = cloudinary_upload_signature(public_id)
-    if not signed:
-        return None
-    cloud = signed["cloud_name"]
-    form = aiohttp.FormData()
-    form.add_field("file", file_bytes, filename=f"{public_id}.{ext}", content_type=content_type)
-    for k in ("api_key", "timestamp", "signature", "public_id", "folder"):
-        form.add_field(k, str(signed[k]))
-    form.add_field("resource_type", resource_type)
-    # Video files are much larger than a generated still — allow more time to upload.
-    timeout = 180 if resource_type == "video" else 60
+    """Upload to S3 — works for both images (GENERATE's gpt-image-1 stills) and
+    videos (a user's own uploaded ad video). Name kept for its callers below."""
+    from app.utils.s3_upload import upload_bytes
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://api.cloudinary.com/v1_1/{cloud}/{resource_type}/upload",
-                              data=form, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                body = json.loads(await r.text())
-                return body.get("secure_url") if r.ok else None
+        return await upload_bytes(file_bytes, folder="uri-ads", resource_type=resource_type, public_id=public_id)
     except Exception as e:
-        print(f"[Creative] Cloudinary upload error: {e}", flush=True)
+        print(f"[Creative] S3 upload error: {e}", flush=True)
         return None
 
 
@@ -786,11 +766,11 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
         # picture). Every OTHER caller of this same engine uploads to Cloudinary first;
         # this one didn't. Mirror that here so ads always get a real hosted URL.
         if image_url and image_url.startswith("data:"):
-            from app.utils.cloudinary_upload import upload_base64
+            from app.utils.s3_upload import upload_base64
             try:
                 image_url = await upload_base64(image_url, folder="uri-social/jane-ads")
             except Exception as e:
-                print(f"[Creative] Cloudinary upload failed, cannot use for a Meta ad: {e}", flush=True)
+                print(f"[Creative] S3 upload failed, cannot use for a Meta ad: {e}", flush=True)
                 return None
         return image_url
     except Exception as e:
