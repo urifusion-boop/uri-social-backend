@@ -441,3 +441,8 @@ def test_running_campaign_is_not_refunded(monkeypatch):
 def test_delete_after_the_automatic_refund_gives_nothing_more():
     record = _prepaid_row(unspent_refunded_ngn=6_000)
     assert billing.unspent_refund_ngn(record, 40_000) == 0
+
+
+def test_total_due_lands_on_the_stated_budget_exactly():
+    from app.agents.jane_ads.router import _total_due_ngn
+    assert _total_due_ngn(C.ad_spend_from_budget(60_000)) == 60_000
