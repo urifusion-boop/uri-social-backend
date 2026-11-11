@@ -59,7 +59,7 @@ def _plain(name: str) -> str:
     return re.sub(r"\s*\([^)]*\)", "", name or "").strip()
 
 
-def _entries(node: Any, id_keys: Iterable[str], name_keys: Iterable[str]) -> list[dict]:
+def _entries(node: Any, id_keys: Iterable[str], name_keys: Iterable[str], keep_raw: bool = False) -> list[dict]:
     """Every {"id", "name"} found anywhere in a lookup response: an object with one of the id keys and one of the name
     keys, however deeply nested, first occurrence of an id winning."""
     found: dict[str, dict] = {}
@@ -69,7 +69,10 @@ def _entries(node: Any, id_keys: Iterable[str], name_keys: Iterable[str]) -> lis
             ident = next((n[k] for k in id_keys if n.get(k) not in (None, "")), None)
             name = next((n[k] for k in name_keys if isinstance(n.get(k), str) and n[k].strip()), None)
             if ident is not None and name:
-                found.setdefault(str(ident), {"id": str(ident), "name": name.strip()})
+                entry = {"id": str(ident), "name": name.strip()}
+                if keep_raw:   # the entry's other plain fields, for telling categories apart
+                    entry["raw"] = {k: v for k, v in n.items() if isinstance(v, (str, int, float, bool))}
+                found.setdefault(str(ident), entry)
             for v in n.values():
                 walk(v)
         elif isinstance(n, list):
@@ -114,6 +117,19 @@ def _match(names: list[str], pool: list[dict], best: Callable[[str, list[dict]],
     return ids
 
 
+def _describe_pool(pool: list[dict]) -> None:
+    """Log which plain fields the category entries carry and the values they take, so video categories can be told
+    from creator categories (TikTok lists both in one response but the API has no scene filter)."""
+    fields: dict[str, set] = {}
+    for e in pool:
+        for k, v in (e.get("raw") or {}).items():
+            if k not in ("action_category_id", "action_category_name", "id", "name"):
+                fields.setdefault(k, set()).add(v)
+    summary = {k: sorted(map(str, vals))[:8] for k, vals in fields.items()}
+    print(f"[TikTokAdsAdapter] action category fields (value samples): {summary}; "
+          f"first entries {[e.get('raw') for e in pool[:3]]}", flush=True)
+
+
 async def resolve_behavior_targeting(
     interest_names: list[str],
     advertiser_id: str,
@@ -133,7 +149,8 @@ async def resolve_behavior_targeting(
     # its API has no separate creator-category list to take ids from.
     data = await _lookup("/tool/action_category/", {"advertiser_id": advertiser_id}, access_token)
     if data is not None:
-        pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"))
+        pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"), keep_raw=True)
+        _describe_pool(pool)
         category_ids = _match(names, pool, best_match, MAX_ACTION_CATEGORIES)
         by_id = {e["id"]: e["name"] for e in pool}
         print(f"[TikTokAdsAdapter] action categories: {len(pool)} read; matched "
