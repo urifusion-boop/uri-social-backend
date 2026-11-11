@@ -62,12 +62,12 @@ def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience():
 def test_no_topics_means_nothing_is_looked_up():
     with patch.object(bt, "_lookup", new=AsyncMock()) as lookup:
         got = _run(bt.resolve_behavior_targeting([], "adv1", "tok", _best_tiktok_interest, True))
-    assert got.fields_for("CONVERSIONS") == {} and lookup.await_count == 0
+    assert got.fields() == {} and lookup.await_count == 0
 
 
 def test_failed_lookups_just_leave_the_audiences_out():
     got = _resolve(["Education"])                      # every lookup answers None
-    assert got.fields_for("TRAFFIC") == {}
+    assert got.fields() == {}
 
 
 # ── purchase intention ────────────────────────────────────────────────────────
@@ -81,15 +81,27 @@ def test_purchase_intention_is_looked_up_only_when_asked_for():
     assert _resolve(["Education"], False, **{"/tool/interest_keyword/recommend/": PURCHASE}).purchase_intention_keyword_ids == []
 
 
-@pytest.mark.parametrize("objective, included", [
-    ("TRAFFIC", False), ("LEAD_GENERATION", False), ("VIDEO_VIEWS", False),
-    ("CONVERSIONS", True), ("APP_PROMOTION", True), ("PRODUCT_SALES", True),
-])
-def test_tiktok_only_accepts_purchase_intention_on_conversion_style_objectives(objective, included):
+def test_purchase_intention_goes_with_the_interactions_on_every_objective():
     t = bt.BehaviorTargeting(actions=[{"action_scene": "VIDEO_RELATED"}], purchase_intention_keyword_ids=["p1"])
-    fields = t.fields_for(objective)
-    assert ("purchase_intention_keyword_ids" in fields) is included
-    assert fields["actions"] == [{"action_scene": "VIDEO_RELATED"}]       # the interactions go on every objective
+    assert t.fields() == {"actions": [{"action_scene": "VIDEO_RELATED"}], "purchase_intention_keyword_ids": ["p1"]}
+
+
+def test_attempts_go_from_everything_down_to_nothing():
+    video, hashtag = {"action_scene": "VIDEO_RELATED"}, {"action_scene": "HASHTAG_RELATED"}
+    t = bt.BehaviorTargeting(actions=[video, hashtag], purchase_intention_keyword_ids=["p1"])
+    assert t.attempts() == [
+        {"actions": [video, hashtag], "purchase_intention_keyword_ids": ["p1"]},   # everything
+        {"actions": [video, hashtag]},                                              # without purchase intention
+        {"actions": [video]}, {"actions": [hashtag]},                               # one interaction at a time
+        {"purchase_intention_keyword_ids": ["p1"]},                                 # purchase intention alone
+        {},                                                                         # nothing
+    ]
+
+
+def test_with_nothing_to_add_the_only_attempt_is_a_plain_ad_group():
+    assert bt.BehaviorTargeting().attempts() == [{}]
+    one = bt.BehaviorTargeting(actions=[{"action_scene": "VIDEO_RELATED"}])
+    assert one.attempts() == [{"actions": [{"action_scene": "VIDEO_RELATED"}]}, {}]    # no duplicate attempts
 
 
 # ── the launch ────────────────────────────────────────────────────────────────
@@ -108,6 +120,9 @@ class _PickyAdGroup(_RoutedClient):
         return resp
 
 
+PURCHASE_ANSWER = {"code": 0, "message": "OK", "data": {"recommend_keywords": [{"keyword_id": "p1", "keyword": "online courses"}]}}
+
+
 def _launch_with_interests(client):
     plan = _plan(audience_targeting={"flexible_spec": [{"interests": [{"id": "m1", "name": "Education"}]}]})
     client.answers.update({
@@ -115,6 +130,7 @@ def _launch_with_interests(client):
             {"interest_category_id": "10", "interest_category_name": "Education", "level": 1}]}},
         "/tool/action_category/": {"code": 0, "message": "OK", "data": ACTION_CATEGORIES},
         "/tool/hashtag/recommend/": {"code": 0, "message": "OK", "data": HASHTAGS},
+        "/tool/interest_keyword/recommend/": PURCHASE_ANSWER,
     })
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value.__aenter__.return_value = client
@@ -128,7 +144,7 @@ def test_the_launched_ad_group_carries_the_interactions_next_to_the_interests():
     assert result.launched is True
     assert body["interest_category_ids"] == ["10"]
     assert {a["action_scene"] for a in body["actions"]} == {"VIDEO_RELATED", "HASHTAG_RELATED"}
-    assert "purchase_intention_keyword_ids" not in body                      # Jane's objectives are Traffic / Lead gen
+    assert body["purchase_intention_keyword_ids"] == ["p1"]
 
 
 def test_if_tiktok_rejects_every_extra_audience_the_ad_group_is_made_without_them():
@@ -153,3 +169,12 @@ def test_hashtag_keywords_are_plain_words_not_metas_qualified_names():
     assert bt._plain("Education (social concept)") == "Education"
     assert bt._plain("Early childhood education (primary and secondary education)") == "Early childhood education"
     assert bt._plain("Parents (All)") == "Parents"
+
+
+def test_if_tiktok_does_not_accept_purchase_intention_the_interactions_are_kept():
+    client = _PickyAdGroup(lambda body: "purchase_intention_keyword_ids" in body)
+    result = _launch_with_interests(client)
+    final = client.sent("/adgroup/create/")[-1]
+    assert result.launched is True
+    assert "purchase_intention_keyword_ids" not in final
+    assert {a["action_scene"] for a in final["actions"]} == {"VIDEO_RELATED", "HASHTAG_RELATED"}
