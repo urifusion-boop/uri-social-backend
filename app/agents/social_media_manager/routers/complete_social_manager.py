@@ -1743,6 +1743,9 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings"), re
         "pages_messaging",
         "pages_manage_engagement",
         "pages_manage_metadata",
+        # Pages that live in a Business portfolio are left out of /me/accounts unless
+        # the token carries this — live-reported: 4 Pages on the account, only 3 offered.
+        "business_management",
     ]
     # Facebook never asks again for a permission the person once switched off, so a plain
     # reconnect comes back without it every time. rerequest asks for exactly those again.
@@ -1769,6 +1772,67 @@ async def declined_scopes(client, graph_base: str, token: str) -> list[str]:
         return [p["permission"] for p in r.json().get("data", []) if p.get("status") == "declined"]
     except Exception:
         return []
+
+
+_PAGE_FIELDS = "id,name,access_token,picture"
+
+
+async def _graph_list(client, url: str, params: dict, cap: int = 500) -> list[dict]:
+    """Every row of a Graph list edge, following paging.next. Errors end the walk
+    quietly — a missing permission just means fewer rows, never a failed connect."""
+    rows: list[dict] = []
+    next_url, next_params = url, {**params, "limit": 100}
+    while next_url and len(rows) < cap:
+        try:
+            body = (await client.get(next_url, params=next_params)).json()
+        except Exception:
+            break
+        if not isinstance(body, dict) or "error" in body:
+            if isinstance(body, dict):
+                print(f"[FBPages] {url.rsplit('/', 2)[-2:]} → {body['error'].get('message')}", flush=True)
+            break
+        rows.extend(body.get("data") or [])
+        next_url, next_params = (body.get("paging") or {}).get("next"), None
+    return rows
+
+
+async def fetch_all_facebook_pages(client, graph_base: str, user_token: str) -> list[dict]:
+    """The Pages this person can post to. /me/accounts alone misses Pages that sit in a
+    Business portfolio (it also stops at 25 without paging), so those are gathered from
+    each business's owned_pages / client_pages too. A Page with no access_token can't be
+    posted to as the Page, so it's dropped."""
+    found: dict[str, dict] = {}
+
+    for p in await _graph_list(client, f"{graph_base}/me/accounts",
+                               {"access_token": user_token, "fields": _PAGE_FIELDS}):
+        if p.get("id"):
+            found[p["id"]] = p
+    from_me = len(found)
+
+    businesses = await _graph_list(client, f"{graph_base}/me/businesses",
+                                   {"access_token": user_token, "fields": "id,name"}, cap=50)
+    for biz in businesses:
+        for edge in ("owned_pages", "client_pages"):
+            for p in await _graph_list(client, f"{graph_base}/{biz['id']}/{edge}",
+                                       {"access_token": user_token, "fields": _PAGE_FIELDS}):
+                pid = p.get("id")
+                if not pid or (pid in found and found[pid].get("access_token")):
+                    continue
+                if not p.get("access_token"):
+                    # The edge sometimes leaves the token out; ask the Page itself.
+                    try:
+                        one = (await client.get(f"{graph_base}/{pid}",
+                                                params={"access_token": user_token, "fields": _PAGE_FIELDS})).json()
+                        if isinstance(one, dict) and one.get("access_token"):
+                            p = one
+                    except Exception:
+                        pass
+                found[pid] = p
+
+    pages = [p for p in found.values() if p.get("access_token")]
+    print(f"[FBPages] /me/accounts={from_me} businesses={len(businesses)} "
+          f"total_with_token={len(pages)} (seen={len(found)})", flush=True)
+    return pages
 
 
 @router.get("/connect/facebook-direct/callback")
@@ -1848,13 +1912,8 @@ async def facebook_direct_callback(
             if declined:
                 print(f"[FBDirectOAuth] inbox permission(s) still declined after re-asking: {declined}", flush=True)
 
-            # Step 3: get the user's Facebook Pages
-            pages_resp = await client.get(
-                f"{graph_base}/me/accounts",
-                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
-            )
-            pages_data = pages_resp.json()
-            pages = pages_data.get("data", [])
+            # Step 3: get the user's Facebook Pages (their own and their Business portfolios')
+            pages = await fetch_all_facebook_pages(client, graph_base, long_token)
 
             if not pages:
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
