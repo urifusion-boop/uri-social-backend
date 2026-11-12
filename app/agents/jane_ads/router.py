@@ -4640,6 +4640,34 @@ class PlanLaunchBody(BaseModel):
     allow_out_of_area: bool = False
 
 
+# A launch normally finishes in seconds-to-minutes. A claim this old means the request
+# that held it never finished (the server restarted mid-launch) — nothing will ever
+# release it, and the plan would refuse every launch forever ("already being launched").
+_STALE_LAUNCH_AFTER = 20 * 60
+
+
+async def _release_if_stale_launch(db, doc: dict) -> dict:
+    """Give an abandoned "launching" plan back to "pending" so it can be launched again.
+    Platforms create the campaign switched off and only switch it on as the last step,
+    and the wallet is charged only after success — so an interrupted launch has spent
+    nothing and left nothing running."""
+    from datetime import datetime, timezone
+    from . import launch_governance as gov
+    if doc.get("status") != "launching":
+        return doc
+    started = doc.get("launching_at")
+    if started is None:
+        return doc
+    if getattr(started, "tzinfo", None) is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - started).total_seconds() < _STALE_LAUNCH_AFTER:
+        return doc
+    print(f"[Launch] plan {doc.get('plan_id')} stuck launching since {started.isoformat()} — released", flush=True)
+    await gov.release(db, doc["plan_id"], "system",
+                      "The previous launch was interrupted before it finished — nothing was charged.")
+    return await db["jane_ads_pending_plans"].find_one({"plan_id": doc["plan_id"]}) or doc
+
+
 @router.post("/meta/plan/{plan_id}/launch")
 async def meta_launch_plan(
     plan_id: str,
@@ -4661,6 +4689,7 @@ async def meta_launch_plan(
     doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
     if not doc or doc.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Plan not found")
+    doc = await _release_if_stale_launch(db, doc)
     if doc["status"] == "launching":
         raise HTTPException(status_code=409, detail="This plan is already being launched — give it a moment, then refresh.")
     if doc["status"] != "pending":
@@ -5051,6 +5080,7 @@ async def _load_pending_plan(db, plan_id: str, brand_id: str) -> dict:
     doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
     if not doc or doc.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Plan not found")
+    doc = await _release_if_stale_launch(db, doc)
     if doc.get("status") != "pending":
         raise HTTPException(
             status_code=409,

@@ -841,6 +841,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         now = datetime.now(timezone.utc)
         end = now + timedelta(days=days)
 
+        # The video is made TikTok-ready (ratio/codec, ffmpeg) BEFORE anything exists on
+        # TikTok. A phone HEVC video can take minutes to re-encode; done mid-launch, a
+        # deploy/restart in that window left a campaign + ad group on the account with no
+        # ad and the plan stuck "launching" (live, 2026-11-12).
+        prepared_video_url = (
+            await ensure_tiktok_video(plan.creative.image_url) if not is_carousel else ""
+        )
+
         campaign_id = ""
         adgroup_id = ""
         try:
@@ -1047,7 +1055,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # replaced, the file is already sitting on S3 ready to fetch by
                     # the time we hand TikTok the URL, so there's no on-demand-transcode
                     # cold-cache race to warm up first (see tiktok_media.py's docstring).
-                    tiktok_video_url = await ensure_tiktok_video(plan.creative.image_url)
+                    tiktok_video_url = prepared_video_url  # prepared before step 1, above
                     video_resp = await client.post(
                         f"{self._api_base}/file/video/ad/upload/",
                         headers=self._headers(),
