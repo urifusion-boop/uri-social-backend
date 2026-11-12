@@ -212,7 +212,7 @@ class TestPresignedPutUrl:
     upload (CampaignService.ts's uploadVideoDirect)."""
 
     def test_returns_a_put_url_and_the_matching_public_url(self):
-        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+        with patch("app.utils.s3_upload._s3_presign_client") as mock_s3, \
              patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
              patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
             mock_s3.generate_presigned_url.return_value = "https://signed.example/put"
@@ -230,7 +230,7 @@ class TestPresignedPutUrl:
         whose header doesn't match it byte-for-byte — and the browser's real
         file.type varies by source (video/mp4, video/quicktime, ...), so this
         must never be part of the signed Params."""
-        with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+        with patch("app.utils.s3_upload._s3_presign_client") as mock_s3, \
              patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
              patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
             mock_s3.generate_presigned_url.return_value = "https://signed.example/put"
@@ -238,6 +238,24 @@ class TestPresignedPutUrl:
 
         _, kwargs = mock_s3.generate_presigned_url.call_args
         assert "ContentType" not in kwargs["Params"]
+
+    def test_signs_against_the_buckets_regional_host(self):
+        """A browser PUT to the global s3.amazonaws.com host can be redirected, which a
+        CORS request can't follow — the ads video upload failed in a real browser."""
+        import boto3
+        from botocore.config import Config
+        import app.utils.s3_upload as m
+        client = boto3.client(
+            "s3", region_name="eu-west-1", endpoint_url="https://s3.eu-west-1.amazonaws.com",
+            aws_access_key_id="AKIDEXAMPLE", aws_secret_access_key="secret",
+            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        )
+        with patch.object(m, "_s3_presign_client", client), \
+             patch.object(m, "_S3_BUCKET", "uri-social-media-dev"), \
+             patch.object(m, "_S3_REGION", "eu-west-1"):
+            url = presigned_put_url("uri-ads", "upload-abc123", ext="mov")["put_url"]
+        assert url.startswith("https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-ads/upload-abc123.mov?")
+        assert m._s3_presign_client.meta.endpoint_url.endswith(".amazonaws.com")
 
 
 class TestKeyFromPublicUrl:

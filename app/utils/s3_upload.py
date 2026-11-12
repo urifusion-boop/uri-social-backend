@@ -30,6 +30,16 @@ _S3_REGION = os.environ.get("AWS_REGION", "eu-west-1")
 # presigned_put_url() the moment the browser's real file.type didn't match the
 # (absent) signed value. SigV4 only binds headers actually listed as signed.
 _s3_client = boto3.client("s3", region_name=_S3_REGION, config=_BotoConfig(signature_version="s3v4"))
+# Presigned URLs handed to a browser: pinned to the bucket's own regional host. The
+# default client signs against the global s3.amazonaws.com, which S3 may answer with a
+# redirect a browser can't follow on a CORS PUT — the ads "Upload my own" video failed
+# in a real browser while the same URL worked from a script.
+_s3_presign_client = boto3.client(
+    "s3",
+    region_name=_S3_REGION,
+    endpoint_url=f"https://s3.{_S3_REGION}.amazonaws.com",
+    config=_BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+)
 
 _EXT_TO_CONTENT_TYPE = {
     "png": "image/png",
@@ -199,7 +209,7 @@ def presigned_put_url(folder: str, public_id: str, ext: str = "mp4", expires_in:
     by source (video/mp4, video/quicktime for a .mov, video/webm, ...). Leaving it
     unsigned lets the PUT declare whatever Content-Type the file actually is."""
     key = f"{folder}/{public_id}.{ext}"
-    url = _s3_client.generate_presigned_url(
+    url = _s3_presign_client.generate_presigned_url(
         "put_object",
         Params={"Bucket": _S3_BUCKET, "Key": key},
         ExpiresIn=expires_in,
