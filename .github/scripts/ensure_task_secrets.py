@@ -60,6 +60,9 @@ REQUIRED = {
 REQUIRED_ENV = {
     "S3_MEDIA_BUCKET": "uri-social-media-prod",
     "AWS_REGION": "eu-west-1",
+    # Google verified URI's OAuth app for the Google Ads scope, so "Continue with Google"
+    # is offered instead of leading with the Customer ID route (see config.py).
+    "GOOGLE_ADS_OAUTH_VERIFIED": "true",
 }
 
 
