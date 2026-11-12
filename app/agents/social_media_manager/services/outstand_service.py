@@ -319,3 +319,46 @@ class OutstandService:
                     response=resp,
                 )
             return resp.json()
+
+
+# ── Outstand switched off ─────────────────────────────────────────────────────
+# URI no longer uses Outstand. Rather than editing every call site, every public
+# OutstandService method refuses up front (no request is sent) unless
+# settings.OUTSTAND_ENABLED is explicitly true. Callers already treat Outstand errors
+# as failures, so a refused call fails cleanly with a message that tells the owner
+# exactly what to do; publish_confirmation recognises it and flags the connection
+# for reconnecting.
+OUTSTAND_DISABLED_MESSAGE = (
+    "This account was connected through Outstand, which URI no longer uses. "
+    "Reconnect it in Connected Accounts with the Connect button."
+)
+
+
+class OutstandDisabledError(OutstandPublishError):
+    def __init__(self):
+        super().__init__(OUTSTAND_DISABLED_MESSAGE, status_code=410)
+
+
+def _outstand_guard(method):
+    import functools
+    import inspect
+
+    if inspect.iscoroutinefunction(method):
+        @functools.wraps(method)
+        async def wrapper(*args, **kwargs):
+            if not getattr(settings, "OUTSTAND_ENABLED", False):
+                raise OutstandDisabledError()
+            return await method(*args, **kwargs)
+    else:
+        @functools.wraps(method)
+        def wrapper(*args, **kwargs):
+            if not getattr(settings, "OUTSTAND_ENABLED", False):
+                raise OutstandDisabledError()
+            return method(*args, **kwargs)
+    return wrapper
+
+
+for _name, _attr in list(vars(OutstandService).items()):
+    if not _name.startswith("_") and callable(_attr):
+        setattr(OutstandService, _name, _outstand_guard(_attr))
+

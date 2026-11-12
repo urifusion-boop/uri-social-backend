@@ -198,6 +198,10 @@ class Settings(BaseSettings):
     # domain verification needed, unlike PULL_FROM_URL) as an alternative to
     # the existing Outstand-mediated TikTok connection. See
     # app/agents/social_media_manager/services/tiktok_direct_service.py.
+    # Outstand is no longer used: every OutstandService call refuses without contacting
+    # Outstand, so nothing publishes/schedules/looks up through it. Accounts that were
+    # connected through Outstand are told to reconnect directly (Meta / TikTok login).
+    OUTSTAND_ENABLED: bool = False
     TIKTOK_APP_CLIENT_KEY: str = ""
     TIKTOK_APP_CLIENT_SECRET: str = ""
 
