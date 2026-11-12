@@ -5373,10 +5373,9 @@ async def meta_campaigns(
     google_adapter = (google_flow.GoogleCampaigns(db)
                       if with_metrics and google_records and google_flow.configured() else None)
 
-    out = []
     google_own = (await google_flow.get_mode(db, brand_id)) == "own"
-    for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
-                             + [("google", r) for r in google_records]):
+
+    async def _row(platform_name, r):
         is_tiktok = platform_name == "tiktok"
         is_google = platform_name == "google"
         collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
@@ -5448,7 +5447,7 @@ async def meta_campaigns(
                 # on; everything else (paused/active/in review/etc.) still renders.
                 if summary["delivery"] == "Deleted":
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
-                    continue
+                    return None
                 row["status"] = summary["delivery"].lower()
                 if is_google:
                     row["serving_note"] = google_flow.serving_note(summary)
@@ -5500,7 +5499,26 @@ async def meta_campaigns(
                     # Don't fall back to "paused": that hid a campaign that was running.
                     row["status"] = "status unavailable"
                     row["serving_note"] = "Couldn't reach Google to check this campaign. Press Refresh in a minute."
-        out.append(row)
+        return row
+
+    # Every campaign's live numbers used to be fetched one after another, so the page
+    # took as long as the brand's whole campaign history. Fetch them concurrently
+    # (bounded, to stay well inside Meta/TikTok/Google rate limits); order and per-row
+    # behaviour are unchanged.
+    import asyncio
+
+    _sem = asyncio.Semaphore(8)
+
+    async def _bounded(platform_name, r):
+        async with _sem:
+            return await _row(platform_name, r)
+
+    rows = await asyncio.gather(*[
+        _bounded(platform_name, r)
+        for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
+                                 + [("google", r) for r in google_records])
+    ])
+    out = [row for row in rows if row is not None]
 
     out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
     return {"campaigns": out}
