@@ -328,9 +328,10 @@ class OutstandService:
 # as failures, so a refused call fails cleanly with a message that tells the owner
 # exactly what to do; publish_confirmation recognises it and flags the connection
 # for reconnecting.
+# Shown to owners, so it never names the provider — just what to do. publish_confirmation
+# recognises this sentence and swaps in a platform-specific version of it.
 OUTSTAND_DISABLED_MESSAGE = (
-    "This account was connected through Outstand, which URI no longer uses. "
-    "Reconnect it in Connected Accounts with the Connect button."
+    "This account needs to be reconnected. Go to Connected Accounts, tap Reconnect, then try again."
 )
 
 

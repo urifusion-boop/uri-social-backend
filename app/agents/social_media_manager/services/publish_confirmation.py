@@ -47,23 +47,25 @@ _RECONNECT_MARKERS = (
 # Signatures with their own precise, accurate explanation — checked before
 # the generic _RECONNECT_MARKERS catch-all, so a known-specific cause never
 # gets a message that tells the owner to do the wrong thing.
+_HIDE_RAW_MARKERS = ("this account needs to be reconnected", "does not have an active subscription")
+
 _SPECIFIC_CAUSES = [
     (
-        # Outstand switched off (outstand_service.OUTSTAND_DISABLED_MESSAGE), or Outstand's
-        # own "no active subscription" — either way this connection can't publish until
-        # it's reconnected directly.
-        "connected through outstand",
+        # The account can no longer publish through its old connection (the provider was
+        # switched off, or its own subscription lapsed): it needs a direct reconnect.
+        # Owners are never told which provider — just what to do.
+        "this account needs to be reconnected",
         lambda name: (
-            f"Your {name} account was connected through Outstand, which URI no longer uses. Reconnect {name} "
-            f"in Connected Accounts with the Connect button, then publish this post again."
+            f"Your {name} account needs to be reconnected. Go to Connected Accounts, tap Reconnect next to "
+            f"{name}, then publish this post again."
         ),
         True,
     ),
     (
         "does not have an active subscription",
         lambda name: (
-            f"Your {name} account was connected through Outstand, which URI no longer uses. Reconnect {name} "
-            f"in Connected Accounts with the Connect button, then publish this post again."
+            f"Your {name} account needs to be reconnected. Go to Connected Accounts, tap Reconnect next to "
+            f"{name}, then publish this post again."
         ),
         True,
     ),
@@ -126,8 +128,12 @@ def explain(platform: str, raw: str, limit: Optional["_rate_limit.RateLimitInfo"
                 "message": f"{limit.user_message} ({name} said: {text[:220]})"}
     for marker, build_message, reconnect in _SPECIFIC_CAUSES:
         if marker in low:
+            # These two come from the old publishing provider, not from the network
+            # itself — show only the friendly sentence, never the raw provider text.
+            hide_raw = marker in _HIDE_RAW_MARKERS
             return {"reconnect": reconnect, "category": "known" if reconnect else "content",
-                     "message": f"{build_message(name)} ({name} said: {text[:220]})"}
+                     "message": build_message(name) if hide_raw
+                     else f"{build_message(name)} ({name} said: {text[:220]})"}
     if any(m in low for m in _RECONNECT_MARKERS):
         return {"reconnect": True, "category": "known", "message": (
             f"Your {name} connection has expired — {name} ended URI's access (this happens after a password "
