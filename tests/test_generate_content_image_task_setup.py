@@ -26,7 +26,7 @@ import pytest
 
 mongomock_motor = pytest.importorskip("mongomock_motor")
 
-from fastapi import BackgroundTasks, Response
+from fastapi import BackgroundTasks
 
 from app.agents.social_media_manager.routers.complete_social_manager import (
     ContentGenerationRequest,
@@ -131,7 +131,6 @@ class TestGenerateContentImageTaskSetup:
                 generate_content(
                     request=request,
                     background_tasks=BackgroundTasks(),
-                    response=Response(),
                     db=db,
                     ctx=CTX,
                 )
@@ -191,7 +190,6 @@ class TestGenerateContentImageTaskSetup:
                 generate_content(
                     request=request,
                     background_tasks=BackgroundTasks(),
-                    response=Response(),
                     db=db,
                     ctx=CTX,
                 )

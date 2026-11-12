@@ -245,9 +245,9 @@ def test_call_edit_api_clears_old_logo_before_editing_and_resaves_placement():
     with patch(
         "app.agents.social_media_manager.services.image_editing_service.openai_client"
     ) as mock_openai, patch(
-        "app.utils.cloudinary_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.webp")
+        "app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.webp")
     ), patch(
-        "app.utils.cloudinary_upload.upload_base64", new=AsyncMock(return_value="https://cdn.example/background.png")
+        "app.utils.s3_upload.upload_base64", new=AsyncMock(return_value="https://cdn.example/background.png")
     ), patch.object(
         ImageContentService, "clear_logo_region", wraps=ImageContentService.clear_logo_region
     ) as mock_clear, patch.object(
@@ -300,7 +300,7 @@ def test_call_edit_api_skips_logo_handling_entirely_when_draft_has_no_logo():
     with patch(
         "app.agents.social_media_manager.services.image_editing_service.openai_client"
     ) as mock_openai, patch(
-        "app.utils.cloudinary_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.webp")
+        "app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.webp")
     ), patch.object(
         ImageContentService, "clear_logo_region"
     ) as mock_clear, patch.object(

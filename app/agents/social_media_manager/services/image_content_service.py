@@ -9,6 +9,13 @@ from app.domain.responses.uri_response import UriResponse
 from app.services.AIService import AIService
 
 
+
+# Image models given a "reserved logo zone" tend to draw that zone (a dotted
+# placeholder box). Every mention of the logo corner carries this sentence.
+NO_MARK_LOGO = (
+    "Do NOT mark that area in any way: no dotted or dashed lines, no outline, frame, box, border, placeholder, label or watermark — it must look like ordinary background that simply continues."
+)
+
 class ImageContentService:
     """
     AI-powered image generation service for social media content
@@ -797,6 +804,8 @@ class ImageContentService:
         seed_content: str,
         brand_context: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
+        reference_images: Optional[List[str]] = None,
+        reference_image_meta: Optional[List[Dict[str, Any]]] = None,
         feedback: Optional[str] = None,
         image_type: str = "post_image",
         image_model: Optional[str] = None,
@@ -807,11 +816,48 @@ class ImageContentService:
         Generate an AI image optimized for a specific platform.
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         For carousel slides: slide_index and total_slides provide context for slide numbering.
+
+        reference_images (plural) supersedes reference_image (singular, kept for the many
+        other callers of this function that only ever pass one) when both are given.
+        len(ref_imgs) <= 1 behaves EXACTLY as before this parameter existed — same product-
+        preservation pipeline, same forced background removal by default. len(ref_imgs) > 1
+        switches to the multi-reference "combine" path below: no forensic single-product
+        analysis (that pipeline assumes one product, not several unrelated images), a
+        dedicated prompt block that tells the model what role each image plays, and — unlike
+        the single-image path — background removal defaults to OFF per image, since the
+        common combine case is "blend a product shot with a background/scene photo," and
+        forcibly cutting the scene photo down to a cutout would defeat the point. Either way,
+        reference_image_meta (parallel array, same length as the resolved image list) lets
+        the caller override the per-image default and attach an optional role label
+        ("product", "background", "logo", ...) that feeds directly into the prompt.
         """
         try:
             # ALWAYS use GPT-Image-2 generation mode for final graphics (PRD Section 8)
             # Background removal uses edit mode, but final generation uses generation mode
             image_model = "openai/gpt-image-2"
+
+            ref_imgs: List[str] = [
+                i for i in (reference_images if reference_images else ([reference_image] if reference_image else []))
+                if i
+            ]
+            ref_meta: List[Dict[str, Any]] = list(reference_image_meta or [])
+            is_multi_reference = len(ref_imgs) > 1
+
+            def _ref_meta_for(i: int) -> Dict[str, Any]:
+                return ref_meta[i] if i < len(ref_meta) else {}
+
+            def _should_remove_bg(i: int) -> bool:
+                m = _ref_meta_for(i)
+                if "remove_background" in m:
+                    return bool(m["remove_background"])
+                # Default: strip for the classic single-product case (unchanged
+                # behaviour), don't strip per-image in combine mode (see docstring).
+                return not is_multi_reference
+
+            # Everything below this point was written against a single `reference_image`
+            # string — keep it working unchanged for the len(ref_imgs) <= 1 case (the
+            # multi-reference branch, further down, bypasses this variable entirely).
+            reference_image = ref_imgs[0] if ref_imgs else None
 
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
@@ -922,25 +968,52 @@ class ImageContentService:
             brand_name = bc.get("brand_name", "")
             color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
 
-            # Get logo position to reserve space. Shared with the V2 custom-guide
-            # path (custom_visual_guide_v2_service.py) via build_logo_space_note
-            # below, so both image-generation flows tell the model to leave the
-            # user's chosen logo corner clear — the content adapts to the logo's
-            # position, never the other way around.
+            # Get logo position and size to reserve space
             logo_url = bc.get('logo_url')
-            logo_space_note = ImageContentService.build_logo_space_note(bc)
+            logo_position = bc.get('logo_position', 'bottom_right') if logo_url else None
+            logo_size = bc.get('logo_size', 'small')
+
+            # Calculate actual logo space based on size setting
+            # Logo size percentages: small=8%, medium=12%, large=16%
+            # Add minimal padding: just +2% for badge and edge spacing
+            logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
+            logo_pct = logo_size_map.get(logo_size, 0.08)
+
+            # Reserve space = actual logo size + minimal padding for white badge
+            # Small padding to avoid overlap but not squeeze content
+            reserve_width_pct = int((logo_pct + 0.02) * 100)  # e.g., 16% + 2% = 18%
+            reserve_height_pct = int((logo_pct + 0.02) * 100)  # e.g., 16% + 2% = 18%
+
+            logo_reserve_size = f"{reserve_width_pct}% width × {reserve_height_pct}% height"
+
+            # Build logo space reservation instruction - keep it elegant, not restrictive
+            logo_space_note = ""
+            if logo_position:
+                position_map = {
+                    "top_center": "top-center",
+                    "top_left": "top-left corner",
+                    "top_right": "top-right corner",
+                    "bottom_left": "bottom-left corner",
+                    "bottom_center": "bottom-center",
+                    "bottom_right": "bottom-right corner"
+                }
+                pos_text = position_map.get(logo_position, logo_position)
+                # Worded as "plain background that continues", never as a "zone"
+                # to "reserve": image models answer "reserve a logo zone" by
+                # DRAWING the zone (a dotted placeholder box the real logo then
+                # lands inside — reported on staging, Oct 2026).
+                logo_space_note = f"\n\n🚨 CRITICAL - KEEP THE {pos_text.upper()} PLAIN:\n" \
+                    f"The brand's real logo is added to the {pos_text} after the image is made " \
+                    f"(about {logo_reserve_size}). For that to look clean:\n" \
+                    f"  • Leave the {pos_text} as plain, continuous background — the same colour, gradient or " \
+                    f"surface as the area around it\n" \
+                    f"  • NO text of any kind there (not even small text or labels)\n" \
+                    f"  • NO shapes, icons, illustrations, people, products or graphic elements there\n" \
+                    f"  • {NO_MARK_LOGO}\n" \
+                    f"  • Place ALL content (headlines, diagrams, text, visuals) away from the {pos_text}\n" \
+                    f"This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
-            # base_pct=20 is this codebase's own existing baseline (not the 12
-            # some other callers default to). top/bottom are now split, not
-            # one flat figure — _crop_to_ratio removes most of a top+bottom
-            # crop from the BOTTOM (_TOP_CROP_BIAS), since headlines reliably
-            # sit near the top while the bottom/CTA is comparatively
-            # disposable, so the top margin only needs to survive a small
-            # crop while the bottom margin needs to survive a much larger
-            # one. Confirmed live: a LinkedIn headline got clipped at the top
-            # edge when this was still one flat figure sized for an even
-            # 50/50 split.
             _safe_margins = ImageContentService._safe_zone_margins_pct(specs["width"], specs["height"], base_pct=20)
             _top_pct = _safe_margins["top"]
             _bottom_pct = _safe_margins["bottom"]
@@ -967,10 +1040,15 @@ Every element in the image must come from the instructions below. Nothing else.
 
 CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
 Every letter of every word must be 100% inside the image canvas with no clipping.{_crop_note}
-Maintain a minimum {_top_pct}% safe-zone margin from the top edge, and a minimum {_lr_pct}%
-safe-zone margin from the left and right edges.
-Headlines must begin at least {_top_pct}% from the top edge.
+Maintain a minimum {_top_pct}% safe-zone margin from the top edge.
+Maintain a minimum {_bottom_pct}% safe-zone margin from the bottom edge.
+Maintain a minimum {_lr_pct}% safe-zone margin from the left and right edges.
 {bottom_margin_rule}
+This margin applies to EVERY visual element, not only text — decorative shapes, stars,
+arrows, icons, illustrations, badges and any other graphic flourish must also stay fully
+inside it. A star or icon placed right at the edge is just as broken as clipped text once
+the crop runs: it gets cut in half. Treat decoration with the same discipline as copy.
+Headlines must begin at least {_top_pct}% from the top edge.
 If text is too large to fit within these margins, reduce the font size — do NOT let any
 character touch or cross any edge.
 ⚠️ CRITICAL: Text cut off at bottom edges is a CRITICAL FAILURE. Leave generous space
@@ -1193,6 +1271,24 @@ Follow these rules precisely for every image. No exceptions.
 
             do_not_include = "=== DO NOT INCLUDE ===\n" + "\n".join(f"- {item}" for item in do_not_include_items)
 
+            # The logo-reservation rule already appears once at the very top (in
+            # absolute_rules). Repeating it once more as the LAST thing the model
+            # reads — after it has already worked out headline/layout — catches the
+            # cases where an earlier instruction gets lost among everything else in
+            # a long prompt. This applies whether or not a reference image is used
+            # (the reference-image path adds its own reminder later, inside the
+            # composition block, on top of this one).
+            logo_final_reminder = ""
+            if logo_position:
+                logo_final_reminder = (
+                    f"=== FINAL LAYOUT CHECK ===\n"
+                    f"Before finalising, check the {pos_text} of the canvas "
+                    f"({logo_reserve_size}). A brand logo will be placed there after "
+                    f"generation. That area must be plain, continuous background — no letters, "
+                    f"words, icons, or graphics touching it. {NO_MARK_LOGO} If your layout puts "
+                    f"anything there, shift it elsewhere before rendering."
+                )
+
             # ASSEMBLE FINAL PROMPT (Order matters - rules at top!)
             parts = [
                 absolute_rules,
@@ -1202,6 +1298,7 @@ Follow these rules precisely for every image. No exceptions.
                 content_section,
                 format_section,
                 do_not_include,
+                logo_final_reminder,
             ]
             image_prompt = "\n\n".join(p for p in parts if p)
 
@@ -1214,16 +1311,21 @@ Follow these rules precisely for every image. No exceptions.
             product_preservation_block = ""
             cutout_url = reference_image  # Default to original if background removal fails
 
-            if reference_image:
+            if reference_image and not is_multi_reference:
                 try:
                     print(f"\n{'='*60}")
                     print(f"🔬 PRODUCT PRESERVATION PIPELINE ACTIVATED")
                     print(f"{'='*60}")
 
-                    # Step 1: Background removal (get clean product cutout)
-                    from app.utils.background_removal import remove_background
-                    cutout_url = await remove_background(reference_image, method="auto")
-                    print(f"✂️  Background removed: {cutout_url[:80]}...")
+                    # Step 1: Background removal (get clean product cutout) — only
+                    # when this image's own toggle says to (defaults True here,
+                    # preserving the original always-on behaviour for this path).
+                    if _should_remove_bg(0):
+                        from app.utils.background_removal import remove_background
+                        cutout_url = await remove_background(reference_image, method="auto")
+                        print(f"✂️  Background removed: {cutout_url[:80]}...")
+                    else:
+                        print("✂️  Background removal skipped (per-image toggle off)")
 
                     # Step 2: Forensic product analysis (the key innovation)
                     from app.agents.social_media_manager.services.product_analysis_service import ProductAnalysisService
@@ -1242,15 +1344,30 @@ Follow these rules precisely for every image. No exceptions.
 
             # Add composition block based on style's composition_mode (Immersive Composition System PRD)
             # When a reference image is provided, choose composition style based on the visual style
-            if reference_image:
+            # (combine mode gets its own multi-reference block further down instead —
+            # this one is written for "redraw the scene around one exact product").
+            if reference_image and not is_multi_reference:
                 # Get industry and dynamic details for immersive mode
                 industry = bc.get("industry", "general_other")
                 dynamic_motion = ImageContentService._get_dynamic_motion_detail(industry)
                 text_styling = ImageContentService._get_text_styling_detail(industry)
 
+                # The zone descriptions below give the model very specific spatial
+                # instructions (fill this whole side with text). Without an explicit
+                # carve-out, that competes with — and tends to win over — the more
+                # generic logo-reservation rule stated earlier in the prompt, so the
+                # corner holding the logo needs to be named again, right here.
+                logo_corner_note = ""
+                if logo_position:
+                    logo_corner_note = (
+                        f"\n- EXCEPTION: the brand logo is added to the {pos_text} corner afterward "
+                        f"({logo_reserve_size}) — keep that corner plain, continuous background; start the "
+                        f"headline text outside of it, not inside it. {NO_MARK_LOGO}"
+                    )
+
                 if composition_mode == "editorial":
                     # Editorial/Two-Zone mode for minimal/clean styles
-                    composition_block = """
+                    composition_block = f"""
 === EDITORIAL COMPOSITION ===
 Create a professional social media product graphic with TWO distinct zones:
 
@@ -1266,7 +1383,7 @@ TEXT ZONE (45% of frame, opposite side of product):
 - All text placed in this zone: headline, subtext, CTA
 - Text must be in the NEGATIVE SPACE beside the product
 - NO text overlapping or on top of the product
-- 20px minimum gap between any text and the product
+- 20px minimum gap between any text and the product{logo_corner_note}
 
 CRITICAL RULES:
 - The product itself is SACRED - never distort, never regenerate, never modify
@@ -1304,7 +1421,7 @@ TEXT:
 - {text_styling}
 - NEVER overlaps product label
 - Max 3 elements: headline (5 words), subtext (optional), CTA
-- CTA at the bottom, integrated into the scene
+- CTA at the bottom, integrated into the scene{logo_corner_note}
 
 DEPTH AND ATMOSPHERE:
 - THREE depth layers: soft foreground, sharp product, atmospheric bg
@@ -1360,24 +1477,84 @@ OVERALL:
                 print(f"⚠️  Minimum recommended: 400 chars")
 
             print(f"Prompt Length: {len(image_prompt)} chars")
-            print(f"\n{'━'*60}\n"
-                f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
-                f"({'with style' if style_fragment else 'no style'}"
-                f"{' + font' if font_prompt else ''})\n"
-                f"{'━'*60}\n"
-                f"{image_prompt}\n"
-                f"{'━'*60}\n"
-            )
+            if not is_multi_reference:
+                # Combine mode prepends the multi-reference block further down and
+                # prints its own final version there — printing here too would just
+                # show the same prompt twice, once before that block exists.
+                print(f"\n{'━'*60}\n"
+                    f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
+                    f"({'with style' if style_fragment else 'no style'}"
+                    f"{' + font' if font_prompt else ''})\n"
+                    f"{'━'*60}\n"
+                    f"{image_prompt}\n"
+                    f"{'━'*60}\n"
+                )
 
-            # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
-            final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+            if is_multi_reference:
+                # ========== MULTI-REFERENCE COMBINE PATH ==========
+                # No forensic single-product analysis here — that pipeline's whole
+                # premise (exact colour/shape/label preservation of ONE product) doesn't
+                # apply when the images are different things being blended together.
+                # Instead: process each image independently (per-image background
+                # removal per _should_remove_bg), and tell the model in plain language
+                # what role each one plays — gpt-image-1's edit endpoint accepts
+                # multiple images natively but has no way to infer that on its own.
+                from app.utils.background_removal import remove_background
 
-            image_response = await ImageContentService._call_dalle_api(
-                prompt=image_prompt,
-                size=f"{specs['width']}x{specs['height']}",
-                reference_image=final_reference_image,
-                image_model=image_model,
-            )
+                processed_imgs: List[str] = []
+                role_lines: List[str] = []
+                for i, img_url in enumerate(ref_imgs):
+                    meta = _ref_meta_for(i)
+                    label = (meta.get("label") or "").strip()
+                    if _should_remove_bg(i):
+                        try:
+                            processed = await remove_background(img_url, method="auto")
+                        except Exception as e:
+                            print(f"⚠️ Background removal failed for reference image {i} ({label or 'unlabeled'}): {e}")
+                            processed = img_url
+                    else:
+                        processed = img_url
+                    processed_imgs.append(processed)
+                    role_desc = label if label else f"reference image {i + 1}"
+                    bg_note = "background removed, use only the isolated subject" if _should_remove_bg(i) else "use exactly as provided, including its background/setting"
+                    role_lines.append(f"  {i + 1}. {role_desc} — {bg_note}")
+
+                multi_reference_block = (
+                    "=== MULTIPLE REFERENCE IMAGES — COMBINE THEM ===\n"
+                    f"You have been given {len(ref_imgs)} reference images, in this order:\n"
+                    + "\n".join(role_lines) + "\n"
+                    "Combine them into ONE cohesive social media graphic. Every labelled subject "
+                    "(product, person, logo, etc.) must appear EXACTLY as it looks in its own "
+                    "reference image — same shape, colours, proportions, and detail. Do not "
+                    "invent, omit, or merge subjects together. Where a reference is a background/"
+                    "setting, use its environment, lighting, and mood as the scene the other "
+                    "subjects are placed into."
+                )
+                image_prompt = multi_reference_block + "\n\n" + image_prompt
+
+                print(f"\n{'━'*60}\n"
+                    f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] (combining {len(ref_imgs)} reference images)\n"
+                    f"{'━'*60}\n"
+                    f"{image_prompt}\n"
+                    f"{'━'*60}\n"
+                )
+
+                image_response = await ImageContentService._call_dalle_api(
+                    prompt=image_prompt,
+                    size=f"{specs['width']}x{specs['height']}",
+                    reference_images=processed_imgs,
+                    image_model=image_model,
+                )
+            else:
+                # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
+                final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+
+                image_response = await ImageContentService._call_dalle_api(
+                    prompt=image_prompt,
+                    size=f"{specs['width']}x{specs['height']}",
+                    reference_image=final_reference_image,
+                    image_model=image_model,
+                )
 
             if image_response.get('success'):
                 # Composite brand logo onto generated image for all models.
@@ -1398,16 +1575,13 @@ OVERALL:
                         # re-paste the logo onto from scratch, instead of
                         # re-running AI generation just to move a badge.
                         background_image_data_url = data_url
-                        loop = asyncio.get_running_loop()
-                        b64_final, geometry = await loop.run_in_executor(
-                            None,
-                            lambda: ImageContentService._overlay_logo(
-                                _m.group(1), logo_url, logo_position, logo_size, return_geometry=True
-                            ),
+                        b64_final, chosen_position, geometry = await ImageContentService.overlay_logo_smart(
+                            _m.group(1), logo_url, logo_size, preferred_position=logo_position,
+                            return_placement=True,
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
                         if geometry:
-                            logo_placement = {**geometry, "position": logo_position, "logo_size": logo_size}
+                            logo_placement = {**geometry, "position": chosen_position, "logo_size": logo_size}
                 else:
                     print(f"⚠️  LOGO SKIPPED: logo_url is None or empty")
 
@@ -1490,7 +1664,23 @@ OVERALL:
                     composition_mode = s.get("composition_mode", "immersive")
 
             logo_url = bc.get("logo_url")
-            logo_space_note = ImageContentService.build_logo_space_note(bc)
+            logo_position = bc.get("logo_position", "bottom_right") if logo_url else None
+            logo_size = bc.get("logo_size", "small")
+            logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
+            logo_pct = logo_size_map.get(logo_size, 0.08)
+            reserve_pct = int((logo_pct + 0.02) * 100)
+            logo_space_note = ""
+            if logo_position:
+                position_map = {
+                    "top_center": "top-center", "top_left": "top-left corner", "top_right": "top-right corner",
+                    "bottom_left": "bottom-left corner", "bottom_center": "bottom-center", "bottom_right": "bottom-right corner",
+                }
+                pos_text = position_map.get(logo_position, logo_position)
+                logo_space_note = (
+                    f"\nKeep the {pos_text} (about {reserve_pct}% width x {reserve_pct}% height) as plain, "
+                    f"continuous background with no text or graphics — a brand logo will be overlaid there "
+                    f"afterward. {NO_MARK_LOGO}"
+                )
 
             # CTA — same round-robin rotation as _generate_platform_image.
             override_cta = bc.get("override_cta")
@@ -1571,12 +1761,8 @@ rich tonal range, no pure black or pure white."""
             composited_b64 = _b64c.b64encode(composited_png).decode()
 
             if logo_url:
-                logo_position = bc.get("logo_position", "bottom_right")
-                logo_size = bc.get("logo_size", "small")
-                loop = asyncio.get_running_loop()
-                composited_b64 = await loop.run_in_executor(
-                    None,
-                    lambda: ImageContentService._overlay_logo(composited_b64, logo_url, logo_position, logo_size)
+                composited_b64 = await ImageContentService.overlay_logo_smart(
+                    composited_b64, logo_url, logo_size, preferred_position=logo_position
                 )
 
             return UriResponse.get_single_data_response("platform_image", {
@@ -2575,40 +2761,13 @@ rich tonal range, no pure black or pure white."""
             logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
             logo_size_pct = logo_size_map.get(logo_size, 0.08)  # Fallback to 8%
 
-            target_w = max(40, int(bw * logo_size_pct))
-            lw, lh = logo_img.size
-            scale = target_w / lw
-            logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
+            bx, by, badge_w, badge_h, target_w, target_h = ImageContentService._compute_logo_badge_geometry(
+                bw, bh, logo_img.size, logo_size_pct, position
+            )
+            logo_img = logo_img.resize((target_w, target_h), Image.LANCZOS)
             lw, lh = logo_img.size
 
-            # Badge padding (inner: 5px each side, outer edge: 3% of width for better spacing)
             badge_pad_inner = max(5, int(bw * 0.005))
-            edge_pad = max(20, int(bw * 0.03))  # Increased from 1.5% to 3% to avoid text overlap
-
-            badge_w = lw + badge_pad_inner * 2
-            badge_h = lh + badge_pad_inner * 2
-
-            if position == "bottom_left":
-                bx = edge_pad
-                by = bh - badge_h - edge_pad
-            elif position == "top_left":
-                bx = edge_pad
-                by = edge_pad
-            elif position == "top_right":
-                bx = bw - badge_w - edge_pad
-                by = edge_pad
-            elif position == "top_center":
-                bx = (bw - badge_w) // 2
-                by = edge_pad
-            elif position == "bottom_center":
-                bx = (bw - badge_w) // 2
-                by = bh - badge_h - edge_pad
-            elif position == "center":
-                bx = (bw - badge_w) // 2
-                by = (bh - badge_h) // 2
-            else:  # bottom_right (default)
-                bx = bw - badge_w - edge_pad
-                by = bh - badge_h - edge_pad
 
             # Paste logo directly on image (no shadow, no badge background)
             logo_x = bx + badge_pad_inner
@@ -3051,11 +3210,121 @@ Answer with exactly one word: "yes" or "no"."""
 
         return {"top": top_pct, "bottom": bottom_pct, "left_right": left_right_pct}
 
+    # The pixel count of gpt-image-2's fixed 1024x1536 / 1536x1024 buckets: asking for the target's own
+    # ratio at this size costs the same as the bucket it replaces.
+    _GPT2_PIXEL_BUDGET = 1024 * 1536
+
+    @staticmethod
+    def _gpt2_exact_size(target_w: int, target_h: int) -> Optional[str]:
+        """A gpt-image-2 `size` with the target's own aspect ratio (both edges a multiple of 16, the
+        ratio at most 3:1), so the picture comes back already the right shape and nothing has to be
+        cropped off it. A crop is what cut posts off at the edge: the model's 2:3 portrait bucket
+        cropped to TikTok's / Stories' 9:16 loses ~8% off each side, and text the model set near the
+        side was sliced through.
+
+        None when the fixed bucket is already the right shape (square, 3:2, 2:3), or the target is
+        too long and thin for the model to draw (banners): those keep using the bucket.
+        """
+        ratio = target_w / target_h
+        bucket_w, bucket_h = (1536, 1024) if target_w > target_h else (1024, 1536) if target_h > target_w else (1024, 1024)
+        if abs(bucket_w / bucket_h - ratio) / ratio < 0.02:
+            return None
+        w = max(16, round((ImageContentService._GPT2_PIXEL_BUDGET * ratio) ** 0.5 / 16) * 16)
+        h = max(16, round(w / ratio / 16) * 16)
+        if max(w, h) / min(w, h) > 3:
+            return None
+        return f"{w}x{h}"
+
+    @staticmethod
+    def _gpt2_call(fn: Any, size: str, fallback_size: str, **kwargs: Any) -> Any:
+        """Call an OpenAI image endpoint at `size`; if OpenAI refuses that size, once more at
+        `fallback_size`, one of the fixed buckets every gpt-image model accepts."""
+        try:
+            return fn(size=size, **kwargs)
+        except Exception as err:
+            if size == fallback_size or getattr(err, "status_code", None) != 400 or "size" not in str(err).lower():
+                raise
+            print(f"⚠️ GPT-Image-2 refused size {size} ({err}) — retrying at {fallback_size}")
+            uploads = kwargs.get("image")
+            for upload in (uploads if isinstance(uploads, list) else [uploads]):
+                if isinstance(upload, tuple) and hasattr(upload[1], "seek"):
+                    upload[1].seek(0)
+            return fn(size=fallback_size, **kwargs)
+
+    @staticmethod
+    async def crop_and_reupload_for_tiktok(image_url: str, user_id: str) -> str:
+        """Center-crop a user-uploaded image to TikTok's Photo Mode spec
+        (1080x1920, 9:16) and re-upload it, returning the new URL. Used only
+        for TikTok drafts in the Upload Content flow — every other platform
+        keeps the user's original upload untouched, matching how AI-generated
+        images already get a platform-specific size (see IMAGE_SPECS) while
+        raw uploads otherwise pass through as-is. TikTok's own client
+        auto-crops/letterboxes anything off-ratio when it actually posts, so
+        this makes what the user approves in the draft preview match what
+        actually goes live, instead of a surprise crop TikTok applies later.
+        Falls back to the original URL on any failure — a bad crop should
+        never block the upload flow."""
+        import base64 as _b64
+        import io
+        import httpx
+        from PIL import Image
+        from app.utils.s3_upload import upload_bytes
+
+        target_w, target_h = 1080, 1920
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(image_url)
+            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=97)
+            b64 = _b64.b64encode(buf.getvalue()).decode()
+
+            cropped_b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+            cropped_img = Image.open(io.BytesIO(_b64.b64decode(cropped_b64))).convert("RGB")
+            if cropped_img.size != (target_w, target_h):
+                cropped_img = cropped_img.resize((target_w, target_h), Image.LANCZOS)
+
+            out_buf = io.BytesIO()
+            cropped_img.save(out_buf, format="WEBP", quality=97, method=6)
+
+            url = await upload_bytes(
+                out_buf.getvalue(), folder=f"uri-social/tiktok-crop/{user_id}", resource_type="image",
+            )
+            print(f"✅ Cropped upload to TikTok 9:16 ({target_w}x{target_h}): {url[:100]}...", flush=True)
+            return url
+        except Exception as e:
+            print(f"⚠️ TikTok crop failed for {image_url[:80]}: {e} — using original upload as-is", flush=True)
+            return image_url
+
+    @staticmethod
+    def _resize_contain_pad(img: Any, tw: int, th: int) -> Any:
+        """
+        Resize preserving aspect ratio (fit within tw×th, never stretch/squash),
+        then pad the leftover space with fully transparent pixels to reach the
+        exact target canvas. Replaces a plain img.resize((tw, th)), which forces
+        the image to exactly tw×th regardless of its original proportions —
+        visibly stretching or squashing anything whose aspect ratio doesn't
+        already match the target bucket. Padding (not cropping) so nothing the
+        user uploaded is ever cut off either.
+        """
+        from PIL import Image as _PILImage
+
+        img = img.convert("RGBA")
+        scale = min(tw / img.width, th / img.height)
+        new_w, new_h = max(1, round(img.width * scale)), max(1, round(img.height * scale))
+        resized = img.resize((new_w, new_h), _PILImage.LANCZOS)
+        canvas = _PILImage.new("RGBA", (tw, th), (0, 0, 0, 0))
+        canvas.paste(resized, ((tw - new_w) // 2, (th - new_h) // 2), resized)
+        return canvas
+
     @staticmethod
     async def _call_dalle_api(
         prompt: str,
         size: str = "1024x1024",
         reference_image: Optional[str] = None,
+        reference_images: Optional[List[str]] = None,
         image_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -3065,7 +3334,12 @@ Answer with exactly one word: "yes" or "no"."""
         When reference_image (base64 data URL or public URL) is provided, uses
         gpt-image-1's edit endpoint so the reference appears exactly as-is and
         only brand/design overlays are added — bypassing Imagen which would
-        reimagine the scene from scratch.
+        reimagine the scene from scratch. reference_images (plural) does the
+        same but passes MULTIPLE images to that same edit endpoint in one call —
+        gpt-image-1's edit endpoint natively accepts a list (up to 16), and the
+        model uses all of them together for a single output; this was already
+        supported by the API, just never exercised since every caller here used
+        to pass exactly one image.
         """
         import base64 as _b64
         import io
@@ -3079,33 +3353,21 @@ Answer with exactly one word: "yes" or "no"."""
             except (ValueError, AttributeError):
                 target_w, target_h = 1024, 1024
 
-            # ── Image-edit path (reference image provided) ─────────────────────
+            # ── Image-edit path (reference image(s) provided) ──────────────────
             # Skip Imagen (text-to-image only) and use gpt-image-1 edit endpoint,
-            # which takes the reference as a base and applies the prompt as overlays.
-            # GPT-Image-2 handles its own reference image path below.
-            if reference_image and (image_model or "") not in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
+            # which takes the reference(s) as a base and applies the prompt as
+            # overlays/instructions. GPT-Image-2 handles its own reference image
+            # path below. reference_images (plural) takes priority when both are
+            # given, but a single reference_image resolves to a 1-item list here
+            # too, so everything downstream is written against one list either way.
+            all_refs: List[str] = [r for r in (reference_images or ([reference_image] if reference_image else [])) if r]
+            if all_refs and (image_model or "") not in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
                 try:
                     from app.services.AIService import client as _ai_client
                     from PIL import Image as _PILImage
 
-                    # Decode reference image to raw PNG bytes (gpt-image-1 edit requires PNG)
-                    if reference_image.startswith("data:"):
-                        import re as _re_ref
-                        _m = _re_ref.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref.DOTALL)
-                        raw_bytes = _b64.b64decode(_m.group(1)) if _m else None
-                    else:
-                        import httpx as _httpx
-                        async with _httpx.AsyncClient(timeout=20) as _c:
-                            r = await _c.get(reference_image)
-                            raw_bytes = r.content if r.status_code == 200 else None
-
-                    if not raw_bytes:
-                        raise ValueError("Could not load reference image bytes")
-
-                    # Convert to RGBA PNG (required by the edit endpoint)
-                    img = _PILImage.open(io.BytesIO(raw_bytes)).convert("RGBA")
-
-                    # Resize to match requested output dimensions
+                    # Same target canvas bucket for every image in the set, so a
+                    # multi-image edit call gets consistently-sized inputs.
                     if target_w > target_h:
                         edit_size = "1536x1024"
                     elif target_h > target_w:
@@ -3113,11 +3375,38 @@ Answer with exactly one word: "yes" or "no"."""
                     else:
                         edit_size = "1024x1024"
                     tw, th = map(int, edit_size.split("x"))
-                    img = img.resize((tw, th), _PILImage.LANCZOS)
 
-                    png_buf = io.BytesIO()
-                    img.save(png_buf, format="PNG")
-                    png_buf.seek(0)
+                    image_tuples = []
+                    for idx, ref in enumerate(all_refs):
+                        if ref.startswith("data:"):
+                            import re as _re_ref
+                            _m = _re_ref.match(r"data:[^;]+;base64,(.+)", ref, _re_ref.DOTALL)
+                            raw_bytes = _b64.b64decode(_m.group(1)) if _m else b""
+                        else:
+                            import httpx as _httpx
+                            async with _httpx.AsyncClient(timeout=20) as _c:
+                                r = await _c.get(ref)
+                                raw_bytes = r.content if r.status_code == 200 else b""
+
+                        if not raw_bytes:
+                            raise ValueError(f"Could not load reference image bytes (index {idx})")
+
+                        # Fit-within + transparent-pad instead of a plain resize —
+                        # preserves the original's proportions and full content
+                        # instead of stretching/squashing it to the target bucket.
+                        img = _PILImage.open(io.BytesIO(raw_bytes))
+                        img = ImageContentService._resize_contain_pad(img, tw, th)
+
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        buf.seek(0)
+                        image_tuples.append((f"reference_{idx}.png", buf, "image/png"))
+
+                    # images.edit's `image` param accepts either a single file tuple
+                    # or a list — pass the bare tuple for the single-image case
+                    # (matches the original call shape exactly) and the list for
+                    # multi-reference combine mode.
+                    edit_image_arg = image_tuples[0] if len(image_tuples) == 1 else image_tuples
 
                     loop = asyncio.get_running_loop()
                     response = await asyncio.wait_for(
@@ -3125,7 +3414,7 @@ Answer with exactly one word: "yes" or "no"."""
                             None,
                             lambda: _ai_client.images.edit(
                                 model="gpt-image-1",
-                                image=("reference.png", png_buf, "image/png"),
+                                image=edit_image_arg,
                                 prompt=prompt,
                                 n=1,
                                 size=edit_size,
@@ -3170,67 +3459,91 @@ Answer with exactly one word: "yes" or "no"."""
                     import io as _io
 
                     if target_w > target_h:
-                        _gpt2_size = "1536x1024"
+                        _gpt2_bucket = "1536x1024"
                     elif target_h > target_w:
-                        _gpt2_size = "1024x1536"
+                        _gpt2_bucket = "1024x1536"
                     else:
-                        _gpt2_size = "1024x1024"
+                        _gpt2_bucket = "1024x1024"
+                    # The target's own shape where the bucket isn't it, so there is no crop to cut the post.
+                    _gpt2_size = ImageContentService._gpt2_exact_size(target_w, target_h) or _gpt2_bucket
 
-                    if reference_image:
-                        # Decode reference image to PNG bytes for the edit endpoint
-                        if reference_image.startswith("data:"):
-                            import re as _re_ref2
-                            _m2 = _re_ref2.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref2.DOTALL)
-                            _ref_bytes = _b64.b64decode(_m2.group(1)) if _m2 else None
-                        else:
-                            import httpx as _httpx2
-                            async with _httpx2.AsyncClient(timeout=20) as _c2:
-                                _r2 = await _c2.get(reference_image)
-                                _ref_bytes = _r2.content if _r2.status_code == 200 else None
-
-                        if not _ref_bytes:
-                            raise ValueError("Could not load reference image bytes for GPT-Image-2 edit")
-
-                        _ref_img = _PILImage.open(_io.BytesIO(_ref_bytes)).convert("RGBA")
+                    if all_refs:
+                        # image_model is force-set to "openai/gpt-image-2" by every
+                        # caller of _generate_platform_image (PRD Section 8), which
+                        # means the "Image-edit path" block above — despite being
+                        # written first — can never actually run: its own guard
+                        # condition explicitly excludes this exact image_model value.
+                        # THIS is the branch every reference-image generation (single
+                        # or multi) actually goes through. Mirrors the same
+                        # multi-image + letterbox handling as that other branch so
+                        # both stay correct even though only one is reachable.
                         _tw2, _th2 = map(int, _gpt2_size.split("x"))
-                        _ref_img = _ref_img.resize((_tw2, _th2), _PILImage.LANCZOS)
-                        _ref_png_buf = _io.BytesIO()
-                        _ref_img.save(_ref_png_buf, format="PNG")
-                        _ref_png_buf.seek(0)
+                        _gpt2_image_tuples = []
+                        for _idx2, _ref2 in enumerate(all_refs):
+                            if _ref2.startswith("data:"):
+                                import re as _re_ref2
+                                _m2 = _re_ref2.match(r"data:[^;]+;base64,(.+)", _ref2, _re_ref2.DOTALL)
+                                _ref_bytes = _b64.b64decode(_m2.group(1)) if _m2 else None
+                            else:
+                                import httpx as _httpx2
+                                async with _httpx2.AsyncClient(timeout=20) as _c2:
+                                    _r2 = await _c2.get(_ref2)
+                                    _ref_bytes = _r2.content if _r2.status_code == 200 else None
 
-                        print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size})…")
+                            if not _ref_bytes:
+                                raise ValueError(f"Could not load reference image bytes for GPT-Image-2 edit (index {_idx2})")
+
+                            _ref_img = _PILImage.open(_io.BytesIO(_ref_bytes))
+                            _ref_img = ImageContentService._resize_contain_pad(_ref_img, _tw2, _th2)
+                            _ref_png_buf = _io.BytesIO()
+                            _ref_img.save(_ref_png_buf, format="PNG")
+                            _ref_png_buf.seek(0)
+                            _gpt2_image_tuples.append((f"reference_{_idx2}.png", _ref_png_buf, "image/png"))
+
+                        _gpt2_edit_image_arg = _gpt2_image_tuples[0] if len(_gpt2_image_tuples) == 1 else _gpt2_image_tuples
+
+                        print(f"🎨 GPT-Image-2 edit with {len(_gpt2_image_tuples)} reference image(s) ({_gpt2_size})…")
                         loop = asyncio.get_running_loop()
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
-                                lambda: _oai_client.images.edit(
+                                lambda: ImageContentService._gpt2_call(
+                                    _oai_client.images.edit, _gpt2_size, _gpt2_bucket,
                                     model="gpt-image-2",
-                                    image=("reference.png", _ref_png_buf, "image/png"),
+                                    image=_gpt2_edit_image_arg,
                                     prompt=prompt,
                                     n=1,
-                                    size=_gpt2_size,
                                     quality="medium",
+                                    output_format="webp",
+                                    # NOTE: gpt-image-2 does NOT support input_fidelity at all
+                                    # (OpenAI rejects it with a 400 — that param is gpt-image-1
+                                    # only). Do not add it back here; variation/fidelity for V2
+                                    # guides has to be steered through the prompt text instead
+                                    # (see identity_instruction/variation_directive in
+                                    # custom_visual_guide_v2_service.py).
                                 ),
                             ),
-                            timeout=300,
+                            timeout=300,  # 5 minutes timeout for GPT-Image-2
                         )
                         _mode = "gpt-image-2-edit"
                     else:
                         print(f"🎨 GPT-Image-2 direct OpenAI ({_gpt2_size})…")
+                        print(f"📝 Prompt length: {len(prompt)} chars")
+                        print(f"📝 Prompt preview: {prompt[:300]}...")
                         loop = asyncio.get_running_loop()
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
-                                lambda: _oai_client.images.generate(
+                                lambda: ImageContentService._gpt2_call(
+                                    _oai_client.images.generate, _gpt2_size, _gpt2_bucket,
                                     model="gpt-image-2",
                                     prompt=prompt,
                                     n=1,
-                                    size=_gpt2_size,
                                     quality="medium",
                                     output_format="webp",
                                 ),
                             ),
-                            timeout=300,
+                            timeout=300,  # 5 minutes timeout for GPT-Image-2
                         )
                         _mode = "gpt-image-2"
 
@@ -3273,8 +3586,11 @@ Answer with exactly one word: "yes" or "no"."""
                     }
                 except Exception as _gpt2_err:
                     import traceback
-                    print(f"⚠️ GPT-Image-2 failed: {type(_gpt2_err).__name__}: {_gpt2_err} — falling back to Imagen/GPT")
-                    print(f"   Traceback: {traceback.format_exc()}")
+                    print(f"⚠️ GPT-Image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
+                    print(f"⚠️ GPT-Image-2 Error Details:")
+                    print(f"   Error Type: {type(_gpt2_err).__name__}")
+                    print(f"   Error Message: {str(_gpt2_err)}")
+                    traceback.print_exc()
 
             # ── fal.ai path (model explicitly chosen from frontend) ────────────
             _fal_model = image_model or ""

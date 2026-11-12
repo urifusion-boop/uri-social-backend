@@ -93,7 +93,7 @@ class TestReposition:
             "app.agents.social_media_manager.services.image_content_service.ImageContentService.composite_logo_at_position",
             new=AsyncMock(return_value="ZmFrZQ=="),
         ), patch(
-            "app.utils.cloudinary_upload.upload_base64",
+            "app.utils.s3_upload.upload_base64",
             new=AsyncMock(return_value="https://s3.example.com/uri-social/content-drafts/new.webp"),
         ):
             result = _run(LogoRepositionService.reposition("d1", "u1", 12, 34, 100, 60, db))
@@ -127,7 +127,7 @@ class TestReposition:
             "app.agents.social_media_manager.services.image_content_service.ImageContentService.composite_logo_at_position",
             new=AsyncMock(return_value="ZmFrZQ=="),
         ) as mock_composite, patch(
-            "app.utils.cloudinary_upload.upload_base64",
+            "app.utils.s3_upload.upload_base64",
             new=AsyncMock(return_value="https://s3.example.com/slide1-new.webp"),
         ):
             result = _run(LogoRepositionService.reposition(

@@ -215,3 +215,30 @@ def test_what_if_reuses_supplied_summary_instead_of_recomputing_original():
     supplied_summary = build_campaign_summary(plan, req)
     result = what_if(plan, req, budget_ngn=10_000, summary=supplied_summary)
     assert result.original == supplied_summary
+
+
+# ── _preferred_platform_for_challenge ────────────────────────────────────────────
+# Live-caught 2026-09-23: the "challenge" rebuild in meta_plan_ask never threaded
+# preferred_platform through, so correcting a foundation fact on a TikTok plan could
+# silently rebuild it as a Meta plan — the client's platform choice, quietly
+# overturned by an unrelated follow-up question.
+
+def test_challenge_rebuild_pins_tiktok_when_correcting_a_tiktok_plan():
+    from app.agents.jane_ads.router import _preferred_platform_for_challenge
+
+    plan = _plan(platforms=[PlatformPlan(
+        platform=Platform.TIKTOK, budget_ngn=100_000, days=5, variants=1,
+        test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS)])
+    assert _preferred_platform_for_challenge(plan) == "tiktok"
+
+
+def test_challenge_rebuild_does_not_force_tiktok_on_a_meta_plan():
+    from app.agents.jane_ads.router import _preferred_platform_for_challenge
+
+    assert _preferred_platform_for_challenge(_plan()) == ""
+
+
+def test_challenge_rebuild_handles_a_plan_with_no_platforms():
+    from app.agents.jane_ads.router import _preferred_platform_for_challenge
+
+    assert _preferred_platform_for_challenge(_plan(platforms=[])) == ""

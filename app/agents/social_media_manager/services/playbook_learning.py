@@ -89,7 +89,7 @@ def detect_from_edits(edits: List[Dict[str, Any]], profile: Dict[str, Any]) -> L
         out.append({
             "id": "emoji_none",
             "title": "Stop using emojis",
-            "evidence": f"You removed the emojis from {len(stripped)} of the last {len(with_emoji)} drafts that had them.",
+            "evidence": f"In {len(stripped)} of your last {len(with_emoji)} edits to a caption with emojis, you took them out.",
             "change": "Set emoji usage to “No emojis”. Applies to posts, ads, inbox replies and video scripts.",
             "apply": {"guardrails": {"emoji_usage": "no"}},
         })

@@ -9,6 +9,26 @@ from typing import Any, Dict
 
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
+from app.agents.social_media_manager.services import rate_limit as rl
+
+
+def _with_meta_error(failure: Dict[str, Any], response: "httpx.Response") -> Dict[str, Any]:
+    """Keep what Meta said about a refused post. The "not found" shape `UriResponse` returns for a
+    failure says nothing about WHY, so a rate limit — or an expired token — looked like nothing at
+    all. Additive: every existing key stays; `meta_error` and, for a throttle, `rate_limit` are new."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    error = body.get("error") if isinstance(body, dict) and isinstance(body.get("error"), dict) else {}
+    failure["meta_error"] = {
+        "http_status": response.status_code,
+        "code": error.get("code"),
+        "subcode": error.get("error_subcode"),
+        "message": error.get("message") or (response.text or "")[:300],
+    }
+    failure.update(rl.meta_limit_fields(response, body, platform="facebook"))
+    return failure
 
 
 class FacebookService:
@@ -36,9 +56,9 @@ class FacebookService:
                 response = await client.post(url, params=params, data=form)
             print(f"📘 FB post_on_facebook | status={response.status_code} body={response.text[:300]}")
             if response.status_code != HTTPStatus.OK:
-                return UriResponse.get_single_data_response(
+                return _with_meta_error(UriResponse.get_single_data_response(
                     "publish_post", None, code=response.status_code
-                )
+                ), response)
             return UriResponse.create_response("publish_post", response.json())
         except Exception as e:
             print(f"❌ Error posting to Facebook: {e}")
@@ -70,8 +90,8 @@ class FacebookService:
         print(f"📘 FB publish_post | status={response.status_code} body={response.text[:300]}")
 
         if response.status_code != HTTPStatus.OK:
-            return UriResponse.get_single_data_response(
+            return _with_meta_error(UriResponse.get_single_data_response(
                 "publish_post", None, code=response.status_code
-            )
+            ), response)
 
         return UriResponse.create_response("publish_post", response.json())

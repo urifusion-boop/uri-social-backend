@@ -390,6 +390,14 @@ def test_a_refused_subscription_is_explained_by_its_cause():
     admin = subscription_issue("(#200) User does not have sufficient administrative permission for this action on this page.", "uri.social")
     assert admin["code"] == "not_page_admin" and "Full control" in admin["message"] and "uri.social" in admin["message"]
     perm = subscription_issue("(#200) one of these permissions is needed: pages_messaging.")
-    assert perm["code"] == "missing_permission" and "connect Instagram again" in perm["message"]
+    assert perm["code"] == "missing_permission" and "Click Reconnect here" in perm["message"]
+    assert subscription_issue("(#210) A page access token is required to request this resource.")["code"] == "not_page_admin"
     assert subscription_issue("") == {}
     assert subscription_issue("boom")["code"] == "subscription_failed"
+
+
+def test_missing_metadata_permission_says_uri_will_ask_again():
+    from app.agents.inbox.channels import subscription_issue
+    out = subscription_issue("(#200) To subscribe to the feed field, one of these permissions is needed: "
+                             "pages_manage_metadata", "Nayo's creation")
+    assert out["code"] == "missing_permission" and "ask Meta for it again" in out["message"]

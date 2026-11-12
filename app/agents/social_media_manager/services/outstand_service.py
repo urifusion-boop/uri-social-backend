@@ -200,6 +200,24 @@ class OutstandService:
         confirmed = await self.confirm_upload(upload_info["id"], size=len(file_bytes))
         return confirmed["url"]
 
+    async def get_tiktok_creator_info(self, outstand_account_id: str) -> Dict[str, Any]:
+        """TikTok creator info for an Outstand-connected account (GET
+        /v1/tiktok/accounts/{id}/creator-info; works for managed-key and own-key
+        connections). Outstand queries TikTok on every request, as TikTok's guidelines
+        require for the Post to TikTok screen. Raises ValueError with Outstand's reason."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/tiktok/accounts/{outstand_account_id}/creator-info",
+                headers=self.headers,
+            )
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if resp.status_code >= 400 or not body.get("success", resp.status_code < 400):
+            raise ValueError(body.get("error") or f"Outstand creator-info failed (HTTP {resp.status_code})")
+        return body.get("data") or {}
+
     async def get_post_analytics(self, post_id: str) -> Dict[str, Any]:
         """Fetch analytics for a published post from Outstand's GET /v1/posts/{id}/analytics."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -286,10 +304,18 @@ class OutstandService:
             )
             print(f"📡 Outstand response status: {resp.status_code} body: {resp.text[:2000]}")
             if resp.status_code >= 400:
-                try:
-                    error_body = resp.json()
-                except Exception:
-                    error_body = {}
-                outstand_message = error_body.get("error") or resp.text[:500] or f"HTTP {resp.status_code}"
-                raise OutstandPublishError(outstand_message, status_code=resp.status_code)
+                # resp.raise_for_status() raises httpx.HTTPStatusError whose
+                # str() is just "400 Bad Request for url ..." — the actual
+                # reason (in resp.text, already printed above) never reached
+                # the caller's error message, confirmed live 2026-10-14: a
+                # real 400 surfaced to the user as nothing more than "Client
+                # error '400 Bad Request'", useless for diagnosing why.
+                # Raising with the body included here means every caller's
+                # existing `except Exception as e: ...str(e)...` handling
+                # gets the real reason for free, no call-site changes needed.
+                raise httpx.HTTPStatusError(
+                    f"{resp.status_code} {resp.reason_phrase} for url {resp.url}: {resp.text[:1000]}",
+                    request=resp.request,
+                    response=resp,
+                )
             return resp.json()

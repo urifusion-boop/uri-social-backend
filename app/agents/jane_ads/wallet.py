@@ -57,11 +57,15 @@ class WalletService:
 
     # ── Top-up (Flow B funding) ────────────────────────────────────────────────
     async def top_up(
-        self, business_id: str, amount_ngn: float, reference: str = "", now: Optional[datetime] = None
+        self, business_id: str, amount_ngn: float, reference: str = "", now: Optional[datetime] = None,
+        enforce_minimum: bool = True,
     ) -> Transaction:
-        """Credit the wallet. Enforces the ₦5,000 minimum. `reference` is the
-        Squad/Paystack payment ref."""
-        if amount_ngn < C.MIN_TOPUP_NGN:
+        """Credit the wallet. Enforces the ₦5,000 minimum for payments; an admin
+        credit (a refund, say) passes enforce_minimum=False, since a refund is
+        whatever was charged. `reference` is the Squad/Paystack payment ref."""
+        if amount_ngn <= 0:
+            raise MinimumTopUpError("The amount must be more than ₦0.")
+        if enforce_minimum and amount_ngn < C.MIN_TOPUP_NGN:
             raise MinimumTopUpError(
                 f"Minimum top-up is ₦{C.MIN_TOPUP_NGN:,.0f}; got ₦{amount_ngn:,.0f}."
             )
@@ -86,6 +90,34 @@ class WalletService:
             type=TransactionType.TOPUP,
             amount_ngn=round(amount_ngn, 2),
             balance_after_ngn=wallet.balance_ngn,
+            reference=reference,
+            created_at=now,
+        )
+        await self._store.add_transaction(txn)
+        return txn
+
+    async def refund_ad_spend(
+        self, business_id: str, amount_ngn: float, campaign_id: str, now: Optional[datetime] = None,
+    ) -> Transaction:
+        """Give back a deleted campaign's unspent budget. Once per campaign."""
+        now = now or _now()
+        reference = f"refund:{campaign_id}"
+        for t in await self._store.list_transactions(business_id):
+            if t.type == TransactionType.REFUND and t.reference == reference:
+                return t
+
+        wallet = await self.get_or_create(business_id)
+        wallet.balance_ngn = round(wallet.balance_ngn + amount_ngn, 2)
+        wallet.updated_at = now
+        await self._store.upsert_wallet(wallet)
+
+        txn = Transaction(
+            transaction_id=f"txn_{uuid.uuid4().hex[:16]}",
+            business_id=business_id,
+            type=TransactionType.REFUND,
+            amount_ngn=round(amount_ngn, 2),
+            balance_after_ngn=wallet.balance_ngn,
+            campaign_id=campaign_id,
             reference=reference,
             created_at=now,
         )

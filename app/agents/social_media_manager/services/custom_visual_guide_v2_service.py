@@ -873,18 +873,7 @@ Clearly legible at a glance — approximately 45% the size of the headline, not 
 Position: bottom-centre or bottom-right within safe zone.
 Do NOT style it as a button or banner."""
 
-            # The logo's position is the brand's own choice, never the model's to
-            # negotiate — without this, the meta-prompt above only reserves TEXT
-            # zones (step C/G), leaving it free to fill the logo's actual corner
-            # with headline text or decoration, which is what caused the
-            # generated content to collide with the logo instead of the logo's
-            # position being respected. Placed FIRST (highest prompt weight),
-            # same as the default (non-V2) generation path.
-            logo_space_note = ImageContentService.build_logo_space_note(brand_context)
-
-            final_prompt = f"""{logo_space_note}
-
-{style_instructions}
+            final_prompt = f"""{style_instructions}
 
 {content_section}
 
@@ -926,10 +915,6 @@ Do NOT style it as a button or banner."""
             # Step 5: Overlay logo on generated image
             logo_url = brand_context.get("logo_url")
             logo_position = brand_context.get("logo_position", "bottom_right")
-            # Was never read here at all (only logo_position was) — every V2
-            # guide image silently used _overlay_logo's "small" default
-            # regardless of the brand's actual Logo Size setting, unlike the
-            # standard generation path, which always reads this.
             logo_size = brand_context.get("logo_size", "small")
             background_image_url = None
             logo_placement = None
@@ -957,46 +942,52 @@ Do NOT style it as a button or banner."""
                         print(f"[V2] Downloaded image from URL and converted to base64")
 
                 # Overlay logo using ImageContentService (expects base64 string).
-                # return_geometry=True — same contract the standard generation
-                # path already relies on — so Move Logo works consistently
-                # regardless of which generation path produced the image,
-                # instead of only ever working for standard (non-custom-guide)
-                # posts. Previously this call didn't capture geometry or the
-                # pre-overlay background at all, so a V2 guide image could
-                # never be repositioned even though the exact same compositing
-                # function the standard path uses was already being called
-                # right here.
-                logo_result_b64, geometry = ImageContentService._overlay_logo(
+                # overlay_logo_smart ranks candidate corners by actual pixel
+                # busyness first, rather than blindly trusting logo_position —
+                # the art-directed prompt above has no way to guarantee the
+                # model won't place the headline in that exact corner.
+                # return_placement=True — same contract the standard
+                # generation path already relies on via _overlay_logo's own
+                # return_geometry — so Move Logo works consistently
+                # regardless of which generation path produced the image.
+                # Previously this call never captured where the logo actually
+                # landed (or the pre-overlay background needed to later move
+                # it), so a V2-guide image could never be repositioned even
+                # though this exact smart-overlay function was already being
+                # called right here.
+                logo_result_b64, chosen_position, chosen_geometry = await ImageContentService.overlay_logo_smart(
                     b64=base64_image,
                     logo_url=logo_url,
-                    position=logo_position,
                     logo_size=logo_size,
-                    return_geometry=True,
+                    preferred_position=logo_position,
+                    return_placement=True,
                 )
 
-                # Upload final image with logo, and the pre-overlay background
-                # (needed to later re-paste the logo elsewhere without
-                # re-running generation), to S3.
+                # Decode base64 back to bytes for upload
+                final_image_bytes = base64.b64decode(logo_result_b64)
+
                 from app.utils.s3_upload import upload_bytes
 
-                final_image_bytes = base64.b64decode(logo_result_b64)
                 final_image_url = await upload_bytes(
                     final_image_bytes,
                     folder="uri-social/generated-images",
                     resource_type="image",
                 )
 
-                if geometry:
-                    # A raw base64 data URL, not a pre-uploaded Cloudinary URL —
-                    # matching exactly what the standard generation path already
-                    # returns for this same field. The caller (complete_social_
-                    # manager.py's _generate_image_bg) already knows how to
-                    # upload a data: URL background to Cloudinary itself; it
-                    # only skips doing so when the value doesn't start with
-                    # "data:", so returning an already-hosted URL here instead
-                    # would silently get dropped there rather than saved.
+                if chosen_geometry:
+                    # A raw base64 data URL, not a pre-uploaded S3 URL —
+                    # matching exactly what the standard generation path
+                    # already returns for this same field. The caller
+                    # (complete_social_manager.py's _generate_image_bg) only
+                    # uploads this to storage when it starts with "data:";
+                    # an already-hosted URL here would silently get dropped
+                    # there instead of saved.
                     background_image_url = f"data:image/webp;base64,{base64_image}"
-                    logo_placement = {**geometry, "position": logo_position, "logo_size": logo_size}
+                    # chosen_position, not logo_position — overlay_logo_smart
+                    # can move off the preferred corner to avoid a busy area,
+                    # and logo_placement needs to reflect where it actually
+                    # landed, not just what was asked for.
+                    logo_placement = {**chosen_geometry, "position": chosen_position, "logo_size": logo_size}
 
                 print(f"[V2] ✅ Logo overlaid and uploaded: {final_image_url[:80]}...")
             else:

@@ -4,7 +4,6 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
-from pymongo import ReturnDocument
 import asyncio
 import base64
 import re
@@ -15,14 +14,11 @@ from app.services.FacebookService import FacebookService
 from app.core.config import settings
 from app.agents.social_media_manager.services.outstand_service import OutstandService
 from app.agents.social_media_manager.services.x_direct_service import XDirectService
+from pymongo import ReturnDocument
 
 
-# Outstand/Facebook errors are raw API text ("Failed to upload Facebook
-# photo: 400 - Confirm your identity...") — technically accurate, but leaves
-# a user with no idea what actually happened or what to do about it. Where a
-# known Facebook-side signature is recognized, this substitutes a plain-
-# language explanation + next step. Table of (pattern, friendly message) so
-# new signatures can be added without touching the call sites below.
+# ── Prod-only publish-failure helpers (kept from aws/prod; used by reconcile_published_posts
+#    and the admin "Reconcile Facebook/Outstand Publishes" endpoint) ──
 _FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
     (
         re.compile(r"confirm your identity", re.IGNORECASE),
@@ -53,24 +49,6 @@ _FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
     ),
 ]
 
-# Signatures that mean the connection can no longer publish and needs the
-# owner's attention to fix — distinct from the "confirm your identity" case
-# above, which resolves on its own without reconnecting. Two different real
-# causes have been seen live and are both matched here, because the owner
-# needs the same reconnect prompt either way even though the underlying
-# Facebook-side reason differs (see the friendly-message table above for the
-# specific wording for each):
-#   - a dead access token/session ("Vchain" Facebook Page: "Error validating
-#     access token: The session has been invalidated because...")
-#   - the connected account losing Page admin/editor/moderator rights
-#     ("MEEQAT TRAVELS AND TOURS LTD": "...must be an administrator, editor,
-#     or moderator of the page in order to impersonate it.")
-# In both live cases, nothing marked the connection disconnected or told the
-# user to do anything — it just kept silently failing post after post.
-# Matched against the raw Outstand/Facebook error text, not the
-# OutstandPublishError "no social accounts found" signature (that one means
-# Outstand itself no longer has the connection; this means Facebook rejected
-# the token, or the token's permissions, that Outstand is still holding).
 _TOKEN_INVALIDATION_PATTERNS = [
     re.compile(r"error validating access token", re.IGNORECASE),
     re.compile(r"session has been invalidated", re.IGNORECASE),
@@ -78,6 +56,7 @@ _TOKEN_INVALIDATION_PATTERNS = [
     re.compile(r"administrator,?\s*editor,?\s*or moderator of the page", re.IGNORECASE),
 ]
 
+UNKNOWN_FAILURE_ESCALATION_THRESHOLD = 3
 
 def _friendlier_facebook_error(raw: Optional[str]) -> str:
     """Plain-language explanation for a Facebook/Outstand error, keeping the
@@ -103,7 +82,6 @@ def _friendlier_facebook_error(raw: Optional[str]) -> str:
         )
     return f"This post couldn't be published to Facebook. Facebook's detail: {raw}"
 
-
 def _is_token_invalidation_error(raw: Optional[str]) -> bool:
     """True when an error message signature means the connection can no longer
     publish and needs the owner's attention (reconnecting, or fixing Page
@@ -112,7 +90,6 @@ def _is_token_invalidation_error(raw: Optional[str]) -> bool:
     notify the owner."""
     raw = raw or ""
     return any(pattern.search(raw) for pattern in _TOKEN_INVALIDATION_PATTERNS)
-
 
 async def _mark_connection_disconnected_and_notify(
     db: AsyncIOMotorDatabase,
@@ -153,27 +130,11 @@ async def _mark_connection_disconnected_and_notify(
     except Exception as notify_err:
         print(f"⚠️ connection_disconnected notification failed: {notify_err}")
 
-
-# How many consecutive publish failures on one connection, none of them a
-# signature we recognize, before treating it as needing the owner's
-# attention anyway. Catalogued signatures (_TOKEN_INVALIDATION_PATTERNS)
-# escalate on the first occurrence — this is the backstop for everything
-# else. Without it, any Facebook/Outstand error text we haven't specifically
-# seen and added a pattern for gets no fallback action at all, ever: the
-# draft shows publish_failed with the raw error, and the connection sits
-# connection_status="active" and silent no matter how many times in a row it
-# keeps failing — an indefinite game of catching up to error text one string
-# at a time instead of a system that degrades gracefully to something
-# reasonable for the errors nobody's catalogued yet.
-UNKNOWN_FAILURE_ESCALATION_THRESHOLD = 3
-
-
 def _connection_match(user_id: Optional[str], platform: str, connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     match: Dict[str, Any] = {"user_id": user_id, "platform": (connection or {}).get("platform", platform)}
     if connection and connection.get("outstand_account_id"):
         match["outstand_account_id"] = connection["outstand_account_id"]
     return match
-
 
 async def _should_flag_connection(
     db: AsyncIOMotorDatabase,
@@ -211,7 +172,6 @@ async def _should_flag_connection(
     if count >= UNKNOWN_FAILURE_ESCALATION_THRESHOLD:
         return True, f"{count} consecutive unrecognized publish failures (latest: {(raw_error or '')[:200]})"
     return False, ""
-
 
 async def _record_publish_success(
     db: AsyncIOMotorDatabase,
@@ -301,16 +261,20 @@ class ApprovalWorkflowService:
         draft_ids: List[str],
         schedule_option: str = "immediate",  # immediate, schedule, save_draft
         scheduled_datetime: Optional[datetime] = None,
-        approval_notes: Optional[str] = None
+        approval_notes: Optional[str] = None,
+        tiktok_settings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Approve content drafts and optionally schedule them
-        
+
         Args:
             draft_ids: List of draft IDs to approve
             schedule_option: 'immediate', 'schedule', or 'save_draft'
             scheduled_datetime: When to publish (if schedule_option is 'schedule')
             approval_notes: Optional notes from approver
+            tiktok_settings: What the user chose on the Post to TikTok screen. Required to schedule a
+                TikTok image / carousel post (TikTok allows no default), saved on the draft for the
+                scheduler to post with.
         """
         try:
             print(f"✅ approve_content | user_id={user_id} draft_ids={draft_ids} schedule_option={schedule_option}")
@@ -325,6 +289,9 @@ class ApprovalWorkflowService:
             # frontend show a hard failure toast for a post that actually is
             # queued, which is its own kind of misleading.
             warnings = []
+            # Scheduled TikTok photo posts: published by the scheduler with the saved choices, never
+            # handed to Outstand's own scheduler (which would post with defaults the user didn't pick).
+            scheduled_tiktok_photos = set()
 
             for draft_id in draft_ids:
                 try:
@@ -364,6 +331,15 @@ class ApprovalWorkflowService:
                                 errors.append({"draft_id": draft_id, "error": "Instagram carousel requires slides. Re-generate the post."})
                                 continue
 
+                        if draft.get("platform") == "tiktok" and not draft.get("video_url"):
+                            from app.agents.social_media_manager.services import tiktok_media_proxy
+                            from app.agents.social_media_manager.services.tiktok_direct_service import schedule_problem
+                            problem = schedule_problem(tiktok_settings, len(tiktok_media_proxy.draft_image_sources(draft)))
+                            if problem:
+                                errors.append({"draft_id": draft_id, "error": problem})
+                                continue
+                            scheduled_tiktok_photos.add(draft_id)
+
                         # Cancel only "publishing"/"ready_to_publish" stuck states for this
                         # user+platform — NOT already-scheduled posts for other dates.
                         # Users should be able to queue multiple posts for different times.
@@ -390,6 +366,8 @@ class ApprovalWorkflowService:
                         update_data["status"] = "scheduled" if _app_env == "production" else "staging_scheduled"
                         update_data["user_id"] = user_id
                         update_data["platform_post_id"] = None  # reset so cron picks it up fresh
+                        if draft_id in scheduled_tiktok_photos:
+                            update_data["tiktok_settings"] = tiktok_settings
                     elif schedule_option == "immediate":
                         update_data["status"] = "ready_to_publish"
 
@@ -403,7 +381,8 @@ class ApprovalWorkflowService:
                         "platform": draft["platform"],
                         "post_type": draft.get("post_type", "feed"),
                         "status": update_data["status"],
-                        "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None
+                        "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None,
+                        "brand_id": draft.get("brand_id"),
                     })
 
                 except Exception as e:
@@ -435,7 +414,13 @@ class ApprovalWorkflowService:
                         # Facebook carousels: Outstand with scheduled_at + multiple media_urls
                         # publishes each slide as a separate post; cron handles them correctly
                         # by calling _publish_to_platform at publish time with scheduled_at=None.
-                        if _d["platform"] == "instagram" or (
+                        from app.agents.social_media_manager.services import publish_dispatch as _pd_sched
+                        if _d["draft_id"] in scheduled_tiktok_photos:
+                            print(f"🎵 TikTok photo — cron will publish at scheduled_date ({_schedule_dt.isoformat()}) with the saved choices")
+                            continue
+                        _fb_direct = _d["platform"] == "facebook" and bool(
+                            await _pd_sched.preferred_direct_facebook(db, user_id, _d.get("brand_id")))
+                        if _d["platform"] == "instagram" or _fb_direct or (
                             _d["platform"] == "facebook" and _d.get("post_type", "feed") == "carousel"
                         ):
                             print(f"📸 {_d['platform']} carousel/direct — cron will publish at scheduled_date ({_schedule_dt.isoformat()})")
@@ -482,7 +467,7 @@ class ApprovalWorkflowService:
                                     "draft_id": _d["draft_id"],
                                     "warning": (
                                         f"{_d['platform'].capitalize()} rejected this post just now "
-                                        f"({_friendlier_facebook_error(_d['publish_result'].get('error'))}). "
+                                        f"({_d['publish_result'].get('error') or 'unknown error'}). "
                                         f"It's still queued and will retry automatically at the "
                                         f"scheduled time, but you may want to check your "
                                         f"{_d['platform'].capitalize()} connection."
@@ -493,8 +478,7 @@ class ApprovalWorkflowService:
                         warnings.append({
                             "draft_id": _d["draft_id"],
                             "warning": (
-                                f"{_d['platform'].capitalize()} rejected this post just now "
-                                f"({_friendlier_facebook_error(str(_se))}). "
+                                f"{_d['platform'].capitalize()} rejected this post just now ({_se}). "
                                 f"It's still queued and will retry automatically at the scheduled "
                                 f"time, but you may want to check your {_d['platform'].capitalize()} connection."
                             ),
@@ -845,6 +829,7 @@ class ApprovalWorkflowService:
 
             current_time = datetime.utcnow()
             print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()} env={_app_env} status={_sched_status}")
+            from app.agents.social_media_manager.services import publish_dispatch as _pd
 
             # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago).
             # Do NOT clear platform_post_id here — if a post_id was already stored (step 1
@@ -865,6 +850,9 @@ class ApprovalWorkflowService:
                     "status": _sched_status,
                     "scheduled_date": {"$lte": earliest_allowed},
                     "platform_post_id": None,
+                    # A draft deliberately waiting for a rate limit to clear is not overdue until
+                    # that wait itself is more than a day old.
+                    **_pd.not_waiting(earliest_allowed),
                 },
                 {"$set": {"status": "publish_failed", "error_message": "Scheduled time expired (>24h overdue). Re-schedule to publish.", "updated_at": current_time}},
             )
@@ -894,6 +882,8 @@ class ApprovalWorkflowService:
                     "platform_post_id": None,
                     "scheduled_date": {"$lte": current_time, "$type": "date"},
                     "publish_retry_count": {"$not": {"$gte": 3}},
+                    # A daily / app-wide cap is not retried: it only burns the same limit again.
+                    "publish_error_kind": {"$nin": list(_pd.CAP_KINDS)},
                 },
                 {
                     "$set": {"status": _sched_status, "updated_at": current_time},
@@ -906,9 +896,11 @@ class ApprovalWorkflowService:
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
                     # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
-                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False}},
+                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False},
+                     **_pd.not_waiting(current_time)},
                     # Drafts due for publishing with a null platform_post_id
-                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": None},
+                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": None,
+                     **_pd.not_waiting(current_time)},
                     # Outstand-scheduled drafts: poll for published status
                     {"status": _sched_status, "platform_post_id": {"$exists": True, "$ne": None}},
                     # Recover publish_failed drafts that Outstand may have published
@@ -921,41 +913,64 @@ class ApprovalWorkflowService:
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
 
-            # REMOVED (was here from 2026-05-15 to 2026-09-28, commit 46d4424): a
-            # "dedup" step that kept only the single newest-CREATED draft per
-            # (user_id, platform) and silently cancelled every other one to
-            # status="replaced" on every cron tick — with no scheduled_date
-            # awareness at all. That's indistinguishable from having two or more
-            # DIFFERENT posts legitimately scheduled for different days on the
-            # same platform (the normal shape of any real content calendar):
-            # every tick it killed all but the most-recently-created one,
-            # regardless of which was actually due next. Confirmed live-reported:
-            # a user's scheduled posts vanished from the Scheduled tab (the
-            # frontend filters "replaced" out of every active view) and never
-            # reached Facebook — with zero notification, because "replaced" was
-            # never surfaced anywhere as an error.
+            # Deduplicate ALL scheduled content: keep only the newest draft per (user_id, platform).
+            # Applies to both direct-publish drafts (no platform_post_id) and
+            # Outstand-polled drafts (has platform_post_id). This prevents old Outstand
+            # submissions from publishing after a newer draft has already been scheduled.
             #
-            # It was added to fix a real bug ("Facebook was posting 8 times"),
-            # but that was root-caused to duplicate DRAFT CREATION (a double-
-            # submit producing several separate draft docs for what the user
-            # intended as one post) — this blanket keep-only-the-newest rule
-            # never actually addressed that at the source, it just usually
-            # happened to hide most of the resulting duplicates as a side
-            # effect, at the cost of also hiding every legitimately distinct
-            # future post. The two safeguards that DO correctly prevent
-            # double-publishing are both still here and don't have this
-            # failure mode:
-            #   1. approve_content cancels only genuinely in-flight drafts
-            #      ("publishing"/"ready_to_publish") for the same platform at
-            #      the moment a new one is explicitly scheduled — never touches
-            #      other cleanly-"scheduled" future posts.
-            #   2. The atomic find_one_and_update claim below (status=
-            #      _sched_status -> "publishing") ensures only one cron run can
-            #      ever pick up a given draft, so concurrent ticks can't
-            #      double-publish the same draft.
-            # A real fix for duplicate draft creation belongs at that source
-            # (idempotency on the create/approve action), not here.
-            print(f"📋 {len(scheduled_content)} draft(s) to process | ids={[d.get('id') for d in scheduled_content]}")
+            # Live-reported crash (on prod, ported here for the same reason): created_at
+            # is NOT consistently a BSON date across every draft-creation path in this
+            # codebase — the AI-video/ZapCap production pipeline stores it as an ISO
+            # string (datetime.now(timezone.utc).isoformat()), same pattern as
+            # video_publish_service.py's create_job, while most other paths store a real
+            # datetime. Sorting `d.get("created_at") or datetime.min` directly raises
+            # TypeError the moment a string and a datetime (or an aware and a naive
+            # datetime) land in the same candidate batch — which silently aborted the
+            # ENTIRE tick (every draft in it, not just the mismatched one) with no log
+            # line at all, because the outer except below returns {"error": ...} and the
+            # scheduler wrapper only ever checks the plural key "errors". Normalize every
+            # value to a naive UTC datetime before comparing, so type/tz drift between
+            # creation paths can never crash the batch again.
+            def _created_at_key(d: dict) -> datetime:
+                ca = d.get("created_at")
+                if isinstance(ca, str):
+                    try:
+                        ca = datetime.fromisoformat(ca)
+                    except ValueError:
+                        return datetime.min
+                if not isinstance(ca, datetime):
+                    return datetime.min
+                if ca.tzinfo is not None:
+                    ca = ca.astimezone(timezone.utc).replace(tzinfo=None)
+                return ca
+
+            _seen_platform_user: dict = {}
+            _to_cancel: list = []
+            _all_scheduled = [d for d in scheduled_content if d.get("status") == _sched_status]
+            _all_scheduled.sort(key=_created_at_key, reverse=True)
+            for _dup in _all_scheduled:
+                _key = (str(_dup.get("user_id")), _dup.get("platform"))
+                if _key in _seen_platform_user:
+                    _to_cancel.append(_dup.get("id"))
+                else:
+                    _seen_platform_user[_key] = _dup.get("id")
+            if _to_cancel:
+                # Filter out None IDs before cancelling to avoid matching unindexed docs
+                valid_cancel_ids = [i for i in _to_cancel if i is not None]
+                if valid_cancel_ids:
+                    await db["content_drafts"].update_many(
+                        {"id": {"$in": valid_cancel_ids}},
+                        {"$set": {
+                            "status": "replaced",
+                            "error_message": "Superseded by a newer draft for the same platform.",
+                            "updated_at": current_time,
+                        }},
+                    )
+                print(f"🗑️ Cancelled {len(valid_cancel_ids)} duplicate drafts (kept newest per platform): {valid_cancel_ids}")
+                _cancel_set = set(_to_cancel)
+                scheduled_content = [d for d in scheduled_content if d.get("id") not in _cancel_set]
+
+            print(f"✅ After dedup: {len(scheduled_content)} draft(s) to process | ids={[d.get('id') for d in scheduled_content]}")
 
             published_count = 0
             errors = []
@@ -986,127 +1001,23 @@ class ApprovalWorkflowService:
                             published_count += 1
                             print(f"✅ Facebook direct post confirmed live | draft_id={draft['id']} fb_post_id={existing_post_id}")
                         else:
-                            # Outstand post ID — poll Outstand for confirmation
-                            try:
-                                from app.agents.social_media_manager.services.outstand_service import OutstandService
-                                outstand = OutstandService()
-                                post_data = await outstand.get_post(existing_post_id)
-                                post = post_data.get("post", {})
-                                if post.get("publishedAt") and not post.get("isDraft"):
-                                    await db["content_drafts"].update_one(
-                                        {"id": draft["id"]},
-                                        {"$set": {
-                                            "status": "published",
-                                            "published_date": datetime.utcnow(),
-                                            "updated_at": datetime.utcnow(),
-                                            "error_message": None,
-                                        }},
-                                    )
+                            # Outstand post ID, its time has come: hand it to the
+                            # confirmation flow, which marks it published only once
+                            # the network has it, failed only when the network says
+                            # so (a missing post is no longer called "published").
+                            from app.agents.social_media_manager.services import publish_confirmation as _pc
+                            _since = draft.get("publish_submitted_at") or draft.get("scheduled_date") or datetime.utcnow()
+                            moved = await db["content_drafts"].find_one_and_update(
+                                {"id": draft["id"], "status": _sched_status},
+                                {"$set": {"status": _pc.CONFIRMING, "publish_submitted_at": _since,
+                                          "updated_at": datetime.utcnow()}},
+                                return_document=True,
+                            )
+                            if moved:
+                                state = await _pc.confirm(db, moved)
+                                if state == "published":
                                     published_count += 1
-                                    print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
-                                    await _record_publish_success(
-                                        db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
-                                    )
-                                else:
-                                    # Live-reported bug: a post whose underlying platform
-                                    # publish attempt actually FAILED on Outstand's side
-                                    # (e.g. Facebook rejecting it with a real, specific error)
-                                    # was indistinguishable here from one that just hadn't
-                                    # published YET — this branch only ever checked
-                                    # publishedAt, never each socialAccounts[] entry's own
-                                    # status. That left the draft silently stuck in
-                                    # status="scheduled" ("Publishing soon..." forever in the
-                                    # UI) with the real, specific, actionable error from
-                                    # Outstand/Facebook never reaching the user at all.
-                                    failed_accounts = [
-                                        acc for acc in post.get("socialAccounts", [])
-                                        if acc.get("status") == "failed"
-                                    ]
-                                    if failed_accounts:
-                                        error_detail = "; ".join(
-                                            _friendlier_facebook_error(acc.get("error"))
-                                            if acc.get("error") else f"{acc.get('network', 'platform')} publish failed"
-                                            for acc in failed_accounts
-                                        )
-                                        await db["content_drafts"].update_one(
-                                            {"id": draft["id"]},
-                                            {"$set": {
-                                                "status": "publish_failed",
-                                                "error_message": error_detail,
-                                                # Clear it — this submission is dead, retrying
-                                                # would poll the same failed Outstand post
-                                                # forever. platform_post_id=None makes this
-                                                # draft eligible for the existing retry_result
-                                                # sweep above (capped at 3 attempts) instead.
-                                                "platform_post_id": None,
-                                                "updated_at": datetime.utcnow(),
-                                            }},
-                                        )
-                                        print(f"❌ Outstand-scheduled post failed at the platform | draft_id={draft['id']} post_id={existing_post_id} error={error_detail}")
-                                        _worst_raw = next((a.get("error") for a in failed_accounts if a.get("error")), None)
-                                        _flag, _reason = await _should_flag_connection(
-                                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
-                                            connection=None, raw_error=_worst_raw,
-                                        )
-                                        if _flag:
-                                            await _mark_connection_disconnected_and_notify(
-                                                db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
-                                                connection=None, reason=f"{_reason} (detected via scheduled-post poll)",
-                                            )
-                                    else:
-                                        # Live-reported bug: Outstand can simply never answer
-                                        # "published" or "failed" for a post_id (seen in prod,
-                                        # October 2026 — a scheduled Facebook post sat here with
-                                        # platform_post_id set and untouched updated_at for 4+
-                                        # days). The 24h overdue-expiry sweep above only matches
-                                        # drafts with platform_post_id=None, so it can never
-                                        # catch this case. Give up after 24h past the scheduled
-                                        # time — same bound and wording as publish_confirmation.
-                                        # py's GIVE_UP_AFTER — instead of waiting on Outstand
-                                        # forever with no error and no sign anything is wrong.
-                                        _sched_dt = draft.get("scheduled_date")
-                                        _age_from = _sched_dt if isinstance(_sched_dt, datetime) else draft.get("updated_at")
-                                        if isinstance(_age_from, datetime) and (current_time - _age_from) >= timedelta(hours=24):
-                                            await db["content_drafts"].update_one(
-                                                {"id": draft["id"]},
-                                                {"$set": {
-                                                    "status": "publish_failed",
-                                                    "error_message": (
-                                                        "We couldn't confirm this post reached "
-                                                        f"{draft.get('platform', 'the network').capitalize()} "
-                                                        "after 24 hours. Check your page — if it isn't there, publish it again."
-                                                    ),
-                                                    # Clear it so the retry_result sweep above can
-                                                    # pick this up for a fresh attempt (capped at 3).
-                                                    "platform_post_id": None,
-                                                    "updated_at": current_time,
-                                                }},
-                                            )
-                                            print(f"⏰ Gave up confirming draft_id={draft['id']} post_id={existing_post_id} — no answer from Outstand 24h+ past scheduled_date")
-                                        else:
-                                            print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
-                            except Exception as e:
-                                print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
-                                # 404 = Outstand no longer has the post, so it can't be
-                                # confirmed. It used to be marked "published" here, which
-                                # hid posts that never went out. Say so instead; retries
-                                # are capped (publish_retry_count) so a post that did go
-                                # out is never sent twice automatically.
-                                if "404" in str(e):
-                                    await db["content_drafts"].update_one(
-                                        {"id": draft["id"]},
-                                        {"$set": {
-                                            "status": "publish_failed",
-                                            "error_message": (
-                                                "The publishing service no longer has this post, so it can't be "
-                                                "confirmed. Check your page, and publish it again if it isn't there."
-                                            ),
-                                            "platform_post_id": None,
-                                            "publish_retry_count": 3,
-                                            "updated_at": datetime.utcnow(),
-                                        }},
-                                    )
-                                    print(f"🗑️ Outstand post gone (404), marked unconfirmed | draft_id={draft['id']}")
+                                print(f"🔎 Outstand-scheduled post {existing_post_id} | draft_id={draft['id']} → {state}")
                         continue  # Never re-publish a draft that already has a post_id
 
                     # Atomically claim this draft before publishing to prevent concurrent cron
@@ -1154,13 +1065,22 @@ class ApprovalWorkflowService:
                             })
                             print(f"🔍 LinkedIn fallback lookup | found={bool(connection)} connected_via={connection.get('connected_via') if connection else 'N/A'} has_token={bool(connection.get('linkedin_access_token')) if connection else False} has_urn={bool(connection.get('person_urn') or connection.get('active_author_urn')) if connection else False}")
                     else:
-                        connections_cursor = db["social_connections"].find({
-                            "user_id": draft_user_id,
-                            "platform": _platform_key,
-                            "connection_status": "active",
-                        }).sort("created_at", -1).limit(1)
-                        conn_list = await connections_cursor.to_list(length=1)
-                        connection = conn_list[0] if conn_list else None
+                        connection = None
+                        if _platform_key == "facebook":
+                            connection = await _pd.preferred_direct_facebook(db, draft_user_id, draft.get("brand_id"))
+                        elif _platform_key == "tiktok":
+                            # The same account the Post to TikTok screen and Publish Now use: a direct
+                            # TikTok-login connection first, else the Outstand one.
+                            from app.agents.social_media_manager.services.tiktok_direct_service import resolve_tiktok_connection
+                            _, connection = await resolve_tiktok_connection(db, draft_user_id)
+                        if not connection:
+                            connections_cursor = db["social_connections"].find({
+                                "user_id": draft_user_id,
+                                "platform": _platform_key,
+                                "connection_status": "active",
+                            }).sort("created_at", -1).limit(1)
+                            conn_list = await connections_cursor.to_list(length=1)
+                            connection = conn_list[0] if conn_list else None
 
                     # Outstand live-lookup fallback — skip platforms that always use direct APIs
                     if not connection and draft["platform"] not in ("instagram", "linkedin"):
@@ -1180,6 +1100,11 @@ class ApprovalWorkflowService:
                                     "connection_status": "active",
                                 }
                                 doc = {
+                                    # Explicit id (mirrors SocialAccountService.finalize_connection) —
+                                    # without it every fallback-synced doc defaults to id: null and
+                                    # the second one ever written collides with the unique index
+                                    # (the recurring "dup key: { id: null }" errors in the logs).
+                                    "id": acc.get("id"),
                                     "user_id": draft_user_id,
                                     "platform": network,
                                     "outstand_account_id": acc.get("id"),
@@ -1208,13 +1133,27 @@ class ApprovalWorkflowService:
                         continue
 
                     print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} connected_via={connection.get('connected_via')} user_id={draft_user_id}")
-                    publish_result = await ApprovalWorkflowService._publish_to_platform(
-                        platform=draft["platform"],
-                        draft=draft,
-                        connection=connection,
-                        scheduled_datetime=None,  # We publish immediately when the time arrives
-                        db=db,
-                    )
+                    async def _send():
+                        return await ApprovalWorkflowService._publish_to_platform(
+                            platform=draft["platform"],
+                            draft=draft,
+                            connection=connection,
+                            scheduled_datetime=None,  # We publish immediately when the time arrives
+                            db=db,
+                        )
+
+                    # One post at a time per account, spaced out — and never wait inside the tick
+                    # (it is bounded to 300s): if the account is busy or rate limited, put the draft
+                    # back with the time to try again and move on to the next one.
+                    sent = await _pd.dispatch(db, draft["platform"], connection, _send, wait_max_s=0.0)
+                    if sent.deferred:
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"], "status": "publishing"},
+                            {"$set": _pd.deferral_fields(draft, sent.resume_at, sent.info, sent.message)},
+                        )
+                        print(f"⏳ Deferred scheduled draft {draft.get('id')} ({draft.get('platform')}): {sent.message}")
+                        continue
+                    publish_result, limit_info = sent.result, sent.info
                     if publish_result is None:
                         publish_result = {"success": False, "error": f"_publish_to_platform returned None for platform={draft['platform']} connected_via={connection.get('connected_via')} — unhandled publish path"}
                     print(f"📊 Scheduled publish result | draft_id={draft['id']}: {publish_result}")
@@ -1228,7 +1167,7 @@ class ApprovalWorkflowService:
                     if publish_result.get("success") and _pc.needs_confirmation(publish_result):
                         # Accepted, not yet live: "Publishing…" until the network answers.
                         await db["content_drafts"].update_one(
-                            {"id": draft["id"]}, {"$set": _pc.awaiting_fields(publish_result)},
+                            {"id": draft["id"]}, {"$set": _pc.awaiting_fields(publish_result), "$unset": _pd.CLEAR_WAIT},
                         )
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                         print(f"⏳ Outstand accepted scheduled post | draft={draft.get('id')} → confirming")
@@ -1254,7 +1193,8 @@ class ApprovalWorkflowService:
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
                                 "error_message": None,
-                            }},
+                            },
+                             "$unset": _pd.CLEAR_WAIT},
                         )
                         print(f"💾 Status→published update | draft={draft.get('id')} matched={update_res.matched_count} modified={update_res.modified_count}")
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
@@ -1273,7 +1213,7 @@ class ApprovalWorkflowService:
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
                     else:
-                        _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "")
+                        _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "", limit_info)
                         await db["content_drafts"].update_one(
                             {"id": draft["id"]},
                             {"$set": {
@@ -1281,6 +1221,7 @@ class ApprovalWorkflowService:
                                 "error_message": _msg,
                                 "network_error": (publish_result.get("error") or "")[:1000] or None,
                                 "updated_at": datetime.utcnow(),
+                                **_pd.cap_fields(limit_info),
                             }},
                         )
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
@@ -1307,10 +1248,11 @@ class ApprovalWorkflowService:
             }
 
         except Exception as e:
-            # Live-reported bug: this used to return {"error": ...} (singular) with no
-            # print at all — a crash here (e.g. the created_at TypeError above, before it
-            # was fixed) silently aborted the ENTIRE candidate batch every single tick it
-            # recurred, with zero trace in the logs, because the scheduler wrapper
+            # Live-reported bug (on prod, ported here): this used to return
+            # {"error": ...} (singular) with no print at all — a crash here (e.g. the
+            # created_at TypeError above, before it was fixed) silently aborted the
+            # ENTIRE candidate batch every single tick it recurred, with zero trace in
+            # the logs, because the scheduler wrapper
             # (notification_scheduler.py's _job_publish_scheduled_content) only ever
             # checks the plural key "errors". Print unconditionally here so a future
             # batch-level crash is never invisible again, and return the same "errors"
@@ -1319,111 +1261,6 @@ class ApprovalWorkflowService:
             import traceback
             traceback.print_exc()
             return {"published_count": 0, "errors": [{"draft_id": "batch", "error": str(e)}]}
-
-    @staticmethod
-    async def reconcile_published_posts(db: AsyncIOMotorDatabase):
-        """
-        publish_scheduled_content's Sept-28 fix (see _friendlier_facebook_error /
-        _is_token_invalidation_error above) taught the SCHEDULED-post cron to
-        check each socialAccounts[] entry's real status instead of trusting
-        Outstand's initial "accepted" response — but that only covers drafts
-        with status="scheduled". A draft published via "Publish Now" is marked
-        status="published" the moment Outstand ACCEPTS the submission
-        (outstand_post_status="queued"/"processing" — see _publish_to_platform's
-        caller), which only means Outstand will attempt the dispatch, not that
-        each platform actually accepted it. Nothing ever revisited that draft
-        afterward.
-
-        Live-reported: a "Vchain" Facebook post (post_id=MADzP) was marked
-        published in our DB, confirmed via CloudWatch logs to have actually
-        failed on Facebook's side ("Error validating access token") — the only
-        reason it surfaced at all was someone manually opening that post's
-        analytics, which checks Outstand's live status but never corrects the
-        draft's own status field. This sweep does for "published" drafts what
-        the scheduled cron already does for "scheduled" ones.
-
-        Bounded to a 7-day window (Outstand/platform status for very old posts
-        isn't useful to keep re-polling) and to drafts not yet confirmed
-        (outstand_post_status still "queued"/"processing" — once confirmed
-        either way it's set to "published" or the draft moves to
-        "publish_failed", so it drops out of this query on its own).
-        """
-        try:
-            current_time = datetime.utcnow()
-            earliest = current_time - timedelta(days=7)
-            candidates = await db["content_drafts"].find({
-                "status": "published",
-                "outstand_post_status": {"$in": ["queued", "processing"]},
-                "platform_post_id": {"$exists": True, "$ne": None},
-                "published_date": {"$gte": earliest},
-            }).to_list(length=100)
-
-            print(f"🔁 reconcile_published_posts | candidates={len(candidates)} ids={[d.get('id') for d in candidates]}")
-
-            if not candidates:
-                return {"checked": 0, "corrected": 0}
-
-            from app.agents.social_media_manager.services.outstand_service import OutstandService
-            outstand = OutstandService()
-            corrected = 0
-
-            for draft in candidates:
-                post_id = draft.get("platform_post_id")
-                # Facebook direct post IDs ("1234567_9876543") never went through
-                # Outstand and have no outstand_post_status to begin with — this
-                # query can't actually match one, but guard anyway for safety.
-                if re.match(r'^\d+_\d+$', str(post_id)):
-                    continue
-                try:
-                    post_data = await outstand.get_post(post_id)
-                    post = post_data.get("post", {})
-                    failed_accounts = [acc for acc in post.get("socialAccounts", []) if acc.get("status") == "failed"]
-                    if failed_accounts:
-                        error_detail = "; ".join(
-                            _friendlier_facebook_error(acc.get("error"))
-                            if acc.get("error") else f"{acc.get('network', 'platform')} publish failed"
-                            for acc in failed_accounts
-                        )
-                        await db["content_drafts"].update_one(
-                            {"id": draft["id"]},
-                            {"$set": {
-                                "status": "publish_failed",
-                                "error_message": error_detail,
-                                "updated_at": current_time,
-                            }},
-                        )
-                        corrected += 1
-                        print(f"❌ Published draft actually failed at the platform | draft_id={draft['id']} post_id={post_id} error={error_detail}")
-                        _worst_raw = next((a.get("error") for a in failed_accounts if a.get("error")), None)
-                        _flag, _reason = await _should_flag_connection(
-                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
-                            connection=None, raw_error=_worst_raw,
-                        )
-                        if _flag:
-                            await _mark_connection_disconnected_and_notify(
-                                db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
-                                connection=None, reason=f"{_reason} (detected via published-post reconciliation)",
-                            )
-                    elif post.get("publishedAt"):
-                        await db["content_drafts"].update_one(
-                            {"id": draft["id"]},
-                            {"$set": {"outstand_post_status": "published", "updated_at": current_time}},
-                        )
-                        print(f"✅ Published draft confirmed live | draft_id={draft['id']} post_id={post_id}")
-                        await _record_publish_success(
-                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
-                        )
-                    # Neither failed nor confirmed published yet — leave as-is,
-                    # it'll be re-checked next tick.
-                except Exception as e:
-                    print(f"⚠️ Could not poll Outstand for published draft_id={draft['id']}: {e}")
-
-            return {"checked": len(candidates), "corrected": corrected}
-        except Exception as e:
-            print(f"❌ reconcile_published_posts crashed: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"checked": 0, "corrected": 0, "error": str(e)}
 
     @staticmethod
     async def _trigger_immediate_publishing(
@@ -1437,6 +1274,8 @@ class ApprovalWorkflowService:
         via Outstand's native scheduledAt support instead of publishing immediately.
         """
         results = {}
+        from app.agents.social_media_manager.services import publish_dispatch as _pd
+        from app.agents.social_media_manager.services import rate_limit as _rl
 
         for draft_id in draft_ids:
             try:
@@ -1448,13 +1287,36 @@ class ApprovalWorkflowService:
                 platform = draft["platform"]
                 print(f"🚀 Immediate publish | draft_id={draft_id} platform={platform} user_id={user_id}")
 
-                connections_cursor = db["social_connections"].find({
-                    "user_id": user_id,
-                    "platform": platform,
-                    "connection_status": "active",
-                }).sort("created_at", -1).limit(1)
-                connection = await connections_cursor.to_list(length=1)
-                connection = connection[0] if connection else None
+                connection = None
+                # TikTok: prefer a direct-OAuth connection (FILE_UPLOAD, bypasses
+                # Outstand) over the generic lookup below — that query doesn't
+                # filter by connected_via, so it would otherwise pick whichever
+                # connection happens to be most recently created rather than
+                # reliably preferring direct.
+                if platform == "tiktok":
+                    connection = await db["social_connections"].find_one({
+                        "user_id": user_id,
+                        "platform": "tiktok",
+                        "connected_via": "tiktok_direct_oauth",
+                        "connection_status": "active",
+                    })
+                    if connection:
+                        print(f"🔗 Preferring direct TikTok connection open_id={connection.get('open_id')}")
+
+                # Facebook: a Page connected directly with Meta wins over a newer Outstand connection.
+                if platform == "facebook":
+                    connection = await _pd.preferred_direct_facebook(db, user_id, draft.get("brand_id"))
+                    if connection:
+                        print(f"🔗 Preferring direct Facebook connection page_id={connection.get('page_id')}")
+
+                if not connection:
+                    connections_cursor = db["social_connections"].find({
+                        "user_id": user_id,
+                        "platform": platform,
+                        "connection_status": "active",
+                    }).sort("created_at", -1).limit(1)
+                    connection = await connections_cursor.to_list(length=1)
+                    connection = connection[0] if connection else None
 
                 # Fall back to Outstand live lookup if local mirror is empty.
                 # Skip Instagram — it always uses direct Graph API, never Outstand.
@@ -1479,6 +1341,11 @@ class ApprovalWorkflowService:
                             # Sync to local DB so future lookups work
                             from datetime import datetime as _dt
                             doc = {
+                                # Explicit id (mirrors SocialAccountService.finalize_connection) —
+                                # without it every fallback-synced doc defaults to id: null and
+                                # the second one ever written collides with the unique index
+                                # (the recurring "dup key: { id: null }" errors in the logs).
+                                "id": acc.get("id"),
                                 "user_id": user_id,
                                 "platform": network,
                                 "outstand_account_id": acc.get("id"),
@@ -1510,13 +1377,37 @@ class ApprovalWorkflowService:
                     continue
 
                 print(f"🔗 Using connection: connected_via={connection.get('connected_via')} outstand_account_id={connection.get('outstand_account_id')}")
-                publish_result = await ApprovalWorkflowService._publish_to_platform(
-                    platform=platform,
-                    draft=draft,
-                    connection=connection,
-                    scheduled_datetime=scheduled_datetime,
-                    db=db,
-                )
+
+                async def _send():
+                    return await ApprovalWorkflowService._publish_to_platform(
+                        platform=platform,
+                        draft=draft,
+                        connection=connection,
+                        scheduled_datetime=scheduled_datetime,
+                        db=db,
+                    )
+
+                limit_info = None
+                if scheduled_datetime is not None:
+                    # Handing Outstand a post with a future send time is a submission, not a publish:
+                    # the real send is gated when the scheduler dispatches it.
+                    publish_result = await _send()
+                else:
+                    # One post at a time per account, spaced out. If the account is busy or rate
+                    # limited, wait only a few seconds, then answer "queued" and let the scheduler
+                    # post it — not a failure, and not counted as one.
+                    sent = await _pd.dispatch(db, platform, connection, _send,
+                                              wait_max_s=_rl.get_settings().immediate_wait_max_s)
+                    if sent.deferred:
+                        await db["content_drafts"].update_one(
+                            {"id": draft_id},
+                            {"$set": _pd.deferral_fields(draft, sent.resume_at, sent.info, sent.message),
+                             "$unset": {"last_dispatch_warning": ""}},
+                        )
+                        print(f"⏳ Deferred draft_id={draft_id}: {sent.message}")
+                        results[draft_id] = _pd.queued_result(sent)
+                        continue
+                    publish_result, limit_info = sent.result, sent.info
                 print(f"📊 Publish result for draft_id={draft_id}: {publish_result}")
 
                 conn_filter = (
@@ -1531,7 +1422,7 @@ class ApprovalWorkflowService:
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {**_pc.awaiting_fields(publish_result), "scheduled_date": None},
-                         "$unset": {"last_dispatch_warning": ""}},
+                         "$unset": {"last_dispatch_warning": "", **_pd.CLEAR_WAIT}},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                     publish_result["status"] = _pc.CONFIRMING
@@ -1548,7 +1439,7 @@ class ApprovalWorkflowService:
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
                             },
-                            "$unset": {"last_dispatch_warning": ""},
+                            "$unset": {"last_dispatch_warning": "", **_pd.CLEAR_WAIT},
                         },
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
@@ -1587,7 +1478,7 @@ class ApprovalWorkflowService:
                         }},
                     )
                 else:
-                    _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "")
+                    _msg = await _pc.failed_on_submit(db, draft, connection, publish_result.get("error") or "", limit_info)
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
@@ -1595,6 +1486,7 @@ class ApprovalWorkflowService:
                             "error_message": _msg,
                             "network_error": (publish_result.get("error") or "")[:1000] or None,
                             "updated_at": datetime.utcnow(),
+                            **_pd.cap_fields(limit_info),
                         }},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
@@ -1607,6 +1499,20 @@ class ApprovalWorkflowService:
                 results[draft_id] = {"success": False, "error": str(e)}
 
         return results
+
+    @staticmethod
+    def _facebook_result(success: bool, post_id, response) -> Dict[str, Any]:
+        """The result of a direct Facebook feed/carousel publish. On failure it now carries what Meta
+        said (`error`) and, for a throttle, the typed `rate_limit` — before, a refused post came back
+        with no error at all, so a Facebook rate limit (or an expired token) was invisible."""
+        result: Dict[str, Any] = {"success": success, "post_id": post_id, "raw_response": response}
+        if not success and isinstance(response, dict):
+            meta = response.get("meta_error") or {}
+            if meta.get("message"):
+                result["error"] = f"Facebook publish failed: {meta['message']}"
+            if response.get("rate_limit") is not None:
+                result["rate_limit"] = response["rate_limit"]
+        return result
 
     @staticmethod
     async def _upload_base64_to_imgbb(data_url: str) -> Optional[str]:
@@ -1705,6 +1611,44 @@ class ApprovalWorkflowService:
         except Exception as e:
             print(f"⚠️ TikTok image normalization failed for {url}, using original: {e}")
             return url
+
+    @staticmethod
+    async def _poll_tiktok_publish(outstand, post_id: str):
+        """Poll Outstand until a TikTok post is confirmed published or fails.
+
+        Returns (published: bool, failure_reason: str | None). Acceptance by
+        Outstand's POST /v1/posts (a 200 with a post id) is not the same as
+        actually publishing — TikTok's own rejection (e.g. the unaudited-app
+        privacy restriction) arrives asynchronously and only shows up here,
+        live-confirmed 2026-10-16: Outstand returned 200 success:true, and
+        TikTok's "unaudited_client_can_only_post_to_private_accounts" only
+        surfaced minutes later through this poll. Never as an exception
+        around the publish_post() call itself.
+        """
+        for _ in range(90):
+            await asyncio.sleep(8)
+            try:
+                check = await outstand.get_post(post_id)
+            except Exception as poll_err:
+                print(f"⚠️ TikTok publish-status poll failed for {post_id}: {poll_err}")
+                continue
+            check_post = check.get("post") or check.get("data") or {}
+            if isinstance(check_post, list):
+                check_post = check_post[0] if check_post else {}
+            if check_post.get("publishedAt") and not check_post.get("isDraft"):
+                return True, None
+            # The failure reason lives per-account, not on the post itself —
+            # live-confirmed via Outstand's own dashboard: socialAccounts[].status
+            # == "failed" with socialAccounts[].error holding the real detail.
+            failed_acct = next(
+                (a for a in (check_post.get("socialAccounts") or []) if a.get("status") == "failed"),
+                None,
+            )
+            if failed_acct:
+                failure_reason = failed_acct.get("error") or "unknown reason"
+                print(f"⚠️ TikTok post {post_id} failed: {failure_reason}")
+                return False, failure_reason
+        return False, None
 
     @staticmethod
     async def _upload_base64_image_to_facebook(
@@ -1890,16 +1834,6 @@ class ApprovalWorkflowService:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
             post_type = draft.get("post_type", "feed")
-            # A draft can carry a video without post_type having been explicitly
-            # set to "reel" — e.g. uploaded content defaults to "feed" even when
-            # a video was uploaded. The frontend already treats any draft with a
-            # video_url as a Reel (DraftCard's isReel: post_type === 'reel' ||
-            # !!draft.video_url); mirror that here so publishing doesn't fall
-            # through to the image-only feed path and demand an image for
-            # content that's actually a video. Carousel/story are untouched — a
-            # video can't be a carousel slide or classic story image here.
-            if post_type not in ("carousel", "story") and draft.get("video_url"):
-                post_type = "reel"
 
             if post_type == "carousel":
                 slides = draft.get("slides", [])
@@ -2078,7 +2012,11 @@ class ApprovalWorkflowService:
         # ── Facebook direct OAuth — always route through Outstand ────────────────
         # Direct FB API post IDs (pageId_postId format) break the Outstand polling
         # loop and cause 8x duplicate publishes. Always use Outstand for Facebook.
-        if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
+        # Exception: a direct connection that holds the Page and its token posts straight to the Page
+        # (publish_dispatch.posts_directly) and falls through to the direct block further down.
+        from app.agents.social_media_manager.services import publish_dispatch as _pd_route
+        if (platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth"
+                and not _pd_route.posts_directly(platform, connection)):
             if db is not None:
                 _fb_user_id = connection.get("user_id")
                 _fb_page_id = str(connection.get("page_id") or "")
@@ -2140,6 +2078,42 @@ class ApprovalWorkflowService:
                 else:
                     print(f"⚠️ FB — no Outstand Facebook account found anywhere, falling back to direct FB API")
                     # fall through to legacy Facebook block below
+
+        # ── Scheduled TikTok image / carousel post: the choices made when scheduling ──
+        # (who can view, comments, disclosure) were saved on the draft, and go out with the post
+        # whichever way the account is connected.
+        if platform == "tiktok" and not draft.get("video_url") and draft.get("tiktok_settings"):
+            from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+            return await VideoPublishService.publish_scheduled_tiktok_photo(draft, connection, db)
+
+        # ── TikTok direct (FILE_UPLOAD, bypasses Outstand) ───────────────────────
+        if platform == "tiktok" and connection.get("connected_via") == "tiktok_direct_oauth":
+            from app.agents.social_media_manager.services.tiktok_direct_service import (
+                get_valid_tiktok_access_token,
+                publish_tiktok_direct,
+                TikTokDirectAPIError,
+            )
+            video_url = draft.get("video_url") or ""
+            if not video_url:
+                if draft.get("image_url") or draft.get("slides"):
+                    # A photo post scheduled before its posting choices were saved with it.
+                    return {"success": False, "error": "This TikTok photo post is missing its posting choices (who can view it, comments, disclosure). Open it and schedule it again."}
+                return {"success": False, "error": "TikTok post has no video_url. Re-generate the video before publishing."}
+            if db is None:
+                return {"success": False, "error": "TikTok direct publish requires a database handle."}
+            try:
+                access_token = await get_valid_tiktok_access_token(db, connection)
+                publish_id, status = await publish_tiktok_direct(access_token, video_url, content)
+                print(f"✅ TikTok direct publish: publish_id={publish_id} status={status}")
+                return {"success": True, "post_id": publish_id, "raw_response": {"publish_id": publish_id, "status": status}}
+            except TikTokDirectAPIError as e:
+                print(f"❌ TikTok direct publish failed: {e}")
+                failed = {"success": False, "error": f"TikTok direct publish failed: {str(e)}"}
+                # A rate limit / cap is carried as typed info so the caller can defer (temporary) or
+                # explain (cap) rather than treat it as a plain failure.
+                if getattr(e, "rate_limit", None) is not None:
+                    failed["rate_limit"] = e.rate_limit
+                return failed
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
@@ -2280,8 +2254,9 @@ class ApprovalWorkflowService:
                             media_urls = [image_url]
 
                 # Pass video_url as the Outstand media whenever no image/slide media was
-                # found — not gated on post_type == "reel". Live-reported bug: the upload
-                # form (UploadContentForm.tsx) has no "reel" option at all, so an uploaded
+                # found — not gated on post_type == "reel". Live-reported bug (prod,
+                # ported here for the same reason): the upload form
+                # (UploadContentForm.tsx) has no "reel" option at all, so an uploaded
                 # video is always saved with post_type="feed" — the same root cause
                 # approve_content's schedule-time validation was fixed for (see that
                 # function's own "Instagram requires an image or video" comment), but this
@@ -2320,10 +2295,27 @@ class ApprovalWorkflowService:
                         ]
                     media_urls = [await outstand.upload_media_from_url(u) for u in media_urls]
                     # DIRECT_POST so it goes live instead of sitting as an inbox draft.
-                    # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
-                    # 2026-08-17; before that, TikTok's API only accepted SELF_ONLY for
-                    # an unaudited app (see the identical fix in video_publish_service.py).
-                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}}
+                    # PUBLIC_TO_EVERYONE was believed correct per an earlier note claiming
+                    # the app's Content Posting API audit passed 2026-08-17 — live-confirmed
+                    # WRONG 2026-10-14: a real post was rejected with TikTok's own
+                    # "unaudited_client_can_only_post_to_private_accounts", meaning this
+                    # app has NOT passed that audit (or didn't at the time of that post).
+                    # Still tried as the first attempt since it's correct once/if the app
+                    # does pass audit — the except block below falls back to SELF_ONLY on
+                    # exactly this rejection, so a currently-unaudited app still gets a
+                    # real (if private) post instead of a hard failure.
+                    tiktok_config = {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
+                    # Music PRD (MUS-PRD-01) §2.2/§8, resolved: TikTok's Content Posting
+                    # API has NO track-selection field for photo/carousel posts (verified
+                    # against TikTok's own docs, 2026-09-15) — only this boolean, which
+                    # triggers TikTok's own automatic pick. Outstand's own docs confirm
+                    # it's "a photo-only option that is ignored for videos", so gating on
+                    # `not draft.get("video_url")` here is belt-and-suspenders, not load-
+                    # bearing — but it keeps the field meaning honest (never sent for a
+                    # video draft this endpoint is publishing).
+                    if not draft.get("video_url") and draft.get("tiktok_auto_add_music"):
+                        tiktok_config["autoAddMusic"] = True
+                    platform_config = {"tiktok": tiktok_config}
 
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
                 result = await outstand.publish_post(
@@ -2373,41 +2365,105 @@ class ApprovalWorkflowService:
                 # = 12 min) so a draft is only marked "published" in our DB
                 # once TikTok has actually confirmed it, not just accepted it.
                 if success and platform == "tiktok" and post_id:
-                    published = False
-                    failure_reason = None
-                    for _ in range(90):
-                        await asyncio.sleep(8)
-                        try:
-                            check = await outstand.get_post(post_id)
-                        except Exception as poll_err:
-                            print(f"⚠️ TikTok publish-status poll failed for {post_id}: {poll_err}")
-                            continue
-                        check_post = check.get("post") or check.get("data") or {}
-                        if isinstance(check_post, list):
-                            check_post = check_post[0] if check_post else {}
-                        if check_post.get("publishedAt") and not check_post.get("isDraft"):
-                            published = True
-                            break
-                        # The failure reason lives per-account, not on the post
-                        # itself — live-confirmed 2026-10-10 via Outstand's own
-                        # dashboard: socialAccounts[].status == "failed" with
-                        # socialAccounts[].error holding the real detail (e.g.
-                        # "picture_size_check_failed", a TikTok-side rejection
-                        # of one of the images, not a stuck/pending state).
-                        failed_acct = next(
-                            (a for a in (check_post.get("socialAccounts") or []) if a.get("status") == "failed"),
-                            None,
+                    published, failure_reason = await ApprovalWorkflowService._poll_tiktok_publish(outstand, post_id)
+
+                    # TikTok's rejection of an unaudited app's PUBLIC_TO_EVERYONE
+                    # post arrives asynchronously (see _poll_tiktok_publish) —
+                    # Outstand already accepted post_id, which is now dead, so
+                    # the only way to recover is a brand-new post, not a retry
+                    # of this one. TikTok's own suggested fix is SELF_ONLY.
+                    is_tiktok_privacy_issue = (
+                        not published
+                        and failure_reason
+                        and platform_config
+                        and platform_config.get("tiktok", {}).get("postMode") == "DIRECT_POST"
+                        and platform_config.get("tiktok", {}).get("privacyLevel") != "SELF_ONLY"
+                        and ("privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower())
+                    )
+                    if is_tiktok_privacy_issue:
+                        print(f"⚠️ TikTok post {post_id} failed on privacyLevel/audit ({failure_reason}) — submitting a new post as SELF_ONLY")
+                        retry_config = {**platform_config["tiktok"], "privacyLevel": "SELF_ONLY"}
+                        retry_result = await outstand.publish_post(
+                            outstand_account_ids=[connection["outstand_account_id"]],
+                            content=content,
+                            scheduled_at=scheduled_at,
+                            media_urls=media_urls,
+                            tweets=tweets,
+                            platform_config={"tiktok": retry_config},
                         )
-                        if failed_acct:
-                            failure_reason = failed_acct.get("error") or "unknown reason"
-                            print(f"⚠️ TikTok post {post_id} failed: {failure_reason}")
-                            break
+                        print(f"📬 Outstand retry publish response: {retry_result}")
+                        retry_post_obj = retry_result.get("post") or retry_result.get("data") or {}
+                        if isinstance(retry_post_obj, list):
+                            retry_post_obj = retry_post_obj[0] if retry_post_obj else {}
+                        retry_post_id = retry_post_obj.get("id")
+                        if retry_post_id:
+                            post_id = retry_post_id
+                            post_status = retry_post_obj.get("status", "")
+                            result = retry_result
+                            published, failure_reason = await ApprovalWorkflowService._poll_tiktok_publish(outstand, post_id)
+
+                    # Live-confirmed 2026-10-16: SELF_ONLY can fail with the exact
+                    # same "unaudited_client_can_only_post_to_private_accounts"
+                    # error — TikTok's generic message doesn't actually reflect
+                    # which privacyLevel was sent, meaning the real block is
+                    # DIRECT_POST itself (likely the app's Content Posting API
+                    # under re-review after an unrelated portal change), not the
+                    # privacy value. No privacyLevel fixes that, so fall back to
+                    # TikTok's third suggested option: MEDIA_UPLOAD, which drops
+                    # privacyLevel entirely and delivers to the creator's TikTok
+                    # inbox as a draft instead of posting directly.
+                    is_still_privacy_issue = (
+                        not published
+                        and failure_reason
+                        and platform_config
+                        and platform_config.get("tiktok", {}).get("postMode") == "DIRECT_POST"
+                        and ("privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower())
+                    )
+                    media_upload_delivered = False
+                    if is_still_privacy_issue:
+                        print(f"⚠️ TikTok post {post_id} still failed on privacyLevel/audit ({failure_reason}) — submitting a new post as MEDIA_UPLOAD")
+                        media_upload_config = {k: v for k, v in platform_config["tiktok"].items() if k not in ("postMode", "privacyLevel")}
+                        media_upload_config["postMode"] = "MEDIA_UPLOAD"
+                        media_result = await outstand.publish_post(
+                            outstand_account_ids=[connection["outstand_account_id"]],
+                            content=content,
+                            scheduled_at=scheduled_at,
+                            media_urls=media_urls,
+                            tweets=tweets,
+                            platform_config={"tiktok": media_upload_config},
+                        )
+                        print(f"📬 Outstand MEDIA_UPLOAD response: {media_result}")
+                        media_post_obj = media_result.get("post") or media_result.get("data") or {}
+                        if isinstance(media_post_obj, list):
+                            media_post_obj = media_post_obj[0] if media_post_obj else {}
+                        media_post_id = media_post_obj.get("id")
+                        if media_post_id:
+                            # MEDIA_UPLOAD never sets publishedAt until the creator
+                            # manually finishes it in the TikTok app — polling for
+                            # that would just burn the full 12-minute budget, so
+                            # treat acceptance itself as the outcome here.
+                            post_id = media_post_id
+                            post_status = media_post_obj.get("status", "")
+                            result = media_result
+                            media_upload_delivered = True
+
+                    if media_upload_delivered:
+                        error_msg = (
+                            "TikTok is currently blocking direct posting for this app (likely under review). "
+                            f"This was delivered to @{connection.get('account_name') or connection.get('outstand_account_id')}'s "
+                            "TikTok inbox as a draft instead — open the TikTok app to review and publish it manually."
+                        )
+                        print(f"📥 TikTok post {post_id} delivered to inbox (MEDIA_UPLOAD) — {error_msg} Not marking this draft as published.")
+                        return {
+                            "success": False,
+                            "post_id": post_id,
+                            "outstand_status": post_status,
+                            "raw_response": result,
+                            "error": error_msg,
+                        }
+
                     if published:
                         print(f"✅ TikTok post {post_id} confirmed published")
-                        if db is not None:
-                            await _record_publish_success(
-                                db=db, user_id=connection.get("user_id"), platform=platform, connection=connection,
-                            )
                         return {"success": True, "post_id": post_id, "outstand_status": "published",
                                 "raw_response": result, "via": "outstand", "confirmed": True,
                                 "outstand_account_id": connection.get("outstand_account_id")}
@@ -2439,49 +2495,7 @@ class ApprovalWorkflowService:
                         "outstand_account_id": connection.get("outstand_account_id")}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
-                from app.agents.social_media_manager.services.outstand_service import OutstandPublishError
-
-                # "No social accounts found matching the provided account
-                # identifiers" is Outstand's signature for "this connection
-                # no longer exists on our side" — confirmed live against
-                # Outstand's own list_accounts API for several affected
-                # users: it was always revoked on Outstand's/the platform's
-                # side, never a transient error. "Error validating access
-                # token" / "session has been invalidated" is the Facebook-side
-                # equivalent — Outstand still has the connection, but the
-                # token it's holding is dead (live-reported: "Vchain"'s
-                # Facebook Page). Without this, the connection stays
-                # connection_status="active" forever and every future publish
-                # just fails silently again — up to 16 times for one user
-                # before the first signature was caught.
-                _msg = e.message if isinstance(e, OutstandPublishError) else str(e)
-                user_id = connection.get("user_id")
-                if db is not None and "no social accounts found" in _msg.lower():
-                    # Outstand's own signature for "this connection no longer
-                    # exists on our side at all" — always escalates immediately,
-                    # not subject to the unrecognized-error threshold below,
-                    # since there's nothing ambiguous about it.
-                    await _mark_connection_disconnected_and_notify(
-                        db=db, user_id=user_id, platform=platform, connection=connection,
-                        reason="Outstand no longer recognizes it",
-                    )
-                    return {
-                        "success": False,
-                        "error": f"Your {platform} connection is no longer valid. Please reconnect your account.",
-                    }
-                if db is not None:
-                    _flag, _reason = await _should_flag_connection(
-                        db=db, user_id=user_id, platform=platform, connection=connection, raw_error=_msg,
-                    )
-                    if _flag:
-                        await _mark_connection_disconnected_and_notify(
-                            db=db, user_id=user_id, platform=platform, connection=connection, reason=_reason,
-                        )
-                        return {
-                            "success": False,
-                            "error": f"Your {platform} connection is no longer valid. Please reconnect your account.",
-                        }
-                return {"success": False, "error": _friendlier_facebook_error(_msg)}
+                return {"success": False, "error": f"Outstand publish failed: {str(e)}"}
 
         # ── Legacy direct Facebook connection ─────────────────────────────────
         if platform == "facebook":
@@ -2551,7 +2565,7 @@ class ApprovalWorkflowService:
                     resp_data = response.get("responseData") or {}
                     post_id = resp_data.get("id") or resp_data.get("post_id")
                     success = response.get("status", False) and post_id is not None
-                return {"success": success, "post_id": post_id, "raw_response": response}
+                return ApprovalWorkflowService._facebook_result(success, post_id, response)
 
             # ── Facebook story ─────────────────────────────────────────────────
             elif post_type == "story":
@@ -2639,9 +2653,114 @@ class ApprovalWorkflowService:
                     post_id = resp_data.get("id") or resp_data.get("post_id")
                     success = response.get("status", False) and post_id is not None
 
-                return {"success": success, "post_id": post_id, "raw_response": response}
+                return ApprovalWorkflowService._facebook_result(success, post_id, response)
 
         return {"success": False, "error": f"Platform '{platform}' publishing not implemented yet"}
+
+    @staticmethod
+    async def reconcile_published_posts(db: AsyncIOMotorDatabase):
+        """
+        publish_scheduled_content's Sept-28 fix (see _friendlier_facebook_error /
+        _is_token_invalidation_error above) taught the SCHEDULED-post cron to
+        check each socialAccounts[] entry's real status instead of trusting
+        Outstand's initial "accepted" response — but that only covers drafts
+        with status="scheduled". A draft published via "Publish Now" is marked
+        status="published" the moment Outstand ACCEPTS the submission
+        (outstand_post_status="queued"/"processing" — see _publish_to_platform's
+        caller), which only means Outstand will attempt the dispatch, not that
+        each platform actually accepted it. Nothing ever revisited that draft
+        afterward.
+
+        Live-reported: a "Vchain" Facebook post (post_id=MADzP) was marked
+        published in our DB, confirmed via CloudWatch logs to have actually
+        failed on Facebook's side ("Error validating access token") — the only
+        reason it surfaced at all was someone manually opening that post's
+        analytics, which checks Outstand's live status but never corrects the
+        draft's own status field. This sweep does for "published" drafts what
+        the scheduled cron already does for "scheduled" ones.
+
+        Bounded to a 7-day window (Outstand/platform status for very old posts
+        isn't useful to keep re-polling) and to drafts not yet confirmed
+        (outstand_post_status still "queued"/"processing" — once confirmed
+        either way it's set to "published" or the draft moves to
+        "publish_failed", so it drops out of this query on its own).
+        """
+        try:
+            current_time = datetime.utcnow()
+            earliest = current_time - timedelta(days=7)
+            candidates = await db["content_drafts"].find({
+                "status": "published",
+                "outstand_post_status": {"$in": ["queued", "processing"]},
+                "platform_post_id": {"$exists": True, "$ne": None},
+                "published_date": {"$gte": earliest},
+            }).to_list(length=100)
+
+            print(f"🔁 reconcile_published_posts | candidates={len(candidates)} ids={[d.get('id') for d in candidates]}")
+
+            if not candidates:
+                return {"checked": 0, "corrected": 0}
+
+            from app.agents.social_media_manager.services.outstand_service import OutstandService
+            outstand = OutstandService()
+            corrected = 0
+
+            for draft in candidates:
+                post_id = draft.get("platform_post_id")
+                # Facebook direct post IDs ("1234567_9876543") never went through
+                # Outstand and have no outstand_post_status to begin with — this
+                # query can't actually match one, but guard anyway for safety.
+                if re.match(r'^\d+_\d+$', str(post_id)):
+                    continue
+                try:
+                    post_data = await outstand.get_post(post_id)
+                    post = post_data.get("post", {})
+                    failed_accounts = [acc for acc in post.get("socialAccounts", []) if acc.get("status") == "failed"]
+                    if failed_accounts:
+                        error_detail = "; ".join(
+                            _friendlier_facebook_error(acc.get("error"))
+                            if acc.get("error") else f"{acc.get('network', 'platform')} publish failed"
+                            for acc in failed_accounts
+                        )
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {
+                                "status": "publish_failed",
+                                "error_message": error_detail,
+                                "updated_at": current_time,
+                            }},
+                        )
+                        corrected += 1
+                        print(f"❌ Published draft actually failed at the platform | draft_id={draft['id']} post_id={post_id} error={error_detail}")
+                        _worst_raw = next((a.get("error") for a in failed_accounts if a.get("error")), None)
+                        _flag, _reason = await _should_flag_connection(
+                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                            connection=None, raw_error=_worst_raw,
+                        )
+                        if _flag:
+                            await _mark_connection_disconnected_and_notify(
+                                db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                                connection=None, reason=f"{_reason} (detected via published-post reconciliation)",
+                            )
+                    elif post.get("publishedAt"):
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {"outstand_post_status": "published", "updated_at": current_time}},
+                        )
+                        print(f"✅ Published draft confirmed live | draft_id={draft['id']} post_id={post_id}")
+                        await _record_publish_success(
+                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
+                        )
+                    # Neither failed nor confirmed published yet — leave as-is,
+                    # it'll be re-checked next tick.
+                except Exception as e:
+                    print(f"⚠️ Could not poll Outstand for published draft_id={draft['id']}: {e}")
+
+            return {"checked": len(candidates), "corrected": corrected}
+        except Exception as e:
+            print(f"❌ reconcile_published_posts crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"checked": 0, "corrected": 0, "error": str(e)}
 
 
 # Usage Examples:

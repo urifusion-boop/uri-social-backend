@@ -460,8 +460,11 @@ async def apply_edits(
                     "Ad copy rejected: " + "; ".join(v.guidance for v in blocking)
                 )
             else:
+                from .creative_paths import disclose
+                # An edit can't take a paid creator's disclosure out of the ad.
                 plan_update["creative"] = plan.creative.model_copy(
-                    update={"headline": headline, "primary_text": caption}
+                    update={"headline": headline,
+                            "primary_text": disclose(caption, plan.creative.provenance)}
                 )
                 applied += [k for k in ("headline", "caption") if k in edits]
 

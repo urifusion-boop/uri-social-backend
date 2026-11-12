@@ -197,7 +197,7 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
             if ok:
                 break
             scopes = await granted_scopes(candidate)
-            err = f"{err} [token carries: {', '.join(scopes) or 'unknown'}; {await token_report(candidate)}]"
+            err = f"{err} [token carries: {', '.join(scopes) or 'unknown'}]"
         # Store the Page's own token: replies are Page-scoped too, so a user token
         # here fails every send with the same (#210).
         await db[CHANNEL_ACCOUNTS].update_many(
@@ -283,23 +283,31 @@ def subscription_issue(error: str, page_name: str = "") -> dict:
     """What a refused Page subscription means for the owner, and what to do about it."""
     low = (error or "").lower()
     page = page_name or "this Page"
-    if "administrative permission" in low or "two factor" in low:
+    # (#210) on a Page means the login could not get that Page's own token: it has no
+    # role on the Page, the same fix as missing admin control.
+    if "administrative permission" in low or "two factor" in low or "(#210)" in low:
         return {"code": "not_page_admin", "message": (
-            f"The Facebook login used to connect doesn't have full admin control of {page}, so Meta "
-            "won't deliver its messages. In Meta Business Settings → Accounts → Pages, open the Page, "
-            "give your user Full control (and switch on two-factor authentication if Meta asks), then "
-            "disconnect and connect again in Connected Accounts.")}
+            f"The Facebook account used to connect doesn't have full control of {page}, so Meta "
+            "won't deliver its messages. Ask the Page's owner to open Meta Business Settings → "
+            "Accounts → Pages → the Page, and give your Facebook account Full control (turn on "
+            "two-factor authentication if Meta asks). Then click Reconnect here.")}
+    if "pages_manage_metadata" in low:
+        return {"code": "missing_permission", "message": (
+            f"Meta didn't give Uri permission to manage {page}'s messages. Click Reconnect: Uri "
+            "will ask Meta for it again, so leave it switched on. If this message comes back "
+            "after that, the permission is still waiting on Meta's approval for Uri — contact "
+            "support.")}
     if "pages_messaging" in low or "pages_manage_metadata" in low or "permission" in low:
         return {"code": "missing_permission", "message": (
             f"This connection of {page} was made without the permissions needed to receive messages. "
-            "In Connected Accounts, disconnect and connect Instagram again and leave every permission "
-            "switched on when Meta asks. Facebook alone can't grant them.")}
+            "Click Reconnect here and leave every permission switched on when Meta asks.")}
     return {"code": "subscription_failed", "message": (
-        f"Meta wouldn't start sending {page}'s messages to Uri. Disconnect and connect again in "
-        "Connected Accounts; if it keeps failing, contact support.")} if error else {}
+        f"Meta wouldn't start sending {page}'s messages to Uri. Click Reconnect here; if it keeps "
+        "failing, contact support.")} if error else {}
 
 
-async def _debug_token(token: str) -> dict:
+async def granted_scopes(token: str) -> list[str]:
+    """The permissions Meta says this token actually carries; [] when it can't be read."""
     import httpx
 
     from app.core.config import settings
@@ -309,27 +317,9 @@ async def _debug_token(token: str) -> dict:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get("https://graph.facebook.com/debug_token",
                                  params={"input_token": token, "access_token": app_token})
-        return r.json().get("data") or {}
+        return sorted((r.json().get("data") or {}).get("scopes") or [])
     except Exception:
-        return {}
-
-
-async def granted_scopes(token: str) -> list[str]:
-    """The permissions Meta says this token actually carries; [] when it can't be read."""
-    return sorted((await _debug_token(token)).get("scopes") or [])
-
-
-async def token_report(token: str) -> str:
-    """What a refused token is: its kind, who it was issued to, and which Pages each
-    Page-scoped permission was granted for (Meta lets a user grant a permission to some
-    Pages and not others, which looks identical to "granted" in the plain scope list)."""
-    data = await _debug_token(token)
-    granular = ", ".join(
-        f"{g.get('scope')}→{'/'.join(g.get('target_ids') or ['all'])}"
-        for g in data.get("granular_scopes") or []
-        if g.get("scope") in ("pages_manage_metadata", "pages_messaging", "pages_show_list"))
-    return (f"type={data.get('type') or '?'}, user={data.get('user_id') or data.get('profile_id') or '?'}"
-            f"{', granted per Page: ' + granular if granular else ''}")
+        return []
 
 
 async def page_view(page_id: str, page_token: str) -> dict:

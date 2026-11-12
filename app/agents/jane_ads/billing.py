@@ -33,6 +33,7 @@ Design guarantees:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from . import constants as C
 
@@ -50,6 +51,94 @@ async def _notify(notification_service, *, user_id: str, subject: str, message: 
         status="sent",
         metadata={"campaign_id": campaign_id, "message": message},
     )
+
+
+def unspent_refund_ngn(record: dict, spend_ngn: float) -> float:
+    """What a deleted campaign gives back: what it was charged upfront, less its real
+    spend at the same markup the fee was charged at, so the fee is only kept on money
+    that was actually spent. Records billed as they spend hold no prepaid money. TikTok
+    records carry no markup because a TikTok plan is charged with no fee."""
+    charged = float(record.get("charged_upfront_ngn") or 0)
+    if charged <= 0:
+        return 0.0
+    markup = float(record.get("ad_spend_markup") or 1.0)
+    already = float(record.get("unspent_refunded_ngn") or 0)
+    return round(max(0.0, charged - spend_ngn * markup - already), 2)
+
+
+# Meta's reported spend keeps settling for a while after a campaign stops, so the
+# refund waits this long past the end date before trusting the final figure.
+REFUND_SETTLE_HOURS = 1
+
+
+def _parse_end(ends_at) -> Optional[datetime]:
+    if not ends_at:
+        return None
+    try:
+        end = datetime.fromisoformat(str(ends_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+
+
+def _ended_long_enough(ends_at, now: datetime) -> bool:
+    end = _parse_end(ends_at)
+    return bool(end) and (now - end).total_seconds() >= REFUND_SETTLE_HOURS * 3600
+
+
+def refund_status(record: dict, spend_ngn: float, ends_at, now: Optional[datetime] = None) -> Optional[dict]:
+    """What the campaign card says about the budget it didn't spend.
+
+    done     — already back in the wallet
+    pending  — ended; the next hourly sweep returns it (about an hour)
+    on_end   — still scheduled; comes back about an hour after it ends
+    """
+    if record.get("unspent_refunded_at"):
+        amount = float(record.get("unspent_refunded_ngn") or 0)
+        return {"state": "done", "amount_ngn": amount} if amount > 0 else None
+    if not record.get("charged_upfront_ngn"):
+        return None
+    amount = unspent_refund_ngn(record, spend_ngn)
+    end = _parse_end(ends_at)
+    if amount <= 0 or not end:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return {"state": "pending" if end <= now else "on_end", "amount_ngn": amount, "ends_at": end.isoformat()}
+
+
+async def _refund_unspent_when_finished(db, collection, r, summary, wallet, notification_service,
+                                        now: Optional[datetime] = None) -> float:
+    """A campaign paid for upfront that ends without spending its whole budget gives
+    the rest back to the wallet, once, at the same maths a delete uses."""
+    now = now or datetime.now(timezone.utc)
+    if r.get("unspent_refunded_at") or not _ended_long_enough(summary.get("ends_at"), now):
+        return 0.0
+    spent = float(summary.get("spend_ngn") or 0)
+    amount = unspent_refund_ngn(r, spent)
+    claimed = await db[collection].find_one_and_update(
+        {"campaign_id": r["campaign_id"], "unspent_refunded_at": None},
+        {"$set": {"unspent_refunded_at": now, "unspent_refunded_ngn": amount,
+                  "paid_ad_budget_ngn": max(spent, 0.01), "budget_spent_at": None}},
+    )
+    if claimed is None or amount <= 0:
+        return 0.0
+    try:
+        await wallet.refund_ad_spend(r["business_id"], amount, r["campaign_id"])
+    except Exception as e:
+        print(f"[billing] unspent refund failed for {r['campaign_id']}: {e}", flush=True)
+        await db[collection].update_one({"campaign_id": r["campaign_id"]},
+                                        {"$set": {"unspent_refunded_at": None, "unspent_refunded_ngn": 0,
+                                                  "paid_ad_budget_ngn": None}})
+        return 0.0
+    name = r.get("display_name") or "Your campaign"
+    await _notify(
+        notification_service, user_id=r.get("user_id"),
+        subject=f"₦{amount:,.0f} back in your wallet",
+        message=(f"{name} has finished. It spent ₦{spent:,.0f}, so the ₦{amount:,.0f} it "
+                 "didn't use is back in your ad wallet."),
+        campaign_id=r["campaign_id"],
+    )
+    return amount
 
 
 async def reconcile_ad_spend_charges(db) -> dict:
@@ -87,7 +176,51 @@ async def reconcile_ad_spend_charges(db) -> dict:
         for k in result:
             result[k] += tiktok_result[k]
 
+    # Google: each campaign lives in its brand's OWN Google Ads account, so one
+    # dispatcher finds the right account per campaign (google_flow.GoogleCampaigns).
+    from . import google_flow
+    if google_flow.configured() and await db[google_flow.GOOGLE_CAMPAIGNS].find_one({"brand_id": {"$ne": None}}):
+        google_result = await _sweep_platform(
+            db, wallet, notification_service, adapter=google_flow.GoogleCampaigns(db),
+            collection=google_flow.GOOGLE_CAMPAIGNS, api_error_cls=google_flow.GoogleAdsAPIError,
+        )
+        for k in result:
+            result[k] += google_result[k]
+
     return result
+
+
+async def _stop_at_paid_budget(db, collection, r, summary, adapter, api_error_cls, notification_service) -> None:
+    """A campaign paid for in full at launch must not spend past what was paid:
+    the platform bills its owner (for Google, URI) for anything more. Pauses it
+    once its spend reaches the ad budget, and says so once."""
+    # The ad spend part of what was charged — or, once its unspent part was refunded,
+    # only what it had spent: a campaign restarted after that refund must not spend
+    # money the client already got back.
+    paid = float(r.get("paid_ad_budget_ngn") or r.get("budget_ngn") or 0)
+    spent = float(summary.get("spend_ngn") or 0)
+    if not paid or spent < paid or summary.get("delivery") != "Active" or r.get("budget_spent_at"):
+        return
+    claimed = await db[collection].find_one_and_update(
+        {"campaign_id": r["campaign_id"], "budget_spent_at": None},
+        {"$set": {"budget_spent_at": datetime.now(timezone.utc)}},
+    )
+    if claimed is None:
+        return
+    try:
+        await adapter.set_delivery(r["campaign_id"], active=False)
+    except api_error_cls as e:
+        print(f"[billing] could not stop {r['campaign_id']} at its budget: {e}", flush=True)
+        await db[collection].update_one({"campaign_id": r["campaign_id"]}, {"$set": {"budget_spent_at": None}})
+        return
+    name = r.get("display_name") or "Your campaign"
+    await _notify(
+        notification_service, user_id=r.get("user_id"),
+        subject=f"{name} has used its budget",
+        message=(f"{name} spent the ₦{paid:,.0f} you paid for, so I've stopped it. "
+                 "Start a new campaign whenever you're ready for more."),
+        campaign_id=r["campaign_id"],
+    )
 
 
 async def _sweep_platform(db, wallet, notification_service, *, adapter, collection: str, api_error_cls) -> dict:
@@ -98,7 +231,8 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
     convention both adapters follow — see their own docstrings)."""
     from .wallet import InsufficientFundsError
 
-    records = await db[collection].find({}, {"_id": 0}).to_list(length=500)
+    # detached_at: the brand let go of that (Google) ad account — URI can't reach it.
+    records = await db[collection].find({"detached_at": None}, {"_id": 0}).to_list(length=500)
 
     checked = paused_total = 0
     charged_total = 0.0
@@ -128,6 +262,8 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
         # status); it just never debits. Records without this key predate
         # charge-at-launch and are still billed as they spend, as they were sold.
         if r.get("charged_upfront_ngn"):
+            await _stop_at_paid_budget(db, collection, r, summary, adapter, api_error_cls, notification_service)
+            await _refund_unspent_when_finished(db, collection, r, summary, wallet, notification_service)
             continue
 
         # Per campaign, not global: the markup this one was SOLD under. A campaign

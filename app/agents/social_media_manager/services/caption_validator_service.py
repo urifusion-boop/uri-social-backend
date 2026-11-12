@@ -83,6 +83,31 @@ class CaptionValidatorService:
         "i said what i said",
         "understood the assignment",
         "chef's kiss",
+        # content_calendar_v2's GENERIC_AI_WORDS (creative_framework.py) only
+        # ever governed the calendar's own PLAN titles — the real draft text
+        # is written by this shared service for every generation path
+        # (Create Content tab, calendar-sourced drafts, Listening cards
+        # alike), so a word banned only in the plan still reached the
+        # published caption untouched. Confirmed live: a calendar-generated
+        # post used "unlock"/"transform"/"discover" despite the plan's own
+        # titles being clean. Merged here once so every path shares the same
+        # list instead of drifting again. (elevate/seamless/game-changer/
+        # revolutionary were already present above.)
+        "transform",
+        "unlock",
+        "discover",
+        "journey",
+        "empower",
+        "unleash",
+        "supercharge",
+        "harness",
+        "delve",
+        "dive into",
+        "deep dive",
+        "next level",
+        "skyrocket",
+        "effortless",
+        "navigate the",
     ]
 
     # PRD Section 2.2: Banned Closers
@@ -98,13 +123,21 @@ class CaptionValidatorService:
     ]
 
     @staticmethod
-    def validate_caption(caption: str, custom_banned_words: List[str] = None) -> Dict[str, Any]:
+    def validate_caption(caption: str, custom_banned_words: List[str] = None,
+                         max_words: int = None) -> Dict[str, Any]:
         """
         Validate a caption against all banned AI patterns.
 
         Args:
             caption: The generated caption to validate
             custom_banned_words: Additional brand-specific banned words
+            max_words: Optional hard word-count ceiling (e.g. for a
+                calendar-sourced post, which should stay close to the
+                plan's own concise idea rather than being expanded into a
+                much longer essay by the platform's own prompt). None (the
+                default) skips this check entirely — most generation paths
+                have no length complaint and shouldn't suddenly start
+                failing validation.
 
         Returns:
             {
@@ -115,6 +148,11 @@ class CaptionValidatorService:
         """
         issues = []
         import re
+
+        if max_words is not None:
+            word_count = len(re.findall(r"\S+", caption))
+            if word_count > max_words:
+                issues.append(f"too_many_words: {word_count} (target: {max_words})")
 
         # Check for em dashes
         for dash in CaptionValidatorService.BANNED_PUNCTUATION["em_dash"]:
@@ -286,6 +324,15 @@ class CaptionValidatorService:
 
         if any("too_many_exclamations" in issue for issue in issues):
             fix_instructions.append("- Reduce exclamation marks to 1 or 0. Use stronger words instead of punctuation for emphasis")
+
+        words_issue = next((i for i in issues if "too_many_words" in i), None)
+        if words_issue:
+            target = words_issue.split("target: ")[-1].rstrip(")")
+            fix_instructions.append(
+                f"- This is too long — cut it down to about {target} words. Keep the strongest line or two, "
+                "the key point, and the call to action. Remove everything else rather than shortening every "
+                "sentence a little; a short, punchy post beats a long one trimmed down."
+            )
 
         if any("excessive_parallel_lists" in issue for issue in issues):
             fix_instructions.append("- Break up the three-part parallel lists. Use 2 items, or 4 items, or restructure completely")

@@ -260,7 +260,7 @@ class NotificationService:
         if not await self._check_rate_limit(user_id):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = first_name or email.split("@")[0]
 
         # Welcome email
@@ -335,6 +335,57 @@ class NotificationService:
         else:
             print(f"⚠️ Failed to send admin signup alert for {email}")
 
+    # ==================== Admin: Google Ads MCC Ineligibility Alert ====================
+
+    async def notify_admin_google_ads_mcc_ineligible(self, reason: str):
+        """Sent once, the first time URI's Google Ads Manager Account is
+        confirmed unable to create fresh client accounts (see
+        MccNotEligibleToCreateAccounts / set_mcc_creation_eligibility) — not
+        on every subsequent attempt that hits the same already-known
+        restriction. This is a real, actionable ops task (link a qualifying
+        existing account to unblock every brand after that), not a per-user
+        error, so it goes to the team rather than surfacing only as a log
+        line no one is watching."""
+        admin_email = settings.ADMIN_NOTIFICATION_EMAIL
+        if not admin_email:
+            print("⚠️ ADMIN_NOTIFICATION_EMAIL not set — skipping Google Ads eligibility alert")
+            return
+
+        now = datetime.utcnow()
+        subject = "Action needed: Google Ads account creation is blocked"
+
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+            <h2 style="color:#DC2626;">Google Ads: Manager Account can't create new accounts</h2>
+            <p>URI's Google Ads Manager Account just failed to create a fresh client account for a
+            new client. Google's real response was:</p>
+            <p style="background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:12px;color:#991B1B;">
+                {reason}
+            </p>
+            <p><b>What this means:</b> "Create one for me" is now hidden in the app for every new
+            client until this is resolved — they're guided to sign up with Google directly and
+            link that account instead, so nothing is broken for users, but assisted account
+            creation stays off.</p>
+            <p><b>To fix it:</b> link any real, spend-qualified Google Ads account (>$1,000 lifetime
+            spend, clean policy history — it does not need to belong to any specific client) to
+            URI's Manager Account via the existing "I already have a Google Ads account" flow.
+            Once that succeeds, creation unlocks automatically for every client.</p>
+            <table style="width:100%;border-collapse:collapse;margin-top:12px;">
+                <tr><td style="padding:8px;font-weight:bold;">Time (UTC)</td><td style="padding:8px;">{now.strftime("%Y-%m-%d %H:%M:%S")}</td></tr>
+            </table>
+        </div>
+        """
+
+        success = await email_service.send_raw_email(
+            to_email=admin_email,
+            subject=subject,
+            html_body=html,
+        )
+        if success:
+            print("📧 Admin alerted: Google Ads MCC not eligible to create accounts")
+        else:
+            print("⚠️ Failed to send Google Ads eligibility alert")
+
     # ==================== PRD 4.2: Content Created Notification ====================
 
     async def _brand_prefs_configured(self, user_id: str, brand_id: Optional[str]) -> bool:
@@ -384,7 +435,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "content_created", hours=4):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Your Content is Ready! ✨"
@@ -453,7 +504,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "content_posted", hours=2):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = f"Content Published on {platform}! 🚀"
@@ -552,7 +603,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "daily_suggestion", hours=20):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Today's Content Idea 💡"
@@ -599,7 +650,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "inactivity", hours=48):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "We Miss You! Your Audience is Waiting 👋"
@@ -643,7 +694,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "trial_start", hours=24):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = first_name or email.split("@")[0]
 
         subject = "Your Free Trial Has Started! 🎯"
@@ -683,7 +734,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "trial_ending", hours=24):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Your Trial Ends Soon ⏳"
@@ -718,7 +769,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "trial_expired", hours=48):
             return
 
-        app_url = settings.WEB_APP_URL or "https://www.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Your Free Trial Has Ended"

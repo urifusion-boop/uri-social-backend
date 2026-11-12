@@ -10,12 +10,19 @@ from datetime import datetime, timedelta
 import asyncio
 import secrets
 import string
+import secrets
+import string
 from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
 from app.database import get_db
 from app.services.CreditService import credit_service
 from app.services.TrialService import trial_service
 from app.services.EmailService import email_service
+from app.domain.models.billing_models import (
+    AccessCode,
+    CreateAccessCodeRequest,
+    UpdateAccessCodeRequest,
+)
 from app.domain.models.billing_models import (
     AccessCode,
     CreateAccessCodeRequest,
@@ -358,6 +365,7 @@ async def get_user_details(
         "trial_end": user.get("trial_end"),
         "credits_balance": credits_balance,
         "brand_profiles": brand_profiles,
+        "ad_wallets": await _ad_wallets(db, billing_id),
         "content_count": content_count,
         "workspaces": workspaces,
         "is_admin": bool(user.get("is_admin")),
@@ -463,6 +471,55 @@ async def _resolve_billing_id(user_id: str, db: AsyncIOMotorDatabase) -> str:
     return _billing_user_id(user)
 
 
+async def _ad_wallets(db: AsyncIOMotorDatabase, billing_id: str) -> list[dict]:
+    """The user's brand accounts and each one's ad wallet. Wallets are keyed by the
+    brand ACCOUNT id (brnd_…, what the app switches between), not the brand_profiles
+    _id — reading that showed ₦0 for a brand holding money."""
+    from app.agents.jane_ads.store import MongoWalletStore
+    from app.agents.jane_ads.wallet import WalletService
+    from app.services.BrandAccountService import BrandAccountService
+
+    wallet = WalletService(MongoWalletStore(db))
+    brands = await BrandAccountService.list_brands_for_user(billing_id, db)
+    return [{"brand_id": b.brand_id, "name": b.name, "ad_wallet_ngn": await wallet.get_balance(b.brand_id)}
+            for b in brands]
+
+
+class AdWalletCreditRequest(BaseModel):
+    amount_ngn: float = Field(..., gt=0)
+    reason: Optional[str] = None
+
+
+@router.post("/users/{user_id}/brands/{brand_id}/ad-wallet/credit")
+async def credit_brand_ad_wallet(
+    user_id: str,
+    brand_id: str,
+    body: AdWalletCreditRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Add money to one of a user's brand ad wallets without a payment — goes through
+    WalletService.top_up so balance and ledger move together, with the admin on the
+    reference so it is never mistaken for a real payment."""
+    import uuid
+    from app.agents.jane_ads.store import MongoWalletStore
+    from app.agents.jane_ads.wallet import WalletService
+
+    from app.services.AgencyService import AgencyService
+
+    billing_id = await _resolve_billing_id(user_id, db)
+    if brand_id not in await AgencyService.accessible_brand_ids(billing_id, db):
+        raise HTTPException(status_code=404, detail="That brand doesn't belong to this user")
+
+    actor = (admin_user.get("email") or (admin_user.get("claims") or {}).get("email") or "admin").lower()
+    wallet = WalletService(MongoWalletStore(db))
+    await wallet.top_up(brand_id, body.amount_ngn, reference=f"manual:{actor}:{uuid.uuid4().hex[:12]}",
+                        enforce_minimum=False)
+    print(f"[admin] {actor} added NGN{body.amount_ngn:,.0f} to ad wallet {brand_id} "
+          f"— {body.reason or 'no reason'}", flush=True)
+    return {"brand_id": brand_id, "ad_wallet_ngn": await wallet.get_balance(brand_id)}
+
+
 @router.post("/users/{user_id}/credits/adjust")
 async def adjust_user_credits(
     user_id: str,
@@ -481,6 +538,68 @@ async def adjust_user_credits(
         "credits_balance": wallet.credits_remaining,
         "bonus_credits": wallet.bonus_credits,
         "total_credits": wallet.total_credits,
+    }
+
+
+class SetSubscriptionRequest(BaseModel):
+    plan_tier_id: str = Field(..., description="subscription_tiers.tier_id to grant, e.g. 'starter'")
+    duration_days: int = Field(default=30, gt=0, description="How many days this grant lasts before falling back to free")
+    reason: Optional[str] = Field(default=None, description="Admin's free-text note for this grant")
+
+
+@router.post("/users/{user_id}/subscription/set")
+async def set_user_subscription(
+    user_id: str,
+    body: SetSubscriptionRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Directly assign a user a subscription tier. This is the actual "change
+    this user's plan" action — /credits/adjust above only ever touches
+    bonus_credits, which is why topping a user up to 20 credits there never
+    made the admin panel stop showing "free"; a bonus grant and a plan
+    change are different things.
+    """
+    billing_id = await _resolve_billing_id(user_id, db)
+
+    tier = await db["subscription_tiers"].find_one({"tier_id": body.plan_tier_id})
+    if not tier:
+        raise HTTPException(status_code=404, detail=f"Plan '{body.plan_tier_id}' not found")
+
+    wallet = await credit_service.admin_set_subscription(
+        billing_id,
+        body.plan_tier_id,
+        tier.get("credits_monthly", tier.get("credits", 0)),
+        body.duration_days,
+        notes=body.reason,
+    )
+    return {
+        "user_id": user_id,
+        "subscription_tier": wallet.subscription_tier,
+        "end_date": wallet.end_date.isoformat() if wallet.end_date else None,
+        "credits_balance": wallet.credits_remaining,
+    }
+
+
+class ClearSubscriptionRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, description="Admin's free-text note for this revert")
+
+
+@router.post("/users/{user_id}/subscription/clear")
+async def clear_user_subscription(
+    user_id: str,
+    body: ClearSubscriptionRequest = ClearSubscriptionRequest(),
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Revert a user to free — the undo for /subscription/set (e.g. the wrong tier was picked)."""
+    billing_id = await _resolve_billing_id(user_id, db)
+    wallet = await credit_service.admin_clear_subscription(billing_id, notes=body.reason)
+    return {
+        "user_id": user_id,
+        "subscription_tier": wallet.subscription_tier,
+        "credits_balance": wallet.credits_remaining,
     }
 
 
@@ -711,37 +830,6 @@ async def brand_profile_integrity_scan(
     }
 
 
-@router.post("/social-media/reconcile-published-posts")
-async def admin_reconcile_published_posts(
-    admin_user: dict = Depends(verify_admin),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-):
-    """
-    Manual trigger for ApprovalWorkflowService.reconcile_published_posts, for
-    an admin to run from the Admin page instead of needing a cron secret.
-
-    Live-reported: a draft published immediately (not scheduled) is marked
-    status="published" the moment Outstand accepts the submission, but
-    nothing ever re-checks whether the platform actually went through with
-    it — a Facebook token invalidation (e.g. the "Vchain" Page, confirmed via
-    CloudWatch) silently failed post after post with status staying
-    "published" and no error anywhere. This re-checks every such draft from
-    the last 7 days against Outstand's real status: a genuine platform
-    failure gets corrected to publish_failed with the real error (and, if
-    the error is a dead token/session, the connection gets marked
-    disconnected and its owner notified); a confirmed-live post is marked so
-    it stops being re-checked; anything still pending is left alone.
-
-    Deliberately not yet on the automatic scheduler (see
-    notification_scheduler.py) — this is its first run against real
-    production data, triggered here so its effect can be reviewed in
-    CloudWatch before it runs unsupervised on a cron.
-    """
-    from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
-    result = await ApprovalWorkflowService.reconcile_published_posts(db=db)
-    return {"status": True, **result}
-
-
 # ── Access codes — admin-generated partner/comp codes (e.g. "ASA26") ──────────
 # Generic and reusable: an admin can create a new code for any plan/duration
 # at any time and hand it to anybody. Each redeemer gets their own 60-day (or
@@ -839,7 +927,16 @@ async def list_access_codes(
     """
     codes = []
     async for doc in db["access_codes"].find({}, {"_id": 0}).sort("created_at", -1):
-        assigned_emails = doc.get("assigned_emails") or []
+        # Some codes predate the single-email -> roster migration (commit
+        # 8438595e) and were never backfilled, so they still carry the old
+        # assigned_to_email field instead of assigned_emails. Recover that
+        # assignment here rather than returning an empty roster and losing
+        # it from view, and always set assigned_emails explicitly — doc is
+        # the raw Mongo document, which omits the key entirely when it was
+        # never written, and the frontend assumes it's always an array.
+        legacy_email = doc.get("assigned_to_email")
+        assigned_emails = doc.get("assigned_emails") or ([legacy_email] if legacy_email else [])
+        doc["assigned_emails"] = assigned_emails
         redeemed_count = doc.get("redemption_count", 0)
         doc["assigned_count"] = len(assigned_emails)
         doc["redeemed_count"] = redeemed_count
@@ -911,7 +1008,8 @@ async def list_access_code_redemptions(
             effective_status = "active"
         redemptions.append({**r, "email": email, "effective_status": effective_status})
 
-    for assigned_email in access_code.get("assigned_emails") or []:
+    legacy_email = access_code.get("assigned_to_email")
+    for assigned_email in access_code.get("assigned_emails") or ([legacy_email] if legacy_email else []):
         if assigned_email.lower() not in redeemed_emails_lower:
             redemptions.append({
                 "code": code,
@@ -1065,7 +1163,9 @@ async def update_access_code(
         revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
 
     updated = await db["access_codes"].find_one({"code": code}, {"_id": 0})
-    assigned_emails = updated.get("assigned_emails") or []
+    legacy_email = updated.get("assigned_to_email")
+    assigned_emails = updated.get("assigned_emails") or ([legacy_email] if legacy_email else [])
+    updated["assigned_emails"] = assigned_emails
     redeemed_count = updated.get("redemption_count", 0)
     updated["assigned_count"] = len(assigned_emails)
     updated["redeemed_count"] = redeemed_count
@@ -1118,7 +1218,8 @@ async def send_access_code_email(
     access_code = await db["access_codes"].find_one({"code": code}, {"_id": 0})
     if not access_code:
         raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
-    assigned_emails = access_code.get("assigned_emails") or []
+    legacy_email = access_code.get("assigned_to_email")
+    assigned_emails = access_code.get("assigned_emails") or ([legacy_email] if legacy_email else [])
     if not assigned_emails:
         raise HTTPException(status_code=400, detail="This code isn't assigned to anyone — add emails first")
     if email:
@@ -1134,3 +1235,34 @@ async def send_access_code_email(
     for target in targets:
         _send_access_code_email(target, code, tier, access_code["duration_days"], access_code.get("label", ""))
     return {"sent": True, "to": targets}
+
+
+@router.post("/social-media/reconcile-published-posts")
+async def admin_reconcile_published_posts(
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Manual trigger for ApprovalWorkflowService.reconcile_published_posts, for
+    an admin to run from the Admin page instead of needing a cron secret.
+
+    Live-reported: a draft published immediately (not scheduled) is marked
+    status="published" the moment Outstand accepts the submission, but
+    nothing ever re-checks whether the platform actually went through with
+    it — a Facebook token invalidation (e.g. the "Vchain" Page, confirmed via
+    CloudWatch) silently failed post after post with status staying
+    "published" and no error anywhere. This re-checks every such draft from
+    the last 7 days against Outstand's real status: a genuine platform
+    failure gets corrected to publish_failed with the real error (and, if
+    the error is a dead token/session, the connection gets marked
+    disconnected and its owner notified); a confirmed-live post is marked so
+    it stops being re-checked; anything still pending is left alone.
+
+    Deliberately not yet on the automatic scheduler (see
+    notification_scheduler.py) — this is its first run against real
+    production data, triggered here so its effect can be reviewed in
+    CloudWatch before it runs unsupervised on a cron.
+    """
+    from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+    result = await ApprovalWorkflowService.reconcile_published_posts(db=db)
+    return {"status": True, **result}

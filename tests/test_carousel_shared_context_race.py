@@ -17,6 +17,10 @@ _resolve_carousel_shared_context() runs it exactly once, in the caller,
 before any per-slide task is created, and every slide receives the same
 already-resolved brand_context from the start — nothing left to race on.
 
+This also has to go through _resolve_platform_style_pool — unlike prod,
+dev supports per-platform style/guide overrides, so the resolver needs the
+draft's platform to pick the right pool and rotation-index field.
+
 Second, separate fix (Oct 2026, also confirmed live via customer
 screenshot): a brand with NO custom guide — just library style_selections
 — got a visibly DIFFERENT style on every slide of the same carousel. That
@@ -38,7 +42,7 @@ from app.agents.social_media_manager.routers.complete_social_manager import (
 )
 
 
-def _fake_db(brand_profile=None, custom_guide_v2=None, custom_guide_v1_detail=None):
+def _fake_db(brand_profile=None, custom_guide_v2=None):
     collections = {
         "brand_profiles": MagicMock(
             find_one=AsyncMock(return_value=brand_profile or {}),
@@ -69,8 +73,8 @@ class TestResolveCarouselSharedContextCustomGuide:
         brand_context = {"brand_id": "brand-1", "user_id": "u1"}
 
         resolved = await _resolve_carousel_shared_context(
-            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-1",
-            platform="instagram",
+            db=db, brand_context=brand_context, style_override=None,
+            carousel_id="carousel-1", platform="instagram",
         )
 
         assert resolved["custom_guide_v2_id"] == "507f1f77bcf86cd799439011"
@@ -81,7 +85,6 @@ class TestResolveCarouselSharedContextCustomGuide:
         # across other drafts/carousels in the same request.
         assert "custom_guide_v2_id" not in brand_context
 
-        # Written twice: once for the custom guide fields, once for the CTA.
         assert cols["content_drafts"].update_one.await_count == 2
         guide_write = cols["content_drafts"].update_one.call_args_list[0]
         assert guide_write[0][0] == {"id": "carousel-1"}
@@ -93,8 +96,8 @@ class TestResolveCarouselSharedContextCustomGuide:
         brand_context = {"brand_id": "brand-1", "default_link": "uri.social/book"}
 
         resolved = await _resolve_carousel_shared_context(
-            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-2",
-            platform="instagram",
+            db=db, brand_context=brand_context, style_override=None,
+            carousel_id="carousel-2", platform="facebook",
         )
 
         assert "custom_guide_v2_id" not in resolved
@@ -109,8 +112,8 @@ class TestResolveCarouselSharedContextCustomGuide:
         brand_context = {"brand_id": "brand-1"}
 
         resolved = await _resolve_carousel_shared_context(
-            db=db, brand_context=brand_context, style_override=["minimalist"], carousel_id="carousel-3",
-            platform="instagram",
+            db=db, brand_context=brand_context, style_override=["minimalist"],
+            carousel_id="carousel-3", platform="instagram",
         )
 
         assert "custom_guide_v2_id" not in resolved
@@ -121,11 +124,34 @@ class TestResolveCarouselSharedContextCustomGuide:
         brand_context = {"brand_id": "brand-1", "cta_styles": ["DM us", "Call now"], "cta_rotation_index": 1}
 
         resolved = await _resolve_carousel_shared_context(
-            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-4",
-            platform="instagram",
+            db=db, brand_context=brand_context, style_override=None,
+            carousel_id="carousel-4", platform="instagram",
         )
 
         assert resolved["override_cta"] == "Call now"
+
+    @pytest.mark.asyncio
+    async def test_per_platform_guide_override_used_when_present(self):
+        db, cols = _fake_db(
+            brand_profile={
+                "selected_custom_guides_v2": [],  # no brand-wide guide
+                "selected_custom_guides_v2_by_platform": {"instagram": ["507f1f77bcf86cd799439011"]},
+                "style_rotation_index_by_platform": {"instagram": 0},
+            },
+            custom_guide_v2={"original_image_url": "https://example.com/ig-ref.png", "name": "IG-only Guide"},
+        )
+        brand_context = {"brand_id": "brand-1"}
+
+        resolved = await _resolve_carousel_shared_context(
+            db=db, brand_context=brand_context, style_override=None,
+            carousel_id="carousel-5", platform="instagram",
+        )
+
+        assert resolved["custom_guide_v2_id"] == "507f1f77bcf86cd799439011"
+        # Rotation-index write-back must target the per-platform field, not
+        # the brand-wide one, when a per-platform override is what resolved.
+        guide_write_bp = cols["brand_profiles"].update_one.call_args_list[0]
+        assert "style_rotation_index_by_platform.instagram" in guide_write_bp[0][1]["$set"]
 
     @pytest.mark.asyncio
     async def test_no_custom_guide_resolves_one_library_style_for_the_whole_carousel(self):
@@ -142,8 +168,8 @@ class TestResolveCarouselSharedContextCustomGuide:
         brand_context = {"brand_id": "brand-1"}
 
         resolved = await _resolve_carousel_shared_context(
-            db=db, brand_context=brand_context, style_override=None, carousel_id="carousel-7",
-            platform="instagram",
+            db=db, brand_context=brand_context, style_override=None,
+            carousel_id="carousel-7", platform="instagram",
         )
 
         assert resolved["style_slug"] == "vibrant"
@@ -160,8 +186,8 @@ class TestResolveCarouselSharedContextCustomGuide:
         brand_context = {"brand_id": "brand-1"}
 
         resolved = await _resolve_carousel_shared_context(
-            db=db, brand_context=brand_context, style_override=["street_editorial"], carousel_id="carousel-8",
-            platform="instagram",
+            db=db, brand_context=brand_context, style_override=["street_editorial"],
+            carousel_id="carousel-8", platform="instagram",
         )
 
         # The override wins over the brand's own style_selections, and (like
@@ -235,8 +261,6 @@ class TestGenerateImageBgSkipsWhenAlreadyResolved:
 
     def test_caller_resolves_once_before_spawning_per_slide_tasks(self):
         source = inspect.getsource(csm)
-        # The caller must call the resolver before the per-slide loop, and pass
-        # its result — not the shared brand_context_dict — into each slide's task.
         resolve_idx = source.index("carousel_brand_context = await _resolve_carousel_shared_context")
         loop_idx = source.index("for slide_index, slide in enumerate(slides):")
         task_call_idx = source.index("brand_context=carousel_brand_context")

@@ -11,7 +11,6 @@ import re
 import subprocess
 import tempfile
 import time
-import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -169,8 +168,8 @@ async def _clean_audio(video_bytes: bytes) -> bytes:
 
 
 # ── SFX library ───────────────────────────────────────────────────────────────
-# SFX files hosted on Cloudinary — permanent CDN URLs, no container dependency
-_SFX_CDN = "https://res.cloudinary.com/df8ckaeam/video/upload/uri-sfx"
+# SFX files hosted on S3 — permanent CDN URLs, no container dependency
+_SFX_CDN = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-sfx"
 SFX_LIBRARY: Dict[str, str] = {
     "whoosh":   f"{_SFX_CDN}/whoosh.mp3",    # fast cuts / transitions
     "impact":   f"{_SFX_CDN}/impact.mp3",    # emphasis zooms / key claims
@@ -186,13 +185,16 @@ SFX_LIBRARY: Dict[str, str] = {
 # ── S3 upload ──────────────────────────────────────────────────────────────
 # Was three hand-rolled signed-REST calls to Cloudinary: direct byte upload
 # capped at 95MB, a separate raw-resource path for audio, and a third
-# function (_cloudinary_fetch_url) that had Cloudinary fetch a video from our
-# own static file server purely to dodge that same 95MB cap. S3 has no such
-# cap (a single put_object goes up to 5GB), so the one remaining caller of
-# that third function now just uploads the bytes directly instead — the
-# fetch-a-URL indirection served no purpose once the limit it was dodging
-# stopped existing. Names kept identical so no call site elsewhere in this
-# file needed to change.
+# function (_cloudinary_fetch_url, removed) that had Cloudinary fetch a video
+# from our own static file server purely to dodge that same 95MB cap. S3 has
+# no such cap (a single put_object goes up to 5GB), so the one remaining
+# caller of that third function now just uploads the bytes directly instead —
+# the fetch-a-URL indirection served no purpose once the limit it was
+# dodging stopped existing. The two functions that remain are the chokepoint
+# 14+ call sites across this file, multi_clip_service.py and
+# voiceover_service.py already funnel through — names kept identical so none
+# of those call sites needed to change, same convention s3_upload.py's own
+# module docstring already established for the drop-in swap.
 
 async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[str]:
     """Upload video bytes to S3. No size cap (unlike the old 95MB Cloudinary
@@ -224,26 +226,11 @@ async def _upload_audio_to_cloudinary(audio_bytes: bytes, public_id: str) -> Opt
         return None
 
 
+
+
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
 
-# Cloudinary transition style per video type — fadewhite is the flash cut Shotstack lacked
-# Luma matte public IDs uploaded to our Cloudinary account.
-# Black→white wipe: black areas show the base clip, white areas show the next clip.
-_LUMA_MATTE_BY_TYPE: Dict[str, str] = {
-    "tiktok":   "uri-transitions/circle-wipe",    # hard-edge circle expanding from center
-    "product":  "uri-transitions/diagonal-wipe",  # diagonal sweep top-left → bottom-right
-    "founder":  "uri-transitions/circle-wipe",    # same circle but slower (2.5s)
-}
-# Per-type transition duration (seconds) — must match the actual luma-matte video's length
-# uploaded to Cloudinary, because that determines how many seconds of overlap occur.
-# Used only when luma_pid is not None; hard-cut paths use transition_dur=0.0.
-_TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
-    "tiktok":   0.8,
-    "product":  0.8,
-    "founder":  1.0,
-}
-_CLD_TRANSITION_DUR = 1.0   # default fallback
-_MIN_SEG_DUR       = 4.0   # minimum keep-segment length (must exceed max transition_dur)
+_MIN_SEG_DUR = 4.0   # minimum keep-segment length — a shorter one creates a jarring cut
 
 # Shotstack overlay style per video type for topic-change transitions.
 # "color: None" → falls back to the brand primary_color at render time.
@@ -264,8 +251,8 @@ _DEFAULT_TRANSITION_STYLE: Dict[str, Any] = {
 # ── Icon overlay asset library ────────────────────────────────────────────────
 # Each category has an emoji fallback and an optional Lottie JSON URL.
 # Set LOTTIEFILES_API_KEY env var to enable dynamic search (free account suffices).
-# Lottie URLs can also be replaced with Cloudinary-hosted .json raw assets.
-_CDN = "https://res.cloudinary.com/df8ckaeam/raw/upload"
+# Lottie URLs can also be replaced with S3-hosted .json raw assets.
+_CDN = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com"
 _ICON_OVERLAY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "fire":      {"emoji": "🔥", "lottie": f"{_CDN}/uri-lottie/fire.json", "position": "topRight",     "size": 150},
     "star":      {"emoji": "⭐", "lottie": f"{_CDN}/uri-lottie/star.json", "position": "topRight",     "size": 140},
@@ -362,17 +349,8 @@ async def _resolve_icon_html(category: str) -> str:
     )
 
 
-def _cloudinary_public_id(url: str) -> str:
-    """Extract Cloudinary public_id from a full upload URL.
-    e.g. .../video/upload/v1234567/uri-video-production/abc.mp4 → uri-video-production/abc
-    """
-    import re
-    m = re.search(r"/video/upload/(?:v\d+/)?(.+?)(?:\.\w+)?$", url)
-    return m.group(1) if m else ""
-
-
 def _wrap_hook_text(text: str, max_chars: int = 20) -> str:
-    """Split text at word boundaries for multi-line Cloudinary text overlay."""
+    """Split text at word boundaries for multi-line text overlay."""
     words = text.split()
     lines, line = [], ""
     for word in words:
@@ -422,70 +400,6 @@ async def _generate_hook_text(transcript: str) -> Optional[str]:
             from app.services.AIService import _alert_openai_out_of_credit
             await _alert_openai_out_of_credit(str(exc))
         return None
-
-
-def _cld_encode_text(text: str) -> str:
-    """URL-encode text for a Cloudinary l_text layer. Commas and slashes must be double-encoded."""
-    encoded = urllib.parse.quote(text, safe='')
-    encoded = encoded.replace('%2C', '%252C')
-    encoded = encoded.replace('%2F', '%252F')
-    return encoded
-
-
-def _build_cloudinary_cut_url(
-    public_id: str,
-    keep_segments: List[Dict],
-    luma_matte_pid: Optional[str] = "uri-transitions/circle-wipe",
-    transition_dur: float = 1.0,
-    hook_text: str = "",
-    primary_color: str = "#FFD700",
-) -> str:
-    """
-    Build a Cloudinary transformation URL: luma-matte transitions between segments,
-    then a branded hook text overlay baked into the first 2.5s of the video.
-
-    Pass luma_matte_pid=None for hard cuts (no transition effect between segments).
-    Hook overlay uses Cloudinary's native l_text layer — rendered server-side at
-    full resolution, completely avoiding Shotstack's unreliable HTML renderer.
-    """
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    if not cloud or not keep_segments:
-        return ""
-
-    pid_enc = public_id.replace("/", ":")
-
-    first = keep_segments[0]
-    parts: List[str] = [
-        f"so_{first['src_start']:.3f},eo_{first['src_end']:.3f}"
-    ]
-    for seg in keep_segments[1:]:
-        s = f"{seg['src_start']:.3f}"
-        e = f"{seg['src_end']:.3f}"
-        if luma_matte_pid:
-            luma_enc = luma_matte_pid.replace("/", ":")
-            parts.append(
-                f"l_video:{pid_enc}/so_{s},eo_{e}"
-                f"/e_transition,l_video:{luma_enc}/fl_layer_apply"
-                f"/fl_layer_apply"
-            )
-        else:
-            # Hard cut — fl_splice appends the segment sequentially (end-to-end).
-            # Without fl_splice, l_video/fl_layer_apply would OVERLAY both segments
-            # simultaneously, causing all audio tracks to play at the same time.
-            parts.append(
-                f"fl_splice,l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
-            )
-
-    url = (
-        f"https://res.cloudinary.com/{cloud}/video/upload/"
-        + "/".join(parts)
-    )
-
-    # Hook text overlay — baked into the Cloudinary video, shown for the first 2.5s.
-    # Using Montserrat 900 (Google Fonts), brand primary color background, white text.
-    # Font size scales with text length so it never overflows the 1080px frame.
-    url += f"/{public_id}.mp4"
-    return url
 
 
 async def _pexels_search(query: str) -> Optional[str]:
@@ -583,11 +497,8 @@ async def _fal_generate(description: str) -> Optional[str]:
 
 
 async def _upload_image_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optional[str]:
-    """Upload raw B-roll still bytes to S3 and return the public URL. Name
-    kept for its one call site below — same S3 migration as the video/audio
-    uploaders above."""
+    """Upload raw B-roll image bytes to S3 under uri-broll/ and return the URL."""
     from app.utils.s3_upload import upload_bytes
-
     try:
         return await upload_bytes(img_bytes, folder="uri-broll", resource_type="image", public_id=public_id)
     except Exception as e:
@@ -654,36 +565,38 @@ async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
 
 
 # ── Background music ──────────────────────────────────────────────────────────
-# Curated CC0 instrumentals uploaded to Cloudinary from archive.org.
-# To add more tracks: download a CC0 MP3, upload via cloudinary.uploader.upload(resource_type="video"),
-# then append the secure_url to the appropriate mood list below.
+# Curated CC0 instrumentals, re-hosted on S3 from archive.org (originally via Cloudinary).
+# To add more tracks: download a CC0 MP3, upload to the uri-music/<mood>/ S3 prefix,
+# then append the URL to the appropriate mood list below.
 
 import random as _random
 
+_MUSIC_CDN = "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-music"
+
 _MUSIC_BY_MOOD: Dict[str, List[str]] = {
     "upbeat": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851582/uri-music/upbeat/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851597/uri-music/upbeat/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851609/uri-music/upbeat/track-2.mp3",
+        f"{_MUSIC_CDN}/upbeat/track-0.mp3",
+        f"{_MUSIC_CDN}/upbeat/track-1.mp3",
+        f"{_MUSIC_CDN}/upbeat/track-2.mp3",
     ],
     "chill": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851623/uri-music/chill/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851634/uri-music/chill/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851652/uri-music/chill/track-2.mp3",
+        f"{_MUSIC_CDN}/chill/track-0.mp3",
+        f"{_MUSIC_CDN}/chill/track-1.mp3",
+        f"{_MUSIC_CDN}/chill/track-2.mp3",
     ],
     "cinematic": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851665/uri-music/cinematic/track-0.mp3",
+        f"{_MUSIC_CDN}/cinematic/track-0.mp3",
     ],
     "dramatic": [],  # falls back to cinematic
     "acoustic": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851680/uri-music/acoustic/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851690/uri-music/acoustic/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851704/uri-music/acoustic/track-2.mp3",
+        f"{_MUSIC_CDN}/acoustic/track-0.mp3",
+        f"{_MUSIC_CDN}/acoustic/track-1.mp3",
+        f"{_MUSIC_CDN}/acoustic/track-2.mp3",
     ],
     "electronic": [
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851717/uri-music/electronic/track-0.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851729/uri-music/electronic/track-1.mp3",
-        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851740/uri-music/electronic/track-2.mp3",
+        f"{_MUSIC_CDN}/electronic/track-0.mp3",
+        f"{_MUSIC_CDN}/electronic/track-1.mp3",
+        f"{_MUSIC_CDN}/electronic/track-2.mp3",
     ],
 }
 
@@ -1448,21 +1361,17 @@ def _original_to_timeline(
     t: float,
     keep_segments: List[Dict[str, float]],
     clamp: bool = False,
-    transition_dur: float = 0.0,
 ) -> Optional[float]:
     """Map a timestamp in the original video to its position in the output timeline.
-    transition_dur: when Cloudinary overlaps adjacent segments by this amount, each
-    subsequent segment starts earlier — pass the same value used in _build_cloudinary_cut_url.
     clamp: if t is in a cut, return the start of the next kept segment instead of None."""
     offset = 0.0
-    for i, seg in enumerate(keep_segments):
+    for seg in keep_segments:
         seg_dur = seg["src_end"] - seg["src_start"]
         if seg["src_start"] <= t <= seg["src_end"]:
             return offset + (t - seg["src_start"])
         if clamp and t < seg["src_start"]:
             return offset
-        overlap = transition_dur if i < len(keep_segments) - 1 else 0.0
-        offset += seg_dur - overlap
+        offset += seg_dur
     return None
 
 
@@ -1478,8 +1387,6 @@ def build_shotstack_timeline(
     job_id: str = "",
     music_url: Optional[str] = None,
     hook_text: str = "",
-    cloudinary_cut_url: str = "",   # pre-cut + transitioned video from Cloudinary
-    transition_dur: float = 0.0,    # overlap per cut used by Cloudinary (for SRT timing)
     logo_url: str = "",             # brand logo; slides in over the last 3s
     brand_name: str = "",           # brand name for lower-third and outro
     primary_color: str = "#FFD700", # caption active-word background + hook accent
@@ -1500,79 +1407,60 @@ def build_shotstack_timeline(
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
-    raw_total = sum(s["src_end"] - s["src_start"] for s in keep_segments)
-    # Cloudinary transitions overlap adjacent segments, reducing total duration
-    total_duration = raw_total - max(0, len(keep_segments) - 1) * transition_dur
+    total_duration = sum(s["src_end"] - s["src_start"] for s in keep_segments)
 
-    # ── Video track ───────────────────────────────────────────────────────────
+    # ── Video track: multi-clip Shotstack timeline, per-segment Ken Burns + skew ──
     video_clips: List[Dict] = []
 
     _orig_volume = 0 if mute_original_audio else 1
 
-    if cloudinary_cut_url:
-        # Cloudinary pre-rendered the cuts + transitions — Shotstack gets ONE clip.
-        # Apply a global slow zoom so the full video has forward motion.
-        video_clips = [{
-            "asset": {"type": "video", "src": cloudinary_cut_url, "volume": _orig_volume},
-            "start": 0,
-            "length": round(total_duration, 3),
+    timeline_pos = 0.0
+    for i, seg in enumerate(keep_segments):
+        seg_dur = seg["src_end"] - seg["src_start"]
+        if seg_dur < 0.1:
+            continue
+
+        seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
+        base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
+
+        clip: Dict[str, Any] = {
+            "asset": {
+                "type": "video",
+                "src": video_url,
+                "trim": seg["src_start"],
+                "volume": _orig_volume,
+            },
+            "start": round(timeline_pos, 3),
+            "length": round(seg_dur, 3),
             "fit": "cover",
-            "effect": "zoomInSlow",
-        }]
-        print(
-            f"[VideoProduction] using Cloudinary pre-cut URL ({len(keep_segments)} segments) "
-            f"orig_volume={_orig_volume}",
-            flush=True,
-        )
-    else:
-        # Fallback: multi-clip Shotstack timeline with per-segment Ken Burns + skew
-        timeline_pos = 0.0
-        for i, seg in enumerate(keep_segments):
-            seg_dur = seg["src_end"] - seg["src_start"]
-            if seg_dur < 0.1:
-                continue
+            "effect": base_effect,
+        }
 
-            seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
-            base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
+        if i > 0:
+            clip["transition"] = {"in": "zoom"}
 
-            clip: Dict[str, Any] = {
-                "asset": {
-                    "type": "video",
-                    "src": video_url,
-                    "trim": seg["src_start"],
-                    "volume": _orig_volume,
+        if seg_zooms:
+            z = seg_zooms[0]
+            clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
+            clip["transform"] = {
+                "rotate": {
+                    "angle": [
+                        {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
+                         "interpolation": "bezier", "easing": "easeOutBack"},
+                        {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
+                         "interpolation": "bezier", "easing": "easeOutCubic"},
+                    ]
                 },
-                "start": round(timeline_pos, 3),
-                "length": round(seg_dur, 3),
-                "fit": "cover",
-                "effect": base_effect,
+                "skew": {
+                    "x": [
+                        {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
+                         "interpolation": "bezier", "easing": "easeOutCubic"},
+                    ]
+                },
             }
 
-            if i > 0:
-                clip["transition"] = {"in": "zoom"}
-
-            if seg_zooms:
-                z = seg_zooms[0]
-                clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-                clip["transform"] = {
-                    "rotate": {
-                        "angle": [
-                            {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
-                             "interpolation": "bezier", "easing": "easeOutBack"},
-                            {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
-                             "interpolation": "bezier", "easing": "easeOutCubic"},
-                        ]
-                    },
-                    "skew": {
-                        "x": [
-                            {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
-                             "interpolation": "bezier", "easing": "easeOutCubic"},
-                        ]
-                    },
-                }
-
-            video_clips.append(clip)
-            timeline_pos += seg_dur
+        video_clips.append(clip)
+        timeline_pos += seg_dur
 
     # ── Caption track — 4 style types ────────────────────────────────────────
     # Each SRT entry is routed to exactly one type (standard / emphasis / metric / cta).
@@ -1590,8 +1478,8 @@ def build_shotstack_timeline(
     # ── Pass 1: map every SRT entry to timeline positions ────────────────────
     _mapped: List[tuple] = []   # (tl_start, tl_end, entry)
     for entry in srt_entries:
-        ts = _original_to_timeline(entry["start"], keep_segments, transition_dur=transition_dur)
-        te = _original_to_timeline(entry["end"],   keep_segments, clamp=True, transition_dur=transition_dur)
+        ts = _original_to_timeline(entry["start"], keep_segments)
+        te = _original_to_timeline(entry["end"],   keep_segments, clamp=True)
         if ts is None or te is None:
             continue
         ts = max(0.0, ts)
@@ -1732,7 +1620,7 @@ def build_shotstack_timeline(
             orig_at = float(sfx.get("at", -1))
             if orig_at < 0 or orig_at > video_duration:
                 continue
-            tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+            tl_at = _original_to_timeline(orig_at, keep_segments)
             if tl_at is None:
                 continue
             sfx_clips.append({
@@ -1771,7 +1659,7 @@ def build_shotstack_timeline(
         conf    = float(change.get("confidence", 1.0))
         if orig_at < 0 or orig_at >= video_duration or conf < _CONFIDENCE_THRESHOLD:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        tl_at = _original_to_timeline(orig_at, keep_segments)
         if tl_at is None:
             continue
         clip_start  = max(0.0, round(tl_at - _tc_dur / 2, 3))
@@ -1810,11 +1698,11 @@ def build_shotstack_timeline(
         ov_dur  = float(ov.get("duration", 1.5))
         if orig_at < 0 or orig_at >= video_duration:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        tl_at = _original_to_timeline(orig_at, keep_segments)
         if tl_at is None:
             # Timestamp landed in a cut — try up to 3s later to find a kept segment
             for nudge in (1.0, 2.0, 3.0):
-                tl_at = _original_to_timeline(min(orig_at + nudge, video_duration - 0.1), keep_segments, transition_dur=transition_dur)
+                tl_at = _original_to_timeline(min(orig_at + nudge, video_duration - 0.1), keep_segments)
                 if tl_at is not None:
                     break
         if tl_at is None:
@@ -1855,7 +1743,7 @@ def build_shotstack_timeline(
         br_dur = min(float(br.get("duration", 3.0)), 4.0)
         if orig_at < 0 or orig_at >= video_duration:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        tl_at = _original_to_timeline(orig_at, keep_segments)
         if tl_at is None:
             continue
         # Clamp duration so b-roll doesn't run past the timeline end
@@ -1911,8 +1799,8 @@ def build_shotstack_timeline(
     hook_clips: List[Dict] = []
     if hook_text:
         _hook_upper = hook_text.upper()
-        # Full-width colored banner with CSS word-wrap — works regardless of whether
-        # Cloudinary handles cuts. Width=720 matches Shotstack hd 9:16 canvas.
+        # Full-width colored banner with CSS word-wrap. Width=720 matches Shotstack
+        # hd 9:16 canvas.
         _hook_html = (
             "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
             "<style>"
@@ -2177,7 +2065,14 @@ async def run_production_job(
         print(f"[VideoProduction] job={job_id} {progress}% {message}", flush=True)
 
     try:
-        duration = _probe_duration(video_bytes)
+        # to_thread, not a direct call — _probe_duration shells out to ffprobe
+        # synchronously (up to a 30s timeout); called directly, that blocks
+        # THE ENTIRE event loop for the duration, including the /health
+        # endpoint, since this background job runs on the same loop as the
+        # HTTP server. Confirmed live: every video production run froze the
+        # whole backend long enough for ECS's health check to time out and
+        # kill the task, over and over, every ~40-50s.
+        duration = await asyncio.to_thread(_probe_duration, video_bytes)
         print(f"[VideoProduction] duration={duration:.1f}s", flush=True)
 
         # ── Load brand profile for branding overlays ──────────────────────────────
@@ -2241,7 +2136,9 @@ async def run_production_job(
             await update(30, "Captions disabled — skipping transcription…")
         else:
             await update(5, "Checking audio…")
-            has_speech = _probe_has_speech(video_bytes)
+            # Same event-loop-blocking risk as _probe_duration above — this one
+            # runs ffprobe AND ffmpeg volumedetect (up to 90s combined).
+            has_speech = await asyncio.to_thread(_probe_has_speech, video_bytes)
             print(f"[VideoProduction] has_speech={has_speech}", flush=True)
 
             if has_speech:
@@ -2279,10 +2176,12 @@ async def run_production_job(
         await update(30, "Cleaning audio…")
         cleaned_bytes = await _clean_audio(video_bytes)
 
-        # Write to the static server too as a fallback (reliable, no size
-        # limit), but the real upload is now a direct S3 put — S3 has no
-        # per-request size cap to dodge the way the old Cloudinary
-        # fetch-from-URL trick did.
+        # Also write to the static server regardless of S3 outcome below — a
+        # real, independent fallback if the S3 upload fails for any reason,
+        # not a workaround for a size cap S3 doesn't have (unlike the old
+        # Cloudinary direct-upload path, which capped at 95MB and was why
+        # this used to go through a URL-fetch indirection instead of just
+        # uploading cleaned_bytes directly, as it does now).
         await update(38, "Uploading clean video…")
         video_static_dir = "/app/static/videos"
         os.makedirs(video_static_dir, exist_ok=True)
@@ -2297,7 +2196,7 @@ async def run_production_job(
             print(f"[VideoProduction] static write failed: {e}", flush=True)
 
         clean_video_url = await _upload_to_cloudinary(cleaned_bytes, job_id)
-        # Fallback chain: S3 → static → Reap source
+        # Fallback chain: S3 -> static -> Reap source
         if not clean_video_url:
             clean_video_url = static_url or _reap_video_url
 
@@ -2442,40 +2341,8 @@ async def run_production_job(
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
 
-        # Build Cloudinary cut URL — hard cuts (no luma-matte) so both segment audio
-        # tracks never overlap, and transition_dur=0.0 keeps caption timestamps exact.
-        # Shotstack topic-change flash/swipe overlays provide visual polish at cut points.
-        luma_pid       = None   # hard cuts
-        transition_dur = 0.0
-        cloudinary_cut_url = ""
-        if "res.cloudinary.com" in (clean_video_url or ""):
-            cld_pid = _cloudinary_public_id(clean_video_url)
-            if cld_pid:
-                keep_segs_preview = _build_keep_segments(cuts, duration)
-                if len(keep_segs_preview) > 1:
-                    cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs_preview, luma_pid, transition_dur,
-                        hook_text=hook_text,
-                        primary_color=primary_color,
-                    )
-                    # Compute where each cut appears in the OUTPUT video.
-                    # With custom luma-matte transitions, total duration = sum(seg_durs).
-                    # (Transitions are overlaid, not additive — cuts happen at segment ends.)
-                    _cum = 0.0
-                    _marks = []
-                    for _seg in keep_segs_preview[:-1]:
-                        _cum += _seg["src_end"] - _seg["src_start"]
-                        _marks.append(f"{int(_cum // 60)}:{int(_cum % 60):02d}")
-                    print(
-                        f"[CloudinaryEdit] {len(keep_segs_preview)} segments → "
-                        f"luma-matte {luma_pid.split('/')[-1]} ({transition_dur}s) | "
-                        f"cuts at {', '.join(_marks)} in output | "
-                        f"{cloudinary_cut_url[:70]}…",
-                        flush=True,
-                    )
-
         timeline = build_shotstack_timeline(
-            video_url=clean_video_url,      # cleaned voice track (fallback path)
+            video_url=clean_video_url,      # cleaned voice track
             video_duration=duration,
             cuts=cuts,
             zooms=zooms,
@@ -2487,8 +2354,6 @@ async def run_production_job(
             music_url=music_url,
             music_volume=music_volume,
             hook_text=hook_text,
-            cloudinary_cut_url=cloudinary_cut_url,
-            transition_dur=transition_dur if cloudinary_cut_url else 0.0,
             logo_url=logo_url,
             brand_name=brand_name,
             primary_color=primary_color,
@@ -2635,36 +2500,8 @@ async def run_render_phase(job_id: str, db) -> None:
                 await update(62, "Selecting background music…")
                 music_url = _pick_music_url(music_mood)
 
-        # ── Stage 5: Build Cloudinary cut URL + Shotstack timeline ───────────────
+        # ── Stage 5: Build Shotstack timeline ─────────────────────────────────────
         await update(65, "Building edit timeline…")
-
-        # Resolve luma-matte PID from transition_style.
-        # Default "auto" uses hard cuts — no audio overlap and perfect caption sync.
-        # Luma-matte styles are still available on explicit request but require the
-        # transition_dur value to exactly match the uploaded luma-matte video's length.
-        _LUMA_BY_STYLE: Dict[str, Optional[str]] = {
-            "auto":          None,   # hard cuts by default — no audio overlap
-            "circle_wipe":   "uri-transitions/circle-wipe",
-            "diagonal_wipe": "uri-transitions/diagonal-wipe",
-            "flash":         None,
-            "swipe":         None,
-            "hard_cut":      None,
-            "none":          None,
-        }
-        luma_pid       = _LUMA_BY_STYLE.get(transition_style, None)
-        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR) if luma_pid else 0.0
-
-        cloudinary_cut_url = ""
-        if "res.cloudinary.com" in (clean_video_url or ""):
-            cld_pid = _cloudinary_public_id(clean_video_url)
-            if cld_pid:
-                keep_segs = _build_keep_segments(cuts, duration)
-                if len(keep_segs) > 1:
-                    cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs, luma_pid, transition_dur,
-                        hook_text=hook_text,
-                        primary_color=primary_color,
-                    )
 
         # ── Resolve icon overlays — fetch Lottie JSON (or build emoji HTML) ────────
         resolved_icon_overlays: List[Dict[str, Any]] = []
@@ -2693,8 +2530,6 @@ async def run_render_phase(job_id: str, db) -> None:
             job_id=job_id,
             music_url=music_url,
             hook_text=hook_text,
-            cloudinary_cut_url=cloudinary_cut_url,
-            transition_dur=transition_dur if cloudinary_cut_url else 0.0,
             logo_url=logo_url,
             brand_name=brand_name,
             primary_color=primary_color,

@@ -148,6 +148,29 @@ async def destination_already_answered(db, brand_id: str, thread_id: str) -> boo
     return bool((doc or {}).get("destination_answered"))
 
 
+async def remember_audience(db, brand_id: str, thread_id: str, *, variant: Optional[dict] = None,
+                            own_audience: str = "", passed: bool = False) -> None:
+    """Keep the audience picked for this campaign on the thread, so a later step (or a
+    page reload) that doesn't resend it doesn't put the plan picker back up. `passed`
+    records that the step went by with nothing to choose."""
+    if not (brand_id and thread_id) or not (variant or own_audience or passed):
+        return
+    await db[THREADS_COLLECTION].update_one(
+        {"brand_id": brand_id, "thread_id": thread_id},
+        {"$set": {"chosen_audience": {"variant": variant, "own_audience": own_audience, "passed": passed}}},
+    )
+
+
+async def chosen_audience(db, brand_id: str, thread_id: str) -> dict:
+    """The audience already picked in this thread, or {}."""
+    if not (brand_id and thread_id):
+        return {}
+    doc = await db[THREADS_COLLECTION].find_one(
+        {"brand_id": brand_id, "thread_id": thread_id}, {"_id": 0, "chosen_audience": 1}
+    )
+    return (doc or {}).get("chosen_audience") or {}
+
+
 async def thread_history(db, brand_id: str, thread_id: str) -> list[dict]:
     """The messages tagged to one thread, oldest first."""
     if not (brand_id and thread_id) or db is None:
@@ -157,6 +180,25 @@ async def thread_history(db, brand_id: str, thread_id: str) -> list[dict]:
                  {"_id": 0, "brand_id": 0, "user_id": 0})
            .sort("created_at", 1).limit(500))
     return await cur.to_list(length=500)
+
+
+def seed_message_from_card(card: dict) -> str:
+    """Same idea as seed_message_from_campaign, but for a Listening
+    "ad_test" card (PRD §9.3: "Alternatives... a proposed ad test, draft
+    only, requires approval") instead of a past launched campaign — a
+    plain-English brief built from the card's own evidence-backed action,
+    so a thread started from "Propose this as an ad" opens already primed
+    with the real angle instead of a blank "what do you want to advertise?"
+    Nothing here plans, drafts creative or launches anything — it only
+    seeds the first message of an ordinary draft thread the owner then
+    drives through Jane Ads exactly as if they'd typed it themselves."""
+    action = card.get("action") or {}
+    parts = [action.get("title") or f"Run an ad about {card.get('topic_name') or card.get('topic')}"]
+    if action.get("hook"):
+        parts.append(f"angle: {action['hook']}")
+    if action.get("cta"):
+        parts.append(f"goal: {action['cta']}")
+    return ". ".join(p for p in parts if p)
 
 
 def seed_message_from_campaign(camp: dict) -> str:

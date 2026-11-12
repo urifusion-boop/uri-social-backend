@@ -30,7 +30,7 @@ class TestRepositionDraftLogoRouter:
         ) as mock_reposition:
             with pytest.raises(HTTPException) as exc_info:
                 await reposition_draft_logo(
-                    draft_id="d1", request=req, db=MagicMock(), auth={"user_id": "u1"}
+                    draft_id="d1", request=req, db=MagicMock(), token={"user_id": "u1"}
                 )
         assert exc_info.value.status_code == 400
         assert "height" in exc_info.value.detail
@@ -45,7 +45,7 @@ class TestRepositionDraftLogoRouter:
             new=AsyncMock(return_value={"status": True, "responseData": {"image_url": "https://x/y.png"}}),
         ) as mock_reposition:
             response = await reposition_draft_logo(
-                draft_id="d1", request=req, db=fake_db, auth={"user_id": "u1"}
+                draft_id="d1", request=req, db=fake_db, token={"user_id": "u1"}
             )
 
         assert response.status_code == 200
@@ -62,7 +62,7 @@ class TestRepositionDraftLogoRouter:
             new=AsyncMock(return_value={"status": True, "responseData": {}}),
         ) as mock_reposition:
             await reposition_draft_logo(
-                draft_id="d1", request=req, db=MagicMock(), auth={"user_id": "u1"}
+                draft_id="d1", request=req, db=MagicMock(), token={"user_id": "u1"}
             )
         assert mock_reposition.call_args.kwargs["slide_index"] == 2
 
@@ -74,7 +74,7 @@ class TestRepositionDraftLogoRouter:
             new=AsyncMock(return_value={"status": False, "responseMessage": "No brand logo configured."}),
         ):
             response = await reposition_draft_logo(
-                draft_id="d1", request=req, db=MagicMock(), auth={"user_id": "u1"}
+                draft_id="d1", request=req, db=MagicMock(), token={"user_id": "u1"}
             )
         assert response.status_code == 400
 
@@ -84,5 +84,5 @@ class TestRepositionDraftLogoRouter:
 
         req = _fake_request({"x": 1, "y": 2, "width": 3, "height": 4})
         with pytest.raises(HTTPException) as exc_info:
-            await reposition_draft_logo(draft_id="d1", request=req, db=MagicMock(), auth={})
+            await reposition_draft_logo(draft_id="d1", request=req, db=MagicMock(), token={})
         assert exc_info.value.status_code == 401

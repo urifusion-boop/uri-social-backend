@@ -597,5 +597,5 @@ class TestCreativeCallSites:
 
     def test_generate_call_site_supplies_budget(self):
         src = open("app/agents/jane_ads/router.py").read()
-        i = src.index("creative = await generate_ad_creative(")
+        i = src.index("return await generate_ad_creative(")
         assert "budget_ngn=float(parsed.budget_ngn or 0)" in src[i:i+900]

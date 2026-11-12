@@ -6,6 +6,20 @@ on:
       - develop
   workflow_dispatch:
 
+# Without this, several quick pushes queue several parallel runs against the
+# same mutable image tag (uriteam/urisvc:uriagentdev) — an older run can
+# finish (and push) after a newer run already pushed, silently leaving the
+# VM running stale code even though git HEAD looks current.
+# cancel-in-progress is deliberately false: this workflow's deploy job runs
+# `docker compose down` then `up -d` on the live VM — killing a run between
+# those two steps would leave production down. Instead, let any in-flight
+# run finish safely, and only the single most-recently-queued run behind it
+# survives (GitHub Actions drops the others), so the final deploy always
+# matches the latest push without ever cutting off a deploy mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest

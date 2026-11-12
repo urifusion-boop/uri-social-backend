@@ -8,8 +8,21 @@ from app.domain.models.chat_model import (
 )
 from typing import Any, List
 import asyncio
+import re
 
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def _friendly_openai_message(error_message: str) -> str:
+    """OpenAI's SDK renders a failed call's error as "Error code: 429 -
+    {python dict repr}" — fine in a log line, not in an admin's inbox or
+    dashboard. Pulls out just the human sentence OpenAI actually sent
+    ('message': '...'), falling back to the raw text (trimmed) if the
+    shape doesn't match what's expected."""
+    match = re.search(r"'message':\s*'((?:[^'\\]|\\.)*)'", error_message)
+    if match:
+        return match.group(1).replace("\\'", "'")
+    return error_message[:300]
 
 
 async def _alert_openai_out_of_credit(error_message: str) -> None:
@@ -28,6 +41,7 @@ async def _alert_openai_out_of_credit(error_message: str) -> None:
     try:
         from app.database import get_db
         from app.services import platform_alerts
+        friendly = _friendly_openai_message(error_message)
         await platform_alerts.raise_alert(
             get_db(),
             kind="openai_insufficient_quota",
@@ -35,7 +49,7 @@ async def _alert_openai_out_of_credit(error_message: str) -> None:
             detail=(
                 "Every AI feature on the platform (Content Calendar, Social Listening, and anything "
                 "else that calls OpenAI) is down until the balance is topped up or auto-reload is "
-                f"enabled on the OpenAI account. Raw error: {error_message[:300]}"
+                f"enabled on the OpenAI account. OpenAI says: “{friendly}”"
             ),
         )
     except Exception as e:
@@ -104,18 +118,18 @@ class AIService:
             # branch below — OpenAI raises the exact same RateLimitError class and
             # 429 status for both a real rate limit AND a zero/negative account
             # balance, so the generic check used to catch every insufficient_quota
-            # error first and this branch was unreachable dead code here, same as
-            # in structured_chat_completion below. The "Our team has been
-            # notified" in this branch's own message used to be a promise this
-            # code could never keep, since it never actually ran.
+            # error first and this branch was unreachable dead code. That's why
+            # this service could never actually report "out of credit" even
+            # though it tried to — every failure of either kind came out as the
+            # same generic "temporarily unavailable" message.
             if "insufficient_quota" in error_message:
                 print("⚠️ OpenAI quota insufficient - credits exhausted")
                 await _alert_openai_out_of_credit(error_message)
-                return {"error": "Content generation is temporarily unavailable. Our team has been notified and will resolve this shortly."}
+                return {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
 
             if "RateLimitError" in str(type(e)) or "429" in error_message:
-                print("⚠️ OpenAI rate limit exceeded - quota exhausted")
-                return {"error": "We're experiencing high demand right now. Please try again in a few moments."}
+                print("⚠️ OpenAI rate limit exceeded")
+                return {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
 
             if "authentication" in error_message.lower() or "401" in error_message:
                 print("⚠️ OpenAI authentication error - invalid API key")

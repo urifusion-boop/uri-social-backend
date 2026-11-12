@@ -20,6 +20,9 @@ from app.agents.social_media_manager.routers.v3_toggle_endpoint import router as
 from app.agents.social_media_manager.routers.custom_visual_guides import router as custom_guides_router
 from app.agents.social_media_manager.routers.custom_visual_guides_v2 import router as custom_guides_v2_router
 from app.agents.social_media_manager.routers.canvas_editor import router as canvas_editor_router
+from app.agents.social_media_manager.routers.jane_router import router as jane_router
+from app.agents.visual_engine_v2.routers.visual_engine_v2_router import router as visual_engine_v2_router
+from app.agents.content_calendar_v2.routers.content_calendar_v2_router import router as content_calendar_v2_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -28,11 +31,10 @@ from app.routers.bug_report_router import router as bug_report_router
 from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
+from app.routers.admin_router import router as admin_router
 from app.agents.social_media_manager.routers.blog_router import router as blog_router
 from app.routers.agency_router import router as agency_router
 from app.agents.social_media_manager.routers.sdk_router import router as sdk_router
-from app.agents.social_media_manager.routers.jane_router import router as jane_router
-from app.routers.admin_router import router as admin_router
 from app.routers.jane_escalations_router import router as jane_escalations_router
 
 # Initialize Sentry
@@ -151,6 +153,19 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create scheduled_job_locks TTL index: {e}")
 
+    # TTL-expire per-account publish gates (services/rate_limit.py): one document per connected
+    # account holding its lease, minimum gap and any rate-limit pause. `expires_at` is set to a day
+    # past the latest of those, so an account's gate disappears once it has been quiet for a day.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["publish_account_gate"].create_index(
+            "expires_at", expireAfterSeconds=0, name="expires_at_ttl"
+        )
+        print("✅ publish_account_gate TTL index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create publish_account_gate TTL index: {e}")
+
     # TTL-expire daily-notification claims (NotificationService._try_claim_
     # daily_notification) — only needed to survive same-day duplicate-send
     # races, so a 2-day expiry is comfortably past its useful life.
@@ -196,10 +211,7 @@ _ALLOWED_ORIGINS = [
     # Staging — staging.urisocial.com/app-staging.urisocial.com/api-staging.urisocial.com
     # never actually existed as real DNS records; uri-staging (frontend) and
     # api-social-dev (backend) are the real CNAMEs, confirmed directly against
-    # the DNS provider's own record list. (Also fixes a real bug in the
-    # previous version here: a missing comma after uri-staging.urisocial.com
-    # silently concatenated it with the next string literal into one
-    # nonsensical origin that could never match a real request.)
+    # the DNS provider's own record list.
     "https://uri-staging.urisocial.com",
     "https://api-social-dev.urisocial.com",
     # Production
@@ -292,6 +304,14 @@ app.include_router(
 )
 
 # Include additional social platform routers
+from app.agents.inbox.router import router as inbox_router
+from app.agents.inbox.voice_router import router as inbox_voice_router
+app.include_router(inbox_router)
+app.include_router(inbox_voice_router)
+from app.agents.inbox.onebox_router import router as inbox_onebox_router
+app.include_router(inbox_onebox_router)
+from app.agents.jane_ads.growth.router import router as jane_ads_growth_router
+app.include_router(jane_ads_growth_router)
 app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
@@ -309,8 +329,18 @@ app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
 app.include_router(custom_guides_router)  # V1
 app.include_router(custom_guides_v2_router)  # V2 - Advanced style transfer
 
+# Include Visual Engine V2 (4-layer compositing system)
+app.include_router(visual_engine_v2_router, prefix="/social-media/visual-engine", tags=["Visual Engine V2"])
+
+# Include Content Calendar V2 (30-day content intelligence engine, staging-only —
+# see /Users/macintoshhd/.claude/plans/enchanted-wiggling-treehouse.md)
+app.include_router(content_calendar_v2_router, prefix="/social-media/content-calendar-v2", tags=["Content Calendar V2"])
+
 # Include Canvas Editor (layered document editing)
 app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])
+
+# Include Jane's First Message (personalized onboarding)
+app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Message"])
 
 # Include Agency Accounts (agency layer wrapping Jane) under both paths, same
 # dual-mount pattern as auth_router above. Bare /agency/* is what SDK/API-key
@@ -327,26 +357,18 @@ app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 # Include SDK router (API key authentication for external developers)
 app.include_router(sdk_router, tags=["SDK"])
 
-# Include Jane's First Message (personalized onboarding welcome message)
-app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Message"])
-
-# Jane + Ads (VSG-01 ad format library, campaign chat, connected ad-account flows)
+# Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
 from app.agents.jane_ads.router import router as jane_ads_router
 app.include_router(jane_ads_router)
-from app.agents.inbox.router import router as inbox_router
-from app.agents.inbox.voice_router import router as inbox_voice_router
-from app.agents.inbox.onebox_router import router as inbox_onebox_router
-app.include_router(inbox_router)
-app.include_router(inbox_voice_router)
-app.include_router(inbox_onebox_router)
-from app.agents.jane_ads.growth.router import router as jane_ads_growth_router
-app.include_router(jane_ads_growth_router)
 
-# Content Calendar V2 (30-day content intelligence engine) — replaces v1 as the
-# visible Calendar tab; v1's own routes/service are untouched underneath (still
-# used directly by V2's service module, see content_calendar_v2_service.py).
-from app.agents.content_calendar_v2.routers.content_calendar_v2_router import router as content_calendar_v2_router
-app.include_router(content_calendar_v2_router, prefix="/social-media/content-calendar-v2", tags=["Content Calendar V2"])
+# Uri Market Intelligence (PRD v1.0, dev-only while in testing) — social
+# listening: collect, classify, score, and surface evidence-backed insights.
+# Mock-adapter only for now; real provider adapters register into
+# scan_runner.ADAPTER_REGISTRY as they land. Do NOT port this include to
+# aws/prod until the feature is ready — see the module's own docstrings for
+# current status.
+from app.agents.market_intelligence.router import router as market_intelligence_router
+app.include_router(market_intelligence_router, tags=["Market Intelligence"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)

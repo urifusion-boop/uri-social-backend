@@ -9,6 +9,7 @@ service — see the plan this was built against for the full isolation
 rationale: /Users/macintoshhd/.claude/plans/enchanted-wiggling-treehouse.md
 """
 import asyncio
+from datetime import datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -131,10 +132,16 @@ async def regenerate_item_v2_endpoint(
     try:
         updated = await cal_v2_svc.regenerate_item_v2(
             plan_id, item_index, ctx["user_id"], db, brand_id=ctx["brand_id"], reason=request.reason,
+            regen_scope=request.scope, new_format=request.new_format,
         )
         return UriResponse.get_single_data_response("calendar_plan_v2", updated)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        # Bad scope/new_format is a client input error (400), not a missing
+        # plan/item (404) — regenerate_item_v2 validates scope before ever
+        # looking either up, so the message itself tells them apart.
+        msg = str(e)
+        status = 400 if ("scope" in msg or "new_format" in msg) else 404
+        raise HTTPException(status_code=status, detail=msg)
     except Exception as e:
         import traceback
         print(traceback.format_exc())
@@ -244,9 +251,17 @@ async def create_draft_from_item_v2(
             or int(item.get("carousel_slide_count") or 3)
         ) if is_carousel else 1
         if is_carousel and request.num_slides:
-            # The user picked their own slide count — it wins over the plan's
-            # 2-5 suggestion. 10 is Instagram's carousel limit.
-            planned_slides = max(2, min(10, int(request.num_slides)))
+            # The user picked their own slide count — it used to win outright
+            # up to Instagram's 10-slide platform limit, which let a calendar
+            # carousel ship with far more slides than the plan's own "never
+            # more than 3" rule (VALIDATION_RULES["carousel_slide_range"] in
+            # creative_framework.py) — the plan's suggested count already
+            # respects that cap; only this user-override path didn't.
+            # Confirmed live: a manually-picked slide count produced a
+            # published carousel well past 3 slides. Clamped to the same
+            # business rule here too, so it can't be bypassed by picking a
+            # bigger number.
+            planned_slides = max(2, min(3, int(request.num_slides)))
         estimated_credits = planned_slides if is_carousel else 1
 
         is_trial_user = await trial_service.has_active_trial(user_id)
@@ -306,6 +321,35 @@ async def create_draft_from_item_v2(
             drafts = result.get("responseData", {}).get("drafts", [])
             draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
             await cal_v2_svc.mark_acted_on_v2(plan_id, item_index, draft_ids, user_id, db, brand_id=brand_id)
+
+            # This item started life as a real Listening opportunity card
+            # (see _listening_candidate_concepts) — now that it's actually
+            # become a draft, close the loop back onto that card the same
+            # way the direct /listening/cards/{id}/create path does: same
+            # field shape as that endpoint's own mi_listen_card_actions
+            # insert (market/type are load-bearing — personalize.py's
+            # relevance-adjustment learning signal queries on them, not
+            # just card_id), so the learning loop (Listening PRD §11:
+            # "content created -> links insight -> asset -> post") sees
+            # this regardless of which of the two routes was used.
+            source_card_id = item.get("source_card_id")
+            if source_card_id and draft_ids:
+                now = datetime.utcnow()
+                source_card = await db["mi_listen_cards"].find_one(
+                    {"id": source_card_id, "brand_id": brand_id, "content_id": None}
+                )
+                if source_card:
+                    await db["mi_listen_cards"].update_one(
+                        {"id": source_card_id},
+                        {"$set": {"status": "acted", "content_id": draft_ids[0], "created_draft_ids": draft_ids,
+                                 "updated_at": now}},
+                    )
+                    await db["mi_listen_card_actions"].insert_one({
+                        "card_id": source_card_id, "brand_id": brand_id, "user_id": user_id, "action": "created",
+                        "content_id": draft_ids[0], "market": source_card["market"], "topic": source_card["topic"],
+                        "type": source_card["type"], "scores": source_card.get("scores"), "at": now,
+                        "via": "content_calendar_v2",
+                    })
 
             request_id = result.get("responseData", {}).get("request_id")
             # V2-only cost rule (deliberately diverges from v1's create_draft_from_calendar_day,

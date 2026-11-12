@@ -112,7 +112,7 @@ class CreditTransaction(BaseModel):
     amount: int = Field(..., description="Credit amount (negative for deduction)")
     balance_before: int = Field(..., description="Credit balance before transaction")
     balance_after: int = Field(..., description="Credit balance after transaction")
-    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing", "admin_adjustment"] = Field(..., description="Why credits changed")
+    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing", "video_generation", "admin_adjustment", "blog_generation", "image_retry", "whatsapp_image_edit"] = Field(..., description="Why credits changed")
     campaign_id: Optional[str] = Field(default=None, description="Reference to content_requests if applicable")
     retry_count: Optional[int] = Field(default=0, description="Retry number if applicable")
     notes: Optional[str] = Field(default=None, description="Free-text context — e.g. an admin's stated reason for a manual credit/trial adjustment, distinct from the fixed `reason` category")
@@ -145,11 +145,11 @@ class SubscriptionTier(BaseModel):
     tier_id: str = Field(..., description="starter|growth|pro|agency|custom")
     name: str = Field(..., description="Display name")
 
-    # Monthly pricing (base price)
+    # Monthly pricing (base price) - NGN
     price_ngn_monthly: int = Field(..., description="Monthly price in Nigerian Naira")
     credits_monthly: int = Field(..., description="Monthly credit allocation")
 
-    # Multi-duration pricing (calculated with 5% discount)
+    # Multi-duration pricing - NGN (calculated with 5% discount)
     price_ngn_3months: int = Field(..., description="3-month price with 5% discount")
     price_ngn_6months: int = Field(..., description="6-month price with 5% discount")
     price_ngn_12months: int = Field(..., description="12-month price with 5% discount")
@@ -349,22 +349,6 @@ class InitializePaymentRequest(BaseModel):
         }
 
 
-class PurchaseCustomCreditsRequest(BaseModel):
-    """
-    Request to buy an arbitrary quantity of bonus credits at a fixed
-    per-credit price (see PaymentService.CUSTOM_CREDIT_PRICE_NGN).
-    Credits are added as bonus_credits (never expire) once payment verifies.
-    """
-    quantity: int = Field(..., ge=1, le=1000, description="Number of credits to purchase (1-1000)")
-
-    class Config:
-        schema_extra = {
-            "example": {
-                "quantity": 10
-            }
-        }
-
-
 class InitializePaymentResponse(BaseModel):
     """Response with SQUAD payment data for inline modal"""
     payment_url: str = Field(..., description="SQUAD hosted checkout page (fallback)")
@@ -392,6 +376,22 @@ class VerifyPaymentRequest(BaseModel):
     transaction_ref: str = Field(..., description="SQUAD transaction reference")
 
 
+class PurchaseCustomCreditsRequest(BaseModel):
+    """
+    Request to buy an arbitrary quantity of bonus credits at a fixed
+    per-credit price (see PaymentService.CUSTOM_CREDIT_PRICE_NGN).
+    Credits are added as bonus_credits (never expire) once payment verifies.
+    """
+    quantity: int = Field(..., ge=1, le=1000, description="Number of credits to purchase (1-1000)")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "quantity": 10
+            }
+        }
+
+
 class CreditBalanceResponse(BaseModel):
     """
     User credit balance information with billing cycle
@@ -408,9 +408,14 @@ class CreditBalanceResponse(BaseModel):
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date")
     next_renewal: Optional[datetime] = None
     low_credit_warning: bool = Field(default=False, description="True if credits <= 3 (PRD 7.3)")
+    has_had_plan: bool = Field(
+        default=False,
+        description="True if the user has ever had a plan or bought credits (beyond the free trial). Lets the app "
+                    "tell 'trial ended' from 'your credits ran out' — the second must never be called a trial.",
+    )
     trial_credits_included: int = Field(
         default=0,
-        description="Portion of credits_remaining/total_credits coming from an unexpired trial, not the subscription/bonus wallet — the trial keeps running on its own clock independent of subscription status, so this can be nonzero even for a paid subscriber.",
+        description="Portion of credits_remaining/total_credits coming from an unexpired trial, not the subscription/bonus wallet. Not yet populated by get_credit_balance on this branch — always 0 today, kept as a real field so admin_router.py's tier-labeling logic has something safe to read rather than erroring.",
     )
 
     class Config:

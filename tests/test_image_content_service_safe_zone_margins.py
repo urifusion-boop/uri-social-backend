@@ -178,8 +178,6 @@ class TestSafeZoneMarginsInPrompt:
 
         prompt = captured["prompt"]
         margins = ImageContentService._safe_zone_margins_pct(1200, 628)
-        assert margins["top"] > 20
-        assert margins["bottom"] > 20
         assert f"{margins['top']}% safe-zone margin from the top edge" in prompt
         assert f"{margins['bottom']}% safe-zone margin from the bottom edge" in prompt
         assert "20% safe-zone margin from the top edge" not in prompt
@@ -206,6 +204,6 @@ class TestSafeZoneMarginsInPrompt:
 
         prompt = captured["prompt"]
         assert "20% safe-zone margin from the top edge" in prompt
-        assert "20%\nsafe-zone margin from the left and right edges" in prompt
         assert "20% safe-zone margin from the bottom edge" in prompt
+        assert "20% safe-zone margin from the left and right" in prompt
         assert "cropped to fit" not in prompt

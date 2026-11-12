@@ -47,16 +47,16 @@ CHANNELS = {
 }
 
 # In-app panel types the frontend already knows how to show.
-_PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_posted"}
+_PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_posted", "post_failed": "post_failed"}
 
-# The two alerts every brand has always received. They stay on until the brand
+# The alerts every brand has always received. They stay on until the brand
 # picks its own list of alerts — choosing only a channel (the normal state
 # after onboarding) must not silence them.
 _DEFAULT_EVENTS = {"post_ready", "post_published"}
 
-# Never optional: an owner must hear that a customer is waiting on a person,
-# whatever alerts they picked.
-_ALWAYS_EVENTS = {"inbox_needs_reply", "ad_growth_alert", "inbox_quota"}
+# Never optional: an owner must hear that a post didn't go out, or that a
+# customer is waiting on a person, whatever alerts they picked.
+_ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply", "ad_growth_alert", "inbox_quota"}
 
 # Sent here whatever channel the brand chose, on top of that channel. WhatsApp
 # only goes to owners who linked a number (see notify).
@@ -103,6 +103,8 @@ def channels_for(event: str, prefs: Dict[str, Any]) -> List[str]:
         out.append("email")  # no channel chosen: these two have always gone by email
     if event == "post_ready":
         out += prefs["approval_channels"]
+    # A customer waiting on a person always reaches the owner directly too: a
+    # Slack or push alert alone is easy to miss, and nobody sits on a dashboard.
     out += _DIRECT_TOO.get(event, [])
     seen: List[str] = []
     for c in out:
@@ -204,6 +206,7 @@ async def notify(
     meta = {**(metadata or {}), "brand_id": brand_id, "dedupe_key": dedupe_key, "link": link}
     results: Dict[str, Any] = {}
     for channel in channels_for(event, prefs):
+        # Added on top rather than chosen: no linked number means nothing to send.
         if channel == "whatsapp" and prefs["channel"] != "whatsapp" and not user.get("whatsapp_phone"):
             continue
         try:

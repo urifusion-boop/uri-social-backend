@@ -237,8 +237,19 @@ Write one caption. No alternatives, no meta-commentary.
         """Every word the brand has said never to use (see brand_brief.banned_words)."""
         return brand_brief.banned_words(brand_context)
 
+    # A calendar-sourced idea already IS a roughly 60-word caption (content_
+    # calendar_v2's own MAX_CAPTION_WORDS) — the platform prompts below ask
+    # for 80-300 words and literally say "CONTENT TO TRANSFORM", which reads
+    # as "expand this" to the model. Confirmed live: calendar-generated
+    # posts came out noticeably wordier than the plan's own preview text for
+    # exactly that reason. This caps what the real draft asks for when the
+    # seed is calendar-sourced, instead of the platform's normal range.
+    CALENDAR_SEED_TYPE = "calendar_v2_idea"
+    CALENDAR_MAX_WORDS = 70
+
     @staticmethod
-    def build_caption_prompt(seed_content: str, platform: str, brand_context: Optional[Dict[str, Any]]) -> str:
+    def build_caption_prompt(seed_content: str, platform: str, brand_context: Optional[Dict[str, Any]],
+                             seed_type: str = "text") -> str:
         """The complete prompt a caption is written from. One place, so real
         posts and "Preview Jane's voice" can never drift apart. Order:
           1. Banned patterns (universal)
@@ -250,6 +261,12 @@ Write one caption. No alternatives, no meta-commentary.
         brand_context = brand_brief.for_platform(brand_context, platform)
         brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
         platform_prompt = ContentGenerationService.PLATFORM_PROMPTS[platform].format(seed_content=seed_content)
+        if seed_type == ContentGenerationService.CALENDAR_SEED_TYPE:
+            platform_prompt += (
+                f"\n\nThis idea already came pre-written and concise — do not expand or pad it into a "
+                f"longer post. Write roughly {ContentGenerationService.CALENDAR_MAX_WORDS} words or fewer, "
+                "ignoring any longer word range suggested above for this platform."
+            )
         voice_instructions = ""
         if brand_context and brand_context.get("voice_profile"):
             voice_profile = dict(brand_context["voice_profile"])
@@ -336,6 +353,35 @@ Write one caption. No alternatives, no meta-commentary.
             parts.append(
                 f'- Brand website: {brand_context["website"]}. '
                 f'You may reference it naturally in a CTA if it fits the content.'
+            )
+
+        if brand_context.get("unique_selling_proposition"):
+            parts.append(
+                f'- What makes this brand different: {brand_context["unique_selling_proposition"]}. '
+                f'Let this differentiation show through naturally, especially in hooks or CTAs.'
+            )
+
+        if brand_context.get("price_range"):
+            parts.append(
+                f'- Price positioning: {brand_context["price_range"]}. '
+                f'Match the tone and vocabulary to this price tier (e.g. don\'t use budget '
+                f'language for a premium brand, or exclusive/luxury language for a budget one).'
+            )
+
+        if brand_context.get("business_stage"):
+            # Same wording as calendar_rules.py's _STAGE_GUIDANCE — a
+            # single source of truth so a single post and a calendar week never
+            # disagree on what "new"/"growing"/etc. actually means for tone.
+            from .calendar_rules import _STAGE_GUIDANCE
+            guidance = _STAGE_GUIDANCE.get(brand_context["business_stage"])
+            if guidance:
+                parts.append(f'- Business stage: this is {guidance}.')
+
+        priorities = brand_context.get("business_priorities")
+        if isinstance(priorities, list) and priorities:
+            parts.append(
+                f'- Current business priorities: {", ".join(priorities[:4])}. '
+                f'Lean into these where the post naturally supports them.'
             )
 
         # ── Voice & tone ──────────────────────────────────────────────────────
@@ -661,7 +707,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         generation_tasks = []
         for platform in valid_platforms:
             task = ContentGenerationService._generate_platform_content(
-                platform, enriched_seed_content, request_id, user_id, brand_context
+                platform, enriched_seed_content, request_id, user_id, brand_context, seed_type=seed_type
             )
             generation_tasks.append(task)
         
@@ -725,17 +771,33 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                     upsert=True,
                 )
                 # Save each draft
+                _brand_id = (brand_context or {}).get("brand_id")
                 for draft in drafts:
+                    draft_doc = {
+                        **draft,
+                        "request_id": request_id,
+                        "user_id": user_id,
+                        # Live-reported: "pending" here put every freshly
+                        # generated draft straight into Content Library's
+                        # "Needs Review" bucket by default, with no actual
+                        # review step ever submitting it there (submit_for_approval
+                        # in approval_workflow_service.py is dead code — no
+                        # router ever calls it) and no way for a user to tell
+                        # "Needs Review" apart from "just generated, untouched".
+                        # "approved" is the value content_calendar_v2_service.py's
+                        # own repurposing-candidate query already treats as a
+                        # normal, usable draft — matches that existing
+                        # convention and lands in Content Library's "Draft"
+                        # bucket like every other normal draft does.
+                        "approval_status": "approved",
+                        "created_at": generated_at,
+                        "updated_at": generated_at,
+                    }
+                    if _brand_id:
+                        draft_doc["brand_id"] = _brand_id
                     await db["content_drafts"].replace_one(
                         {"id": draft["id"]},
-                        {
-                            **draft,
-                            "request_id": request_id,
-                            "user_id": user_id,
-                            "approval_status": "pending",
-                            "created_at": generated_at,
-                            "updated_at": generated_at,
-                        },
+                        draft_doc,
                         upsert=True,
                     )
             except Exception as db_err:
@@ -768,6 +830,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         request_id: str,
         user_id: str,
         brand_context: Optional[Dict[str, Any]] = None,
+        seed_type: str = "text",
     ) -> Dict[str, Any]:
         """
         Generate content for a specific platform using your existing AIService
@@ -781,7 +844,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         brand_context = brand_brief.for_platform(brand_context, platform)
         try:
             # Get platform-specific prompt
-            prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context)
+            prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context, seed_type)
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
@@ -813,10 +876,13 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
             is_thread = platform in ("twitter", "x")
             # Everything the writer was given — a statistic that isn't in here was invented.
             sources = f"{seed_content}\n{json.dumps(brand_context or {}, default=str, ensure_ascii=False)}"
+            max_words = (ContentGenerationService.CALENDAR_MAX_WORDS
+                        if seed_type == ContentGenerationService.CALENDAR_SEED_TYPE else None)
 
             def _check(text: str):
                 style = CaptionValidatorService.validate_caption(
-                    ContentGenerationService._for_validation(text, platform), custom_banned_words)
+                    ContentGenerationService._for_validation(text, platform), custom_banned_words,
+                    max_words=max_words)
                 if is_thread:
                     # A thread is laid out as tweets, not as one phone-screen caption.
                     kept = [i for i in style["issues"] if i not in ("wall_of_text", "insufficient_line_breaks")]

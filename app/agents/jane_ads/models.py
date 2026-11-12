@@ -227,6 +227,13 @@ class CampaignPlan(BaseModel):
                                              # Meta rejects link-ad creation with no real media
                                              # attached, so the real adapter needs this, not just
                                              # the platform/budget decision
+    # The other concepts being tested beside `creative`, one ad set each (concepts.py).
+    concepts: list["AdCreative"] = Field(default_factory=list)
+    # single_ad_set: every ad in one ad set. abo: one ad set each, budget split equally.
+    ad_layout: str = "single_ad_set"
+    # How many ads Jane is still working up to. One request can't make them all before
+    # the connection times out, so the rest are added one at a time after the plan.
+    concepts_wanted: int = 0
     shoot_script: Optional["ShootScript"] = None  # Path C — set only when creative.video_recommendation
                                              # fired; the user can film this and swap it in via
                                              # POST /meta/plan/{id}/creative before launching
@@ -243,6 +250,14 @@ class CampaignPlan(BaseModel):
                                              # {} — broad on this axis — when nothing resolved;
                                              # merged with geo.meta_targeting_from_geo() at
                                              # launch, never replaces it.
+    campaign_group_id: Optional[str] = None # Set only for a multi-platform campaign — ties
+                                             # this plan to its sibling plans launched for the
+                                             # SAME brief on other platforms (frontend generates
+                                             # one id, sends it on each platform's own
+                                             # single-platform request). Pure passthrough tag,
+                                             # stored on this plan's record and the adapter's
+                                             # campaign doc — never read by any planning/launch
+                                             # decision. None on every ordinary single-platform plan.
 
 
 class SpendAuthorization(BaseModel):
@@ -399,6 +414,12 @@ class AdCreative(BaseModel):
     # event pipeline yet to emit it to (see that module's own docstring).
     vsg01_format_id: str = ""
     vsg01_format_attributes: dict = Field(default_factory=dict)
+    # What this creative IS (creative_paths.provenance): the production path, whether
+    # it's synthetic, and for UGC who is speaking and on what terms. Empty for the
+    # paths that predate it.
+    provenance: dict = Field(default_factory=dict)
+    # Which test concept this creative is, when one campaign tests several (concepts.py).
+    concept: str = ""
 
 
 # ── Path C: script-and-shoot (PRD §4.1) ───────────────────────────────────────

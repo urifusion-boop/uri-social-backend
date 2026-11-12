@@ -9,6 +9,7 @@ can't be made returns nothing rather than a false alarm.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from typing import Optional
 
@@ -18,7 +19,6 @@ from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
 _RATIO_OK = ((9 / 16, 0.03), (4 / 5, 0.03), (1.0, 0.03))
 _MAX_STORY_SECONDS = 60
 _FORMATS_OK = {"mp4", "mov", "gif"}
-_TRANSFORM_OR_VERSION = re.compile(r"^(v\d+|[a-z]{1,3}_[^/]*)$")
 
 
 def whatsapp_link_steps(number: str) -> str:
@@ -52,34 +52,41 @@ async def whatsapp_warning(plan) -> list[str]:
     ]
 
 
-def _public_id(url: str) -> str:
-    _, sep, tail = (url or "").partition("/video/upload/")
-    if not sep:
-        return ""
-    parts = tail.split("?")[0].split("/")
-    while len(parts) > 1 and _TRANSFORM_OR_VERSION.match(parts[0]):
-        parts.pop(0)
-    return re.sub(r"\.\w+$", "", "/".join(parts))
-
-
 async def video_facts(url: str) -> Optional[dict]:
-    """width, height, duration (s), format of a Cloudinary-hosted video; None if unknown."""
-    public_id = _public_id(url)
-    if not public_id:
+    """width, height, duration (s), format of a video at any URL; None if unknown.
+
+    ffprobe reads the container headers directly over HTTP(S) — no admin API
+    or hosting-provider-specific lookup needed, so this works the same for an
+    S3 URL as it used to for a Cloudinary one."""
+    if not url:
         return None
-
-    def fetch() -> dict:
-        import cloudinary.api
-        return cloudinary.api.resource(public_id, resource_type="video")
-
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", url,
+    ]
     try:
-        info = await asyncio.to_thread(fetch)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        data = json.loads(stdout.decode())
     except Exception:
         return None
-    if not info.get("width") or not info.get("height"):
+
+    width = height = 0
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video":
+            width, height = s.get("width", 0), s.get("height", 0)
+            break
+    if not width or not height:
         return None
-    return {"width": info["width"], "height": info["height"],
-            "duration": info.get("duration"), "format": (info.get("format") or "").lower()}
+    duration_raw = data.get("format", {}).get("duration")
+    fmt = (data.get("format", {}).get("format_name") or "").split(",")[0]
+    ext = (re.sub(r"\?.*$", "", url).rsplit(".", 1)[-1] if "." in url else fmt).lower()
+    return {"width": width, "height": height,
+            "duration": float(duration_raw) if duration_raw else None, "format": ext}
 
 
 def video_problems(facts: dict) -> list[str]:

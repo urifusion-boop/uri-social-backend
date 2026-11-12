@@ -150,13 +150,17 @@ async def seed_subscription_tiers():
             "price_ngn_3months": 750,
             "price_ngn_6months": 750,
             "price_ngn_12months": 750,
+            "price_usd_monthly": 1,
+            "price_usd_3months": 1,
+            "price_usd_6months": 1,
+            "price_usd_12months": 1,
             "credits_monthly": 1,
             "price_ngn": 750,  # Legacy
             "credits": 1,  # Legacy
             "price_per_credit": 750,
             "features": [
                 "Pay Per Credit",
-                "₦750 per Campaign",
+                "₦750 / $1 per Campaign",
                 "All Features Included",
                 "No Monthly Commitment"
             ],
