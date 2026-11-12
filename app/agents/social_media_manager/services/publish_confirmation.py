@@ -49,6 +49,25 @@ _RECONNECT_MARKERS = (
 # gets a message that tells the owner to do the wrong thing.
 _SPECIFIC_CAUSES = [
     (
+        # Outstand switched off (outstand_service.OUTSTAND_DISABLED_MESSAGE), or Outstand's
+        # own "no active subscription" — either way this connection can't publish until
+        # it's reconnected directly.
+        "connected through outstand",
+        lambda name: (
+            f"Your {name} account was connected through Outstand, which URI no longer uses. Reconnect {name} "
+            f"in Connected Accounts with the Connect button, then publish this post again."
+        ),
+        True,
+    ),
+    (
+        "does not have an active subscription",
+        lambda name: (
+            f"Your {name} account was connected through Outstand, which URI no longer uses. Reconnect {name} "
+            f"in Connected Accounts with the Connect button, then publish this post again."
+        ),
+        True,
+    ),
+    (
         "confirm your identity",
         lambda name: (
             f"{name} needs you to confirm your identity before this Page can publish. This is a security check "
