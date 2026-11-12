@@ -38,6 +38,14 @@ CONNECTIONS = "social_connections"
 _TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
 _API_BASE = "https://open.tiktokapis.com/v2"
 
+# What a direct TikTok connection asks the user to grant. user.info.stats (follower / like /
+# video totals) and video.list (per-video views, likes, comments, shares) feed the Performance
+# page; both must be approved on the TikTok developer app or TikTok refuses the whole consent
+# screen with scope_not_authorized.
+TIKTOK_SCOPES = "user.info.basic,user.info.stats,video.list,video.publish"
+# The two read scopes a connection made before they were added is missing.
+ANALYTICS_SCOPES = ("user.info.stats", "video.list")
+
 # TikTok access tokens live 2h (24h before 1 Dec 2026) and the response's expires_in says
 # which — refresh a bit early so a publish never races a token that expires mid-flight.
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
@@ -152,7 +160,7 @@ def build_authorize_url(client_key: str, redirect_uri: str, state: str) -> str:
     params = {
         "client_key": client_key,
         "redirect_uri": redirect_uri,
-        "scope": "user.info.basic,video.publish",
+        "scope": TIKTOK_SCOPES,
         "response_type": "code",
         "state": state,
         "disable_auto_auth": 1,
@@ -192,6 +200,58 @@ async def fetch_user_info(access_token: str) -> dict:
     data = resp.json()
     _raise_for_error(data, "user info fetch")
     return (data.get("data") or {}).get("user") or {}
+
+
+def has_analytics_scopes(connection_doc: dict) -> bool:
+    """Whether this connection's user granted the read scopes the Performance page needs. A
+    connection made before they were requested has no record of them and must reconnect once."""
+    granted = {x.strip() for x in str(connection_doc.get("granted_scopes") or "").split(",") if x.strip()}
+    return all(sc in granted for sc in ANALYTICS_SCOPES)
+
+
+async def fetch_user_stats(access_token: str) -> dict:
+    """Profile totals — follower_count, following_count, likes_count, video_count — for the
+    connected account. Needs the user.info.stats scope."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{_API_BASE}/user/info/",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"fields": "open_id,display_name,avatar_url,follower_count,following_count,likes_count,video_count"},
+        )
+    data = _checked(resp, "user stats fetch")
+    return (data.get("data") or {}).get("user") or {}
+
+
+_VIDEO_FIELDS = (
+    "id,create_time,cover_image_url,share_url,video_description,title,duration,"
+    "view_count,like_count,comment_count,share_count"
+)
+
+
+async def list_videos(access_token: str, max_videos: int = 60) -> list[dict]:
+    """The account's most recent public videos, newest first, with their lifetime view / like /
+    comment / share counts. Needs the video.list scope. TikTok pages 20 at a time."""
+    videos: list[dict] = []
+    cursor: Optional[int] = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        while len(videos) < max_videos:
+            body: dict = {"max_count": 20}
+            if cursor is not None:
+                body["cursor"] = cursor
+            resp = await client.post(
+                f"{_API_BASE}/video/list/",
+                params={"fields": _VIDEO_FIELDS},
+                headers=_headers(access_token),
+                json=body,
+            )
+            inner = _checked(resp, "video list").get("data") or {}
+            videos.extend(inner.get("videos") or [])
+            if not inner.get("has_more"):
+                break
+            cursor = inner.get("cursor")
+            if cursor is None:
+                break
+    return videos[:max_videos]
 
 
 async def _refresh_tokens(refresh_token: str) -> dict:
