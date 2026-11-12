@@ -1860,10 +1860,12 @@ async def facebook_direct_callback(
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
-            # Several Pages: let the owner choose which one(s) to connect instead of silently
-            # taking the first (live-reported: "there was no option to select which of my
-            # Facebook Pages"). Same stash-and-pick shape as Instagram's direct connect.
-            if len(pages) > 1:
+            # Always let the owner choose which Page(s) to connect — even when there's only
+            # one — so nothing is connected until they pick it (live-reported twice: first
+            # "no option to select which of my Facebook Pages", then "it just connects, I
+            # want to see the available Pages first even if it's just one"). Same
+            # stash-and-pick shape as Instagram's direct connect.
+            if pages:
                 import secrets
                 token = secrets.token_urlsafe(24)
                 await db["pending_facebook_connections"].insert_one({
