@@ -1860,7 +1860,35 @@ async def facebook_direct_callback(
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
-            # Use the first page (most users have one main page)
+            # Several Pages: let the owner choose which one(s) to connect instead of silently
+            # taking the first (live-reported: "there was no option to select which of my
+            # Facebook Pages"). Same stash-and-pick shape as Instagram's direct connect.
+            if len(pages) > 1:
+                import secrets
+                token = secrets.token_urlsafe(24)
+                await db["pending_facebook_connections"].insert_one({
+                    "token": token,
+                    "pages": [
+                        {
+                            "page_id": p["id"],
+                            "page_name": p.get("name") or "Facebook Page",
+                            "page_access_token": p.get("access_token"),
+                            "profile_picture_url": (
+                                p.get("picture", {}).get("data", {}).get("url", "")
+                                if isinstance(p.get("picture"), dict) else ""
+                            ),
+                        }
+                        for p in pages if p.get("id") and p.get("access_token")
+                    ],
+                    "created_at": datetime.utcnow(),
+                })
+                print(f"[FBDirectOAuth] {len(pages)} Pages — awaiting the owner's pick (token={token})")
+                pick_redirect = f"{web_app_url}/workspace/?tab=connections"
+                return RedirectResponse(
+                    f"{pick_redirect}&connected=facebook_pending&token={urllib.parse.quote(token)}"
+                )
+
+            # Exactly one Page: connect it straight away.
             page = pages[0]
             page_id = page["id"]
             page_name = page["name"]
@@ -1929,6 +1957,85 @@ async def facebook_direct_finalize(
         raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
+
+
+@router.get("/connect/facebook-direct/pending/{token}")
+async def facebook_direct_pending(token: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """The Facebook Pages awaiting the owner's pick, stashed by the callback when the
+    Meta login manages more than one Page. Never returns Page tokens."""
+    pending = await db["pending_facebook_connections"].find_one({"token": token})
+    if not pending:
+        return UriResponse.error_response(
+            "This connection session has expired — please connect Facebook again.", code=404
+        )
+    return UriResponse.get_single_data_response("pending_facebook_connection", {
+        "token": token,
+        "pages": [
+            {"page_id": p["page_id"], "page_name": p.get("page_name"),
+             "profile_picture_url": p.get("profile_picture_url")}
+            for p in pending.get("pages", [])
+        ],
+    })
+
+
+@router.post("/connect/facebook-direct/finalize-pending")
+async def facebook_direct_finalize_pending(
+    body: Dict[str, Any],
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """Connect the Facebook Page(s) the owner picked. Stored active straight away (this
+    call is already authenticated), exactly like the single-Page path ends up after
+    /finalize. Only the picked Pages are consumed from the session."""
+    from app.models.brand_account import BrandAccount
+    from datetime import timezone
+
+    token = body.get("token")
+    page_ids = body.get("page_ids") or ([body["page_id"]] if body.get("page_id") else [])
+    if not token or not page_ids:
+        raise HTTPException(status_code=400, detail="token and page_ids are required")
+
+    pending = await db["pending_facebook_connections"].find_one({"token": token})
+    if not pending:
+        raise HTTPException(status_code=404, detail="This connection session has expired — please connect Facebook again.")
+
+    by_id = {p["page_id"]: p for p in pending.get("pages", [])}
+    chosen = [by_id[i] for i in page_ids if i in by_id]
+    if not chosen:
+        raise HTTPException(status_code=400, detail="Those Pages weren't part of this connection session.")
+
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    now = datetime.now(timezone.utc).isoformat()
+
+    connected = []
+    for p in chosen:
+        conn_doc = {
+            "id": f"fb_{p['page_id']}",
+            "user_id": user_id,
+            "platform": "facebook",
+            "connected_via": "facebook_direct_oauth",
+            "page_id": p["page_id"],
+            "page_access_token": p["page_access_token"],
+            "account_name": p.get("page_name") or "Facebook Page",
+            "profile_picture_url": p.get("profile_picture_url") or "",
+            "connection_status": "active",
+            "connected_at": now,
+            "updated_at": now,
+        }
+        if not is_personal:
+            conn_doc["brand_id"] = brand_id
+        await db["social_connections"].update_one({"id": conn_doc["id"]}, {"$set": conn_doc}, upsert=True)
+        connected.append({"page_id": p["page_id"], "page_name": conn_doc["account_name"]})
+
+    remaining = [p for p in pending.get("pages", []) if p["page_id"] not in {c["page_id"] for c in connected}]
+    if remaining:
+        await db["pending_facebook_connections"].update_one({"token": token}, {"$set": {"pages": remaining}})
+    else:
+        await db["pending_facebook_connections"].delete_one({"token": token})
+
+    return UriResponse.get_single_data_response("facebook_connected", {"connected": connected, "total": len(connected)})
 
 
 # ── TikTok direct — Content Posting API via FILE_UPLOAD, bypassing Outstand.
