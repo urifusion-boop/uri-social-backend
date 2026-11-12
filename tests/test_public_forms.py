@@ -114,15 +114,16 @@ def test_contact_is_rate_limited_per_ip(env):
     assert codes == [200] * mod._RATE_LIMIT + [429]
 
 
-def test_waitlist_dedupes_by_email_and_only_notifies_first_time(env):
+def test_waitlist_dedupes_by_email_but_notifies_every_time(env):
     client, db, sent = env
     assert client.post("/public/api-waitlist", json={"email": "A@B.com"}).status_code == 200
     assert client.post("/public/api-waitlist", json={"email": "a@b.com", "name": "Ada"}).status_code == 200
 
     (row,) = db["api_waitlist"].docs
     assert row["email"] == "a@b.com" and row["name"] == "Ada"
-    assert len(sent) == 1 and sent[0]["to_email"] == "urisocialinsight@gmail.com"
-    assert "Name" not in sent[0]["html_body"]
+    assert [m["to_email"] for m in sent] == ["urisocialinsight@gmail.com"] * 2
+    assert sent[0]["subject"].endswith("New signup") and sent[1]["subject"].endswith("Repeat signup")
+    assert all("Name" not in m["html_body"] for m in sent)
 
 
 def test_waitlist_rejects_bad_email(env):
