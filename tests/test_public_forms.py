@@ -73,7 +73,7 @@ def test_contact_stores_and_emails_hello(env):
     assert doc["email"] == "zinop96@gmail.com" and doc["message"] == "hello"
 
     (mail,) = sent
-    assert mail["to_email"] == "hello@urisocial.com"
+    assert mail["to_email"] == "urisocialinsight@gmail.com"
     assert mail["reply_to"].lower() == "zinop96@gmail.com"
     assert "General Inquiry" in mail["subject"]
 
@@ -121,7 +121,8 @@ def test_waitlist_dedupes_by_email_and_only_notifies_first_time(env):
 
     (row,) = db["api_waitlist"].docs
     assert row["email"] == "a@b.com" and row["name"] == "Ada"
-    assert len(sent) == 1 and sent[0]["to_email"] == "hello@urisocial.com"
+    assert len(sent) == 1 and sent[0]["to_email"] == "urisocialinsight@gmail.com"
+    assert "Name" not in sent[0]["html_body"]
 
 
 def test_waitlist_rejects_bad_email(env):
