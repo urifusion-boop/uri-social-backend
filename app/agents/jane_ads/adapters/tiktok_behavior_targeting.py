@@ -9,8 +9,10 @@ Field names and limits below are from TikTok's own Marketing API SDK (adgroup/cr
   * actions[]  {action_scene, action_period, video_user_actions, action_category_ids}. action_scene is VIDEO_RELATED
     (watched / liked / commented / shared, over 7 or 15 days), CREATOR_RELATED (follows / visits a creator's page) or
     HASHTAG_RELATED (viewed a hashtag). Valid only when TikTok is the only placement, which is how Jane launches.
-    Video ids come from GET /tool/action_category/, hashtag ids from GET /tool/hashtag/recommend/. Live on staging
-    (2026-11-11): VIDEO_RELATED accepted; CREATOR_RELATED rejected with those same ids, so it is left out.
+    Video AND creator ids both come from GET /tool/action_category/, one flat list whose entries each carry an
+    action_scene (CREATOR_RELATED / VIDEO_RELATED) and have separate ids, so each scene must be given only its own
+    (staging 2026-11-11: creator scene rejected when handed video ids). Creator actions are FOLLOWING / VIEW_HOMEPAGE,
+    not the video ones. Hashtag ids come from GET /tool/hashtag/recommend/.
   * purchase_intention_keyword_ids, from GET /tool/interest_keyword/recommend/ with audience_type=PURCHASE_INTENTION.
     The SDK says TikTok accepts it only for the App promotion, Conversions and Product sales objectives, but the
     Ads Manager offers it on Jane's Traffic campaigns, so it is tried on every launch and dropped (see
@@ -30,6 +32,7 @@ import httpx
 from app.core.config import settings
 
 VIDEO_ACTIONS = ["WATCHED_TO_END", "LIKED", "COMMENTED", "SHARED"]
+CREATOR_ACTIONS = ["FOLLOWING", "VIEW_HOMEPAGE"]
 HASHTAG_ACTIONS = ["VIEW_HASHTAG"]
 VIDEO_ACTION_DAYS = 15            # the longer of TikTok's 7 / 15 day windows: a wider, not a tighter, audience
 MAX_ACTION_CATEGORIES = 3         # per scene; Jane's interests are already few, and each one narrows the audience
@@ -53,21 +56,28 @@ class BehaviorTargeting:
         return out
 
     def attempts(self) -> list:
-        """The field sets to try for the ad group, widest first, ending with none: everything, then the interactions
-        without purchase intention, then one interaction at a time, then purchase intention alone. A rejected create
-        leaves nothing behind, so one audience TikTok does not accept costs only the others' retries, not the launch."""
+        """The field sets to try for the ad group, widest first, ending with none: everything, then everything but one
+        audience (purchase intention first, the one TikTok is likeliest to refuse), then one interaction at a time, then
+        purchase intention alone. A rejected create leaves nothing behind, so an audience TikTok does not accept costs
+        only a few retries, not the launch and not the audiences that are accepted."""
         out: list = []
 
         def add(d: dict) -> None:
             if d and d not in out:
                 out.append(d)
 
-        add(self.fields())
-        add({"actions": self.actions} if self.actions else {})
+        def build(actions: list, purchase: list) -> dict:
+            return {**({"actions": actions} if actions else {}),
+                    **({"purchase_intention_keyword_ids": purchase} if purchase else {})}
+
+        purchase = self.purchase_intention_keyword_ids
+        add(build(self.actions, purchase))
+        add(build(self.actions, []))
+        for i in reversed(range(len(self.actions))):
+            add(build(self.actions[:i] + self.actions[i + 1:], purchase))
         for action in self.actions:
-            add({"actions": [action]})
-        add({"purchase_intention_keyword_ids": self.purchase_intention_keyword_ids}
-            if self.purchase_intention_keyword_ids else {})
+            add(build([action], []))
+        add(build([], purchase))
         out.append({})
         return out
 
@@ -80,18 +90,19 @@ def _plain(name: str) -> str:
 
 def _entries(node: Any, id_keys: Iterable[str], name_keys: Iterable[str], keep_raw: bool = False) -> list[dict]:
     """Every {"id", "name"} found anywhere in a lookup response: an object with one of the id keys and one of the name
-    keys, however deeply nested, first occurrence of an id winning."""
+    keys, however deeply nested, first occurrence of an id (within its action_scene) winning."""
     found: dict[str, dict] = {}
 
     def walk(n: Any) -> None:
         if isinstance(n, dict):
             ident = next((n[k] for k in id_keys if n.get(k) not in (None, "")), None)
+            scene = n.get("action_scene") if isinstance(n.get("action_scene"), str) else ""
             name = next((n[k] for k in name_keys if isinstance(n.get(k), str) and n[k].strip()), None)
             if ident is not None and name:
                 entry = {"id": str(ident), "name": name.strip()}
                 if keep_raw:   # the entry's other plain fields, for telling categories apart
                     entry["raw"] = {k: v for k, v in n.items() if isinstance(v, (str, int, float, bool))}
-                found.setdefault(str(ident), entry)
+                found.setdefault(f"{scene}|{ident}", entry)   # ids are only unique within a scene
             for v in n.values():
                 walk(v)
         elif isinstance(n, list):
@@ -136,19 +147,6 @@ def _match(names: list[str], pool: list[dict], best: Callable[[str, list[dict]],
     return ids
 
 
-def _describe_pool(pool: list[dict]) -> None:
-    """Log which plain fields the category entries carry and the values they take, so video categories can be told
-    from creator categories (TikTok lists both in one response but the API has no scene filter)."""
-    fields: dict[str, set] = {}
-    for e in pool:
-        for k, v in (e.get("raw") or {}).items():
-            if k not in ("action_category_id", "action_category_name", "id", "name"):
-                fields.setdefault(k, set()).add(v)
-    summary = {k: sorted(map(str, vals))[:8] for k, vals in fields.items()}
-    print(f"[TikTokAdsAdapter] action category fields (value samples): {summary}; "
-          f"first entries {[e.get('raw') for e in pool[:3]]}", flush=True)
-
-
 async def resolve_behavior_targeting(
     interest_names: list[str],
     advertiser_id: str,
@@ -163,25 +161,23 @@ async def resolve_behavior_targeting(
     if not names:
         return result
 
-    # Video interactions use /tool/action_category/ (confirmed live: TikTok accepts them). CREATOR_RELATED is NOT sent:
-    # TikTok rejected it ("Invalid behavior targeting category") with the very same ids the video scene accepted, and
-    # its API has no separate creator-category list to take ids from.
+    # Video and creator interactions both use /tool/action_category/, which lists the two kinds together; each entry's
+    # action_scene says which, and each scene is matched against its own entries only.
     data = await _lookup("/tool/action_category/", {"advertiser_id": advertiser_id}, access_token)
     if data is not None:
         pool = _entries(data, ("action_category_id", "id"), ("action_category_name", "name"), keep_raw=True)
-        _describe_pool(pool)
-        category_ids = _match(names, pool, best_match, MAX_ACTION_CATEGORIES)
-        by_id = {e["id"]: e["name"] for e in pool}
-        print(f"[TikTokAdsAdapter] action categories: {len(pool)} read; matched "
-              f"{[(i, by_id.get(i)) for i in category_ids]} for {names}", flush=True)
-        if not category_ids:
-            print(f"[TikTokAdsAdapter] no video/creator category matched {names} "
-                  f"({len(pool)} categories read from TikTok)", flush=True)
-        if category_ids:
-            result.actions.append({
-                "action_scene": "VIDEO_RELATED", "action_period": VIDEO_ACTION_DAYS,
-                "video_user_actions": VIDEO_ACTIONS, "action_category_ids": category_ids,
-            })
+        for scene, actions, period in (("VIDEO_RELATED", VIDEO_ACTIONS, VIDEO_ACTION_DAYS),
+                                       ("CREATOR_RELATED", CREATOR_ACTIONS, 0)):
+            scoped = [e for e in pool if (e.get("raw") or {}).get("action_scene") == scene]
+            category_ids = _match(names, scoped, best_match, MAX_ACTION_CATEGORIES)
+            by_id = {e["id"]: e["name"] for e in scoped}
+            print(f"[TikTokAdsAdapter] {scene} categories: {len(scoped)} of {len(pool)} read; matched "
+                  f"{[(i, by_id.get(i)) for i in category_ids]} for {names}", flush=True)
+            if category_ids:
+                result.actions.append({
+                    "action_scene": scene, "action_period": period,
+                    "video_user_actions": actions, "action_category_ids": category_ids,
+                })
 
     keywords = list(dict.fromkeys(k for k in (_plain(n) for n in names) if k))[:5]
     data = await _lookup(
@@ -215,7 +211,11 @@ async def resolve_behavior_targeting(
                 "/tool/interest_keyword/recommend/",
                 {"advertiser_id": advertiser_id, "keyword": name, "audience_type": "PURCHASE_INTENTION", "limit": 3},
                 access_token)
-            for entry in _entries(data or {}, ("keyword_id", "id"), ("keyword", "name")):
+            found = _entries(data or {}, ("keyword_id", "id"), ("keyword", "name"))
+            if not found:
+                print(f"[TikTokAdsAdapter] no purchase intention keywords for {name!r}; TikTok answered "
+                      f"{str(data)[:300]}", flush=True)
+            for entry in found:
                 if entry["id"] not in ids:
                     ids.append(entry["id"])
         result.purchase_intention_keyword_ids = ids[:MAX_PURCHASE_INTENT]
