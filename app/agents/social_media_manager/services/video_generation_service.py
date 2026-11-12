@@ -10,6 +10,7 @@ import httpx
 
 from app.core.config import settings
 from app.database import get_db
+from app.services import fal_errors
 from app.utils.s3_upload import upload_bytes, upload_file_path
 from app.agents.social_media_manager.services import yarngpt_tts_service
 from app.agents.social_media_manager.services.people_consistency import with_face_stability
@@ -336,6 +337,8 @@ def is_retryable(exc: BaseException) -> bool:
     for, our own validation errors, and anything the model or its safety filter refused."""
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, NoResubmit, ValueError)):
         return False
+    if fal_errors.is_out_of_credit(exc):
+        return False         # our fal balance is used up: every further try is refused the same way
     msg = str(exc).lower()
     if _is_image_flag(msg):
         return True          # an inconsistent filter: the same image often passes on the next try
@@ -452,6 +455,11 @@ class VideoGenerationService:
             avatar_voice = DEFAULT_AVATAR_VOICE
         await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
+        # Set once fal refuses a call because our balance is used up. Every later scene would be refused the same
+        # way (and each refusal used to cost retries and a pointless fallback), so they are not attempted.
+        out_of_credit = False
+        delivered = 0
+
         for scene in scenes:
             scene_num = scene.get("scene_number", 0)
             await col.update_one({"job_id": job_id}, {"$set": {"current_scene": scene_num}})
@@ -464,6 +472,10 @@ class VideoGenerationService:
                 "text_overlay": scene.get("text_overlay"),
                 "video_prompt": scene.get("video_prompt", ""),
             }
+
+            if out_of_credit:
+                await VideoGenerationService._push_unavailable_clip(col, base_fields, outcome, job_id)
+                continue
 
             # §6 ("Reliability & fallback"): "Fallback to the nearest lower-cost/
             # quality-compatible route where possible" + "Record whether fallback
@@ -485,6 +497,17 @@ class VideoGenerationService:
                     # Still rendering on fal (and billed): deliver it when it lands; don't fail it or re-render it.
                     await VideoGenerationService._hand_off_late_clip(job_id, col, scene, base_fields, outcome,
                                                                      primary_error, started)
+                    continue
+                if fal_errors.is_out_of_credit(primary_error):
+                    # Not a problem with this scene: our fal account is empty. A fallback model runs on the same
+                    # account, so it is skipped too.
+                    out_of_credit = True
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: fal refused the call, balance used up "
+                          f"({str(primary_error)[:200]}) — stopping the job", flush=True)
+                    await fal_errors.alert_out_of_credit(primary_error)
+                    await VideoGenerationService._push_unavailable_clip(
+                        col, base_fields, outcome, job_id, started=started,
+                        fal_request_id=getattr(primary_error, "request_id", None))
                     continue
                 # The talking-avatar model routinely takes 3-12+ minutes to
                 # complete even on success (fal.ai's own request history,
@@ -574,6 +597,14 @@ class VideoGenerationService:
                                                                      late, started)
                     continue
                 except Exception as fallback_error:
+                    if fal_errors.is_out_of_credit(fallback_error):
+                        out_of_credit = True
+                        print(f"[VideoGenJob {job_id}] Scene {scene_num}: fal refused the fallback, balance used up "
+                              f"({str(fallback_error)[:200]}) — stopping the job", flush=True)
+                        await fal_errors.alert_out_of_credit(fallback_error)
+                        await VideoGenerationService._push_unavailable_clip(
+                            col, base_fields, outcome, job_id, started=started)
+                        continue
                     latency = round(time.monotonic() - started, 2)
                     print(f"[VideoGenJob {job_id}] Scene {scene_num}: fallback {fallback_model} "
                           f"also failed ({fallback_error})")
@@ -590,6 +621,7 @@ class VideoGenerationService:
                     continue
 
             latency = round(time.monotonic() - started, 2)
+            delivered += 1
             await col.update_one({"job_id": job_id}, {"$push": {"clips": {
                 **base_fields,
                 "video_url": video_url,
@@ -600,6 +632,14 @@ class VideoGenerationService:
                 "warning": " ".join(w for w in (fallback_warning, scene_notes.get("voice_fallback")) if w) or None,
                 "latency_seconds": latency,
             }}})
+
+        if out_of_credit:
+            # Say it plainly for the whole job. With nothing delivered the job has failed outright; with some scenes
+            # made it stays a (partial) completion and the page offers what was made.
+            update: Dict[str, Any] = {"error_code": fal_errors.ERROR_CODE, "error": fal_errors.JOB_MESSAGE}
+            if not delivered:
+                update["status"] = "failed"
+            await col.update_one({"job_id": job_id}, {"$set": update})
 
         # Every scene has been dispatched. Complete the job now, unless a clip is still rendering on fal: then it stays
         # "generating" (so the page keeps polling and nothing can be merged early) until the last late clip lands.
@@ -647,6 +687,24 @@ class VideoGenerationService:
                 os.unlink(tmp_path)
         cost_usd = round(actual_seconds * info["cost_per_second"], 3)
         return stored_url, cost_usd
+
+    @staticmethod
+    async def _push_unavailable_clip(col, base_fields: dict, outcome: str, job_id: str,
+                                     started: Optional[float] = None, fal_request_id: Optional[str] = None) -> None:
+        """Record a scene that was not made because fal is refusing our calls (our balance is used up). Carries a short
+        customer-facing message and the code the page keys on, never fal's own error text."""
+        await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+            **base_fields,
+            "video_url": None,
+            "cost_usd": None,
+            "outcome": outcome,
+            "routed_model": None,
+            "fallback_used": False,
+            "latency_seconds": round(time.monotonic() - started, 2) if started is not None else None,
+            "fal_request_id": fal_request_id,
+            "error": fal_errors.CLIP_MESSAGE,
+            "error_code": fal_errors.ERROR_CODE,
+        }}})
 
     @staticmethod
     async def _hand_off_late_clip(job_id: str, col, scene: dict, base_fields: dict, outcome: str,
