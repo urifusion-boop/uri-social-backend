@@ -21,7 +21,7 @@ async def register(db, brand_id: str, campaign_id: str, ad_id: str, attributes: 
     doc = {"brand_id": brand_id, "campaign_id": campaign_id, "ad_id": ad_id,
            "test_group": test_group or "default", "version": existing + 1,
            "attributes": {k: str(v)[:200] for k, v in (attributes or {}).items()
-                          if k in ("hook", "value_proposition", "format", "cta", "image", "notes")},
+                          if k in ("concept", "hook", "value_proposition", "offer", "format", "cta", "image", "notes")},
            "created_by": actor, "created_at": datetime.now(timezone.utc)}
     await db[VARIANTS].update_one({"campaign_id": campaign_id, "ad_id": ad_id},
                                   {"$set": doc}, upsert=True)

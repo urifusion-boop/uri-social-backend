@@ -67,3 +67,22 @@ TELEGRAM_WEBHOOK_SECRET=
 VAPID_PUBLIC_KEY=
 VAPID_PRIVATE_KEY=
 VAPID_SUBJECT=mailto:support@urisocial.com
+
+# Posting rate limits (app/agents/social_media_manager/services/rate_limit.py).
+# All optional; the defaults are used when unset. These are tunables, not platform facts.
+# Minimum seconds between two posts to the same TikTok account (TikTok allows 6 post-starts a minute per user):
+TIKTOK_MIN_GAP_S=12
+# Minimum seconds between two posts to the same Instagram/Facebook account (no verified basis; an ops choice):
+META_MIN_GAP_S=5
+# How long one post may hold its account, seconds. Must outlast a whole publish (TikTok polling, Outstand ~12 min):
+PUBLISH_GATE_LEASE_S=900
+# Longest a background publish job waits for its account before telling the user when to try again, seconds:
+PUBLISH_JOB_WAIT_MAX_S=600
+# Longest the Approve request waits for a busy account before answering "queued", seconds:
+PUBLISH_IMMEDIATE_WAIT_MAX_S=20
+# Longest one background job sleeps retrying a temporary rate limit before giving up, seconds:
+PUBLISH_INLINE_RETRY_BUDGET_S=60
+
+# Facebook Pages connected directly with Meta post straight to the Page (Graph API). Set to false to send
+# them through Outstand again when Outstand has the Page (publish_dispatch.facebook_direct_enabled):
+FACEBOOK_POST_DIRECT=true

@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "intent_patterns": {
+    "en": {
+      "purchase": ["where can i buy", "who sells", "where to buy", "how much is", "price of", "looking for", "need a", "want to buy"],
+      "recommendation": ["recommend", "which is best", "any good", "anyone know", "suggest a", "worth it", "better than"],
+      "problem": ["doesn't work", "not working", "disappointed", "waste of money", "too expensive", "scam", "fake"],
+      "how_to": ["how to use", "how do i", "how to choose", "tips for", "difference between"]
+    },
+    "pcm": {
+      "purchase": ["who dey sell", "where i fit buy", "how much be", "i dey find"],
+      "recommendation": ["abeg recommend", "una know any", "which one better"],
+      "problem": ["e no work", "dem scam me", "e no good"],
+      "how_to": ["how person go", "how i go take"]
+    }
+  },
+  "categories": [
+    {
+      "id": "beauty_skincare",
+      "label": "Beauty & skincare",
+      "core_terms": ["skincare", "skin care", "moisturizer", "sunscreen", "serum", "cleanser", "toner", "niacinamide", "retinol",
+                     "vitamin c serum", "hyperpigmentation", "dark spots", "acne", "korean skincare", "body lotion", "glowing skin"],
+      "local_terms": {"pcm": ["dark spot cream", "skin wey dey glow", "toning cream"]},
+      "excluded": ["skin in the game", "skins game", "minecraft skin"]
+    },
+    {
+      "id": "hair_wigs",
+      "label": "Hair & wigs",
+      "core_terms": ["wig", "wigs", "frontal wig", "closure wig", "lace front", "bone straight", "human hair", "bob wig",
+                     "raw hair", "pixie curls", "wig install", "frontal install", "hair vendor", "knotless braids"],
+      "local_terms": {"pcm": ["who dey sell wig", "wig vendor"]},
+      "excluded": ["wig wag", "big wig"]
+    },
+    {
+      "id": "fashion_clothing",
+      "label": "Fashion & clothing",
+      "core_terms": ["ready to wear", "aso ebi", "ankara", "native wear", "senator wear", "agbada", "owambe outfit", "thrift",
+                     "okrika", "two piece set", "corset dress", "bridal dress", "boutique"],
+      "local_terms": {"pcm": ["cloth wey fine", "where i fit buy cloth"]},
+      "excluded": []
+    },
+    {
+      "id": "social_media_marketing",
+      "label": "Social media marketing",
+      "core_terms": ["social media manager", "content creator", "instagram growth", "smm", "content calendar",
+                     "social media agency", "ugc creator", "tiktok growth", "grow my page", "brand strategist",
+                     "social media marketing", "content strategy"],
+      "local_terms": {"pcm": ["who fit run my page", "manage my page"]},
+      "excluded": ["manager of the month", "football manager"]
+    },
+    {
+      "id": "food_restaurants",
+      "label": "Food & restaurants",
+      "core_terms": ["jollof rice", "small chops", "food delivery", "restaurant", "brunch", "catering", "shawarma",
+                     "suya", "chops", "meal prep"],
+      "local_terms": {"pcm": ["where i fit chop", "food wey sweet"]},
+      "excluded": []
+    }
+  ]
+}

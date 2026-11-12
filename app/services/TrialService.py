@@ -58,19 +58,15 @@ class TrialService:
     def user_credits_collection(self):
         return self.db["user_credits"]
 
-    # ==================== Trial Expiry Handling ====================
-
     async def _ensure_wallet_on_trial_expiry(self, user_id: str) -> None:
         """
         Create a credit wallet with 0 credits when trial expires.
         This ensures users without subscriptions are properly blocked.
         """
-        # Check if user already has a wallet
         existing_wallet = await self.user_credits_collection.find_one({"user_id": user_id})
         if existing_wallet:
             return  # User already has a wallet, no need to create
 
-        # Create wallet with 0 credits
         now = datetime.utcnow()
         wallet = UserCreditWallet(
             user_id=user_id,
@@ -194,21 +190,20 @@ class TrialService:
         user_id: str,
         campaign_id: str,
         reason: str = "campaign_generation",
-        amount: int = 1,  # NEW: Support deducting multiple credits (video editing bills 4/8/12+ per job)
+        amount: int = 1,  # NEW: Support deducting multiple credits (for carousel)
     ) -> bool:
         """
         Deduct N trial credits (default 1).
         PRD 5.2: Works same as paid users — deduct 1 credit per campaign.
-        For carousels/video: deduct more than 1 in a single call.
+        For carousels: deduct 1 credit per image.
         Returns False if trial expired or insufficient credits.
-
-        Atomic check-and-decrement: the expiry/balance guard lives in the
-        filter, so two concurrent requests can't both read the same
-        credits_remaining and both succeed (the old find_one -> compute ->
-        update_one pattern allowed exactly that).
         """
         now = datetime.utcnow()
 
+        # Atomic check-and-decrement: the expiry/balance guard lives in the
+        # filter, so two concurrent requests can't both read the same
+        # credits_remaining and both succeed (the old find_one -> $set
+        # pattern allowed exactly that).
         updated = await self.trials_collection.find_one_and_update(
             {
                 "user_id": user_id,
@@ -220,29 +215,17 @@ class TrialService:
         )
 
         if not updated:
-            # Either no trial doc, trial expired, or insufficient credits —
-            # in the expired/exhausted case main previously ensured a 0-credit
-            # wallet exists here so subsequent (non-trial) checks don't break;
-            # preserve that even though the atomic filter can't tell us which
-            # case we're in without a second read.
-            trial_doc = await self.trials_collection.find_one({"user_id": user_id})
-            if not trial_doc or now >= trial_doc["trial_end_date"] or trial_doc["credits_remaining"] <= 0:
-                await self._ensure_wallet_on_trial_expiry(user_id)
             return False
 
         balance_after = updated["credits_remaining"]
         balance_before = balance_after + amount
-
-        # If this deduction brings credits to 0, create wallet for when trial fully expires
-        if balance_after == 0:
-            await self._ensure_wallet_on_trial_expiry(user_id)
 
         # Log deduction
         await self.credit_transactions_collection.insert_one(
             CreditTransaction(
                 user_id=user_id,
                 type="deduction",
-                amount=-amount,
+                amount=-amount,  # Log actual amount deducted
                 balance_before=balance_before,
                 balance_after=balance_after,
                 reason=reason,
@@ -324,8 +307,6 @@ class TrialService:
         """PRD 8: Check if user has already used their trial (abuse prevention)."""
         trial_doc = await self.trials_collection.find_one({"user_id": user_id})
         return trial_doc is not None
-
-    # ==================== Admin Overrides ====================
 
     async def admin_adjust_trial_credits(
         self, user_id: str, amount: int, notes: Optional[str] = None

@@ -10,6 +10,7 @@ the existing user wallet unchanged.
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 
 from app.models.agency import BrandCreditUsage
 
@@ -92,21 +93,44 @@ class AgencyCreditService:
             return {"success": True, "billing": "user_wallet"}
 
         # ── Agency brand: wallet + caps + usage log ──────────────────────────
-        avail = await AgencyCreditService.check_availability(brand_id, credits, db)
-        if not avail["allowed"]:
-            return {"success": False, "reason": avail["reason"]}
+        # The per-brand monthly cap is a soft, advisory limit — it depends on
+        # an aggregation over a separate collection (brand_credit_usage), so
+        # it can't be folded into one atomic operation with the wallet
+        # decrement below. Under concurrent load it's possible for usage to
+        # slightly overshoot the cap; that's an acceptable soft-limit
+        # tradeoff. The wallet balance itself (the part that's actually
+        # money) is guarded atomically regardless.
+        if agency.get("per_brand_caps_enabled") and brand.get("monthly_credit_cap") is not None:
+            used = await AgencyCreditService.brand_usage_this_month(brand_id, db)
+            if used + credits > brand["monthly_credit_cap"]:
+                return {"success": False, "reason": "brand_cap_reached"}
 
-        await db[AGENCIES].update_one(
-            {"agency_id": agency["agency_id"]},
+        # Atomic guard-and-decrement in one operation — two concurrent
+        # deductions against the same agency wallet can no longer both read
+        # a sufficient balance and both succeed (the old check_availability-
+        # then-$inc pattern allowed exactly that, the same race class
+        # CreditService.deduct_credit() was already fixed for elsewhere).
+        updated_agency = await db[AGENCIES].find_one_and_update(
+            {
+                "agency_id": agency["agency_id"],
+                "wallet_credits": {"$gte": credits},
+            },
             {"$inc": {"wallet_credits": -credits}, "$set": {"updated_at": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER,
         )
+
+        if not updated_agency:
+            return {"success": False, "reason": "agency_wallet_empty"}
+
         await db[USAGE].insert_one(BrandCreditUsage(
             brand_id=brand_id, agency_id=agency["agency_id"], operation_type=operation,
             credits_consumed=credits, consumed_by_user_id=user_id,
         ).to_dict())
 
-        # Low-credit alerts (20% / 10% / near-empty) — fire-and-forget
-        await AgencyCreditService._maybe_alert_low_credit(agency, credits, db)
+        # Low-credit alerts (20% / 10% / near-empty) — fire-and-forget.
+        # updated_agency already reflects the post-deduction balance, so
+        # pass just_spent=0 rather than subtracting credits a second time.
+        await AgencyCreditService._maybe_alert_low_credit(updated_agency, 0, db)
 
         return {"success": True, "billing": "agency_wallet"}
 

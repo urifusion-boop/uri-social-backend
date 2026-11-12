@@ -20,6 +20,7 @@ def _jwt():
 from . import actions as act
 from . import creative, engine, evaluate, forecast, leads, metrics
 from . import policy as pol
+from . import stages
 from .detect import totals_for_ui
 
 router = APIRouter(prefix="/jane-ads/growth", tags=["Jane + Ads — Growth Intelligence"])
@@ -128,6 +129,7 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         ends = engine._aware((await _adapter(db, r).fetch_adset_schedule(campaign_id)).get("end_time"))
     except Exception:
         pass
+    controls = await _controls(db, r)
     return {
         "campaign_id": campaign_id, "name": r.get("display_name") or "Campaign",
         "totals": t, "daily": [daily[k] for k in sorted(daily)],
@@ -140,9 +142,21 @@ async def campaign_detail(campaign_id: str, db: AsyncIOMotorDatabase = Depends(g
         "leads": await leads.stats(db, brand, ad_ids, t["spend_ngn"]),
         "follow_ups": await leads.follow_up_gaps(db, brand, ad_ids),
         "creative_test": creative.compare(variants, ad_rows) if variants else None,
+        "testing": await _testing(db, r, ad_rows, controls.get("daily_budget_ngn")),
         "forecast": forecast.project(rows, ends),
-        "controls": await _controls(db, r),
+        "controls": controls,
     }
+
+
+async def _testing(db, r: dict, ad_rows: list[dict], daily_budget_ngn: Optional[float]) -> dict:
+    """The campaign's stage, each creative's verdict, and how the next round should be laid out."""
+    goal = await engine.load_goal(db, r["campaign_id"])
+    a = await engine.assess(db, r, ad_rows, goal)
+    proven = len(a.get("proven_ad_ids") or [])
+    daily = float(daily_budget_ngn or r.get("launch_daily_ngn") or 0)
+    target = goal.get("target_cost_per_order_ngn") or goal.get("target_cpl_ngn")
+    a["next_round"] = stages.recommend_structure(daily, 7, target, proven=proven) if daily else None
+    return a
 
 
 async def _controls(db, r: dict) -> dict:
@@ -214,6 +228,7 @@ async def set_goal(campaign_id: str, payload: dict = Body(...),
             "target_cpl_ngn": num("target_cpl_ngn"),
             "target_cost_per_qualified_ngn": num("target_cost_per_qualified_ngn"),
             "target_results": num("target_results"),
+            "target_cost_per_order_ngn": num("target_cost_per_order_ngn"),
             "conversion_definition": str(payload.get("conversion_definition") or
                                          "A conversation started from the ad")[:200],
             "updated_by": ctx.get("user_id", ""), "updated_at": datetime.now(timezone.utc)}
@@ -229,16 +244,35 @@ async def set_goal(campaign_id: str, payload: dict = Body(...),
 
 
 @router.post("/recommendations/{rec_id}/approve")
-async def approve(rec_id: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+async def approve(rec_id: str, payload: Optional[dict] = Body(None),
+                  db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                   ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """Approve a suggestion as proposed, or with the owner's own figure: a budget
+    suggestion can be approved at a different amount (the original stays on record)."""
     brand = _brand(ctx)
     rec = await db[engine.RECOMMENDATIONS].find_one({"id": rec_id, "brand_id": brand})
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found")
-    if rec["status"] not in ("proposed", "failed"):
+    if rec["status"] not in ("proposed", "failed", "deferred"):
         raise HTTPException(status_code=409, detail=f"Already {rec['status']}")
     if not await _can_change(db, ctx):
         raise HTTPException(status_code=403, detail="Only an admin can approve changes to a campaign.")
+    edited = (payload or {}).get("to_ngn")
+    if edited is not None:
+        if rec["action_type"] != "set_daily_budget":
+            raise HTTPException(status_code=400, detail="Only a budget suggestion can be approved at a different amount.")
+        try:
+            to = float(edited)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Enter a daily budget in naira.")
+        rec["original_parameters"] = dict(rec.get("parameters") or {})
+        rec["parameters"] = {**(rec.get("parameters") or {}), "to_ngn": to}
+        rec["summary"] = f"Set the daily budget to ₦{to:,.0f} (edited from the suggestion)"
+        await db[engine.RECOMMENDATIONS].update_one({"id": rec_id}, {"$set": {
+            "parameters": rec["parameters"], "original_parameters": rec["original_parameters"],
+            "summary": rec["summary"], "edited_by": ctx.get("user_id", "")}})
+        await engine.event(db, brand, rec["campaign_id"], "recommendation_edited", recommendation_id=rec_id,
+                           actor=ctx.get("user_id", ""), before=rec["original_parameters"], after=rec["parameters"])
     record = await _campaign(db, brand, rec["campaign_id"])
     result = await engine.approve(db, _adapter(db, record), record, _clean(rec), ctx.get("user_id", ""))
     if result.get("status") == "refused":
@@ -250,17 +284,21 @@ async def approve(rec_id: str, db: AsyncIOMotorDatabase = Depends(get_db_depende
 async def decide(rec_id: str, payload: dict = Body(...),
                  db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                  ctx: dict = Depends(get_active_brand_context)) -> dict:
-    """Reject a suggestion, or mark one you carried out yourself as done."""
+    """Reject a suggestion, defer it for a few days, or mark one you carried out yourself as done."""
     brand = _brand(ctx)
     rec = await db[engine.RECOMMENDATIONS].find_one({"id": rec_id, "brand_id": brand})
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found")
     decision = payload.get("decision")
-    if decision not in ("rejected", "done"):
-        raise HTTPException(status_code=400, detail="decision must be rejected or done")
+    if decision not in ("rejected", "done", "deferred"):
+        raise HTTPException(status_code=400, detail="decision must be rejected, done or deferred")
     now = datetime.now(timezone.utc)
     update = {"status": decision, "decided_by": ctx.get("user_id", ""), "decided_at": now,
               "note": str(payload.get("note") or "")[:300]}
+    if decision == "deferred":
+        # Comes back as a live suggestion after the wait if the problem is still there.
+        days = max(1, min(int(payload.get("days") or 3), 30))
+        update["deferred_until"] = now + timedelta(days=days)
     if decision == "done":
         # A change made outside URI is still measured: log it so its window is evaluated.
         entry = {"action_id": rec_id, "idempotency_key": rec_id, "brand_id": brand,
@@ -368,6 +406,74 @@ async def emergency_stop(payload: dict = Body(default={}),
     return {"policy": await engine.load_policy(db, brand)}
 
 
+@router.post("/campaigns/{campaign_id}/variation-jobs")
+async def start_variation_job(campaign_id: str, payload: dict = Body(...),
+                              db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                              ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """Make a variation in the background: see ad_jobs.py for why."""
+    from .. import ad_jobs
+    await _campaign(db, _brand(ctx), campaign_id)
+    return {"job_id": await ad_jobs.start(db, _brand(ctx), lambda: make_variation(campaign_id, payload, db, ctx))}
+
+
+@router.post("/campaigns/{campaign_id}/variations")
+async def make_variation(campaign_id: str, payload: dict = Body(...),
+                         db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                         ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """One new ad based on a winner, added to the ad set the winner runs in. One per
+    request, because a single ad takes most of the connection's 120 seconds."""
+    from app.services.CreditService import credit_service
+    from ..creative import generate_ad_creative
+    from ..policy import Severity, review_ad_creative
+    from . import variations
+
+    r = await _campaign(db, _brand(ctx), campaign_id)
+    if (r.get("platform") or "meta") != "meta":
+        raise HTTPException(status_code=400, detail="Variations are only available on Instagram & Facebook.")
+    source_ad = str(payload.get("ad_id") or "")
+    ad_ids = list(r.get("ad_ids") or ([r["ad_id"]] if r.get("ad_id") else []))
+    if source_ad not in ad_ids:
+        raise HTTPException(status_code=404, detail="That ad isn't in this campaign.")
+    if len(ad_ids) >= variations.MAX_ADS:
+        raise HTTPException(status_code=400, detail=f"This campaign already has {variations.MAX_ADS} ads. Pause one first.")
+    user_id = ctx.get("user_id") or ""
+    if not await credit_service.check_sufficient_credits(user_id, required=1):
+        raise HTTPException(status_code=402, detail="You're out of content credits. Top up to make a variation.")
+    adapter = _adapter(db, r)
+    if getattr(adapter, "demo", False):
+        raise HTTPException(status_code=400, detail="Variations aren't available on the demo campaign.")
+    try:
+        source = await variations.read_source(adapter, source_ad)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    ad = await generate_ad_creative(
+        r.get("display_name") or r.get("name") or "Your Business", r.get("category") or "",
+        r.get("goal") or "messages",
+        (f"Make a fresh variation of this winning ad. Keep its core message, change the hook and "
+         f"the picture.\nIts headline: {source['headline']}\nIts text: {source['text']}"),
+        user_id=user_id, db=db, brand_id=_brand(ctx), city=r.get("city") or "",
+        destination_type=r.get("destination_type") or "whatsapp",
+        destination_cta=r.get("destination_cta") or "")
+    if not ad.image_url:
+        raise HTTPException(status_code=503, detail="We couldn't make that ad just now. Please try again.")
+    if any(v.severity == Severity.BLOCK for v in review_ad_creative(ad.headline, ad.primary_text).violations):
+        raise HTTPException(status_code=400, detail="That version didn't pass the ad policy check. Please try again.")
+    try:
+        new_ad = await variations.add_to_ad_set(
+            adapter, source, ad.headline, ad.primary_text, ad.image_url,
+            f"JaneAds-{r.get('business_id')}-ad-variation-{len(ad_ids) + 1}")
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    await credit_service.deduct_credit(user_id, campaign_id=campaign_id, reason="campaign_generation")
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": campaign_id}, {"$set": {"ad_ids": [*ad_ids, new_ad]}})
+    await creative.register(db, _brand(ctx), campaign_id, new_ad,
+                            {"concept": f"Variation of {source['headline']}"[:200], "hook": ad.headline,
+                             "image": ad.image_url}, "variations", user_id)
+    await engine.event(db, _brand(ctx), campaign_id, "variation_added", actor=user_id, source_ad=source_ad, ad_id=new_ad)
+    return {"ad_id": new_ad, "headline": ad.headline, "primary_text": ad.primary_text, "image_url": ad.image_url}
+
+
 @router.post("/campaigns/{campaign_id}/variants")
 async def add_variant(campaign_id: str, payload: dict = Body(...),
                       db: AsyncIOMotorDatabase = Depends(get_db_dependency),
@@ -379,6 +485,31 @@ async def add_variant(campaign_id: str, payload: dict = Body(...),
                                 payload.get("attributes") or {}, str(payload.get("test_group") or ""),
                                 ctx.get("user_id", ""))
     return {"variant": {k: v[k] for k in v if k != "_id"}}
+
+
+@router.get("/structure")
+async def structure(daily_budget_ngn: float, days: int = 7, target_cost_ngn: Optional[float] = None,
+                    concepts: Optional[int] = None,
+                    _ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """How many concepts a budget can genuinely test, and how to lay them out on Meta."""
+    if daily_budget_ngn <= 0 or days < 1:
+        raise HTTPException(status_code=400, detail="Enter a daily budget and a number of days.")
+    return stages.recommend_structure(daily_budget_ngn, days,
+                                      target_cost_ngn if target_cost_ngn and target_cost_ngn > 0 else None,
+                                      concepts)
+
+
+@router.get("/experiments")
+async def experiments(status: Optional[str] = None, limit: int = 100,
+                      db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                      ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """What each creative this brand has run taught us, newest first."""
+    q: dict = {"brand_id": _brand(ctx)}
+    if status:
+        q["status"] = status
+    docs = await db[engine.EXPERIMENTS].find(q, {"_id": 0}).sort("updated_at", -1) \
+        .limit(max(1, min(limit, 500))).to_list(500)
+    return {"experiments": docs}
 
 
 @router.patch("/leads/{conversation_id}")
@@ -404,6 +535,8 @@ async def set_lead_stage(conversation_id: str, payload: dict = Body(...),
         {"_id": ObjectId(conversation_id), "workspace_id": _brand(ctx)}, {"$set": update})
     if not res.matched_count:
         raise HTTPException(status_code=404, detail="Not found")
+    await engine.event(db, _brand(ctx), "", "business_outcome_manually_recorded", actor=ctx.get("user_id", ""),
+                       conversation_id=conversation_id, stage=stage, value_ngn=update.get("lead_value"))
     return {"status": "ok", "stage": stage}
 
 

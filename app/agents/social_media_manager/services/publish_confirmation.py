@@ -23,6 +23,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+from pymongo import ReturnDocument
+
+from app.agents.social_media_manager.services import rate_limit as _rate_limit
+
 CONFIRMING = "confirming"
 SLOW_AFTER = timedelta(minutes=30)
 GIVE_UP_AFTER = timedelta(hours=24)
@@ -32,25 +36,80 @@ _NETWORK_NAMES = {
     "x": "X", "threads": "Threads", "pinterest": "Pinterest", "youtube": "YouTube", "tiktok": "TikTok",
 }
 
+# The network's own words that mean the login it gave URI no longer works.
+_RECONNECT_MARKERS = (
+    "access token", "session has been invalidated", "session is invalid", "token has expired",
+    "token expired", "changed their password", "error validating", "has not authorized",
+    "not authorized", "permissions", "permission", "reauthor", "re-authorize", "oauthexception",
+    "invalid oauth", "expired",
+)
+
+# Signatures with their own precise, accurate explanation — checked before
+# the generic _RECONNECT_MARKERS catch-all, so a known-specific cause never
+# gets a message that tells the owner to do the wrong thing.
+_SPECIFIC_CAUSES = [
+    (
+        "confirm your identity",
+        lambda name: (
+            f"{name} needs you to confirm your identity before this Page can publish. This is a security check "
+            f"from {name} itself, not something wrong with your account here — open the {name} app (or Meta "
+            f"Business Suite) and check Notifications or Support Inbox for a verification prompt, then follow "
+            f"{name}'s steps. Once confirmed, this and future posts will go out normally again — no need to "
+            f"reconnect anything here."
+        ),
+        False,  # resolves on its own, not a reconnect-worthy signature
+    ),
+    (
+        # Live-reported: "MEEQAT TRAVELS AND TOURS LTD"'s Facebook post failed
+        # with "400 - The user must be an administrator, editor, or moderator
+        # of the page in order to impersonate it." The connected account lost
+        # its admin/editor/moderator role on the Page itself (removed, role
+        # changed, Page ownership changed) — the token can still be
+        # technically valid, so this is NOT a dead session, and the generic
+        # "reconnect" message is actively misleading here: reconnecting with
+        # the same now-demoted account hits this identical error again.
+        "administrator, editor, or moderator of the page",
+        lambda name: (
+            f"{name} says the connected account is no longer an admin, editor or moderator of this Page, so "
+            f"it can't post there. Ask whoever manages the Page to restore that access, or go to Connected "
+            f"Accounts and reconnect {name} using an account that already has it."
+        ),
+        True,  # does need reconnecting (or a role fix), just not the generic wording
+    ),
+]
+
+
 def network_name(platform: str) -> str:
     return _NETWORK_NAMES.get((platform or "").lower(), (platform or "the network").title())
 
 
-def explain(platform: str, raw: str) -> Dict[str, Any]:
+def explain(platform: str, raw: str, limit: Optional["_rate_limit.RateLimitInfo"] = None) -> Dict[str, Any]:
     """The network's error in words an owner can act on, whether the account
-    needs reconnecting right now, and which category it falls in — category
-    distinguishes a genuinely known signature ("known") from a one-off
-    content issue that should never trigger reconnect escalation
-    ("content") from an error that's simply never been catalogued ("unknown"),
-    so the caller can apply the repeated-failure threshold only to the last
-    of those, not to every unrecognized string."""
+    needs reconnecting right now, and which category it falls in:
+    "known" (a catalogued signature, always escalates immediately),
+    "content" (a one-off issue with this post, e.g. a bad image — never
+    escalates), or "unknown" (not catalogued at all — does not escalate on a
+    single occurrence, but see _should_flag_connection for why it isn't
+    ignored forever either). Every category gets a plain-language message
+    immediately, on the first occurrence — only whether the whole connection
+    gets flagged for reconnect is more cautious."""
     name = network_name(platform)
     text = " ".join(str(raw or "").split())
     low = text.lower()
-    # On this branch an expired login disconnects the account (prod's own
-    # helper), so only the signatures prod already trusts count.
-    from app.agents.social_media_manager.services.approval_workflow_service import _is_token_invalidation_error
-    if _is_token_invalidation_error(text):
+    # A rate limit or cap first, before anything else can claim it. It is NOT a broken connection:
+    # reconnect stays False, and "rate_limit" / "daily_cap" are neither "known" (which flags the
+    # connection) nor "unknown" (which counts toward the repeated-failure threshold that eventually
+    # tells the owner to reconnect) — so no number of limits can ever send someone to Reconnect.
+    # `limit` is the typed rate limit the platform call attached, when it did; otherwise read the text.
+    limit = limit or _rate_limit.classify_text(platform, text)
+    if limit:
+        return {"reconnect": False, "category": "rate_limit" if limit.retryable else "daily_cap",
+                "message": f"{limit.user_message} ({name} said: {text[:220]})"}
+    for marker, build_message, reconnect in _SPECIFIC_CAUSES:
+        if marker in low:
+            return {"reconnect": reconnect, "category": "known" if reconnect else "content",
+                     "message": f"{build_message(name)} ({name} said: {text[:220]})"}
+    if any(m in low for m in _RECONNECT_MARKERS):
         return {"reconnect": True, "category": "known", "message": (
             f"Your {name} connection has expired — {name} ended URI's access (this happens after a password "
             f"change or a security check). Reconnect {name} in Connected Accounts, then publish this post again."
@@ -88,19 +147,23 @@ def read_outcome(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"state": "pending", "error": ""}
 
 
-async def _flag_reconnect(db, draft: Dict[str, Any], message: str, reason: str = "token invalidated") -> None:
-    # Prod's existing path for a dead login: mark the connection disconnected
-    # (Connected Accounts then asks to reconnect) and email the owner, deduped.
-    from app.agents.social_media_manager.services.approval_workflow_service import (
-        _mark_connection_disconnected_and_notify,
-    )
-    platform = draft.get("platform", "unknown")
+def _reconnect_match(draft: Dict[str, Any]) -> Dict[str, Any]:
+    # The account that failed, and the brand's own connection for that
+    # network (the card the owner sees).
     account_id = draft.get("outstand_account_id")
-    await _mark_connection_disconnected_and_notify(
-        db=db, user_id=draft.get("user_id"), platform=platform,
-        connection={"platform": platform, "outstand_account_id": account_id} if account_id else None,
-        reason=f"{reason} (detected via publish confirmation)",
-    )
+    brand_id = draft.get("brand_id")
+    which = ([{"outstand_account_id": account_id}] if account_id else []) + ([{"brand_id": brand_id}] if brand_id else [])
+    query: Dict[str, Any] = {"platform": draft.get("platform"), "user_id": draft.get("user_id")}
+    if which:
+        query["$or"] = which
+    return query
+
+
+async def _flag_reconnect(db, draft: Dict[str, Any], message: str) -> None:
+    # Reconnecting replaces these docs, which clears it (see _clear_reconnect).
+    await db["social_connections"].update_many(_reconnect_match(draft), {"$set": {
+        "needs_reconnect": True, "reconnect_reason": message, "needs_reconnect_since": datetime.utcnow(),
+    }})
 
 
 async def _clear_reconnect(db, draft: Dict[str, Any]) -> None:
@@ -112,6 +175,56 @@ async def _clear_reconnect(db, draft: Dict[str, Any]) -> None:
         )
 
 
+# How many consecutive publish failures on one connection, none of them a
+# signature we recognize, before treating it as needing the owner's
+# attention anyway. A catalogued signature (explain()'s category "known")
+# escalates on the very first occurrence — this is the backstop for
+# everything else: without it, a Facebook/Outstand error we've never
+# specifically catalogued gets no fallback action at all, no matter how many
+# times in a row it keeps failing, an indefinite game of catching up to
+# error text one string at a time instead of a system that degrades
+# gracefully to something reasonable for the errors nobody's seen yet.
+UNKNOWN_FAILURE_ESCALATION_THRESHOLD = 3
+
+
+async def _should_flag_connection(db, draft: Dict[str, Any], category: str, message: str) -> bool:
+    """Whether an "unknown"-category failure means this connection needs the
+    owner's attention right now. A single one-off failure (a bad image, a
+    transient Outstand hiccup) must not trigger a "reconnect your account"
+    alert on its own — only a real, repeated pattern on the same connection
+    does, the same bar a human reading the logs would use before concluding
+    "this connection is actually broken". Known and content-issue categories
+    are decided entirely by explain() and never reach this function with
+    anything to do."""
+    # `is None`, not `not db`: a Motor database refuses to be used as a boolean.
+    if category != "unknown" or db is None:
+        return False
+    try:
+        updated = await db["social_connections"].find_one_and_update(
+            _reconnect_match(draft),
+            {"$inc": {"consecutive_publish_failures": 1},
+             "$set": {"last_publish_error": message, "updated_at": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
+    except Exception as e:
+        print(f"⚠️ _should_flag_connection: counter update failed: {e}")
+        return False
+    count = (updated or {}).get("consecutive_publish_failures", 0)
+    return count >= UNKNOWN_FAILURE_ESCALATION_THRESHOLD
+
+
+async def _record_publish_success(db, draft: Dict[str, Any]) -> None:
+    """Resets the unrecognized-failure counter on an actual successful
+    publish, so a connection that struggled once and recovered doesn't carry
+    a stale count toward a future, unrelated run of failures."""
+    if db is None:
+        return
+    try:
+        await db["social_connections"].update_many(_reconnect_match(draft), {"$set": {"consecutive_publish_failures": 0}})
+    except Exception as e:
+        print(f"⚠️ _record_publish_success: counter reset failed: {e}")
+
+
 async def _notify(db, draft: Dict[str, Any], published: bool, message: str = "") -> None:
     try:
         if published:
@@ -119,12 +232,20 @@ async def _notify(db, draft: Dict[str, Any], published: bool, message: str = "")
             await notification_service.notify_content_posted(
                 user_id=draft.get("user_id"), platform=draft.get("platform", ""),
                 content_preview=(draft.get("content") or "")[:120],
-                campaign_id=draft.get("campaign_id", ""),
+                campaign_id=draft.get("campaign_id", ""), brand_id=draft.get("brand_id"),
             )
         else:
-            # The failed post shows its reason in Scheduled; an expired login is
-            # also emailed by _flag_reconnect (prod's connection_disconnected alert).
-            print(f"❌ Post didn't publish | draft_id={draft.get('id')} platform={draft.get('platform')}: {message}")
+            from app.services import brand_notifier
+            from app.core.config import settings
+            app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
+            await brand_notifier.notify(
+                db, draft.get("user_id"), draft.get("brand_id"), "post_failed",
+                title=f"Your {network_name(draft.get('platform', ''))} post didn't publish",
+                message=message, link=f"{app_url}/workspace",
+                metadata={"draft_id": draft.get("id"), "platform": draft.get("platform"),
+                          "reconnect": "Reconnect" in (message or "")},
+                dedupe_key=draft.get("id"), dedupe_hours=24,
+            )
     except Exception as e:  # a notification must never block the status update
         print(f"⚠️ publish confirmation notify failed for {draft.get('id')}: {e}")
 
@@ -154,10 +275,7 @@ async def confirm(db, draft: Dict[str, Any], outstand=None, now: Optional[dateti
             "$unset": {"publish_slow": ""},
         })
         await _clear_reconnect(db, draft)
-        from app.agents.social_media_manager.services.approval_workflow_service import _record_publish_success
-        await _record_publish_success(
-            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
-        )
+        await _record_publish_success(db, draft)
         await _notify(db, draft, published=True)
         return "published"
 
@@ -165,35 +283,22 @@ async def confirm(db, draft: Dict[str, Any], outstand=None, now: Optional[dateti
         if outcome.get("missing"):
             message = (f"The publishing service no longer has this post, so it can't be confirmed on "
                        f"{network_name(draft.get('platform', ''))}. Check your page, and publish it again if it isn't there.")
-            reconnect, reason = False, ""
+            reconnect = False
         else:
             info = explain(draft.get("platform", ""), outcome["error"])
             message, reconnect = info["message"], info["reconnect"]
-            reason = "token invalidated (recognized error signature)"
-            # A known signature always escalates. A genuinely uncatalogued
-            # error ("unknown") does not just get silently dropped either —
-            # it increments the same per-connection counter every other
-            # failure path uses, and escalates once a real pattern shows up
-            # on this connection specifically, not on the first occurrence
-            # (which could just be this one post). A recognized content
-            # issue ("content" — e.g. a bad image) never escalates at all,
-            # since that's never a sign the connection itself is broken.
+            # A known signature already set reconnect=True above. An
+            # uncatalogued error doesn't just get ignored — it counts toward
+            # the per-connection repeated-failure threshold instead.
             if not reconnect and info.get("category") == "unknown":
-                from app.agents.social_media_manager.services.approval_workflow_service import _should_flag_connection
-                _platform = draft.get("platform", "unknown")
-                _account_id = draft.get("outstand_account_id")
-                reconnect, reason = await _should_flag_connection(
-                    db=db, user_id=draft.get("user_id"), platform=_platform,
-                    connection={"platform": _platform, "outstand_account_id": _account_id} if _account_id else None,
-                    raw_error=outcome["error"],
-                )
+                reconnect = await _should_flag_connection(db, draft, info["category"], message)
         await db["content_drafts"].update_one({"id": draft["id"], "status": CONFIRMING}, {
             "$set": {"status": "publish_failed", "error_message": message, "updated_at": now,
                      "network_error": outcome["error"][:1000] if outcome["error"] else None},
             "$unset": {"publish_slow": ""},
         })
         if reconnect:
-            await _flag_reconnect(db, draft, message, reason=reason or "token invalidated")
+            await _flag_reconnect(db, draft, message)
         await _notify(db, draft, published=False, message=message)
         return "failed"
 
@@ -229,14 +334,18 @@ async def run(db, limit: int = 200) -> Dict[str, int]:
     return counts
 
 
-async def failed_on_submit(db, draft: Dict[str, Any], connection: Dict[str, Any], raw_error: str) -> str:
+async def failed_on_submit(db, draft: Dict[str, Any], connection: Dict[str, Any], raw_error: str,
+                           limit: Optional["_rate_limit.RateLimitInfo"] = None) -> str:
     """A post the network refused outright when it was sent. Returns the message
     to store; flags the connection when its login has lapsed and tells the owner."""
-    info = explain(draft.get("platform", ""), raw_error or "")
+    info = explain(draft.get("platform", ""), raw_error or "", limit)
     try:
-        if info["reconnect"]:
-            await _flag_reconnect(db, {**draft, "outstand_account_id": (connection or {}).get("outstand_account_id")},
-                                  info["message"])
+        _draft = {**draft, "outstand_account_id": (connection or {}).get("outstand_account_id")}
+        reconnect = info["reconnect"]
+        if not reconnect and info.get("category") == "unknown":
+            reconnect = await _should_flag_connection(db, _draft, info["category"], info["message"])
+        if reconnect:
+            await _flag_reconnect(db, _draft, info["message"])
         await _notify(db, draft, published=False, message=info["message"])
     except Exception as e:
         print(f"⚠️ failed_on_submit bookkeeping failed for {draft.get('id')}: {e}")

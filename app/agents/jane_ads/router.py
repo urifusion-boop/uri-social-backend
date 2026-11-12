@@ -61,6 +61,11 @@ META_DELETED_CAMPAIGN_SUBCODE = 1487566
 _AI_DIFFICULTIES = "We're experiencing some difficulties on our end — please try again in a little while."
 
 
+def _google_connection_message(state: str) -> str:
+    from .google_flow import connection_message
+    return connection_message(state)
+
+
 def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
     """Meta's ad-account-level rate limit ("too many calls to this ad-account")
     is shared across every caller of that account — heavy testing/usage can trip
@@ -615,6 +620,70 @@ async def creative_drafts(
     return {"drafts": drafts}
 
 
+def _wizard_draft_key(brand_ctx: dict) -> str:
+    # Personal accounts (no agency brand) still get a working slot of their own.
+    return brand_ctx.get("brand_id") or brand_ctx["user_id"]
+
+
+class WizardDraftBody(BaseModel):
+    # Opaque JSON blob — the Campaign Builder wizard's own in-progress state
+    # (objective, platform, audience, budget, creative, the last plan/creative
+    # seen for each platform, ...). Never read or interpreted here; stored and
+    # returned exactly as sent.
+    payload: dict
+
+
+@router.get("/wizard-drafts")
+async def list_wizard_drafts(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Every in-progress Campaign Builder run for this brand, most recent
+    first — the backstop behind the frontend's own (faster, free) localStorage
+    list (campaign-wizard/wizardDraft.ts). Live-reported: a single slot per
+    brand silently discarded an earlier unfinished run the moment a second one
+    was started, so each draft now keeps its own slot by draft_id."""
+    from .wizard_draft import list_drafts
+    docs = await list_drafts(db, _wizard_draft_key(brand_ctx))
+    return {
+        "drafts": [
+            {
+                "draft_id": d["draft_id"],
+                "payload": d.get("payload"),
+                "updated_at": d["updated_at"].isoformat() if d.get("updated_at") else None,
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.post("/wizard-draft/{draft_id}")
+async def save_wizard_draft(
+    draft_id: str,
+    body: WizardDraftBody,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Autosave for one in-progress Campaign Builder run, upserted on every
+    save. See wizard_draft.py and the frontend's campaign-wizard/
+    wizardDraft.ts, which calls this as a backstop behind its own (faster,
+    free) localStorage copy."""
+    from .wizard_draft import save_draft
+    await save_draft(db, _wizard_draft_key(brand_ctx), draft_id, body.payload)
+    return {"ok": True}
+
+
+@router.delete("/wizard-draft/{draft_id}")
+async def delete_wizard_draft(
+    draft_id: str,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    from .wizard_draft import delete_draft
+    await delete_draft(db, _wizard_draft_key(brand_ctx), draft_id)
+    return {"ok": True}
+
+
 _UPLOAD_IMAGE_TYPES = {
     "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp",
 }
@@ -710,17 +779,25 @@ async def creative_upload(
     return {"url": url, "is_video": is_video}
 
 
+_VIDEO_MIME_EXT = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+    "video/x-matroska": "mkv", "video/x-msvideo": "avi", "video/3gpp": "3gp",
+}
+
+
 @router.post("/creative/upload-signature")
-async def creative_upload_signature(brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
-    """A presigned S3 PUT so the browser uploads a video directly, not relayed
-    through us. A phone video relayed through /creative/upload on a slow
-    connection outlasts the request timeout. Response is {put_url, public_url}
-    — the frontend does a plain PUT of the raw file body to put_url, then uses
-    public_url as the final creative URL (not a multipart POST with signed
-    form fields the way the old Cloudinary flow worked)."""
-    from .creative import cloudinary_upload_signature
+async def creative_upload_signature(
+    content_type: str = "video/mp4",
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """A presigned S3 PUT URL so the browser uploads a video straight to S3. A phone
+    video relayed through /creative/upload on a slow connection outlasts the request
+    timeout — this keeps our own backend out of the transfer path entirely, same as
+    the Cloudinary signed-upload flow this replaced."""
+    from .creative import s3_upload_signature
     import uuid as _uuid
-    signed = cloudinary_upload_signature(f"upload-{_uuid.uuid4().hex[:12]}")
+    ext = _VIDEO_MIME_EXT.get(content_type, "mp4")
+    signed = s3_upload_signature(f"upload-{_uuid.uuid4().hex[:12]}", ext=ext)
     if not signed:
         raise HTTPException(status_code=503, detail="Uploads aren't available right now.")
     return signed
@@ -1293,6 +1370,7 @@ async def jane_google_ads_admin_connect_initiate():
 async def jane_google_ads_admin_connect_callback(
     code: Optional[str] = None,
     error: Optional[str] = None,
+    state: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Exchanges the code and stores it as THE single admin connection (upsert on a
@@ -1300,7 +1378,28 @@ async def jane_google_ads_admin_connect_callback(
     the app: this isn't part of any brand-facing flow, there's nowhere in the UI to
     land."""
     from app.core.config import settings
-    from .google_ads_connection import exchange_code_for_tokens, save_admin_connection, GoogleAdsConnectionError
+    from .google_ads_connection import (
+        exchange_code_for_tokens, save_admin_connection, GoogleAdsConnectionError,
+        finish_signin, identity_manages_mcc, safe_return_to, take_signin_state,
+    )
+
+    # A brand owner coming back from "Continue with Google" — same registered
+    # redirect URI as the admin connect, told apart by the one-time state we issued.
+    if state and state.startswith("b_"):
+        import urllib.parse as _up
+        state_doc = await take_signin_state(db, state)
+        if not state_doc:
+            return RedirectResponse(f"{safe_return_to('')}/workspace/?tab=connections&google=error"
+                                    f"&reason={_up.quote('That sign-in link expired. Please try again.')}")
+        back = f"{state_doc.get('return_to') or safe_return_to('')}/workspace/?tab=connections"
+        if error or not code:
+            reason = "You cancelled the Google sign-in." if error == "access_denied" else "Google sign-in didn't complete."
+            return RedirectResponse(f"{back}&google=error&reason={_up.quote(reason)}")
+        outcome = await finish_signin(db, state_doc, code)
+        url = f"{back}&google={outcome['outcome']}"
+        if outcome.get("detail"):
+            url += f"&reason={_up.quote(outcome['detail'])}"
+        return RedirectResponse(url)
 
     if error:
         return HTMLResponse(f"<p>Google Ads admin connect failed: {error}</p>", status_code=400)
@@ -1324,6 +1423,19 @@ async def jane_google_ads_admin_connect_callback(
             "already granted this app access before. Revoke access at "
             "myaccount.google.com/permissions and try again.</p>",
             status_code=502,
+        )
+
+    # This link needs no login, so check the identity before trusting it: only
+    # someone who really has URI's manager account may become the admin connection.
+    try:
+        allowed = await identity_manages_mcc(tokens["access_token"])
+    except GoogleAdsConnectionError:
+        allowed = False
+    if not allowed:
+        return HTMLResponse(
+            "<p>That Google account doesn't have access to URI's Google Ads manager account, "
+            "so it can't be used as the admin connection. Nothing was changed.</p>",
+            status_code=403,
         )
 
     await save_admin_connection(db, tokens)
@@ -1481,14 +1593,30 @@ async def jane_google_ads_link_existing(
     """Path (a): client already has a Google Ads account — send a manager-link
     invitation. On the known 'already linked to another manager' friction, returns
     a specific, actionable message instead of a generic failure."""
-    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, request_manager_link
+    from .google_ads_connection import (
+        AccountNotLinkable,
+        AdsConnectionRequired,
+        GoogleAdsConnectionError,
+        InvalidCustomerId,
+        request_manager_link,
+    )
 
     try:
         result = await request_manager_link(
             db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id,
         )
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except AccountNotLinkable as e:
+        # Google refused for a reason the owner can fix (no such account, a
+        # manager account, no admin user...) — say which, as a 400.
+        print(f"ℹ️  Google Ads account not linkable: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except InvalidCustomerId as e:
+        # Caught before any Google API call was even made — a client input
+        # problem, not a rejected REST call, so 400 (not the 502 below).
+        print(f"ℹ️  Invalid Google Ads customer ID entered: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except GoogleAdsConnectionError as e:
         print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
@@ -1496,13 +1624,189 @@ async def jane_google_ads_link_existing(
     if result.get("manager_link_status") == "refused":
         return {
             "manager_link_status": "refused",
-            "detail": (
+            # A specific reason from Google when there is one; otherwise the
+            # general guidance for an account another manager is holding.
+            "detail": result.get("reason") or (
                 "This Google Ads account is already linked to another manager. "
                 "Ask the client to remove that link in their account "
                 "(Admin → Access and security → Managers) before reconnecting."
             ),
         }
     return result
+
+
+class GoogleSigninStartBody(BaseModel):
+    return_to: str = ""     # the app's own origin, so the browser comes back to the same site
+
+
+@router.post("/google/connect/signin/start")
+async def jane_google_ads_signin_start(
+    body: GoogleSigninStartBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """ "Continue with Google": returns the Google sign-in URL. After signing in the
+    owner lands back on Connected Accounts with their account linked (one usable
+    account) or a list to choose from — no Customer ID to find."""
+    from .google_ads_connection import GoogleAdsConnectionError, start_signin
+
+    try:
+        url = await start_signin(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.return_to)
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"auth_url": url}
+
+
+@router.get("/google/connect/signin/accounts")
+async def jane_google_ads_signin_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The Google Ads accounts the owner's sign-in found, by name. Empty once the
+    sign-in is used up or older than its short lifetime."""
+    from .google_ads_connection import _fresh_signin, get_any_google_ads_connection, usable_accounts
+
+    conn = await get_any_google_ads_connection(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    signin = _fresh_signin(conn)
+    found = (signin or {}).get("accounts") or []
+    return {
+        "signed_in": bool(signin),
+        "accounts": [{k: a.get(k) for k in ("customer_id", "name", "currency_code")} for a in usable_accounts(found)],
+        "other_accounts": len(found) - len(usable_accounts(found)),
+    }
+
+
+class GoogleSigninSelectBody(BaseModel):
+    customer_id: str
+
+
+@router.post("/google/connect/signin/select")
+async def jane_google_ads_signin_select(
+    body: GoogleSigninSelectBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Link the account the owner picked: URI sends the request and accepts it on
+    their behalf, so it is usually linked by the time this returns."""
+    from .google_ads_connection import AccountNotLinkable, GoogleAdsConnectionError, link_selected_account
+
+    try:
+        return await link_selected_account(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id)
+    except AccountNotLinkable as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except GoogleAdsConnectionError as e:
+        print(f"⚠️  Google Ads REST failure: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+class GoogleModeBody(BaseModel):
+    mode: str            # "uri" | "own"
+
+
+@router.post("/google/mode")
+async def jane_google_ads_mode(
+    body: GoogleModeBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Choose how this brand's Google ads run: in URI's account (nothing to
+    connect, the wallet pays everything) or in the brand's own Google Ads account
+    (Google bills them for the ad spend, the wallet pays URI's fee). Campaigns
+    already running stay where they are."""
+    from . import google_flow
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="Pick a brand first.")
+    try:
+        mode = await google_flow.set_mode(db, brand_id, body.mode)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Choose “Run by URI” or “My own Google Ads account”.")
+    ready, reason = await google_flow.readiness(db, brand_ctx.get("user_id"), brand_id)
+    return {"mode": mode, "ready": ready, "detail": reason}
+
+
+@router.post("/google/connection/change-account")
+async def jane_google_ads_change_account(
+    pause_campaigns: bool = False,
+    keep_running: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Let go of the chosen Google Ads account and go back to "choose your
+    account". Withdraws a pending invitation / removes an accepted link on
+    Google's side too. If URI campaigns are still in that account, answers 409
+    with the list unless pause_campaigns or keep_running says what to do."""
+    return await _release_google_ads(db, brand_ctx, remove=False,
+                                     pause_campaigns=pause_campaigns, keep_running=keep_running)
+
+
+@router.delete("/google/connection")
+async def jane_google_ads_disconnect(
+    pause_campaigns: bool = False,
+    keep_running: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Disconnect Google Ads for this brand altogether (also ends the link on
+    Google's side). Same campaign check as change-account."""
+    return await _release_google_ads(db, brand_ctx, remove=True,
+                                     pause_campaigns=pause_campaigns, keep_running=keep_running)
+
+
+def _campaigns_in_account_message(total: int, running: int) -> str:
+    many = total != 1
+    them = "them" if many else "it"
+    return (
+        f"{total} URI campaign{'s are' if many else ' is'} still in this Google Ads account"
+        f"{f' ({running} running)' if running else ''}. Once URI lets go of the account it can't pause, "
+        f"track or bill {them}. Pause {them} first, or keep {them} running and manage {them} in Google Ads yourself."
+    )
+
+
+async def _release_google_ads(db, brand_ctx: dict, remove: bool,
+                              pause_campaigns: bool = False, keep_running: bool = False) -> dict:
+    from . import google_flow
+    from .google_ads_connection import (
+        AccountNotLinkable, AdsConnectionRequired, get_any_google_ads_connection, release_account,
+    )
+
+    user_id, brand_id = brand_ctx.get("user_id"), brand_ctx.get("brand_id")
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
+    customer_id = (conn or {}).get("customer_id") or ""
+
+    # Once URI lets go of the account it can no longer pause, track or bill the
+    # campaigns it launched there. So say which are still there and let the
+    # owner choose: pause them first, or leave them running under their own control.
+    live: list = []
+    paused = 0
+    if customer_id and not (conn or {}).get("created_account_by_uri"):
+        live = await google_flow.campaigns_in_account(db, brand_id, customer_id)
+        if live and not (pause_campaigns or keep_running):
+            running = sum(1 for c in live if c["delivery"] in ("Active", "Unknown"))
+            raise HTTPException(status_code=409, detail={
+                "code": "google_campaigns_in_account",
+                "campaigns": live,
+                "running": running,
+                "message": _campaigns_in_account_message(len(live), running),
+            })
+        if live and pause_campaigns:
+            try:
+                paused = await google_flow.pause_campaigns(db, live)
+            except google_flow.GoogleAdsAPIError as e:
+                raise HTTPException(status_code=502, detail=(
+                    f"Couldn't pause every campaign, so nothing was changed: {e}"))
+
+    try:
+        result = await release_account(db, user_id, brand_id, remove=remove)
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except AccountNotLinkable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if live:
+        await google_flow.detach_campaigns(db, brand_id, customer_id)
+    return {**result, "campaigns_paused": paused,
+            "campaigns_left_running": 0 if pause_campaigns else
+            sum(1 for c in live if c["delivery"] in ("Active", "Unknown"))}
 
 
 class GoogleAdsCreateAccountBody(BaseModel):
@@ -1517,14 +1821,32 @@ async def jane_google_ads_create_account(
 ) -> dict:
     """Path (b): client has no Google Ads account — create one fresh under URI's
     MCC (auto-linked, no accept step needed)."""
-    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, create_client_account_under_mcc
+    from .google_ads_connection import (
+        AdsConnectionRequired,
+        GoogleAdsConnectionError,
+        MccNotEligibleToCreateAccounts,
+        create_client_account_under_mcc,
+    )
 
     try:
         return await create_client_account_under_mcc(
             db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.account_name,
         )
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except MccNotEligibleToCreateAccounts as e:
+        # Caught BEFORE the broader GoogleAdsConnectionError below — it's a
+        # subclass, so ordering matters. A distinct code (not a generic 502)
+        # so the frontend can show the actual guided next step (sign up with
+        # Google directly, then link) instead of a dead-end "try again" error.
+        print(f"ℹ️  Google Ads account-creation not yet eligible: {e}")
+        if e.newly_discovered:
+            from app.services.NotificationService import notification_service
+            try:
+                await notification_service.notify_admin_google_ads_mcc_ineligible(str(e))
+            except Exception as notify_err:
+                print(f"⚠️ Failed to send Google Ads eligibility alert: {notify_err}")
+        raise HTTPException(status_code=409, detail="google_ads_mcc_not_eligible_to_create")
     except GoogleAdsConnectionError as e:
         print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
@@ -1532,6 +1854,7 @@ async def jane_google_ads_create_account(
 
 @router.get("/google/connection/status")
 async def jane_google_ads_connection_status(
+    refresh: bool = False,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -1539,19 +1862,61 @@ async def jane_google_ads_connection_status(
     state in the body — this is a pure status read, not a pre-flight gate inside a
     build flow, so there's never a reason to raise here (unlike
     resolve_customer_id_for_launch, which does)."""
-    from .google_ads_connection import resolve_connection_state
+    from .google_ads_connection import get_admin_connection, owner_approval_settling, refresh_connection
     from .whatsapp import get_brand_whatsapp
+    from app.core.config import settings as _settings
 
-    state, conn = await resolve_connection_state(
-        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"),
+    # While an invitation is pending (or on "Check again", refresh=true) this
+    # asks Google whether it was accepted — the owner accepts it in Google Ads,
+    # so our own record can't know. It used to only re-read our record, which
+    # left every linked account "waiting" forever.
+    state, conn, sync_error = await refresh_connection(
+        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), force=refresh,
     )
     wa_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
+    # URI-wide, not per-brand (URI has exactly one MCC) — a previously
+    # CONFIRMED result from set_mcc_creation_eligibility, not a live check on
+    # every status poll. None means never tested yet: the frontend still
+    # offers "Create one for me" optimistically in that case, same as before
+    # this existed, with the real attempt's own failure handling as the
+    # fallback if it turns out not to be eligible after all.
+    admin_conn = await get_admin_connection(db)
+    can_create_account = (admin_conn or {}).get("mcc_can_create_accounts")
+    # URI pays Google: ads run in one of URI's own Google Ads accounts, so the
+    # brand has nothing to connect. These say whether that's ready for them.
+    from .google_uri_accounts import available as uri_available, brand_account as uri_brand_account
+    uri_account = await uri_brand_account(db, brand_ctx.get("brand_id"))
+    from . import google_flow
     return {
+        # How this brand's Google ads run: "uri" (URI's account, nothing to connect,
+        # wallet pays all) or "own" (their account, Google bills them, wallet pays the fee).
+        "mode": await google_flow.get_mode(db, brand_ctx.get("brand_id")),
+        "uri_managed": await uri_available(db, brand_ctx.get("brand_id")),
+        "uri_account_assigned": bool(uri_account),
         "state": state.value,
         "account_name": (conn or {}).get("account_name", ""),
         "customer_id": (conn or {}).get("customer_id", ""),
         "whatsapp_number": wa_number,
+        "can_create_account": can_create_account,
+        "currency_code": (conn or {}).get("currency_code", ""),
+        "manager_link_status": (conn or {}).get("manager_link_status", ""),
+        "detail": (conn or {}).get("manager_link_error", ""),
+        "created_by_uri": bool((conn or {}).get("created_account_by_uri")),
+        "manager_customer_id": settings_mcc_display(),
+        "sync_error": sync_error,
+        "signin_verified": bool(_settings.GOOGLE_ADS_OAUTH_VERIFIED),
+        # We approved the link with the owner's sign-in and Google is still catching up.
+        "finishing": owner_approval_settling(conn),
     }
+
+
+def settings_mcc_display() -> str:
+    """URI's manager account ID as Google shows it (123-456-7890), so the owner
+    can recognise the request waiting in their Google Ads."""
+    from app.core.config import settings
+
+    digits = "".join(ch for ch in str(settings.GOOGLE_ADS_MCC_CUSTOMER_ID or "") if ch.isdigit())
+    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if len(digits) == 10 else digits
 
 
 @router.get("/instrumentation/{business_id}")
@@ -1605,7 +1970,7 @@ async def admin_access(token: dict = Depends(JWTBearer())) -> dict:
 
 class AdminWalletCreditBody(BaseModel):
     brand_id: str                          # whose wallet to credit
-    amount_ngn: float = Field(gt=0)        # WalletService still enforces the ₦5,000 floor
+    amount_ngn: float = Field(gt=0)        # any amount — refunds are whatever was charged
     note: str = ""                         # why — recorded alongside the credit
 
 
@@ -1636,7 +2001,8 @@ async def admin_wallet_credit(
     reference = f"manual:{actor}:{_uuid.uuid4().hex[:12]}"
     wallet = WalletService(MongoWalletStore(db))
     try:
-        await wallet.top_up(body.brand_id, body.amount_ngn, reference=reference)
+        # Admin-only, so no payment minimum: refunds are whatever was charged.
+        await wallet.top_up(body.brand_id, body.amount_ngn, reference=reference, enforce_minimum=False)
     except MinimumTopUpError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1651,6 +2017,100 @@ async def admin_wallet_credit(
         "credited_by": actor,
         "note": body.note,
     }
+
+
+class AdminGoogleAccountBody(BaseModel):
+    customer_id: str                       # 123-456-7890, under URI's manager account
+
+
+@router.get("/admin/google/uri-accounts")
+async def admin_google_uri_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """URI's own Google Ads accounts and which brand each one serves."""
+    _require_ads_admin(token)
+    from .google_uri_accounts import list_accounts
+    accounts = await list_accounts(db)
+    return {"accounts": accounts, "free": sum(1 for a in accounts if not a.get("brand_id") and a.get("billing_ready"))}
+
+
+@router.get("/admin/google/manager-accounts")
+async def admin_google_manager_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Every account under URI's manager account, as Google sees it, and which
+    of them are already URI's accounts — to spot a new one and add it."""
+    _require_ads_admin(token)
+    from .google_flow import friendly_error
+    from .google_uri_accounts import manager_accounts
+    try:
+        return {"accounts": await manager_accounts(db)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"{friendly_error(e)} (Google said: {e})")
+
+
+@router.post("/admin/google/uri-accounts")
+async def admin_add_google_uri_account(
+    body: AdminGoogleAccountBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Add one of URI's own Google Ads accounts (under URI's manager account,
+    paid by URI) so brands can run Google ads in it. Checked with Google first."""
+    _require_ads_admin(token)
+    from .google_uri_accounts import UriAccountError, add_account
+    from .google_flow import friendly_error
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    try:
+        return {"account": await add_account(db, body.customer_id, actor)}
+    except UriAccountError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=friendly_error(e))
+
+
+class AdminGoogleCreateBody(BaseModel):
+    name: str = "URI - Ads"
+
+
+@router.post("/admin/google/uri-accounts/create")
+async def admin_create_google_uri_account(
+    body: AdminGoogleCreateBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Create a blank URI Google Ads account under the manager account (NGN,
+    Lagos time) and add it to URI's accounts — paid automatically if Google
+    offers monthly invoicing, otherwise waiting for URI's card in Google Ads."""
+    _require_ads_admin(token)
+    from .google_flow import friendly_error
+    from .google_uri_accounts import UriAccountError, create_account
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    try:
+        return {"account": await create_account(db, body.name.strip() or "URI - Ads", actor)}
+    except UriAccountError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"{friendly_error(e)} (Google said: {e})")
+
+
+@router.get("/admin/google/billing-options")
+async def admin_google_billing_options(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Whether software can pay for new URI accounts (monthly invoicing)."""
+    _require_ads_admin(token)
+    from .google_flow import friendly_error
+    from .google_uri_accounts import billing_options
+    try:
+        options = await billing_options(db)
+    except Exception as e:
+        # Admin-only: Google's exact words help more than a friendly summary here.
+        raise HTTPException(status_code=502, detail=f"{friendly_error(e)} (Google said: {e})")
+    return {"automatic_billing": bool(options), "payments_accounts": options}
 
 
 @router.get("/admin/billing-summary")
@@ -1848,9 +2308,170 @@ async def tiktok_test_launch(
     return {
         "campaign_id": result.campaign_id,
         "ad_ids": result.ad_ids,
-        "note": "Created DISABLE (paused) — zero spend. Review and activate it yourself in TikTok Ads Manager if you want it live.",
+        "note": "Created DISABLE (paused) — zero spend. Review and activate it from Campaign Manager if you want it live.",
         "ads_manager_url": f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}",
     }
+
+
+class GoogleTestLaunchBody(BaseModel):
+    business_name: str = "Test Business"
+    category: str = ""            # what the business is, e.g. "document automation software"
+    description: str = ""         # a sentence about what it sells — Jane derives the keywords from this
+    geo: str = "Lagos"            # where customers search from
+    budget_ngn: float = Field(35_000, gt=0)
+    days: int = Field(7, gt=0)
+    headline: str = ""            # optional; keywords fill the rest
+    primary_text: str = ""
+    placement: str = "search"     # search | display | demand_gen | pmax
+    image_url: str = ""           # the picture, for the visual placements
+    logo_url: str = ""
+
+
+@router.post("/google/test-launch")
+async def google_test_launch(
+    body: GoogleTestLaunchBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Creates a REAL Google Search campaign in the active brand's OWN linked
+    Google Ads account, entirely PAUSED (campaign, ad group and ad) — zero
+    spend until a human enables it in Google Ads. Mirrors /meta/test-launch and
+    /tiktok/test-launch: the way to prove the live adapter against a real
+    account before the campaign flow relies on it.
+
+    Uses the same pre-flight gate a real launch will (linked account checked
+    against Google, WhatsApp number present) and never a shared account."""
+    import uuid
+    from .adapters.google import GoogleAdsAdapter, GoogleAdsAPIError, LowClicksWarning
+    from .google_ads_connection import (
+        AdsConnectionRequired, GoogleAdsConnectionError, resolve_customer_id_for_launch,
+    )
+    from .models import (
+        ABTestScope, AdCreative, CampaignPlan, CampaignObjective, Goal, PlatformPlan,
+        PurchaseBehaviour, SpendAuthorization,
+    )
+
+    try:
+        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    business_id = f"google_test_{uuid.uuid4().hex[:8]}"
+    creative = None
+    if body.headline.strip() or body.image_url:
+        creative = AdCreative(image_url=body.image_url, headline=body.headline.strip(),
+                              primary_text=body.primary_text.strip() or body.headline.strip())
+    plan = CampaignPlan(
+        business_id=business_id,
+        goal=Goal.MESSAGES,
+        behaviour=PurchaseBehaviour.SEARCH,
+        platforms=[PlatformPlan(
+            platform=Platform.GOOGLE, budget_ngn=body.budget_ngn, days=body.days,
+            variants=1, test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=body.budget_ngn,
+        account_cap_ngn=body.budget_ngn,
+        whatsapp_number=conn["whatsapp_number"],
+        creative=creative,
+        google_keyword_context={"category": body.category or body.business_name,
+                                "description": body.description, "geo": body.geo,
+                                "placement": body.placement, "business_name": body.business_name,
+                                "logo_url": body.logo_url},
+        explanation=f"Real Google Ads test launch for {body.business_name}",
+    )
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn,
+                              account_cap_ngn=body.budget_ngn)
+    adapter = GoogleAdsAdapter(
+        db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
+        access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
+    )
+    try:
+        result = await adapter.launch_campaign(plan, auth)
+    except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "campaign_id": result.campaign_id,
+        "ad_ids": result.ad_ids,
+        "customer_id": conn["customer_id"],
+        "currency_code": conn.get("currency_code", ""),
+        "note": "Created PAUSED — zero spend. Review it in Google Ads and enable it yourself if you want it live.",
+        "ads_manager_url": f"https://ads.google.com/aw/campaigns?__c={conn['customer_id']}",
+    }
+
+
+async def _google_test_adapter(db, brand_ctx: dict, campaign_id: str):
+    """The adapter for a campaign THIS brand's test launch created — never
+    anything else in their Google Ads account."""
+    from .adapters.google import COLLECTION as GOOGLE_CAMPAIGNS, GoogleAdsAdapter
+    from .google_ads_connection import (
+        AdsConnectionRequired, GoogleAdsConnectionError, resolve_customer_id_for_launch,
+    )
+
+    try:
+        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=_google_connection_message(e.state.value))
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    record = await db[GOOGLE_CAMPAIGNS].find_one({"campaign_id": campaign_id, "customer_id": conn["customer_id"]})
+    if not record or not str(record.get("business_id", "")).startswith("google_test_"):
+        raise HTTPException(status_code=404, detail="That isn't a test campaign created from here.")
+    return GoogleAdsAdapter(
+        db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
+        access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
+    ), record
+
+
+@router.get("/google/test-launch/{campaign_id}")
+async def google_test_launch_read(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Reads a test campaign back from Google — status, budget (account
+    currency and naira), ad, keywords, locations — and exercises the calls the
+    live flow depends on afterwards: spend, new clicks, and pausing the ad."""
+    from .adapters.google import GoogleAdsAPIError
+
+    adapter, record = await _google_test_adapter(db, brand_ctx, campaign_id)
+    try:
+        info = await adapter.describe_campaign(campaign_id)
+        spend = await adapter.fetch_per_ad_spend(campaign_id)
+        clicks = await adapter.poll_conversations(campaign_id)
+        paused = await adapter.pause_ad(campaign_id, str(record.get("ad_id") or ""))
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {
+        **info,
+        "checks": {
+            "spend_read_ngn": [round(x.spend_ngn, 2) for x in spend],
+            "new_clicks": len(clicks),
+            "pause_ad_call_ok": paused,
+        },
+    }
+
+
+@router.delete("/google/test-launch/{campaign_id}")
+async def google_test_launch_remove(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Removes a test campaign (and its budget) from the brand's Google Ads account."""
+    from .adapters.google import GoogleAdsAPIError
+
+    adapter, _ = await _google_test_adapter(db, brand_ctx, campaign_id)
+    try:
+        return await adapter.remove_campaign(campaign_id)
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 class MetaLaunchFromMessageBody(BaseModel):
@@ -1941,10 +2562,36 @@ class MetaLaunchFromMessageBody(BaseModel):
     # keeps today's behaviour exactly as-is (Jane picks, TikTok only when
     # she'd have picked it herself). "tiktok" asks for TikTok specifically —
     # honoured only if TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN are configured
-    # and the creative is a video or a 2+ photo carousel (TikTok's hard
-    # requirement); otherwise an early_return explains why, same shape as every
-    # other early_return here. Any other value is ignored.
-    preferred_platform: str = ""          # "" | "meta" | "tiktok"
+    # and the creative is video (TikTok's hard requirement); otherwise an
+    # early_return explains why, same shape as every other early_return here.
+    preferred_platform: str = ""          # "" | "meta" | "tiktok" | "google"
+    # Where on Google: search | display | demand_gen (YouTube & Discover) | pmax (everywhere).
+    google_placement: str = ""
+    # The production path, when it isn't plain static/upload (creative_paths.py):
+    # "ai_video" uses a finished AI studio video (video_job_id); "ugc" marks the
+    # uploaded video as a person on camera, of kind ugc_kind, used with their consent.
+    # How many different concepts Jane makes to test in one campaign (Meta, generated
+    # images only). Each gets its own ad set and an equal share of the budget.
+    concepts: int = 1
+    creative_path: str = ""               # "" | ai_video | ugc
+    video_job_id: str = ""
+    ugc_kind: str = ""                    # creative_paths.UGC_KINDS
+    ugc_rights_confirmed: bool = False
+    # Multi-platform campaigns (one brief, run separately on several platforms at
+    # once): the frontend already knows the exact per-platform budget/day split it
+    # wants — set here instead of folded into `message` and left for the NL layer
+    # to re-parse, which would risk misreading an injected number. Applied
+    # deterministically to `parsed.budget_ngn`/`parsed.days` right after the NL
+    # parse, before anything downstream (fee markup, wallet gate, PlatformPlan)
+    # reads them. "" preferred_platform + these overrides is still a normal,
+    # single-platform plan — nothing else about this request changes.
+    budget_ngn_override: Optional[float] = None
+    days_override: Optional[int] = None
+    # Ties this plan to its sibling plans launched for the SAME brief on other
+    # platforms, so they can later be queried/reported on together. Purely a
+    # passthrough tag — stored on CampaignPlan and each adapter's campaign
+    # record, never read by any planning/launch decision.
+    campaign_group_id: Optional[str] = None
 
 
 class _PlanBuildResult(BaseModel):
@@ -1975,10 +2622,11 @@ class _PlanBuildResult(BaseModel):
                                               # used, if any — surfaced back to the
                                               # client so the plan card can show which
                                               # audience it's for
-    # True when URI's service fee is not taken from this plan. Only ever set when
-    # body.preferred_platform == "tiktok", so it can never affect a Meta plan. Threaded
-    # through so the wallet gate and the upfront charge at launch agree with what the plan
-    # was actually built (and shown to the client) against.
+    # TEMP (2026-09-17, per explicit user request — revert when real TikTok testing
+    # is done): true when URI's 10% service fee was skipped for this plan. Only ever
+    # set when body.preferred_platform == "tiktok", so it can never affect a Meta
+    # plan. Threaded through so the wallet gate and the upfront charge at launch
+    # agree with what the plan was actually built (and shown to the client) against.
     fee_bypassed: bool = False
     warnings: list[str] = Field(default_factory=list)  # plain-language heads-ups the plan card shows
 
@@ -2033,6 +2681,42 @@ def _extract_trailing_bare_budget(message: str, last_assistant_turn: str) -> Opt
     return value if value > 0 else None
 
 
+async def _resolve_creative_path(body: MetaLaunchFromMessageBody, brand_ctx: dict, db) -> dict:
+    """Turn an AI-video or UGC pick into the upload it really is, and return its
+    provenance (empty for the plain paths). An AI video is resolved to its single
+    merged file here, so every later step treats it exactly like an uploaded video."""
+    from . import creative_paths as cp
+
+    if body.creative_path not in ("ai_video", "ugc"):
+        return {}
+    if body.creative_path == "ai_video":
+        try:
+            url, job = await cp.resolve_ai_video(db, brand_ctx.get("user_id") or "", body.video_job_id)
+        except LookupError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        body.creative_source, body.reference_image_url, body.is_video = "upload", url, True
+        return cp.provenance("ai_video", video_job_id=body.video_job_id, has_people=cp.video_has_people(job))
+    if not body.reference_image_url or not body.is_video:
+        raise HTTPException(status_code=400, detail="Upload the creator or customer video first.")
+    if body.ugc_kind not in cp.UGC_KINDS:
+        raise HTTPException(status_code=400, detail="Say who is in the video.")
+    body.creative_source = "upload"
+    return cp.provenance("ugc", ugc_kind=body.ugc_kind, rights_confirmed=body.ugc_rights_confirmed)
+
+
+def _listed_areas(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+_PLATFORM_LABELS = {"meta": "Instagram & Facebook", "tiktok": "TikTok", "google": "Google"}
+
+
+def _objective_label(value: Optional[str]) -> str:
+    """The plain label of the objective the client picked, or "" if they haven't."""
+    from .objectives import CHOICES
+    return next((c["label"] for c in CHOICES if c["value"] == (value or "").strip()), "")
+
+
 async def _build_campaign_plan(
     body: MetaLaunchFromMessageBody, brand_ctx: dict, db: AsyncIOMotorDatabase,
 ) -> "_PlanBuildResult | dict":
@@ -2048,24 +2732,34 @@ async def _build_campaign_plan(
     from app.core.config import settings
     from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
     from .creative import creative_from_draft, creative_from_recomposite, creative_from_upload, generate_ad_creative, get_brand_context, service_area_from_geo, write_shoot_script
-    from .decision_engine import apply_platform_override, plan_campaign
+    from .decision_engine import apply_platform_override, as_client_choice, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import to_campaign_request, NlUnavailableError
-    from .jane_consultant import build_history_turns, consult
+    from .jane_consultant import build_history_turns, client_named_areas, consult
     from .threads import thread_history
     from .policy import Severity, review_ad_creative
 
+    from . import google_flow
+    from .creative import search_ad_creative
+
+    creative_prov = await _resolve_creative_path(body, brand_ctx, db)
+
+    # Google runs in the brand's OWN linked Google Ads account, so a brand can be
+    # ready for Google with no Meta Page at all. Known up front (our own record, no
+    # network) because it changes what counts as "not connected" below.
+    google_ready, google_not_ready_reason = await google_flow.readiness(
+        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    meta_configured = bool(settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN)
     # TikTok's own ad account is entirely separate from any Meta Page (see
-    # adapters/tiktok.py) — a brand explicitly asking for TikTok must never be blocked
-    # on Meta config/connection at all (live-confirmed 2026-10-19: a client who picked
-    # TikTok but had no Facebook Page connected got "Connect your Facebook Page" before
-    # TikTok was ever considered). Everything below is unchanged for any other request.
+    # adapters/tiktok.py) — a brand explicitly asking for TikTok must never be
+    # blocked on Meta config/connection at all. Live-confirmed 2026-10-19: this
+    # whole step used to only ever consult google_ready, so a client who picked
+    # TikTok but had no Facebook Page connected got "Connect your Facebook Page"
+    # before TikTok was ever considered.
     tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
     tiktok_preferred = body.preferred_platform == "tiktok"
-    tiktok_only = tiktok_preferred and tiktok_ready
-
-    if not tiktok_only and not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
-        raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
+    if not meta_configured and not google_ready and not (tiktok_ready and tiktok_preferred):
+        raise HTTPException(status_code=400, detail="No ad platform is configured — need Meta, Google, or TikTok credentials")
 
     # 0. Per-brand Meta ads connection — checked FIRST, before Jane says a word, so a
     # client never designs a whole campaign only to hit a wall at the end (Per-Brand
@@ -2074,25 +2768,39 @@ async def _build_campaign_plan(
     # require_whatsapp=False here: whether WhatsApp is actually needed depends on the
     # campaign's goal, which Jane hasn't determined yet at this point — a followers/
     # engagement campaign never uses it at all. Re-checked strictly once the goal is
-    # known, at step 1.6 below.
-    if tiktok_only:
-        # No Meta Page: TikTok sends people to the brand's own WhatsApp number (a wa.me
-        # link), so that is all the connection there is. Skipped entirely — this check is
-        # Meta-only and has nothing to say about TikTok.
-        from .whatsapp import get_brand_whatsapp
-        ads_conn = {"page_id": "",
-                    "whatsapp_number": await get_brand_whatsapp(db, brand_ctx.get("brand_id")) or ""}
-    else:
+    # known, at step 1.6 below. Skipped entirely when TikTok was explicitly asked for
+    # and is ready — this check is Meta-only and has nothing to say about TikTok.
+    ads_conn = None
+    if meta_configured and not (tiktok_preferred and tiktok_ready):
         try:
             ads_conn = await resolve_ads_page_for_launch(
                 db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
             )
         except AdsConnectionRequired as e:
-            return {"early_return": {
-                "stage": f"meta_connection_{e.state.value}",
-                "understood": {},
-                "page_name": e.page_name,
-            }}
+            # Live-reported: a client with Instagram & Facebook picked BY NAME
+            # (preferred_platform == "meta") but a broken/unapproved Meta
+            # connection, and a working Google Ads account, got a silent
+            # Google plan instead — "It's picking Google automatically" no
+            # matter what they selected. google_ready alone isn't enough to
+            # swallow this error: the google_only fallback below is for when
+            # Jane is the one choosing between platforms, not for a client
+            # who explicitly asked for Meta. Surface the real problem instead
+            # of substituting a platform they never asked for.
+            if not google_ready or body.preferred_platform == "meta":
+                return {"early_return": {
+                    "stage": f"meta_connection_{e.state.value}",
+                    "understood": {},
+                    "page_name": e.page_name,
+                }}
+    # No Meta Page, but another platform this campaign can actually run on: Google
+    # (linked Google Ads account) or TikTok (explicitly asked for, credentials
+    # configured). There is no Page, and the WhatsApp number is the brand's own.
+    google_only = ads_conn is None and not tiktok_preferred
+    tiktok_only = ads_conn is None and tiktok_preferred
+    if google_only or tiktok_only:
+        from .whatsapp import get_brand_whatsapp
+        ads_conn = {"page_id": "",
+                    "whatsapp_number": await get_brand_whatsapp(db, brand_ctx.get("brand_id")) or ""}
     page_id = ads_conn["page_id"]
 
     if body.creative_source in ("upload", "recomposite") and not body.reference_image_url:
@@ -2170,7 +2878,10 @@ async def _build_campaign_plan(
     try:
         parsed = await consult(body.message, known_business_name, known_category,
                                known_budget, thread_turns, offering=known_offering,
-                               stated_audience=own_audience)
+                               stated_audience=own_audience,
+                               objective_label=_objective_label(body.objective),
+                               budget_override=body.budget_ngn_override,
+                               platform_label=_PLATFORM_LABELS.get(body.preferred_platform or "", ""))
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
@@ -2186,6 +2897,15 @@ async def _build_campaign_plan(
                   "desired_conversions", "city", "geo_mode"):
         if not getattr(parsed, field, None) and prior_understood.get(field):
             setattr(parsed, field, prior_understood[field])
+
+    # Multi-platform campaigns: the frontend already knows the exact per-platform
+    # budget it wants (it did the split itself, across however many platforms the
+    # client picked) and sends it as a real number instead of folding it into
+    # `message` for the AI parse to pick back up — safer for a money-critical
+    # field than hoping the NL layer reads an injected phrase correctly. Applied
+    # before every fallback below so it always wins.
+    if body.budget_ngn_override:
+        parsed.budget_ngn = body.budget_ngn_override
 
     # Live-confirmed separate bug: a client answered a budget question with a bare
     # number and the model's own budget_ngn field came back None on that SAME turn
@@ -2262,12 +2982,15 @@ async def _build_campaign_plan(
     # campaign the wallet cannot fund, and the old model asked them to fund the fee on
     # top of the number they had just given.
     stated_budget_ngn = req.budget_ngn
-    # TikTok pays no URI fee: skip it entirely for a TikTok-requested plan, so funding the
-    # wallet to clear TikTok's own real ad-group floor is all that's needed — no markup on
-    # top. Gated strictly on the client's own explicit TikTok choice, never on what Jane
-    # herself would have picked, so this can never silently apply to a Meta plan.
+    # TEMP (2026-09-17, per explicit user request — revert when real TikTok testing is
+    # done): skip URI's fee entirely for a TikTok-requested plan, so funding the wallet
+    # to clear TikTok's own real ad-group floor is all that's needed — no markup on
+    # top. Gated strictly on the user's own explicit toggle, never on what Jane herself
+    # would have picked, so this can never silently apply to a Meta plan.
     fee_bypassed = (body.preferred_platform == "tiktok")
     req.budget_ngn = stated_budget_ngn if fee_bypassed else C.ad_spend_from_budget(stated_budget_ngn)
+    from .destination import website_in_text
+    _typed_website = website_in_text(body.message)
 
     # TikTok rejects an ad group under its own daily floor (₦31,000) — at launch, after the
     # wallet check. With no fee taken, the stated budget IS the ad spend, so say so now.
@@ -2310,6 +3033,13 @@ async def _build_campaign_plan(
             "question": "Add the WhatsApp number your ads should send people to (Connected Accounts), "
                         "then tell me again and I'll build it.",
         }}
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"] and google_only:
+        return {"early_return": {
+            "stage": "google_connection_no_whatsapp",
+            "understood": parsed.model_dump(),
+            "question": "Add the WhatsApp number your ads should send people to (Connected Accounts → "
+                        "Google Ads), then tell me again and I'll build it.",
+        }}
     if needs_whatsapp_number and not ads_conn["whatsapp_number"] and not tiktok_only:
         try:
             ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
@@ -2333,8 +3063,8 @@ async def _build_campaign_plan(
     # unrelated "sporteinstein.com" left over from an earlier campaign.
     if req.goal != Goal.FOLLOWERS and requested_destination not in ("", "ask"):
         from .destination import (
-            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform,
-            selected_for_objective, set_brand_destination,
+            VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform, selected_for_objective,
+            set_brand_destination,
         )
         # The goal the client has picked so far (None until they have): a destination
         # their goal cannot use is never offered, so a Traffic campaign has no WhatsApp.
@@ -2349,7 +3079,8 @@ async def _build_campaign_plan(
                 "understood": parsed.model_dump(),
                 "question": "Where should people who tap your ad end up?",
                 "destination_options": [
-                    {**opt, "current": brand_destination.get(opt["field"], "")}
+                    {**opt, "current": (_typed_website if opt["field"] == "website_url" and _typed_website
+                                         else brand_destination.get(opt["field"], ""))}
                     for opt in options_for_platform(tiktok_preferred, _goal_objective)
                 ],
                 "cta_choices": cta_choice_list(),
@@ -2391,6 +3122,11 @@ async def _build_campaign_plan(
         from .threads import mark_destination_answered
         await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
 
+    # A budget that can't run is said before the client picks an audience, not after.
+    budget_check = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
+    if budget_check.decision == PlanDecision.ADVISE:
+        return _budget_advice(parsed, budget_check.advice, stated_budget_ngn, fee_bypassed)
+
     # 1.7. Multi-Plan Audience Variants (spec v1.0.0) — most businesses have more than
     # one viable audience, and the client knows their customers better than Jane's
     # reasoning does. Present up to five ranked, genuinely-distinct strategies with an
@@ -2403,13 +3139,27 @@ async def _build_campaign_plan(
     # deliberately as one who tapped a card — so that answer skips the picker too.
     # Without this it regenerated a fresh set of variants and asked again, which reads
     # as the app ignoring what they just told it.
+    from .threads import chosen_audience, remember_audience
     selected_variant: Optional[PlanVariant] = None
-    if body.selected_plan_variant is not None:
+    variant_dump = body.selected_plan_variant
+    remembered: dict = {}
+    if variant_dump is None and not own_audience:
+        # Answered earlier in this campaign: a later step, or a reload, doesn't resend it.
+        remembered = await chosen_audience(db, brand_ctx.get("brand_id"), body.thread_id)
+        variant_dump = remembered.get("variant")
+        own_audience = (remembered.get("own_audience") or "").strip()
+    if variant_dump is not None:
         try:
-            selected_variant = PlanVariant.model_validate(body.selected_plan_variant)
+            selected_variant = PlanVariant.model_validate(variant_dump)
         except Exception as e:
             print(f"[oneshot] selected_plan_variant malformed, ignoring: {e}", flush=True)
-    if selected_variant is None and not own_audience:
+    if selected_variant is not None or own_audience:
+        await remember_audience(db, brand_ctx.get("brand_id"), body.thread_id,
+                                variant=selected_variant.model_dump() if selected_variant else None,
+                                own_audience=own_audience if not selected_variant else "")
+    # Past this step once with no picker: asking again later would put it up after the
+    # client has already answered what comes next, because generation can differ per call.
+    if selected_variant is None and not own_audience and not remembered.get("passed"):
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
             corpus = await _retrieve_for_plan_generation(db, parsed, business_id)
@@ -2446,12 +3196,12 @@ async def _build_campaign_plan(
         # Only ever 0 or 1 genuinely distinct audience exists — nothing to choose
         # between, so fall straight through with Jane's own single read (unchanged
         # today's behaviour) rather than showing a pointless one-card "choice".
+        await remember_audience(db, brand_ctx.get("brand_id"), body.thread_id, passed=True)
 
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
     if result.decision == PlanDecision.ADVISE:
-        return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
-                "advice": result.advice.model_dump(), "trace": result.advice.trace}}
+        return _budget_advice(parsed, result.advice, stated_budget_ngn, fee_bypassed)
     plan = result.plan
 
     # Consultant's own reasoning (jane-strategy-extraction §7.6/§8) — state the geography
@@ -2508,34 +3258,107 @@ async def _build_campaign_plan(
     # launch path yet. Jane's original recommendation is always surfaced in the
     # response for transparency, regardless of what actually launches.
     jane_platforms = [p.platform.value for p in plan.platforms]
-    # tiktok_ready is computed once, at step 0.
-    jane_picked_tiktok = (any(p.platform == Platform.TIKTOK for p in plan.platforms)
-                          and body.preferred_platform != "meta")
-    if tiktok_preferred:
-        # Explicit "give me TikTok" request (MetaLaunchFromMessageBody.preferred_platform) —
-        # purely additive on top of Jane's own silent pick below; does not touch the Meta
-        # routing/gating in the else branch at all. jane_platforms above still reflects what
-        # Jane would have picked on her own, for the same transparency the forced_to_meta
-        # banner already gives.
+    # tiktok_ready computed earlier (step 0), reused here — single source of truth.
+
+    # Google Search: when the client asks for it, when it's the only platform this
+    # brand has connected, or when Jane herself picked Search and the brand's
+    # Google Ads account is linked. A budget too small for Search is said plainly
+    # when Google was asked for (or is all there is); when it was only Jane's own
+    # pick, she quietly uses Instagram/Facebook instead, as she always did.
+    # google_only excludes tiktok_preferred (see step 0) but guarded here too —
+    # a TikTok-preferred request must never fall into the Google branch just
+    # because there's no Meta Page.
+    wants_google = body.preferred_platform == "google"
+    google_budget_warning = ""
+    from .adapters.google_visual import PLACEMENT_LABELS, normalize_placement
+    google_placement = normalize_placement(body.google_placement)
+    jane_picked_google = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
+    use_google = False
+    # The client choosing Instagram & Facebook by name outranks Jane leaning to Search:
+    # the plan used to switch to Google under a selected Meta toggle. Live-reported.
+    meta_chosen = body.preferred_platform == "meta"
+    if wants_google or (google_only and not tiktok_preferred) or (
+            jane_picked_google and google_ready and not tiktok_preferred and not meta_chosen):
+        if not google_ready:
+            return {"early_return": {"stage": "google_not_connected", "understood": parsed.model_dump(),
+                    "question": google_not_ready_reason}}
+        google_plan = apply_platform_override(plan, [Platform.GOOGLE])
+        too_low = (google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+                   if google_placement == "search" else None)
+        below_minimum = google_flow.below_placement_minimum(
+            google_placement, google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+        if below_minimum:
+            # Google itself refuses these, so there is nothing to go ahead with.
+            return {"early_return": {"stage": "google_budget_too_low", "understood": parsed.model_dump(),
+                    "question": below_minimum}}
+        if too_low and (wants_google or (google_only and not tiktok_preferred)):
+            # Asked for Google by name: their call. A small budget still runs
+            # (a test, a trial) — Jane says what to expect in the plan instead
+            # of refusing and repeating herself.
+            google_budget_warning = google_flow.budget_too_low_warning(
+                google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+            google_plan.trace.append(f"google budget below useful level, kept at owner's request: {too_low}")
+            use_google = True
+        else:
+            use_google = not too_low
+
+    if use_google:
+        plan = google_plan
+        forced_to_meta = False
+    elif body.preferred_platform == "tiktok":
+        # Explicit "give me TikTok" request (MetaLaunchFromMessageBody.
+        # preferred_platform) — purely additive on top of Jane's own silent
+        # pick below; does not touch the Meta routing/gating in the else
+        # branch at all. jane_platforms above still reflects what Jane
+        # would have picked on her own, for the same transparency the
+        # forced_to_meta banner already gives.
         if not tiktok_ready:
             return {"early_return": {"stage": "tiktok_not_configured", "understood": parsed.model_dump(),
                     "question": "TikTok Ads isn't connected yet — try again shortly, or drop the TikTok "
                                  "request and I'll use what's available."}}
-        # The real video-or-not check happens further down, once the ACTUAL creative is
-        # built (creative.is_video) — plan.creative.has_video here is still only the NL
-        # parser's guess from the free-text message, which rejected a real uploaded video
-        # every time (confirmed live 2026-09-17).
+        # The real video-or-not check happens further down, once the ACTUAL
+        # creative is built (creative.is_video) — plan.creative.has_video here
+        # is still only the NL parser's guess from the free-text message,
+        # exactly the same "guessed BEFORE the user actually chose upload/
+        # generate" gap the explanation-text patch below already works around
+        # for a different field. Checking it here rejected a real uploaded
+        # video every time, because parsing "promote my face oil" obviously
+        # never says "video" — confirmed live 2026-09-17.
         plan = apply_platform_override(plan, [Platform.TIKTOK])
         forced_to_meta = False
-    elif jane_picked_tiktok and tiktok_ready:
-        plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
-        forced_to_meta = False
     else:
-        forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
-        if forced_to_meta:
-            plan = apply_platform_override(plan, [Platform.META])
+        # "meta" is the client choosing Instagram & Facebook by name: Jane's own
+        # leaning towards TikTok no longer overrides it.
+        jane_picked_tiktok = (any(p.platform == Platform.TIKTOK for p in plan.platforms)
+                              and body.preferred_platform != "meta")
+        if jane_picked_tiktok and tiktok_ready:
+            plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
+            forced_to_meta = False
         else:
-            plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+            forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
+            if forced_to_meta:
+                plan = apply_platform_override(plan, [Platform.META])
+            else:
+                plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+
+    if body.preferred_platform in ("meta", "tiktok", "google"):
+        plan = as_client_choice(plan)
+    named_areas = client_named_areas(parsed)
+    if named_areas:
+        plan.explanation = re.sub(r"you're targeting [^.]*\.",
+                                  f"you're targeting {_listed_areas(named_areas)}.", plan.explanation)
+
+    # The duration the client asked for, wherever they said it. The planner otherwise
+    # picks one from the budget alone, so "for 2 days" was silently ignored.
+    # Same multi-platform override reasoning as budget_ngn_override above — an
+    # explicit number from the frontend wins over the text-parsed guess.
+    from . import concepts as concepts_mod
+    asked_days = body.days_override or concepts_mod.stated_days(body.message)
+    if asked_days:
+        for p in plan.platforms:
+            floor = (max(C.HARD_FLOOR_DAILY_NGN.get(p.platform.value, 0), C.MIN_DAILY_SPEND_NGN)
+                     if p.platform == Platform.META else C.HARD_FLOOR_DAILY_NGN.get(p.platform.value, 0))
+            p.days = concepts_mod.days_for_budget(asked_days, p.budget_ngn, floor)
 
     # 3. Geo refinement — prefer the consultant's own §7 judgment (which of own-radius/
     # watering-hole/mixed/non-local, and which named pockets), validated by real
@@ -2549,7 +3372,7 @@ async def _build_campaign_plan(
     # areas with the variant's when one was selected; the geo MODE (own_radius/
     # watering_hole/mixed) is still Jane's own read, not something a variant changes.
     geo_areas = parsed.geo_areas
-    if selected_variant and selected_variant.geo_pockets:
+    if selected_variant and selected_variant.geo_pockets and not client_named_areas(parsed):
         geo_areas = [{"name": name, "reason": selected_variant.trigger} for name in selected_variant.geo_pockets]
     # A place the client named inside their OWN audience outranks everything above it:
     # they typed it as the answer to "who should this target", so it is this campaign's
@@ -2565,7 +3388,13 @@ async def _build_campaign_plan(
                           "reason": "the area you named in the audience you specified"}]
     geo_dump = None
     try:
-        if parsed.geo_mode:
+        if getattr(parsed, "whole_area", False) and parsed.city and not (
+                own_audience and geo_areas is not parsed.geo_areas):
+            from .geo import GeoMode, whole_area_plan
+            mode = parsed.geo_mode if parsed.geo_mode in {m.value for m in GeoMode} else "watering_hole"
+            plan.geo = whole_area_plan(parsed.city, GeoMode(mode))
+            geo_dump = plan.geo.model_dump()
+        elif parsed.geo_mode:
             from .geo import geo_plan_from_named_areas
             geo_plan = await geo_plan_from_named_areas(
                 parsed.geo_mode, parsed.city, geo_areas, parsed.geo_explanation,
@@ -2675,7 +3504,8 @@ async def _build_campaign_plan(
                 # Pre-fill: what this brand already has on file, per option, so nobody
                 # retypes their own number to change only the button.
                 "destination_options": [
-                    {**opt, "current": brand_destination.get(opt["field"], "")}
+                    {**opt, "current": (_typed_website if opt["field"] == "website_url" and _typed_website
+                                         else brand_destination.get(opt["field"], ""))}
                     for opt in options_for_platform(tiktok_preferred, plan.objective)
                 ],
                 "cta_choices": cta_choice_list(),
@@ -2708,13 +3538,16 @@ async def _build_campaign_plan(
     # Image-selection step (PRD §2): don't silently generate once budget is set — ask the
     # user how to source the image (upload their own / pick a past post / let Jane generate).
     # Only when the caller hasn't already chosen ("ask"); a concrete source skips through.
-    if body.creative_source == "ask":
+    # (Not for Google: a Search ad is text, so there is no image to choose.)
+    if body.creative_source == "ask" and not (use_google and google_placement == "search"):
         from .creative import list_recent_drafts
         drafts = await list_recent_drafts(user_id, db, brand_id, limit=6) if user_id else []
         return {"early_return": {
             "stage": "choose_creative_source",
             "understood": parsed.model_dump(),
-            "creative_options": {"can_generate": True, "drafts": drafts},
+            "creative_options": {"can_generate": True, "drafts": drafts,
+                                 "max_concepts": _concepts_allowed(
+                                     plan, plan.platforms[0].platform.value if plan.platforms else "")},
             # Jane's geography/audience call (stated_plan, jane-strategy-extraction §7.6) is
             # REQUIRED to be confirmed back to the client, never silently decided — this was
             # being computed into plan.explanation but never reaching the client at this step,
@@ -2733,18 +3566,41 @@ async def _build_campaign_plan(
     # geo_areas above — equally forbidden from appearing in copy. Live-confirmed leak:
     # these reached Meta's real targeting but were never passed into the creative
     # functions at all, so the leakage check had no way to catch them.
-    variant_geo_pockets = selected_variant.geo_pockets if selected_variant else None
+    variant_geo_pockets = ((client_named_areas(parsed) or selected_variant.geo_pockets)
+                           if selected_variant else None)
 
-    # Tell the creative step which platform the campaign actually launches on, so a TikTok
-    # campaign's ad copy and image brief are written for TikTok, not Meta/Instagram. Meta
-    # (and anything else) keeps "meta" and is untouched.
-    copy_platform = (Platform.TIKTOK.value
-                     if plan.platforms and plan.platforms[0].platform == Platform.TIKTOK
-                     else Platform.META.value)
+    # By this point plan.platforms has already been narrowed to a single platform
+    # above (either forced to [Platform.TIKTOK] or [Platform.META] — never mixed,
+    # see the routing block a few dozen lines up), so this reliably tells the
+    # creative step which platform the campaign is actually launching on. Without
+    # this, every creative function defaulted to Meta/Instagram framing regardless
+    # of the platform decision made above it — a TikTok campaign's ad copy still
+    # read like a Meta feed ad and its image brief still asked for a staged
+    # brand photoshoot instead of native, phone-shot-feeling creative.
+    creative_platform = plan.platforms[0].platform.value if plan.platforms else Platform.META.value
+    # Display / YouTube & Discover / Everywhere carry a picture, like a feed ad: the
+    # picture and copy are made the feed-ad way. Only Search is text-only.
+    google_visual = creative_platform == Platform.GOOGLE.value and google_placement != "search"
+    copy_platform = Platform.META.value if google_visual else creative_platform
+    # The budget is how the ad runs, never a price to print on it. The message carries
+    # the whole conversation, so "₦14,000 for 2 days" reached the writer as an offer.
+    from .creative_paths import without_budget
+    creative_brief = without_budget(req.description, parsed.budget_ngn)
 
-    if body.creative_source == "upload":
+    if creative_platform == Platform.GOOGLE.value and not google_visual:
+        # A Search ad is text: Jane writes it in the brand's voice and nothing is
+        # generated, so no upload is needed and no content credit is spent.
+        creative = await search_ad_creative(
+            business_name, category, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+            behaviour=plan.behaviour.value, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
+        )
+    elif body.creative_source == "upload":
         creative = await creative_from_upload(
-            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            business_name, category, body.reference_image_url, req.goal.value, creative_brief,
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -2755,7 +3611,7 @@ async def _build_campaign_plan(
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
-            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            business_name, category, body.reference_image_url, req.goal.value, creative_brief,
             user_id=user_id, db=db, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -2779,7 +3635,7 @@ async def _build_campaign_plan(
         # keep the image from the prior plan. Copy is still rewritten to match any changed
         # brief, but no image is generated, so no content credit is spent.
         creative = await creative_from_upload(
-            business_name, category, body.reuse_image_url, req.goal.value, req.description,
+            business_name, category, body.reuse_image_url, req.goal.value, creative_brief,
             user_id=user_id, db=db, brand_id=brand_id, is_video=False,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
@@ -2796,28 +3652,52 @@ async def _build_campaign_plan(
                 status_code=402,
                 detail="You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead.",
             )
-        creative = await generate_ad_creative(
-            business_name, category, req.goal.value, req.description,
-            user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
-            behaviour=plan.behaviour.value, service_area=service_area,
-            audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
-            # Drives creative-stage retrieval; without it budget is 0, retrieval
-            # bails early, and the ad ships with corpus_coverage="none".
-            budget_ngn=float(parsed.budget_ngn or 0),
-            vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
-        )
+        n_concepts = min(max(1, body.concepts), _concepts_allowed(plan, creative_platform))
+        if n_concepts > 1 and not await credit_service.check_sufficient_credits(user_id, required=n_concepts):
+            raise HTTPException(
+                status_code=402,
+                detail=f"Testing {n_concepts} ideas takes {n_concepts} content credits — top up, "
+                       "or test one idea instead.",
+            )
+
+        async def _one(angle: str = ""):
+            return await generate_ad_creative(
+                business_name, category, req.goal.value,
+                concepts_mod.brief_for(creative_brief, angle) if angle else creative_brief,
+                image_layout=concepts_mod.layout_for(angle),
+                user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+                behaviour=plan.behaviour.value, service_area=service_area,
+                audience_segment=variant_segment, who_its_for=variant_who_its_for,
+                geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+                destination_cta=destination_cta,
+                # Drives creative-stage retrieval; without it budget is 0, retrieval
+                # bails early, and the ad ships with corpus_coverage="none".
+                budget_ngn=float(parsed.budget_ngn or 0),
+                vsg01_format_id=None if angle else body.vsg01_format_id, platform=copy_platform,
+            )
+
+        if n_concepts > 1:
+            # The first ad now; the page adds the rest through POST /plan/{id}/ads.
+            first_angle = concepts_mod.ANGLES[0][0]
+            creative = await _one(first_angle)
+            creative.concept = first_angle
+            plan.concepts_wanted = n_concepts
+        else:
+            creative = await _one()
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
-            # (the function's own default) is the closest existing match; there's no
-            # ad-specific reason value and adding one is a shared-model change beyond
-            # this feature's scope.
+            # (the function's own default) is the closest existing match.
             await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
-    if not creative.image_url:
+    if (not creative.headline) if (creative_platform == Platform.GOOGLE.value and not google_visual) \
+            else (not creative.image_url):
         # Empty creative almost always means the image/copy model failed (often the
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+
+    if creative_prov:
+        from .creative_paths import disclose
+        creative.provenance = creative_prov
+        creative.primary_text = disclose(creative.primary_text, creative_prov)
 
     # plan.explanation's "you have photos"/"video" phrase (decision_engine._explain) was
     # written from the NL-guessed has_video BEFORE the user actually chose upload/generate
@@ -2829,18 +3709,21 @@ async def _build_campaign_plan(
             .replace("you have photos", "you have video")
             .replace("no creative is needed for search", "you have video")
         )
+    elif not creative.is_video:
+        plan.explanation = plan.explanation.replace("you have video", "you have photos")
 
-    # TikTok's real video-or-not requirement, checked here (not up at the platform-decision
-    # point) for the same reason the explanation-text patch above exists: creative.is_video
-    # only reflects reality once the ACTUAL creative_source (upload/generate/draft/reuse) has
-    # run — checking any earlier value meant a genuinely uploaded video still got rejected,
-    # because the free-text message parse has no way to know about it. No-op for a Meta-bound
-    # plan.
+    # TikTok's real video-or-not requirement, checked here (not up at the
+    # platform-decision point) for the exact same reason the explanation-text
+    # patch above exists: creative.is_video only reflects reality once the
+    # ACTUAL creative_source (upload/generate/draft/reuse) has run — checking
+    # any earlier value meant a genuinely uploaded video still got rejected,
+    # because the free-text message parse has no way to know about it.
+    # No-op for a Meta-bound plan.
     #
     # A TikTok Carousel Ad (2+ photos) is the other real way in — TikTok has no
-    # single-static-image ad unit at all, so "attach one more photo" is a genuine alternative
-    # to shooting a video, not a downgrade. body.carousel_image_urls carries those, kept
-    # separate from reference_image_url/is_video above.
+    # single-static-image ad unit at all, so "attach one more photo" is a genuine
+    # alternative to shooting a video, not a downgrade. body.carousel_image_urls
+    # carries those, kept separate from reference_image_url/is_video above.
     has_carousel = len(body.carousel_image_urls) >= 2
     if any(p.platform == Platform.TIKTOK for p in plan.platforms) and not creative.is_video and not has_carousel:
         return {"early_return": {"stage": "tiktok_needs_video", "understood": parsed.model_dump(),
@@ -2853,13 +3736,17 @@ async def _build_campaign_plan(
     # runs before a plan is ever shown as ready, not just right before launch.
     # BLOCK severity aborts with the specific guidance; WARN-only violations are
     # logged but don't stop planning (re-checked again at commit in /plan/{id}/launch).
-    policy_result = review_ad_creative(creative.headline, creative.primary_text)
+    policy_result = review_ad_creative(creative.headline, creative.primary_text, platform=creative_platform)
     blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
     if blocking:
         raise HTTPException(
             status_code=400,
             detail=f"Can't use this creative — {blocking[0].guidance}",
         )
+    # Another concept that fails policy is dropped rather than failing the whole plan.
+    plan.concepts = [c for c in plan.concepts if not any(
+        v.severity == Severity.BLOCK
+        for v in review_ad_creative(c.headline, c.primary_text, platform=creative_platform).violations)]
     for v in policy_result.violations:
         print(f"[policy] WARN on plan for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
 
@@ -2877,7 +3764,6 @@ async def _build_campaign_plan(
             pushback_script = await write_shoot_script(
                 business_name, category, req.goal.value, creative.video_recommendation,
                 req.description, await get_brand_context(user_id, db, brand_id) if user_id else {},
-                platform=copy_platform,
             )
         except Exception as e:
             print(f"[oneshot] pushback shoot script skipped: {e}", flush=True)
@@ -2895,10 +3781,23 @@ async def _build_campaign_plan(
         }}
 
     plan.page_id = page_id
+    if creative_platform == Platform.GOOGLE.value:
+        # What the keywords are derived from at launch, and where to target.
+        brand_look = await get_brand_context(user_id, db, brand_id) if google_visual else {}
+        plan.google_keyword_context = {"category": category or business_name,
+                                       "description": req.description, "geo": parsed.city or req.geo or "",
+                                       "placement": google_placement,
+                                       "billing": await google_flow.get_mode(db, brand_id),
+                                       "business_name": business_name,
+                                       "logo_url": brand_look.get("logo_url") or "",
+                                       "brand_color": (brand_look.get("brand_colors") or [""])[0],
+                                       # the owner went ahead with a budget below Search's useful level
+                                       "low_budget_ok": bool(google_budget_warning)}
     plan.whatsapp_number = wa_number
     plan.destination_type = destination_type.value
     plan.destination_link = destination_link
     plan.destination_cta = destination_cta
+    plan.campaign_group_id = body.campaign_group_id
     plan.creative = creative
     if creative.video_recommendation:
         # Path C (PRD §4.1): gpt-image-1 can't shoot the recommended video itself, so
@@ -2909,7 +3808,6 @@ async def _build_campaign_plan(
             plan.shoot_script = await write_shoot_script(
                 business_name, category, req.goal.value, creative.video_recommendation,
                 req.description, await get_brand_context(user_id, db, brand_id) if user_id else {},
-                platform=copy_platform,
             )
         except Exception as e:
             print(f"[oneshot] shoot script skipped: {e}", flush=True)
@@ -3000,6 +3898,8 @@ async def _build_campaign_plan(
         summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
                                          delivery_estimate=estimate, audience_text=audience_text)
         summary_dump = summary.model_dump(mode="json")
+        if google_budget_warning:
+            summary_dump["budget_allocation"]["reason"] = google_budget_warning
     except Exception as e:
         print(f"[oneshot] summary skipped: {e}", flush=True)
 
@@ -3007,7 +3907,14 @@ async def _build_campaign_plan(
     if _runs_on_meta(plan):
         from .preflight import meta_warnings
         warnings = await meta_warnings(plan)
-    elif plan.geo and (plan.geo.city or plan.geo.pins):
+    elif _runs_on_tiktok(plan) and plan.geo and (plan.geo.city or plan.geo.pins):
+        # Was `elif plan.geo and (...)` with no platform check at all — "not
+        # Meta" also matches Google, so a Google plan fell straight into this
+        # branch and got TikTok's own location-targeting caveat attached to
+        # it (confirmed live: a tester's Lagos-targeted plan landed on Google
+        # Search and still showed "TikTok can only target all of Nigeria...
+        # choose Instagram & Facebook instead" — nonsensical on a plan that
+        # was never TikTok).
         from .preflight import tiktok_location_warning
         warnings = [tiktok_location_warning(plan.geo)]
 
@@ -3025,6 +3932,10 @@ def _runs_on_meta(plan: CampaignPlan) -> bool:
     return bool(plan.platforms) and plan.platforms[0].platform == Platform.META
 
 
+def _runs_on_tiktok(plan: CampaignPlan) -> bool:
+    return bool(plan.platforms) and plan.platforms[0].platform == Platform.TIKTOK
+
+
 def _tiktok_budget_too_low_message(budget_ngn: float) -> str:
     """"" when `budget_ngn` clears TikTok's own daily floor; otherwise what the client needs
     to state. TikTok pays no URI fee, so the floor applies to the stated budget as it is."""
@@ -3035,7 +3946,7 @@ def _tiktok_budget_too_low_message(budget_ngn: float) -> str:
             f"What budget would you like to use?")
 
 
-def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False) -> float:
+def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False, fee_only: bool = False) -> float:
     """What the customer's wallet must cover for a campaign whose AD SPEND is
     `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
     taken out of it to arrive at that spend (constants.ad_spend_from_budget).
@@ -3047,16 +3958,28 @@ def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False) -> float:
     wallet empties precisely as Meta's budget is exhausted, with nothing left over and
     nothing uncollected.
 
-    `fee_bypassed` mirrors _PlanBuildResult.fee_bypassed — when true, `ad_spend_ngn` already
-    IS the full stated budget (no fee was ever taken out of it), so the total due is exactly
-    that, with no markup applied on top."""
+    TEMP (2026-09-17, revert when real TikTok testing is done): `fee_bypassed` mirrors
+    _PlanBuildResult.fee_bypassed — when true, `ad_spend_ngn` already IS the full
+    stated budget (no fee was ever taken out of it), so the total due is exactly that,
+    with no markup applied on top."""
+    if fee_only:
+        # Google in the brand's OWN account: Google bills their card for the ad
+        # spend, so the wallet pays URI's fee alone — never the spend twice.
+        return 0.0 if fee_bypassed else round(ad_spend_ngn * (C.AD_SPEND_MARKUP - 1), 2)
     if fee_bypassed:
         return round(ad_spend_ngn, 2)
     return round(ad_spend_ngn * C.AD_SPEND_MARKUP, 2)
 
 
+def _google_own_billing(plan) -> bool:
+    """A Google plan running in the brand's own Google Ads account (Google bills them)."""
+    return bool(plan.platforms and plan.platforms[0].platform == Platform.GOOGLE
+                and (plan.google_keyword_context or {}).get("billing") == "own")
+
+
 async def _wallet_status(
     db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float, fee_bypassed: bool = False,
+    fee_only: bool = False,
 ) -> tuple[float, bool]:
     """(balance, sufficient) — the real Mongo-backed balance vs. the total due. Takes
     AD SPEND, so the total due comes back out as the client's stated budget."""
@@ -3065,14 +3988,18 @@ async def _wallet_status(
 
     wallet = WalletService(MongoWalletStore(db))
     balance = await wallet.get_balance(business_id)
-    return balance, balance >= _total_due_ngn(budget_ngn, fee_bypassed)
+    return balance, balance >= _total_due_ngn(budget_ngn, fee_bypassed, fee_only)
 
 
-def _wallet_shortfall_message(balance: float, budget_ngn: float, fee_bypassed: bool = False) -> str:
+def _wallet_shortfall_message(balance: float, budget_ngn: float, fee_bypassed: bool = False,
+                              fee_only: bool = False) -> str:
     """`budget_ngn` is AD SPEND; the client is told the one number that matters to
     them — the total leaving their wallet, which is the budget they stated. The fee is
     deliberately not itemised: it is inside that figure, not added to it."""
-    due = _total_due_ngn(budget_ngn, fee_bypassed)
+    due = _total_due_ngn(budget_ngn, fee_bypassed, fee_only)
+    if fee_only:
+        return (f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more before launching. "
+                f"URI's fee for this campaign is ₦{due:,.0f}; Google bills your Google Ads account for the ad spend.")
     return (
         f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more "
         f"before launching. This campaign costs ₦{due:,.0f}."
@@ -3099,8 +4026,18 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             # delivery widening does) left the card describing the older one.
             "geo": (plan.geo.model_dump(mode="json") if plan.geo else built.geo_dump),
             "trace": plan.trace,
+            # Google only: where it runs (placement), how it's paid (billing) and the
+            # business name the ad shows — what the plan card's preview and labels read.
+            "google_keyword_context": {
+                k: (plan.google_keyword_context or {}).get(k, "")
+                for k in ("placement", "billing", "business_name")
+            } if plan.google_keyword_context else None,
         },
         "creative": plan.creative.model_dump(mode="json"),
+        "concepts": [c.model_dump(mode="json") for c in plan.concepts],
+        "ad_layout": plan.ad_layout,
+        "concepts_wanted": plan.concepts_wanted,
+        "can_split": bool(plan.platforms and _can_split_ads(plan)),
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
         # So the review can show where leads land (and let the user catch a wrong
@@ -3117,8 +4054,6 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "variant_group_id": built.variant_group_id,
         "audience_text": built.audience_text,
         "selected_plan_variant": built.selected_plan_variant,
-        # Carried through to the launch step below, which reloads this doc rather than built.
-        "fee_bypassed": built.fee_bypassed,
         "warnings": built.warnings,
     }
 
@@ -3139,15 +4074,28 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     wallet = WalletService(MongoWalletStore(db))
     auth = await wallet.authorization_for(business_id, total_funded_wallets_ngn=req.budget_ngn)
 
+    from . import google_flow
+    from .adapters.google import LowClicksWarning
+
     launch_platform = plan.platforms[0].platform if plan.platforms else Platform.META
     is_tiktok = launch_platform == Platform.TIKTOK
+    is_google = launch_platform == Platform.GOOGLE
+    google_conn: dict = {}
 
-    if is_tiktok:
+    if is_google:
+        # The brand's OWN Google Ads account, through the pre-flight gate (the link
+        # is re-checked with Google right now) — never a shared account.
+        adapter, google_conn = await google_flow.adapter_for_launch(db, brand_ctx)
+    elif is_tiktok:
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
     else:
         adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         launch = await adapter.launch_campaign(plan, auth)
+    except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except google_flow.GoogleAdsAPIError as e:
+        google_flow.raise_http(e)
     except TikTokAdsAPIError as e:
         _raise_http_for_tiktok_error(e)
     except MetaAPIError as e:
@@ -3155,13 +4103,14 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     except (ValueError, NotImplementedError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    campaign_collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
-    # TikTok-only (see _video_thumbnail_url docstring): for a video ad,
+    campaign_collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
+                           else "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns")
+    # TikTok-only (see tiktok_media.extract_poster_frame docstring): for a video ad,
     # plan.creative.image_url IS the raw .mp4 URL, which the campaign list's
-    # plain <img> tag can't render — swap in a Cloudinary-derived poster frame
+    # plain <img> tag can't render — swap in a locally-extracted poster frame
     # for display only, purely additive, leaves Meta's own image_url untouched.
     display_image_url = (
-        _video_thumbnail_url(plan.creative.image_url)
+        await _video_thumbnail_url(plan.creative.image_url)
         if is_tiktok and plan.creative.is_video
         else plan.creative.image_url
     )
@@ -3198,7 +4147,13 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         if is_tiktok else
         "Created PAUSED — zero spend. Review and activate in Ads Manager to go live."
     )
+    # Never a link into URI's own ad accounts — only into the brand's own Google one.
     ads_manager_url = ""
+    if is_google:
+        launch_note = ("Created paused — nothing is spent until you turn it on: Campaign Manager → "
+                       "press ▶ on this campaign.")
+        if (await google_flow.get_mode(db, brand_ctx.get("brand_id"))) == "own":
+            ads_manager_url = google_flow.ads_url(google_conn.get("customer_id", ""))
     return {
         "stage": "launched",
         "understood": built.understood,
@@ -3212,12 +4167,53 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "status": "DISABLE" if is_tiktok else "PAUSED",
             "note": launch_note,
             "ads_manager_url": ads_manager_url,
-            # Additive — status already implied this (DISABLE vs PAUSED) but a named field is
-            # what the frontend actually needs for a platform badge, not string-sniffing an
-            # unrelated status value.
-            "platform": "tiktok" if is_tiktok else "meta",
+            # Additive — status already implied this (DISABLE vs PAUSED) but a
+            # named field is what the frontend actually needs for a platform
+            # badge, not string-sniffing an unrelated status value.
+            "platform": "google" if is_google else "tiktok" if is_tiktok else "meta",
         },
     }
+
+
+async def _refund_undelivered_ad(brand_ctx: dict, business_id: str) -> None:
+    from app.services.CreditService import credit_service
+    try:
+        await credit_service.refund_credit(brand_ctx.get("user_id") or "", campaign_id=business_id)
+    except Exception as e:
+        print(f"[credits] refund after dropped connection failed: {e}", flush=True)
+
+
+def _can_split_ads(plan) -> bool:
+    from . import concepts as concepts_mod
+    p = plan.platforms[0]
+    return concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts))
+
+
+def _concepts_allowed(plan, creative_platform: str) -> int:
+    """How many ads Jane can make to test in one campaign. Meta only: they share one ad
+    set by default, so a small budget can still test them."""
+    from . import concepts as concepts_mod
+    if creative_platform != Platform.META.value or not plan.platforms:
+        return 1
+    return concepts_mod.MAX_JANE_MADE
+
+
+def _budget_advice(parsed, advice, stated_budget_ngn: float, fee_bypassed: bool) -> dict:
+    """Tells the client about a too-small budget in the number they typed: what they
+    stated, what's left for ads after the fee, and what to state instead."""
+    if not fee_bypassed:
+        floor = advice.suggested_min_ngn
+        needed = C.budget_for_ad_spend(floor)
+        fee = round(C.SERVICE_FEE_RATE * 100)
+        advice = advice.model_copy(update={
+            "suggested_min_ngn": needed,
+            "reason": (f"₦{stated_budget_ngn:,.0f} leaves ₦{C.ad_spend_from_budget(stated_budget_ngn):,.0f} "
+                       f"for your ads after URI's {fee}% service fee, and they need at least "
+                       f"₦{floor:,.0f} "
+                       f"to work properly. Make your budget at least ₦{needed:,.0f}."),
+        })
+    return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
+            "advice": advice.model_dump(), "trace": advice.trace}}
 
 
 @router.post("/meta/launch-from-message")
@@ -3231,24 +4227,39 @@ async def meta_launch_from_message(
     a REAL campaign to Meta (created PAUSED, zero spend) → returns everything. For
     reviewing a plan before committing to Meta, use /meta/plan-from-message +
     /meta/plan/{id}/launch instead — this endpoint plans and launches in one call."""
+    from . import launch_governance as gov
+
+    await gov.require_launch_role(db, brand_ctx)
     built = await _build_campaign_plan(body, brand_ctx, db)
     if isinstance(built, dict):
         return built["early_return"]
 
+    from . import brief as ads_brief
+    checks = ads_brief.check_plan(built.plan.model_dump(mode="json"), built.req.model_dump(mode="json"),
+                                  await ads_brief.load(db, brand_ctx.get("brand_id") or ""))
+    blocks = ads_brief.unresolved_blocks(checks, allow_out_of_area=False)
+    if blocks:
+        raise HTTPException(status_code=400, detail=blocks[0]["message"])
+
     # Wallet gate — the ad wallet must actually have the money before anything
     # reaches Meta. Blocks with the exact shortfall rather than silently launching
     # a campaign whose real Meta daily budget got clamped to less than requested.
-    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed)
+    own = _google_own_billing(built.plan)
+    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed, own)
     if not sufficient:
         raise HTTPException(status_code=400,
-                            detail=_wallet_shortfall_message(balance, built.req.budget_ngn, built.fee_bypassed))
+                             detail=_wallet_shortfall_message(balance, built.req.budget_ngn, built.fee_bypassed, own))
 
-    return await _do_launch(built, body.message, body.business_name, brand_ctx, db)
+    result = await _do_launch(built, body.message, body.business_name, brand_ctx, db)
+    await gov.audit(db, brand_ctx.get("brand_id"), (result.get("launch") or {}).get("campaign_id", ""),
+                    "campaign_published", brand_ctx.get("user_id") or "", status="paused", via="launch_from_message")
+    return result
 
 
 @router.post("/meta/plan-from-message")
 async def meta_plan_from_message(
     body: MetaLaunchFromMessageBody,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -3263,8 +4274,13 @@ async def meta_plan_from_message(
     built = await _build_campaign_plan(body, brand_ctx, db)
     if isinstance(built, dict):
         return built["early_return"]
+    # The connection dropped while the ad was being made, so nobody will ever see it.
+    if built.plan.creative and built.plan.creative.source == "generate" and await request.is_disconnected():
+        await _refund_undelivered_ad(brand_ctx, built.business_id)
 
-    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed)
+    own_billing = _google_own_billing(built.plan)
+    balance, sufficient = await _wallet_status(
+        db, built.business_id, built.req.budget_ngn, built.fee_bypassed, own_billing)
 
     plan_id = f"plan_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc)
@@ -3305,13 +4321,18 @@ async def meta_plan_from_message(
         "thread_id": built.thread_id,
         "variant_group_id": built.variant_group_id,
         "selected_plan_variant": built.selected_plan_variant,
-        # Launch rebuilds from this document, not from `built`: without it a TikTok plan
-        # quoted fee-free would be charged the fee at launch.
+        # TEMP (2026-09-17, revert when real TikTok testing is done): carried through
+        # to the launch step below, which reloads this doc rather than built.
         "fee_bypassed": built.fee_bypassed,
         "status": "pending",
+        "state_history": [{"state": "review", "at": now, "actor": brand_ctx.get("user_id") or ""}],
         "created_at": now,
         "expires_at": now + timedelta(days=7),
     })
+    from . import launch_governance as gov
+    await gov.audit(db, brand_ctx.get("brand_id"), "", "strategy_generated", brand_ctx.get("user_id") or "",
+                    plan_id=plan_id, objective=built.plan.objective.value if built.plan.objective else "",
+                    plan_variant=built.selected_plan_variant or "")
 
     return {
         "stage": "planned",
@@ -3328,8 +4349,13 @@ async def meta_plan_from_message(
             # stated budget now, so itemising it invited the old "+ service fee" line
             # that asked them to fund more than the number they gave.
             "budget_ngn": built.req.budget_ngn,
-            "total_due_ngn": _total_due_ngn(built.req.budget_ngn, built.fee_bypassed),
+            "total_due_ngn": _total_due_ngn(built.req.budget_ngn, built.fee_bypassed, own_billing),
             "sufficient": sufficient,
+            # Google in the brand's own account: the wallet pays URI's fee only and
+            # Google bills their account for ad_spend_ngn. "" for everything else.
+            "google_billing": ("own" if own_billing else "uri") if built.plan.platforms
+            and built.plan.platforms[0].platform == Platform.GOOGLE else "",
+            "ad_spend_ngn": built.req.budget_ngn,
         },
     }
 
@@ -3387,9 +4413,237 @@ async def meta_plan_update_creative(
     return {"plan_id": plan_id, "creative": plan.creative.model_dump(mode="json")}
 
 
+class PlanAdBody(BaseModel):
+    source: str = "generate"           # generate | upload
+    # Working through "test N ideas": a no-op once the plan has what it asked for, so a
+    # reload part-way can't overshoot, or undo an ad the client has since removed.
+    auto: bool = False
+    reference_image_url: str = ""
+    is_video: bool = False
+    asset_attestation: Optional[str] = None
+    creative_path: str = ""            # "" | ai_video | ugc
+    video_job_id: str = ""
+    ugc_kind: str = ""
+    ugc_rights_confirmed: bool = False
+
+
+class PlanLayoutBody(BaseModel):
+    layout: str
+
+
+async def _pending_meta_plan(db, plan_id: str, brand_ctx: dict) -> tuple[dict, CampaignPlan]:
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if doc["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"This plan is already {doc['status']}.")
+    plan = CampaignPlan.model_validate(doc["plan"])
+    if not plan.platforms or plan.platforms[0].platform != Platform.META or not plan.creative:
+        raise HTTPException(status_code=400, detail="Testing several ads is only available on Instagram & Facebook.")
+    return doc, plan
+
+
+async def _save_plan_ads(db, plan_id: str, plan: CampaignPlan) -> dict:
+    from . import concepts as concepts_mod
+    await db["jane_ads_pending_plans"].update_one(
+        {"plan_id": plan_id}, {"$set": {"plan": plan.model_dump(mode="json")}})
+    p = plan.platforms[0]
+    ads = 1 + len(plan.concepts)
+    return {"plan_id": plan_id, "concepts": [c.model_dump(mode="json") for c in plan.concepts],
+            "ad_layout": plan.ad_layout, "concepts_wanted": plan.concepts_wanted,
+            "can_split": concepts_mod.can_split(p.budget_ngn, p.days, ads)}
+
+
+@router.post("/meta/plan/{plan_id}/ads")
+async def meta_plan_add_ad(
+    plan_id: str,
+    body: PlanAdBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+    request: Request = None,
+) -> dict:
+    """Add another ad to the test this plan runs: one Jane makes, or the client's own
+    photo or video. Any mix works, and each answers to the same checks as the first."""
+    from app.services.CreditService import credit_service
+    from . import concepts as concepts_mod
+    from .creative import creative_from_upload, generate_ad_creative, service_area_from_geo
+    from .creative_paths import disclose, without_budget
+    from .policy import Severity, review_ad_creative
+
+    doc, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if body.auto and 1 + len(plan.concepts) >= plan.concepts_wanted:
+        plan.concepts_wanted = 0
+        return await _save_plan_ads(db, plan_id, plan)
+    if 1 + len(plan.concepts) >= concepts_mod.MAX_ADS:
+        raise HTTPException(status_code=400, detail=f"A test can hold up to {concepts_mod.MAX_ADS} ads.")
+    req = CampaignRequest.model_validate(doc["req"])
+    user_id = brand_ctx.get("user_id") or ""
+    brand_id = brand_ctx.get("brand_id")
+    variant = doc.get("selected_plan_variant") or {}
+    city = plan.geo.city if plan.geo else ""
+    shared = dict(
+        user_id=user_id, db=db, brand_id=brand_id, city=city,
+        service_area=service_area_from_geo(plan.geo, city),
+        audience_segment=variant.get("audience_segment", ""), who_its_for=variant.get("who_its_for", ""),
+        destination_type=plan.destination_type, destination_cta=plan.destination_cta,
+    )
+    name = req.business_name or doc.get("business_name") or "Your Business"
+    # The budget is how the ad runs, never a price to print on it.
+    clean_brief = without_budget(req.description, (doc.get("understood") or {}).get("budget_ngn"))
+    prov: dict = {}
+    if body.source == "generate":
+        if not await credit_service.check_sufficient_credits(user_id, required=1):
+            raise HTTPException(status_code=402, detail="You're out of content credits. Top up, or add your own photo or video.")
+        angle = concepts_mod.next_angle([c.concept for c in [plan.creative, *plan.concepts]])
+        ad = await generate_ad_creative(
+            name, req.category, req.goal.value, concepts_mod.brief_for(clean_brief, angle),
+            behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn,
+            exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id],
+            image_layout=concepts_mod.layout_for(angle),
+            **shared)
+        ad.concept = angle
+    else:
+        path_body = MetaLaunchFromMessageBody(
+            message=doc.get("message") or "", creative_source="upload",
+            reference_image_url=body.reference_image_url, is_video=body.is_video,
+            creative_path=body.creative_path, video_job_id=body.video_job_id,
+            ugc_kind=body.ugc_kind, ugc_rights_confirmed=body.ugc_rights_confirmed)
+        prov = await _resolve_creative_path(path_body, brand_ctx, db)
+        if not path_body.reference_image_url:
+            raise HTTPException(status_code=400, detail="Upload the photo or video first.")
+        ad = await creative_from_upload(
+            name, req.category, path_body.reference_image_url, req.goal.value, clean_brief,
+            is_video=path_body.is_video, asset_attestation=body.asset_attestation, **shared)
+    if not ad.image_url:
+        raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+    if prov:
+        ad.provenance = prov
+        ad.primary_text = disclose(ad.primary_text, prov)
+    blocking = [v for v in review_ad_creative(ad.headline, ad.primary_text, platform=Platform.META.value).violations
+                if v.severity == Severity.BLOCK]
+    if blocking:
+        raise HTTPException(status_code=400, detail=f"Can't use this ad — {blocking[0].guidance}")
+    if body.source == "generate":
+        await credit_service.deduct_credit(user_id, campaign_id=doc["business_id"], reason="campaign_generation")
+    plan.concepts.append(ad)
+    if 1 + len(plan.concepts) >= plan.concepts_wanted:
+        plan.concepts_wanted = 0
+    p = plan.platforms[0]
+    if not concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts)):
+        plan.ad_layout = concepts_mod.SINGLE_AD_SET
+    saved = await _save_plan_ads(db, plan_id, plan)
+    # Kept on the plan, but the client may never see it: don't charge for that.
+    if body.source == "generate" and request is not None and await request.is_disconnected():
+        await _refund_undelivered_ad(brand_ctx, doc["business_id"])
+    return saved
+
+
+class PlanAdEditBody(BaseModel):
+    headline: str = ""
+    primary_text: str = ""
+
+
+@router.post("/meta/plan/{plan_id}/ad-jobs")
+async def meta_plan_start_ad_job(
+    plan_id: str,
+    body: PlanAdBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Add an ad in the background: see ad_jobs.py for why."""
+    from . import ad_jobs
+    await _pending_meta_plan(db, plan_id, brand_ctx)
+    job_id = await ad_jobs.start(db, brand_ctx.get("brand_id"),
+                                 lambda: meta_plan_add_ad(plan_id, body, db, brand_ctx))
+    return {"job_id": job_id}
+
+
+@router.get("/ad-jobs/{job_id}")
+async def read_ad_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import ad_jobs
+    return await ad_jobs.read(db, brand_ctx.get("brand_id"), job_id)
+
+
+@router.patch("/meta/plan/{plan_id}/ads/{index}")
+async def meta_plan_edit_ad(
+    plan_id: str,
+    index: int,
+    body: PlanAdEditBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Edit the words of an added ad. Same checks as the main ad's caption edit."""
+    from .creative_paths import disclose
+    from .policy import Severity, review_ad_creative
+
+    _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if not 0 <= index < len(plan.concepts):
+        raise HTTPException(status_code=404, detail="That ad isn't in this plan.")
+    headline, text = body.headline.strip(), body.primary_text.strip()
+    if not headline or not text:
+        raise HTTPException(status_code=400, detail="Headline and caption cannot be empty.")
+    if len(headline) > 40:
+        raise HTTPException(status_code=400, detail="Keep the headline to 40 characters.")
+    blocking = [v for v in review_ad_creative(headline, text, platform=Platform.META.value).violations
+                if v.severity == Severity.BLOCK]
+    if blocking:
+        raise HTTPException(status_code=400, detail=f"Ad copy rejected: {blocking[0].guidance}")
+    ad = plan.concepts[index]
+    ad.headline, ad.primary_text = headline, disclose(text, ad.provenance)
+    return await _save_plan_ads(db, plan_id, plan)
+
+
+@router.delete("/meta/plan/{plan_id}/ads/{index}")
+async def meta_plan_remove_ad(
+    plan_id: str,
+    index: int,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Take an added ad back out of the test. `index` counts the added ads only, so the
+    plan always keeps its main ad."""
+    _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    if not 0 <= index < len(plan.concepts):
+        raise HTTPException(status_code=404, detail="That ad isn't in this plan.")
+    plan.concepts.pop(index)
+    plan.concepts_wanted = 0
+    return await _save_plan_ads(db, plan_id, plan)
+
+
+@router.post("/meta/plan/{plan_id}/layout")
+async def meta_plan_set_layout(
+    plan_id: str,
+    body: PlanLayoutBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """All the ads in one ad set, or one ad set each with an equal budget."""
+    from . import concepts as concepts_mod
+    if body.layout not in (concepts_mod.SINGLE_AD_SET, concepts_mod.ABO):
+        raise HTTPException(status_code=400, detail="Unknown layout.")
+    _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
+    p = plan.platforms[0]
+    ads = 1 + len(plan.concepts)
+    if body.layout == concepts_mod.ABO and not concepts_mod.can_split(p.budget_ngn, p.days, ads):
+        raise HTTPException(status_code=400, detail=f"Each ad set needs at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} a day. "
+                                                    "Raise the budget or test fewer ads.")
+    plan.ad_layout = body.layout
+    return await _save_plan_ads(db, plan_id, plan)
+
+
+class PlanLaunchBody(BaseModel):
+    # The client confirmed they deliver to places outside their saved service area.
+    allow_out_of_area: bool = False
+
+
 @router.post("/meta/plan/{plan_id}/launch")
 async def meta_launch_plan(
     plan_id: str,
+    body: Optional[PlanLaunchBody] = Body(None),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -3399,10 +4653,16 @@ async def meta_launch_plan(
     from datetime import datetime, timezone
     from .policy import Severity, review_ad_creative
 
+    from . import launch_governance as gov
+
     brand_id = brand_ctx.get("brand_id")
+    actor = brand_ctx.get("user_id") or ""
+    await gov.require_launch_role(db, brand_ctx)
     doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
     if not doc or doc.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Plan not found")
+    if doc["status"] == "launching":
+        raise HTTPException(status_code=409, detail="This plan is already being launched — give it a moment, then refresh.")
     if doc["status"] != "pending":
         raise HTTPException(status_code=409, detail=f"This plan is already {doc['status']} — describe a new campaign to Jane to plan another.")
     expires_at = doc["expires_at"]
@@ -3414,6 +4674,14 @@ async def meta_launch_plan(
 
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
+
+    # The brand's standing brief: service area, exclusions and format constraints
+    # are held at launch, not just shown on the plan.
+    from . import brief as ads_brief
+    checks = ads_brief.check_plan(doc["plan"], doc["req"], await ads_brief.load(db, brand_id))
+    blocks = ads_brief.unresolved_blocks(checks, bool(body and body.allow_out_of_area))
+    if blocks:
+        raise HTTPException(status_code=400, detail=blocks[0]["message"])
 
     # Re-resolve the ads connection AND the destination at commit time rather than
     # trusting the page_id/number/link frozen into the plan when it was first built —
@@ -3431,12 +4699,18 @@ async def meta_launch_plan(
     require_whatsapp = (
         plan.goal != Goal.FOLLOWERS and destination_type == DestinationType.WHATSAPP
     )
-    try:
-        ads_conn = await resolve_ads_page_for_launch(
-            db, brand_ctx.get("user_id"), brand_id, require_whatsapp=require_whatsapp,
-        )
-    except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
+    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
+        # Google runs in the brand's own Google Ads account — there is no Meta Page.
+        # Its own gate (linked account, re-checked with Google) runs in _do_launch.
+        from .whatsapp import get_brand_whatsapp
+        ads_conn = {"page_id": "", "whatsapp_number": await get_brand_whatsapp(db, brand_id) or ""}
+    else:
+        try:
+            ads_conn = await resolve_ads_page_for_launch(
+                db, brand_ctx.get("user_id"), brand_id, require_whatsapp=require_whatsapp,
+            )
+        except AdsConnectionRequired as e:
+            raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]
 
     # A WhatsApp campaign requires a WhatsApp NUMBER — enforced above by
@@ -3462,6 +4736,10 @@ async def meta_launch_plan(
         custom_url=brand_destination["custom_url"],
     )
     plan.destination_cta = brand_destination["destination_cta"]
+    if plan.creative is not None:
+        from .creative_paths import disclose
+        for ad in [plan.creative, *plan.concepts]:
+            ad.primary_text = disclose(ad.primary_text, ad.provenance)
     if plan.goal != Goal.FOLLOWERS and not plan.destination_link:
         raise HTTPException(
             status_code=400,
@@ -3489,17 +4767,28 @@ async def meta_launch_plan(
     # Policy re-check at commit — cheap and deterministic, and real time has passed
     # since the plan was built, so this is a genuine safety re-validation, not just
     # a formality.
-    policy_result = review_ad_creative(plan.creative.headline, plan.creative.primary_text)
-    blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
-    if blocking:
-        raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")
+    launch_platform_value = plan.platforms[0].platform.value if plan.platforms else Platform.META.value
+    for ad in [plan.creative, *plan.concepts]:
+        policy_result = review_ad_creative(ad.headline, ad.primary_text, platform=launch_platform_value)
+        blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
+        if blocking:
+            raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")
 
-    # Carried over from /meta/plan-from-message via the pending-plan doc.
+    # TEMP (2026-09-17, revert when real TikTok testing is done): carried over from
+    # /meta/plan-from-message via the pending-plan doc.
     fee_bypassed = bool(doc.get("fee_bypassed", False))
-    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn, fee_bypassed)
+    from . import google_flow
+    own_billing = False
+    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
+        # Where it runs is the brand's choice at THIS moment — they may have switched
+        # between planning and launching — so the wallet is gated and charged on that.
+        own_billing = (await google_flow.get_mode(db, brand_ctx.get("brand_id"))) == "own"
+        plan.google_keyword_context = {**(plan.google_keyword_context or {}),
+                                       "billing": "own" if own_billing else "uri"}
+    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn, fee_bypassed, own_billing)
     if not sufficient:
         raise HTTPException(status_code=400,
-                            detail=_wallet_shortfall_message(balance, req.budget_ngn, fee_bypassed))
+                             detail=_wallet_shortfall_message(balance, req.budget_ngn, fee_bypassed, own_billing))
 
     built = _PlanBuildResult(
         business_id=doc["business_id"], req=req, plan=plan,
@@ -3508,7 +4797,21 @@ async def meta_launch_plan(
         budget_estimate=doc.get("budget_estimate"), summary=doc.get("summary"),
         thread_id=doc.get("thread_id", ""), fee_bypassed=fee_bypassed,
     )
-    result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+    # Claimed atomically before Meta is called: a double-click or a retried request
+    # finds the plan already launching instead of creating a second campaign.
+    if not await gov.claim(db, plan_id, actor):
+        raise HTTPException(status_code=409, detail="This plan is already being launched — give it a moment, then refresh.")
+    config = await gov.record_approval(db, doc, actor, _total_due_ngn(req.budget_ngn, fee_bypassed, own_billing))
+    await gov.audit(db, brand_id, "", "campaign_submitted", actor, plan_id=plan_id, config_hash=config)
+    try:
+        result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+    except Exception as e:
+        # Meta has no campaign (_do_launch rolls a partial one back before raising),
+        # so the plan goes back to pending to be fixed and launched again.
+        why = e.detail if isinstance(e, HTTPException) else str(e)
+        await gov.release(db, plan_id, actor, str(why))
+        await gov.audit(db, brand_id, "", "campaign_launch_failed", actor, plan_id=plan_id, error=str(why)[:300])
+        raise
 
     # Take the money now the campaign really exists on Meta. Charged AFTER the launch,
     # never before: a launch that fails raises out of _do_launch above, and a client
@@ -3519,7 +4822,7 @@ async def meta_launch_plan(
     # charge this campaign again as it spends (it skips any record carrying
     # charged_upfront_ngn; without that the client would pay twice for the same ads).
     campaign_id = result["launch"]["campaign_id"]
-    due = _total_due_ngn(req.budget_ngn, fee_bypassed)
+    due = _total_due_ngn(req.budget_ngn, fee_bypassed, own_billing)
     try:
         from .store import MongoWalletStore
         from .wallet import InsufficientFundsError, WalletService
@@ -3535,15 +4838,32 @@ async def meta_launch_plan(
         # charged_upfront_ngn — so stated_budget_from_record() fell through to the
         # ad_spend × LEGACY_AD_SPEND_MARKUP reconstruction and showed the wrong
         # BUDGET on the campaign card (e.g. ₦35,000 charged displayed as ₦38,500).
-        charged_collection = ("jane_ads_tiktok_campaigns" if result["launch"].get("platform") == "tiktok"
-                              else "jane_ads_meta_campaigns")
+        charged_collection = {"tiktok": "jane_ads_tiktok_campaigns",
+                              "google": "jane_ads_google_campaigns"}.get(
+                                  result["launch"].get("platform"), "jane_ads_meta_campaigns")
         await db[charged_collection].update_one(
-            {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
+            {"campaign_id": campaign_id},
+            {"$set": {"charged_upfront_ngn": due,
+                      # own account: the wallet paid the fee; Google bills them the spend
+                      **({"google_billing": "own"} if own_billing else {})}},
         )
         # The decision record (CI-SPEC-01 Part 1). Written here because this is the
         # moment every input still exists together — the understanding, the ranked
         # plans, the corpus citations and what was actually charged. Best-effort: it
         # never raises, so it cannot cost a launch the client has just paid for.
+        if plan.concepts:
+            # Each concept registered with what it tests, so Growth can judge them apart.
+            # Best-effort: the campaign is live and paid for either way.
+            from .growth import creative as growth_creative
+            try:
+                launched = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id}) or {}
+                for ad, ad_id in zip([plan.creative, *plan.concepts], launched.get("ad_ids") or []):
+                    await growth_creative.register(
+                        db, brand_ctx.get("brand_id", ""), campaign_id, ad_id,
+                        {"concept": ad.concept, "hook": ad.headline, "image": ad.image_url},
+                        "concepts", brand_ctx.get("user_id") or "")
+            except Exception as e:
+                print(f"[launch] concept registration skipped for {campaign_id}: {e}", flush=True)
         from .campaign_record import write_campaign_record
 
         await write_campaign_record(
@@ -3565,12 +4885,160 @@ async def meta_launch_plan(
         # the honest thing is to say so rather than pretend the launch failed.
         print(f"[launch] campaign {campaign_id} created but wallet charge failed: {e}", flush=True)
         result["wallet"] = {"charged_ngn": 0.0, "charge_failed": True}
+    except Exception as e:
+        # The campaign exists on Meta, so the plan must never return to pending — a
+        # retry would create a second one. Surface the bookkeeping failure instead.
+        print(f"[launch] campaign {campaign_id} created but post-launch bookkeeping failed: {e}", flush=True)
+        result["wallet"] = {"charged_ngn": 0.0, "charge_failed": True}
 
-    await db["jane_ads_pending_plans"].update_one(
-        {"plan_id": plan_id},
-        {"$set": {"status": "launched", "campaign_id": campaign_id}},
-    )
+    await gov.mark_launched(db, plan_id, actor, campaign_id, config_hash=config)
+    await gov.audit(db, brand_id, campaign_id, "campaign_published", actor, plan_id=plan_id,
+                    status="paused", config_hash=config)
     return result
+
+
+@router.get("/brief")
+async def get_ads_brief(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The brand's standing ads brief — saved once, applied to every plan."""
+    from . import brief as ads_brief
+    return {"brief": await ads_brief.load(db, brand_ctx.get("brand_id")),
+            "constraint_options": ads_brief.CONSTRAINTS, "tracking_options": list(ads_brief.TRACKING)}
+
+
+@router.put("/brief")
+async def put_ads_brief(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import brief as ads_brief
+    from . import launch_governance as gov
+    saved = await ads_brief.save(db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id") or "")
+    await gov.audit(db, brand_ctx.get("brand_id"), "", "brief_completed", brand_ctx.get("user_id") or "",
+                    fields=sorted(ads_brief.normalise(payload)))
+    return {"brief": saved}
+
+
+@router.get("/mode")
+async def get_ads_mode(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Guided or Advanced — how much of the ads machinery this user sees for this brand."""
+    from . import brief as ads_brief
+    return {"mode": await ads_brief.load_mode(db, brand_ctx.get("brand_id") or "", brand_ctx.get("user_id") or ""),
+            "modes": list(ads_brief.MODES)}
+
+
+@router.put("/mode")
+async def put_ads_mode(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    from . import brief as ads_brief
+    from . import launch_governance as gov
+    try:
+        mode = await ads_brief.save_mode(db, brand_ctx.get("brand_id") or "", brand_ctx.get("user_id") or "",
+                                         str(payload.get("mode") or ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await gov.audit(db, brand_ctx.get("brand_id"), "", "mode_changed", brand_ctx.get("user_id") or "", mode=mode)
+    return {"mode": mode}
+
+
+@router.get("/creative/paths")
+async def creative_paths_for_brand(
+    category: str = "",
+    description: str = "",
+    has_own_media: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Which creative paths the brand's brief leaves open, and which Jane suggests first."""
+    from . import brief as ads_brief
+    from . import creative_paths as cp
+    brief = await ads_brief.load(db, brand_ctx.get("brand_id") or "")
+    return {**cp.recommend(category, description, brief, has_own_media),
+            "ugc_kinds": {k: v["label"] for k, v in cp.UGC_KINDS.items()}}
+
+
+@router.get("/creative/ai-videos")
+async def creative_ai_videos(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The user's finished AI studio videos that can become an ad."""
+    from . import creative_paths as cp
+    return {"videos": await cp.ai_videos(db, brand_ctx.get("user_id") or "")}
+
+
+@router.post("/creative/creator-brief")
+async def creative_creator_brief(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """CR-06: a filmable brief for a creator, customer or the owner's team."""
+    from . import brief as ads_brief
+    from . import creative_paths as cp
+    from .creative import get_brand_context, write_shoot_script
+    from .nl import parse_message
+
+    brief = await ads_brief.load(db, brand_ctx.get("brand_id") or "")
+    if not cp.availability(brief)["ugc"]["open"]:
+        raise HTTPException(status_code=400, detail="Your ads brief rules out creator or UGC-style content.")
+    kind = str(payload.get("ugc_kind") or "creator_style")
+    if kind not in cp.UGC_KINDS:
+        raise HTTPException(status_code=400, detail="Unknown kind of video.")
+    user_id = brand_ctx.get("user_id") or ""
+    brand_context = await get_brand_context(user_id, db, brand_ctx.get("brand_id")) if user_id else {}
+    name = str(payload.get("business_name") or brand_context.get("brand_name") or "")
+    category = str(payload.get("category") or brand_context.get("industry") or "")
+    description = str(payload.get("description") or "")
+    shots = None
+    try:
+        parsed = await parse_message(description, name, category)
+        description = cp.without_budget(description, parsed.budget_ngn)
+        script = await write_shoot_script(name, category, "messages",
+                                          "a real person on camera builds trust", description,
+                                          brand_context, filmed_by=cp.FILMED_BY[kind])
+        shots = [{"shot": f"Shot {i + 1} · {s.seconds}s", "direction": s.direction}
+                 for i, s in enumerate(script.shots)] or None
+    except Exception as e:
+        print(f"[creator-brief] shoot script skipped: {e}", flush=True)
+    return {"brief": cp.creator_brief(name, category, description, str(payload.get("offer") or ""), kind, shots)}
+
+
+@router.get("/meta/plan/{plan_id}/checks")
+async def plan_checks(
+    plan_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """What this plan launches as, what it costs, and anything in it that conflicts with
+    the brand's brief — before the client approves it."""
+    from . import brief as ads_brief
+    from . import launch_governance as gov
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    req = CampaignRequest.model_validate(doc["req"])
+    own = _google_own_billing(CampaignPlan.model_validate(doc["plan"]))
+    due = _total_due_ngn(req.budget_ngn, bool(doc.get("fee_bypassed")), own)
+    # Audience plans picked together each launch as their own campaign with the full budget.
+    siblings = 1
+    if doc.get("variant_group_id"):
+        siblings = await db["jane_ads_pending_plans"].count_documents(
+            {"brand_id": doc.get("brand_id"), "variant_group_id": doc["variant_group_id"],
+             "status": {"$in": ["pending", "launching", "launched"]}})
+    checks = ads_brief.check_plan(doc["plan"], doc["req"], await ads_brief.load(db, brand_ctx.get("brand_id")),
+                                  max(1, siblings))
+    return {**checks, "costs": ads_brief.costs(doc["req"], due),
+            "can_launch": await gov.can_launch(db, brand_ctx)}
 
 
 # ── Review step — the plan as fields the client can edit before it launches ───
@@ -3596,14 +5064,16 @@ def _preferred_platform_for_challenge(plan: CampaignPlan) -> str:
 
     Live-caught 2026-09-23: the challenge rebuild used to construct its synthetic
     MetaLaunchFromMessageBody with no preferred_platform at all, so a TikTok plan
-    (chosen via an explicit override, not Jane's own silent pick) went back through
-    Jane's own platform decision on any follow-up correction — a client correcting
-    their budget on a TikTok plan could get a Meta plan back, with their platform choice
-    quietly overturned by an unrelated question. Re-reads the platform straight off the
-    plan being corrected, matching what the original launch request pinned. "" (Jane
-    picks) for every non-TikTok plan, exactly as before."""
+    (chosen via an explicit override, not Jane's own silent pick) went back
+    through Jane's own platform decision on any follow-up correction — a client
+    correcting their budget on a TikTok plan could get a Meta plan back, with
+    their platform choice quietly overturned by an unrelated question. Re-reads
+    the platform straight off the plan being corrected, matching what the
+    original launch request pinned."""
     if plan.platforms and plan.platforms[0].platform == Platform.TIKTOK:
         return "tiktok"
+    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
+        return "google"
     return ""
 
 
@@ -3656,9 +5126,9 @@ async def meta_plan_edit_fields(
 
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
-    # TikTok credentials threaded through separately (keyword-only) — locations now resolve
-    # against TikTok's own /tool/region/ for a TikTok plan rather than Meta's Graph API,
-    # which the positional access_token below is for.
+    # TikTok credentials threaded through separately (keyword-only) — locations
+    # now resolve against TikTok's own /tool/region/ for a TikTok plan rather
+    # than Meta's Graph API, which the positional access_token below is for.
     new_plan, new_req, applied, rejections = await apply_edits(
         plan, req, body.edits, settings.META_ADS_ACCESS_TOKEN,
         tiktok_advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID,
@@ -3683,9 +5153,13 @@ async def meta_plan_edit_fields(
                 "client_edits": [*(doc.get("client_edits") or []), {
                     "fields": applied,
                     "at": datetime.now(timezone.utc),
+                    "by": brand_ctx.get("user_id") or "",
                 }],
             }},
         )
+        from . import launch_governance as gov
+        await gov.audit(db, brand_id, "", "strategy_edited", brand_ctx.get("user_id") or "",
+                        plan_id=plan_id, fields=applied)
         # The record of what Jane decided must also carry what the CLIENT decided —
         # otherwise the intelligence layer learns from a plan nobody actually ran.
         try:
@@ -3805,6 +5279,8 @@ async def meta_plan_ask(
         # correction into the flattened brief the SAME way consult() already reads it,
         # and reuse the existing creative image (no new content credit, no image churn)
         # since a foundation-fact correction is about targeting/budget, not the visual.
+        # preferred_platform keeps a TikTok plan pinned — see
+        # _preferred_platform_for_challenge's docstring for the live bug this fixes.
         synthetic_body = MetaLaunchFromMessageBody(
             message=f"{doc['message']} {body.question}".strip(),
             business_name=doc.get("business_name", ""),
@@ -3812,9 +5288,7 @@ async def meta_plan_ask(
             reuse_image_url=plan.creative.image_url if plan.creative else "",
             thread_id=doc.get("thread_id", ""),
             preferred_platform=_preferred_platform_for_challenge(plan),
-            # A carousel plan has no video to reuse; without its photos the rebuild would
-            # stop at "TikTok needs a video or 2+ photos".
-            carousel_image_urls=(plan.creative.carousel_image_urls if plan.creative else []),
+            google_placement=(plan.google_keyword_context or {}).get("placement", ""),
         )
         rebuilt = await _build_campaign_plan(synthetic_body, brand_ctx, db)
         if isinstance(rebuilt, dict):
@@ -3891,14 +5365,29 @@ async def meta_campaigns(
     if with_metrics and settings.TIKTOK_ADS_ACCESS_TOKEN and settings.TIKTOK_ADS_ADVERTISER_ID:
         tiktok_adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
 
+    from . import google_flow
+    google_records = await (db[google_flow.GOOGLE_CAMPAIGNS]
+                     .find({"brand_id": brand_id}, {"_id": 0})
+                     .sort("created_at", -1).to_list(length=200))
+    # One dispatcher for all of them: each Google campaign lives in its brand's own account.
+    google_adapter = (google_flow.GoogleCampaigns(db)
+                      if with_metrics and google_records and google_flow.configured() else None)
+
     out = []
-    for is_tiktok, r in [(False, r) for r in meta_records] + [(True, r) for r in tiktok_records]:
-        collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
-        adapter = tiktok_adapter if is_tiktok else meta_adapter
+    google_own = (await google_flow.get_mode(db, brand_id)) == "own"
+    for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
+                             + [("google", r) for r in google_records]):
+        is_tiktok = platform_name == "tiktok"
+        is_google = platform_name == "google"
+        collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
+                      else "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns")
+        adapter = google_adapter if is_google else tiktok_adapter if is_tiktok else meta_adapter
+        if is_google and r.get("detached_at"):
+            adapter = None      # URI let go of that Google Ads account; nothing to read
         created = r.get("created_at")
         row = {
             "campaign_id": r.get("campaign_id"),
-            "platform": "tiktok" if is_tiktok else "meta",
+            "platform": platform_name,
             "name": r.get("display_name") or "Campaign",
             "headline": r.get("headline", ""),
             "primary_text": r.get("primary_text", ""),
@@ -3910,7 +5399,8 @@ async def meta_campaigns(
             # at launch, so it wins when present; otherwise it's reconstructed from the
             # markup stamped on the record (legacy records carry none, hence the
             # LEGACY_AD_SPEND_MARKUP fallback billing.py already uses).
-            "budget_ngn": C.stated_budget_from_record(r),
+            "budget_ngn": (round(float(r.get("budget_ngn") or 0) * C.AD_SPEND_MARKUP, 2)
+                           if r.get("google_billing") == "own" else C.stated_budget_from_record(r)),
             # What Meta actually received, kept for anything that needs the real spend.
             "ad_spend_ngn": r.get("budget_ngn"),
             "goal": r.get("goal", ""),
@@ -3922,19 +5412,32 @@ async def meta_campaigns(
             # destinations existed carry neither field and were all WhatsApp.
             "destination_type": r.get("destination_type") or "whatsapp",
             "destination_link": r.get("destination_link") or "",
-            # Real last-known state (the toggle endpoint persists it for TikTok on every
-            # activate/pause) — "paused" for a campaign that's never been toggled, which is
-            # accurate: every campaign is created PAUSED (Meta) / DISABLE (TikTok). This is
-            # the fallback when with_metrics is off or a live delivery read fails below; it
-            # used to be hardcoded to "paused", which kept showing a PAUSED badge and the
-            # wrong play/pause icon on a TikTok campaign that WAS running.
+            # Real last-known state (see the toggle endpoint below, which persists
+            # this on every activate/pause) — "paused" only as the default for a
+            # campaign that's never been toggled, which really is accurate: every
+            # campaign is created PAUSED (Meta) / DISABLE (TikTok). This is the
+            # fallback when with_metrics is off or a live delivery read fails below;
+            # "status" used to be hardcoded to "paused" unconditionally, which kept
+            # showing a PAUSED badge and the wrong play/pause icon on a campaign
+            # that WAS actually running, whenever the live metrics fetch for that
+            # row didn't come back (e.g. the whole class of TikTok reporting
+            # failures fixed in the commit right before this one).
             "status": r.get("status", "paused"),
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
-            # TikTok campaigns run in URI's own advertiser account, which clients must not
-            # be pointed at (or shown the id of). Meta's link is unchanged.
-            "ads_manager_url": "",
+            # Only a link into the brand's OWN ad account. Meta, TikTok and URI-run
+            # Google campaigns live in URI's accounts, which clients must not be
+            # pointed at (or shown the account id of).
+            "ads_manager_url": (google_flow.ads_url(r.get("customer_id", ""))
+                                if is_google and google_own else ""),
             "metrics": None,
         }
+        if is_google:
+            row["placement"] = r.get("placement") or "search"
+            # the plan's picture, so a Display / YouTube ad's card shows it
+            row["image_url"] = row["image_url"] or r.get("image_url", "")
+        if is_google and r.get("detached_at"):
+            row["status"] = "not managed by uri"
+            row["detached"] = True
         if adapter and r.get("campaign_id"):
             try:
                 summary = await adapter.fetch_campaign_summary(r["campaign_id"])
@@ -3947,9 +5450,11 @@ async def meta_campaigns(
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
                     continue
                 row["status"] = summary["delivery"].lower()
-                if summary.get("delivery_note"):
-                    # TikTok: switched on, but in review / rejected / out of balance. The card
-                    # renders serving_note for any platform.
+                if is_google:
+                    row["serving_note"] = google_flow.serving_note(summary)
+                elif summary.get("delivery_note"):
+                    # TikTok: switched on, but in review / rejected / out of balance. The
+                    # card renders serving_note for any platform.
                     row["serving_note"] = summary["delivery_note"]
                 # A wa.me link ad reports 0 conversations forever — Meta only fires
                 # the conversation metric for native Click-to-WhatsApp. Rendering that
@@ -3982,13 +5487,19 @@ async def meta_campaigns(
                         if summary.get("cost_per_click_ngn") is not None else None
                     ),
                     "delivery": summary["delivery"],
-                    # What the badge shows when it differs from the on/off state (e.g. "In
-                    # review" while delivery is "Active"). Empty = same as delivery.
+                    # What the badge shows when it differs from the on/off state (e.g.
+                    # "In review" while delivery is "Active"). Empty = same as delivery.
                     "delivery_display": summary.get("delivery_display") or summary["delivery"],
                     "ends_at": summary["ends_at"],
                 }
+                from .billing import refund_status
+                row["refund"] = refund_status(r, summary["spend_ngn"], summary["ends_at"])
             except Exception as e:
                 print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
+                if is_google:
+                    # Don't fall back to "paused": that hid a campaign that was running.
+                    row["status"] = "status unavailable"
+                    row["serving_note"] = "Couldn't reach Google to check this campaign. Press Refresh in a minute."
         out.append(row)
 
     out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
@@ -4322,18 +5833,21 @@ async def extend_quote(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """What keeping this campaign running would cost — before anything is charged."""
+    """What keeping this campaign running would cost — before anything is charged.
+
+    Meta and TikTok both handled (2026-09-25) — the route stays named
+    /meta/campaigns/... for backwards compatibility, same as the other
+    dual-platform endpoints in this file.
+    """
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .extend import ExtendError, new_end_time, quote
     from .store import MongoWalletStore
     from .wallet import WalletService
 
-    brand_id = brand_ctx.get("brand_id")
-    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_id)
-    if tiktok_record is not None:
-        record = tiktok_record
+    record, is_tiktok = await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+
+    if is_tiktok:
         from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
         if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
@@ -4362,9 +5876,7 @@ async def extend_quote(
             "affordable": balance >= q["total_due_ngn"],
         }
 
-    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
-    if not record or record.get("brand_id") != brand_id:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
@@ -4400,34 +5912,35 @@ async def extend_campaign(
 ) -> dict:
     """Keep a campaign running past the date it was set to end.
 
-    Keeps the campaign id, the ad set, the creative and everything Meta has learned
-    about who responds — only the end date moves. Starting a replacement campaign
-    instead throws that learning away, which is worst for exactly the campaigns worth
-    continuing.
+    Keeps the campaign id, the ad set, the creative and everything the platform has
+    learned about who responds — only the end date (and, on TikTok, the budget —
+    see extend_adgroup's own docstring for why) moves. Starting a replacement
+    campaign instead throws that learning away, which is worst for exactly the
+    campaigns worth continuing.
 
     Order matters and mirrors the launch: the wallet is checked first so the common
-    failure is a clean refusal, Meta is extended next, and the client is charged only
-    once Meta has confirmed the new end date. Nobody pays for delivery they did not get.
+    failure is a clean refusal, the platform is extended next, and the client is
+    charged only once it has confirmed the new end date. Nobody pays for delivery
+    they did not get. Meta and TikTok both handled (2026-09-25).
     """
     from datetime import datetime, timezone
 
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .extend import ExtendError, new_end_time, quote
     from .store import MongoWalletStore
     from .wallet import InsufficientFundsError, WalletService
 
     brand_id = brand_ctx.get("brand_id")
-    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_id)
-    if tiktok_record is not None and not body.confirm:
+    record, is_tiktok = await _live_campaign(db, campaign_id, brand_id)
+    if not body.confirm:
         raise HTTPException(
             status_code=400,
             detail="Extending restarts spending on this campaign — confirm to go ahead.",
         )
     wallet = WalletService(MongoWalletStore(db))
-    if tiktok_record is not None:
-        record = tiktok_record
+
+    if is_tiktok:
         from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
         if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
@@ -4492,17 +6005,9 @@ async def extend_campaign(
                     "It runs until this date unless you pause it.",
         }
 
-    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
-    if not record or record.get("brand_id") != brand_id:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    if not body.confirm:
-        raise HTTPException(
-            status_code=400,
-            detail="Extending restarts spending on this campaign — confirm to go ahead.",
-        )
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
-    wallet = WalletService(MongoWalletStore(db))
     try:
         sched = await adapter.fetch_adset_schedule(campaign_id)
     except MetaAPIError as e:
@@ -4579,23 +6084,25 @@ class LiveTargetingBody(BaseModel):
     baseline: str = ""
 
 
-async def _live_campaign(db, campaign_id: str, brand_id: str) -> dict:
+async def _live_campaign(db, campaign_id: str, brand_id: str) -> tuple[dict, bool]:
+    """Looks a live campaign up across both platform collections and says which
+    one it's on — same dual-collection pattern set_meta_campaign_status already
+    uses, extended here now that TikTok has real live targeting to read/edit
+    too (2026-09-25). Returns (record, is_tiktok)."""
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
-    if not record or record.get("brand_id") != brand_id:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    return record
-
-
-async def _tiktok_live_campaign(db, campaign_id: str, brand_id: str) -> Optional[dict]:
-    """The brand's TikTok record for this campaign, or None when it isn't a TikTok campaign.
-
-    A separate lookup rather than a change to _live_campaign above: every Meta endpoint
-    keeps calling that one exactly as before, and the TikTok-aware endpoints below check
-    this FIRST and only fall through to their unchanged Meta code when it returns None."""
+    if record and record.get("brand_id") == brand_id:
+        return record, False
     record = await db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": campaign_id})
     if record and record.get("brand_id") == brand_id:
-        return record
-    return None
+        return record, True
+    from . import google_flow
+    if await google_flow.find_record(db, campaign_id, brand_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Changing the audience or the end date isn't available for Google Search campaigns yet. "
+                   "You can pause it, turn it back on, or delete it and launch a new one.",
+        )
+    raise HTTPException(status_code=404, detail="Campaign not found")
 
 
 _TIKTOK_LEARNING_WARNING = (
@@ -4610,19 +6117,20 @@ async def get_live_targeting(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """Who a LIVE campaign is currently targeting, read fresh from Meta.
+    """Who a LIVE campaign is currently targeting, read fresh from the platform.
 
     Campaign Management PRD §19, "Audience or geography edit" — the only row of that
-    action matrix implemented here.
+    action matrix implemented here. Meta and TikTok both handled now (2026-09-25) —
+    the route stays named /meta/campaigns/... for backwards compatibility, same as
+    the campaign list and status-toggle endpoints already do.
     """
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .live_edit import LEARNING_WARNING, describe_live, targeting_fingerprint
+    from .live_edit import targeting_fingerprint
 
-    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
-    if tiktok_record is not None:
-        record = tiktok_record
+    _, is_tiktok = await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+
+    if is_tiktok:
         from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
         from .live_edit import describe_live_tiktok
 
@@ -4647,7 +6155,9 @@ async def get_live_targeting(
             "learning_warning": _TIKTOK_LEARNING_WARNING if delivering else "",
         }
 
-    await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .live_edit import LEARNING_WARNING, describe_live
+
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         live = await adapter.fetch_adset_targeting(campaign_id)
@@ -4678,29 +6188,33 @@ async def edit_live_targeting(
 
     The sequence is fixed and every step earns its place (PRD §20):
 
-    1. Re-read Meta's CURRENT targeting and check it still matches the baseline the
-       client was shown. A mismatch is 409 — someone edited it in Ads Manager and we do
-       not overwrite people's work (D45/CM17).
-    2. Validate the edit against Meta without changing anything.
+    1. Re-read the platform's CURRENT targeting and check it still matches the
+       baseline the client was shown. A mismatch is 409 — someone edited it in Ads
+       Manager and we do not overwrite people's work (D45/CM17).
+    2. Validate the edit against the platform without changing anything (Meta only —
+       see build_tiktok_targeting_edit/update_adgroup_targeting's own docstrings for
+       why TikTok has no equivalent dry-run step).
     3. Write it.
-    4. Re-read and report from what Meta actually holds. An ack is not an effect (CM13).
+    4. Re-read and report from what the platform actually holds. An ack is not an
+       effect (CM13).
 
-    Only interests, age, gender, placement and locations. Budget, schedule, objective
-    and bid strategy are separate action families and are refused here.
+    Meta: interests, age, gender, placement and locations. TikTok: locations, age and
+    gender only (no interests/placement equivalent — see live_edit.py's
+    TIKTOK_EDITABLE). Budget, schedule, objective and bid strategy are separate action
+    families on both platforms and are refused here.
     """
     from datetime import datetime, timezone
 
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .live_edit import build_targeting_edit, describe_live, targeting_fingerprint
+    from .live_edit import targeting_fingerprint
 
     brand_id = brand_ctx.get("brand_id")
-    tiktok_record = await _tiktok_live_campaign(db, campaign_id, brand_id)
-    if tiktok_record is not None and not body.edits:
+    record, is_tiktok = await _live_campaign(db, campaign_id, brand_id)
+    if not body.edits:
         raise HTTPException(status_code=400, detail="No edits supplied.")
-    if tiktok_record is not None:
-        record = tiktok_record
+
+    if is_tiktok:
         from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
         from .live_edit import build_tiktok_targeting_edit, describe_live_tiktok
 
@@ -4759,9 +6273,8 @@ async def edit_live_targeting(
             "verified": True,
         }
 
-    record = await _live_campaign(db, campaign_id, brand_id)
-    if not body.edits:
-        raise HTTPException(status_code=400, detail="No edits supplied.")
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .live_edit import build_targeting_edit, describe_live
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
@@ -4829,19 +6342,22 @@ async def edit_live_targeting(
 
 
 @router.get("/objectives")
-async def list_objectives(platform: str = "") -> dict:
+async def list_objectives(platform: str = "meta") -> dict:
     """Meta's campaign objectives, for the picker Jane opens the conversation with.
 
     Offered in Meta's own words so that what the client chooses here is what Ads
     Manager shows them later — the mismatch that made this necessary was a client
     asking for sales and finding "Objective: Engagement" on their campaign.
 
-    platform="tiktok" swaps in TikTok-accurate blurbs (see objectives.choices_for_platform)
-    — the five choices and what they're stored as are identical either way, only the
-    explanation underneath each one changes. Any other value returns Meta's, unchanged.
+    platform="tiktok" swaps in TikTok-accurate blurbs (see objectives.
+    choices_for_platform) — the five choices and what they're stored as are
+    identical either way, only the explanation underneath each one changes.
     """
     from .objectives import ACTIONS, choices_for_platform, coerce as objectives_coerce, destinations_for
 
+    # The follow-ups ship WITH the choices so the client is never asked a question the
+    # answer above has already settled, and the frontend never has to hardcode which
+    # question belongs to which objective — that mapping is the backend's (PRD §8).
     return {
         "objectives": [
             {**c,
@@ -4908,8 +6424,25 @@ async def set_meta_campaign_status(
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+    from . import launch_governance as gov
 
     brand_id = brand_ctx.get("brand_id")
+    # Turning a campaign on starts real spend: an admin's decision. Anyone on the
+    # brand may still pause one — stopping spend is never the risky direction.
+    if body.active:
+        await gov.require_launch_role(db, brand_ctx, "turn a campaign on")
+    await gov.audit(db, brand_id, campaign_id, "campaign_resume_requested" if body.active else "campaign_pause_requested",
+                    brand_ctx.get("user_id") or "")
+    from . import google_flow
+    google_record = await google_flow.find_record(db, campaign_id, brand_id)
+    if google_record:
+        if google_record.get("detached_at"):
+            raise HTTPException(status_code=409, detail=google_flow.NO_LONGER_MANAGED)
+        # A Google campaign, in this brand's own Google Ads account.
+        try:
+            return await google_flow.GoogleCampaigns(db).set_delivery(campaign_id, body.active)
+        except google_flow.GoogleAdsAPIError as e:
+            google_flow.raise_http(e)
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
     is_tiktok = False
     if not record:
@@ -4926,10 +6459,12 @@ async def set_meta_campaign_status(
             result = await adapter.set_delivery(campaign_id, body.active)
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
-        # Persist the new state — /meta/campaigns' "status" falls back to this stored value
-        # only when a live metrics fetch doesn't return a real delivery status, so it needs
-        # to reflect the last thing WE did (live-confirmed: an activated TikTok campaign kept
-        # showing a PAUSED badge and a play, not pause, button).
+        # Persist the new state — /meta/campaigns' own "status" field used to be a
+        # hardcoded "paused" literal for every campaign regardless of this call ever
+        # succeeding (live-confirmed: an activated TikTok campaign kept showing a
+        # PAUSED badge and a play, not pause, button). That endpoint falls back to
+        # this stored value only when a live metrics fetch doesn't return a real
+        # delivery status, so it needs to actually reflect the last thing WE did.
         await db["jane_ads_tiktok_campaigns"].update_one(
             {"campaign_id": campaign_id}, {"$set": {"status": "active" if body.active else "paused"}}
         )
@@ -4955,7 +6490,67 @@ async def set_meta_campaign_status(
                        "We've removed it from your list.",
             )
         _raise_http_for_meta_error(e)
+    # Same reasoning as the TikTok branch above — /meta/campaigns' "status" field
+    # needs a real last-known value to fall back to when live metrics aren't
+    # available, not a permanent "paused" literal.
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": campaign_id}, {"$set": {"status": "active" if body.active else "paused"}}
+    )
     return result
+
+
+# TikTok's spend report only looks back this far, so an older campaign's real spend
+# can't be confirmed from it.
+_TIKTOK_SPEND_WINDOW_DAYS = 30
+
+
+async def _spend_before_delete(adapter, record: dict, window_days: Optional[int] = None) -> Optional[float]:
+    """The campaign's real spend, read while it still exists. None means nothing can be
+    refunded automatically. A failed read stops the delete: once it's gone the spend
+    can't be read, and guessing could hand back money that was already spent."""
+    if not record.get("charged_upfront_ngn"):
+        return None
+    if window_days is not None:
+        from datetime import datetime, timedelta, timezone
+        created = record.get("created_at")
+        if not isinstance(created, datetime) or (
+                datetime.now(timezone.utc) - created.replace(tzinfo=created.tzinfo or timezone.utc)
+                > timedelta(days=window_days)):
+            return None
+    try:
+        return sum(row.spend_ngn for row in await adapter.fetch_per_ad_spend(record["campaign_id"]))
+    except Exception as e:
+        print(f"[delete] spend read failed for {record['campaign_id']}: {e}", flush=True)
+        raise HTTPException(status_code=502, detail="Couldn't confirm what this campaign has spent, "
+                                                    "so it wasn't deleted. Please try again.")
+
+
+async def _remove_and_refund(db, collection: str, campaign_id: str, spent: Optional[float],
+                             brand_ctx: dict) -> float:
+    """Drop our record and return the unspent budget. Removing the record is the atomic
+    step, so two delete requests can't both refund."""
+    from . import launch_governance as gov
+    from .billing import unspent_refund_ngn
+    from .store import MongoWalletStore
+    from .wallet import WalletService
+
+    record = await db[collection].find_one_and_delete({"campaign_id": campaign_id})
+    if not record or spent is None:
+        return 0.0
+    amount = unspent_refund_ngn(record, spent)
+    if amount <= 0:
+        return 0.0
+    actor = brand_ctx.get("user_id") or ""
+    try:
+        await WalletService(MongoWalletStore(db)).refund_ad_spend(record["business_id"], amount, campaign_id)
+    except Exception as e:
+        await gov.audit(db, brand_ctx.get("brand_id"), campaign_id, "campaign_refund_failed", actor,
+                        amount_ngn=amount, error=str(e)[:300])
+        raise HTTPException(status_code=500, detail=f"The campaign was deleted, but ₦{amount:,.0f} of unspent "
+                                                    "budget couldn't be returned. Please contact support.")
+    await gov.audit(db, brand_ctx.get("brand_id"), campaign_id, "campaign_refunded", actor,
+                    amount_ngn=amount, spent_ngn=spent)
+    return amount
 
 
 @router.delete("/meta/campaigns/{campaign_id}")
@@ -4973,7 +6568,24 @@ async def delete_meta_campaign(
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
+    from . import launch_governance as gov
+
+    await gov.require_launch_role(db, brand_ctx, "delete a campaign")
+    await gov.audit(db, brand_ctx.get("brand_id"), campaign_id, "campaign_delete_requested", brand_ctx.get("user_id") or "")
     brand_id = brand_ctx.get("brand_id")
+    from . import google_flow
+    google_record = await google_flow.find_record(db, campaign_id, brand_id)
+    if google_record and google_record.get("detached_at"):
+        # URI can't reach it any more — this only removes it from URI's list.
+        await db[google_flow.GOOGLE_CAMPAIGNS].delete_one({"campaign_id": campaign_id})
+        return {"deleted": True, "removed_from_list_only": True}
+    if google_record:
+        try:
+            await google_flow.GoogleCampaigns(db).delete_campaign(campaign_id)
+        except google_flow.GoogleAdsAPIError as e:
+            google_flow.raise_http(e)
+        await db[google_flow.GOOGLE_CAMPAIGNS].delete_one({"campaign_id": campaign_id})
+        return {"deleted": True}
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
     is_tiktok = False
     if not record:
@@ -4986,24 +6598,26 @@ async def delete_meta_campaign(
         if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
             raise HTTPException(status_code=400, detail="TikTok ads not configured")
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        spent = await _spend_before_delete(adapter, record, _TIKTOK_SPEND_WINDOW_DAYS)
         try:
             await adapter.delete_campaign(campaign_id)
         except TikTokAdsAPIError as e:
             _raise_http_for_tiktok_error(e)
-        await db["jane_ads_tiktok_campaigns"].delete_one({"campaign_id": campaign_id})
-        return {"deleted": True}
+        refunded = await _remove_and_refund(db, "jane_ads_tiktok_campaigns", campaign_id, spent, brand_ctx)
+        return {"deleted": True, "refunded_ngn": refunded}
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured")
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    spent = await _spend_before_delete(adapter, record)
     try:
         await adapter.delete_campaign(campaign_id)
     except MetaAPIError as e:
         _raise_http_for_meta_error(e)
 
-    await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": campaign_id})
-    return {"deleted": True}
+    refunded = await _remove_and_refund(db, "jane_ads_meta_campaigns", campaign_id, spent, brand_ctx)
+    return {"deleted": True, "refunded_ngn": refunded}
 
 
 @router.get("/demo", response_class=HTMLResponse)
@@ -5650,67 +7264,6 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
-@router.post("/admin/seed-vsg01-corpus", include_in_schema=False)
-async def _admin_seed_vsg01_corpus(
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
-) -> dict:
-    """ONE-OFF PRODUCTION BOOTSTRAP — mirrors migrations/seed_and_approve_vsg01_corpus.py
-    exactly, but runs inside the deployed app (using the same get_db_dependency every
-    real request uses) instead of needing direct network access to the DocumentDB
-    cluster, which is VPC-private and unreachable from outside. Idempotent — safe to
-    call more than once: records already ingested are left alone, and only records
-    not yet approved get approved.
-
-    Gated by _require_ads_admin — a real authenticated caller whose own JWT email is
-    on JANE_ADS_ADMIN_EMAILS, the same allowlist the billing report above already
-    uses — not a shared static secret. approved_by is the caller's own verified
-    email (corpus.py's own rule: ingestion can never self-approve; this way it can
-    never be spoofed to a placeholder). Remove this endpoint once the corpus is
-    confirmed seeded and approved in prod."""
-    _require_ads_admin(token)
-    approved_by = ((token.get("claims", {}) or {}).get("email") or "").lower()
-
-    from .entities import StrategyStatus
-    from .store import MongoStrategyStore
-    from .vsg01_corpus_seed import build_vsg01_strategies
-
-    store = MongoStrategyStore(db)
-    await store.ensure_indexes()
-
-    strategies = build_vsg01_strategies()
-    to_ingest, to_approve, already_approved = [], [], []
-    for s in strategies:
-        existing = await store.get(s.strategy_id, s.version)
-        if existing is None:
-            to_ingest.append(s)
-            to_approve.append(s)
-        elif existing.status is StrategyStatus.APPROVED:
-            already_approved.append(s.strategy_id)
-        else:
-            to_approve.append(s)
-
-    for s in to_ingest:
-        await store.ingest(s)
-    for s in to_approve:
-        await store.approve(s.strategy_id, s.version, approved_by=approved_by)
-
-    approved = await store.fetch_approved()
-    vsg01_ids = {s.strategy_id for s in strategies}
-    live = sorted(r.strategy_id for r in approved if r.strategy_id in vsg01_ids)
-
-    return {
-        "success": True,
-        "approved_by": approved_by,
-        "newly_ingested": [s.strategy_id for s in to_ingest],
-        "newly_approved": [s.strategy_id for s in to_approve],
-        "already_approved_before_this_call": already_approved,
-        "total_live_now": len(live),
-        "total_expected": len(strategies),
-        "live_strategy_ids": live,
-    }
-
-
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
@@ -5846,3 +7399,64 @@ $("go").onclick = async () => {
   }
 };
 </script></main></body></html>"""
+
+
+@router.post("/admin/seed-vsg01-corpus", include_in_schema=False)
+async def _admin_seed_vsg01_corpus(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """ONE-OFF PRODUCTION BOOTSTRAP — mirrors migrations/seed_and_approve_vsg01_corpus.py
+    exactly, but runs inside the deployed app (using the same get_db_dependency every
+    real request uses) instead of needing direct network access to the DocumentDB
+    cluster, which is VPC-private and unreachable from outside. Idempotent — safe to
+    call more than once: records already ingested are left alone, and only records
+    not yet approved get approved.
+
+    Gated by _require_ads_admin — a real authenticated caller whose own JWT email is
+    on JANE_ADS_ADMIN_EMAILS, the same allowlist the billing report above already
+    uses — not a shared static secret. approved_by is the caller's own verified
+    email (corpus.py's own rule: ingestion can never self-approve; this way it can
+    never be spoofed to a placeholder). Remove this endpoint once the corpus is
+    confirmed seeded and approved in prod."""
+    _require_ads_admin(token)
+    approved_by = ((token.get("claims", {}) or {}).get("email") or "").lower()
+
+    from .entities import StrategyStatus
+    from .store import MongoStrategyStore
+    from .vsg01_corpus_seed import build_vsg01_strategies
+
+    store = MongoStrategyStore(db)
+    await store.ensure_indexes()
+
+    strategies = build_vsg01_strategies()
+    to_ingest, to_approve, already_approved = [], [], []
+    for s in strategies:
+        existing = await store.get(s.strategy_id, s.version)
+        if existing is None:
+            to_ingest.append(s)
+            to_approve.append(s)
+        elif existing.status is StrategyStatus.APPROVED:
+            already_approved.append(s.strategy_id)
+        else:
+            to_approve.append(s)
+
+    for s in to_ingest:
+        await store.ingest(s)
+    for s in to_approve:
+        await store.approve(s.strategy_id, s.version, approved_by=approved_by)
+
+    approved = await store.fetch_approved()
+    vsg01_ids = {s.strategy_id for s in strategies}
+    live = sorted(r.strategy_id for r in approved if r.strategy_id in vsg01_ids)
+
+    return {
+        "success": True,
+        "approved_by": approved_by,
+        "newly_ingested": [s.strategy_id for s in to_ingest],
+        "newly_approved": [s.strategy_id for s in to_approve],
+        "already_approved_before_this_call": already_approved,
+        "total_live_now": len(live),
+        "total_expected": len(strategies),
+        "live_strategy_ids": live,
+    }

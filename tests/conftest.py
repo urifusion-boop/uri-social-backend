@@ -2,9 +2,24 @@
 Shared fixtures for Uri Social API tests.
 """
 
+import asyncio
+
 import pytest
 import httpx
 from tests.config import BASE_URL, TEST_EMAIL, TEST_PASSWORD, TEST_FIRST, TEST_LAST
+
+
+@pytest.fixture(autouse=True)
+def _event_loop_for_sync_tests():
+    """Many sync tests call asyncio.get_event_loop(). pytest-asyncio's async tests leave
+    none set behind them, which failed those sync tests only when run after one."""
+    try:
+        loop = asyncio.get_event_loop_policy().get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    yield
 
 
 @pytest.fixture(scope="session")
@@ -52,6 +67,27 @@ def brand_profile(client, auth_headers):
     )
     assert r.status_code == 200, f"Brand profile setup failed: {r.text}"
     return r.json()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_embeddings_in_tests(monkeypatch):
+    """Tests must never make real external API calls or spend real money.
+    A fast, deterministic fake stands in for AIService.create_embedding
+    everywhere (derived from a hash of the input text, so the same text
+    always gets the same fake vector) — a test that needs a specific,
+    controlled vector or wants to simulate a failure just monkeypatches
+    this again itself, which simply overrides it for that one test."""
+    import hashlib
+
+    from app.services.AIService import AIService
+
+    async def _fake_create_embedding(request):
+        h = hashlib.sha256((request.input or "").encode()).digest()
+        vec = [(b / 255.0) * 2 - 1 for b in h[:16]]
+        data = type("_Embedding", (), {"embedding": vec})()
+        return type("_EmbeddingResponse", (), {"data": [data]})()
+
+    monkeypatch.setattr(AIService, "create_embedding", _fake_create_embedding)
 
 
 @pytest.fixture(autouse=True)

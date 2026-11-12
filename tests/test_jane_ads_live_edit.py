@@ -9,8 +9,11 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
+from unittest.mock import patch
+
 from app.agents.jane_ads.live_edit import (
-    EDITABLE, build_targeting_edit, describe_live, targeting_fingerprint,
+    EDITABLE, TIKTOK_EDITABLE, build_targeting_edit, build_tiktok_targeting_edit,
+    describe_live, describe_live_tiktok, targeting_fingerprint,
 )
 
 
@@ -277,3 +280,128 @@ def test_named_places_win_over_the_country_fallback():
         "countries": ["NG"],
         "neighborhoods": [{"key": "1", "name": "Surulere"}],
     }}) == ["Surulere"]
+
+
+# ── TikTok: the same feature, built natively ─────────────────────────────────
+
+TIKTOK_TARGETING = {
+    "gender": "GENDER_FEMALE", "age_groups": ["AGE_25_34", "AGE_35_44"],
+    "location_ids": ["2001"],
+}
+
+
+def test_describe_live_tiktok_shows_only_the_real_tiktok_fields():
+    # interests joined locations/gender/age as real for TikTok 2026-09-25 — only
+    # placement has no TikTok equivalent at all and stays excluded.
+    async def _fake_names(ids, adv, token):
+        return ["Ikeja"]
+
+    async def _fake_interest_names(ids, adv, token):
+        return []
+
+    with patch("app.agents.jane_ads.adapters.tiktok._tiktok_location_names", _fake_names), \
+         patch("app.agents.jane_ads.adapters.tiktok._tiktok_interest_names", _fake_interest_names):
+        fields = {f["key"]: f for f in _run(describe_live_tiktok(TIKTOK_TARGETING, "adv123", "tok"))}
+    assert set(fields.keys()) == set(TIKTOK_EDITABLE)
+    assert "interests" in fields
+    assert "placement" not in fields
+    assert fields["locations"]["value"] == ["Ikeja"]
+    assert fields["gender"]["value"] == "women"
+    assert fields["age_min"]["value"] == 25
+    assert fields["age_max"]["value"] == 44
+
+
+def test_describe_live_tiktok_shows_current_interests():
+    async def _fake_names(ids, adv, token):
+        return []
+
+    async def _fake_interest_names(ids, adv, token):
+        assert ids == ["10"]
+        return ["Education"]
+
+    targeting = {**TIKTOK_TARGETING, "interest_category_ids": ["10"]}
+    with patch("app.agents.jane_ads.adapters.tiktok._tiktok_location_names", _fake_names), \
+         patch("app.agents.jane_ads.adapters.tiktok._tiktok_interest_names", _fake_interest_names):
+        fields = {f["key"]: f for f in _run(describe_live_tiktok(targeting, "adv123", "tok"))}
+    assert fields["interests"]["value"] == ["Education"]
+
+
+def test_build_tiktok_targeting_edit_refuses_placement():
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"placement": "instagram_only"}, "adv123", "tok"))
+    assert changed is None
+    assert applied == []
+    assert "already launched" in rejected[0]
+
+
+def test_build_tiktok_targeting_edit_resolves_interests(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        assert advertiser_id == "adv123"
+        return [{"name": "Education", "interest_category_id": "10"}], []
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_interests", _fake_resolve)
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"interests": ["Education"]}, "adv123", "tok"))
+    assert rejected == []
+    assert applied == ["interests"]
+    assert changed == {"interest_category_ids": ["10"]}
+
+
+def test_build_tiktok_targeting_edit_reports_unresolved_interests(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        return [], ["Astrology"]
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_interests", _fake_resolve)
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"interests": ["Astrology"]}, "adv123", "tok"))
+    assert changed is None
+    assert applied == []
+    assert any("Astrology" in r for r in rejected)
+
+
+def test_build_tiktok_targeting_edit_clearing_interests_goes_broad():
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"interests": []}, "adv123", "tok"))
+    assert rejected == []
+    assert applied == ["interests"]
+    assert changed == {"interest_category_ids": []}
+
+
+def test_build_tiktok_targeting_edit_applies_gender_and_age():
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"gender": "men", "age_min": 18, "age_max": 24}, "adv123", "tok"))
+    assert rejected == []
+    assert sorted(applied) == ["age_max", "age_min", "gender"]
+    assert changed == {"gender": "GENDER_MALE", "age_groups": ["AGE_18_24"]}
+    # Only what changed — TikTok's /adgroup/update/ is a partial update, unlike
+    # Meta which needs the whole merged targeting object.
+    assert "location_ids" not in changed
+
+
+def test_build_tiktok_targeting_edit_resolves_locations(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        assert advertiser_id == "adv123"
+        return [{"name": "Lekki Peninsula", "location_id": "3001"}], []
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_locations", _fake_resolve)
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"locations": ["Lekki Peninsula"]}, "adv123", "tok"))
+    assert rejected == []
+    assert applied == ["locations"]
+    assert changed == {"location_ids": ["3001"]}
+
+
+def test_build_tiktok_targeting_edit_reports_unresolved_locations(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        return [], ["Nowhereville"]
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_locations", _fake_resolve)
+    changed, applied, rejected = _run(build_tiktok_targeting_edit(
+        TIKTOK_TARGETING, {"locations": ["Nowhereville"]}, "adv123", "tok"))
+    assert changed is None
+    assert applied == []
+    assert any("Nowhereville" in r for r in rejected)

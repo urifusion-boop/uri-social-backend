@@ -184,10 +184,14 @@ async def upload_bytes(
 def presigned_put_url(folder: str, public_id: str, ext: str = "mp4", expires_in: int = 900) -> dict:
     """A presigned PUT URL + the final public URL, for a browser to upload a large
     file straight to S3 — the replacement for Cloudinary's signed-chunked-upload
-    params (cloudinary_upload_signature). A single PUT is simpler than a real
-    resumable multipart upload (which would need three round trips — create/
-    part-urls/complete — instead of one); not worth it unless dropped-connection
-    resume on a large upload turns out to matter in practice.
+    params (cloudinary_upload_signature, now removed). Where that flow chunked the
+    upload specifically to survive a slow mobile connection, going straight to S3
+    at all already removes the one thing actually at risk of timing out (our own
+    backend's request handler sits out of the path entirely either way) — a single
+    PUT is simpler and is what this replaces it with; a real resumable multipart
+    upload would need three round trips (create/part-urls/complete) instead of
+    one, which isn't worth it unless dropped-connection resume on a large upload
+    turns out to matter in practice.
 
     ContentType is deliberately left out of the signed params — a presigned URL
     signed with a specific ContentType rejects a PUT whose header doesn't match it
@@ -215,7 +219,14 @@ async def upload_file_path(
     Python bytes object for some other reason (downloaded media especially —
     stream the download straight to a temp file and hand this the path,
     rather than buffering it fully in memory just to immediately re-upload
-    it)."""
+    it). Confirmed live: a video-generation request doing exactly that
+    (download a multi-MB clip into a `bytes`, then upload_bytes it straight
+    back out) was large enough, combined with glibc not returning the
+    memory to the OS afterward (containerised services commonly keep the
+    per-thread malloc arena it was allocated in), that repeated requests
+    ratcheted the process's memory up until the kernel OOM-killed a uvicorn
+    worker — same final symptom as a real leak, without one actually being
+    in the Python object graph."""
     with open(file_path, "rb") as f:
         head = f.read(200)
     ext = _sniff_extension(head, resource_type)

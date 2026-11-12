@@ -23,8 +23,11 @@ NotificationType = Literal[
     "trial_start",         # Trial activated
     "trial_ending",        # Trial ending soon (24h before)
     "trial_expired",       # Trial ended
+    "campaign_update",     # Jane + Ads: a running campaign needs attention (PRD §7.2)
+    "campaign_ended",      # Jane + Ads: a campaign's window finished (PRD §8)
+    "connection_disconnected",  # A connected account needs the owner to reconnect it
+    "video_clip_ready",    # A slow video clip finished rendering (or could not be finished): come back and merge
     "payment_success",     # Payment completed successfully
-    "connection_disconnected",  # A social connection was revoked on the provider's side
 ]
 
 NotificationChannel = Literal["email", "whatsapp"]

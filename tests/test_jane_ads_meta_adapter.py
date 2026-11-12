@@ -676,6 +676,21 @@ def test_a_website_destination_never_goes_native():
     assert spec["link_data"]["link"] == "https://example.com/shop"
 
 
+def test_an_awareness_link_ad_optimises_for_reach_not_clicks():
+    """Meta refuses LINK_CLICKS under OUTCOME_AWARENESS (subcode 2490408)."""
+    from app.agents.jane_ads.models import CampaignObjective
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 objective=CampaignObjective.AWARENESS)
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(plan, _auth()))
+
+    assert mock_client.post.call_args_list[0].kwargs["json"]["objective"] == "OUTCOME_AWARENESS"
+    assert mock_client.post.call_args_list[1].kwargs["json"]["optimization_goal"] == "REACH"
+
+
 async def _fixed_region(place, access_token="", timeout=8.0):
     """geo resolves the campaign's STATE before guarding pockets against it. Tests
     pin it so they exercise the matching, not Meta's gazetteer."""
@@ -991,3 +1006,74 @@ def test_a_whatsapp_ad_without_a_number_never_becomes_a_link_ad(whatsapp_only):
         with pytest.raises(ValueError, match="WhatsApp number"):
             _run(_adapter().launch_campaign(plan, _auth()))
     assert mock_client.post.call_count == 0          # nothing created on Meta
+
+
+def test_several_concepts_launch_as_one_campaign_with_an_ad_set_each_and_an_even_budget():
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop", ad_layout="abo",
+                 creative=AdCreative(image_url="https://cdn/a.jpg", headline="A", primary_text="pa",
+                                     concept="problem"),
+                 concepts=[AdCreative(image_url="https://cdn/b.jpg", headline="B", primary_text="pb", concept="offer"),
+                           AdCreative(image_url="https://cdn/c.jpg", headline="C", primary_text="pc", concept="outcome")])
+    responses = [{"id": "cmp_1"},
+                 {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"},
+                 {"id": "as_2"}, {"id": "cr_2"}, {"id": "ad_2"},
+                 {"id": "as_3"}, {"id": "cr_3"}, {"id": "ad_3"}]
+    db = FakeDb()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(_adapter(db).launch_campaign(plan, _auth()))
+
+    posts = [c.kwargs["json"] for c in mock_client.post.call_args_list]
+    adsets = [p for p in posts if "daily_budget" in p]
+    ads = [p for p in posts if "adset_id" in p and "creative" in p]
+    pictures = [p["object_story_spec"]["link_data"]["picture"] for p in posts if "object_story_spec" in p]
+    assert len(adsets) == 3 and len({a["daily_budget"] for a in adsets}) == 1
+    assert adsets[0]["daily_budget"] == int(10_000 / 7 / 3 * 100)
+    assert [a["adset_id"] for a in ads] == ["as_1", "as_2", "as_3"]
+    assert pictures == ["https://cdn/a.jpg", "https://cdn/b.jpg", "https://cdn/c.jpg"]
+    assert result.campaign_id == "cmp_1"
+    record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
+    assert record["ad_ids"] == ["ad_1", "ad_2", "ad_3"] and record["concepts"] == ["problem", "offer", "outcome"]
+
+
+def test_several_ads_share_one_ad_set_and_its_whole_budget_by_default_images_and_videos_mixed():
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 creative=AdCreative(image_url="https://cdn/a.jpg", headline="A", primary_text="pa", concept="problem"),
+                 concepts=[AdCreative(image_url="https://cdn/v.mp4", headline="V", primary_text="pv", is_video=True),
+                           AdCreative(image_url="https://cdn/c.jpg", headline="C", primary_text="pc", concept="outcome")])
+    responses = [{"id": "cmp_1"}, {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"},
+                 {"id": "cr_2"}, {"id": "ad_2"}, {"id": "cr_3"}, {"id": "ad_3"}]
+    db = FakeDb()
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient, patch.object(
+            MetaAdPlatformAdapter, "_upload_video_to_meta", new=AsyncMock(return_value=("vid_1", "https://cdn/t.jpg"))):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth()))
+
+    posts = [c.kwargs["json"] for c in mock_client.post.call_args_list]
+    adsets = [p for p in posts if "daily_budget" in p]
+    specs = [p["object_story_spec"] for p in posts if "object_story_spec" in p]
+    assert len(adsets) == 1 and adsets[0]["daily_budget"] == int(10_000 / 7 * 100)
+    assert {p["adset_id"] for p in posts if "adset_id" in p and "creative" in p} == {"as_1"}
+    assert specs[1]["video_data"]["video_id"] == "vid_1" and "link_data" in specs[0] and "link_data" in specs[2]
+    record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
+    assert record["ad_ids"] == ["ad_1", "ad_2", "ad_3"] and record["adset_ids"] == ["as_1"]
+
+
+def test_a_temporarily_unavailable_creative_is_retried_and_each_ad_keeps_its_own_headline():
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 creative=AdCreative(image_url="https://cdn/a.jpg", headline="First", primary_text="pa"),
+                 concepts=[AdCreative(image_url="https://cdn/b.jpg", headline="Second", primary_text="pb")])
+    busy = {"error": {"code": 2, "message": "temporarily unavailable"}}
+    responses = [{"id": "cmp_1"}, {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"}, busy, {"id": "cr_2"}, {"id": "ad_2"}]
+    with patch("httpx.AsyncClient") as MockClient, patch(
+            "app.agents.jane_ads.adapters.meta.RETRY_DELAY_SECONDS", 0):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(_adapter().launch_campaign(plan, _auth()))
+    assert result.campaign_id == "cmp_1"
+    specs = [c.kwargs["json"]["object_story_spec"]["link_data"] for c in mock_client.post.call_args_list
+             if "object_story_spec" in c.kwargs["json"]]
+    assert [s["name"] for s in specs] == ["First", "Second", "Second"]

@@ -5,7 +5,7 @@ import json
 import re
 import subprocess
 import traceback
-from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -13,11 +13,12 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency, get_flexible_brand_context, flexible_auth, get_active_brand_context
-from app.core.config import settings
-from app.domain.responses.uri_response import UriResponse
+from app.dependencies import get_db_dependency, get_active_brand_context, flexible_auth, get_flexible_brand_context
+from app.core.auth_bearer import JWTBearer
 from app.middleware.api_key_auth import verify_api_key
 from app.models.api_key import APIKey
+from app.core.config import settings
+from app.domain.responses.uri_response import UriResponse
 
 from ..services.content_generation_service import ContentGenerationService
 from ..services.image_content_service import ImageContentService
@@ -26,9 +27,20 @@ from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
 from ..services.outstand_service import OutstandService
+from ..services.meta_oauth import build_authorize_url as build_meta_authorize_url
 from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
+
+
+async def flexible_token(auth: dict = Depends(flexible_auth)) -> dict:
+    """Accept a dashboard JWT OR an SDK API key (as prod does on every route here),
+    returning the shape this router's code reads from a JWTBearer token: user_id at
+    the top level plus the JWT's "claims". An API key has no JWT, so its claims
+    carry just the userId."""
+    claims = dict(((auth.get("jwt_payload") or {}).get("claims") or {}))
+    claims.setdefault("userId", auth.get("user_id"))
+    return {**auth, "claims": claims}
 
 # Strong references to fire-and-forget background image-generation tasks, so they
 # aren't garbage-collected mid-flight (asyncio only weakly tracks pending tasks).
@@ -82,6 +94,33 @@ def _apply_intelligent_fallbacks(profile_data: Dict[str, Any], missing_fields: L
     return profile
 
 
+def _get_user_id(token: dict) -> str | None:
+    """
+    Extract user_id from JWT payload.
+    Supports common shapes:
+      - {"user_id": "..."} or {"userId": "..."} or {"id": "..."} or {"sub": "..."}
+      - {"claims": {"userId": "..."}} or {"claims": {"user_id": "..."}}
+    """
+    if not isinstance(token, dict):
+        return None
+
+    # 1) flat keys (top-level)
+    for k in ("user_id", "userId", "id", "sub"):
+        v = token.get(k)
+        if v:
+            return str(v)
+
+    # 2) nested claims
+    claims = token.get("claims") or {}
+    if isinstance(claims, dict):
+        for k in ("userId", "user_id", "id", "sub"):
+            v = claims.get(k)
+            if v:
+                return str(v)
+
+    return None
+
+
 def _brand_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
     """
     Brand-aware Mongo filter for Jane data (drafts, performance, etc.).
@@ -123,22 +162,73 @@ class StoryboardRequest(BaseModel):
     brand_images: List[str] = Field(..., min_items=1, max_items=5)
     optional_text: Optional[str] = Field(None, max_length=1000)
     target_platform: str = "instagram_reels"
-    target_duration_seconds: int = Field(15, ge=5, le=30)
+    target_duration_seconds: int = Field(15, ge=5, le=60)
     video_style: Optional[str] = "clean_commercial"
 
 class StoryboardFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
 
+class CreativeStoryboardRequest(BaseModel):
+    brief: str = Field(..., min_length=10, max_length=2000)
+    reference_images: List[str] = Field(default_factory=list, max_items=5)
+    target_platform: str = "instagram_reels"
+    target_duration_seconds: int = Field(15, ge=5, le=60)
+    # None (the describe-it UI's default — it has no style picker) lets the
+    # model infer the best-fitting style from the brief itself; pass a slug
+    # to force one instead.
+    video_style: Optional[str] = None
+    # Set only when regenerating from a hand-edited creative_direction — see
+    # VideoCreativeService.generate_creative_storyboard's own docstring.
+    creative_direction_override: Optional[str] = Field(None, max_length=2000)
+
+class CreativeFramesRequest(BaseModel):
+    scenes: List[Dict[str, Any]]
+    reference_images: List[str] = Field(default_factory=list, max_items=5)
+
+async def _resolve_tiktok_connection(db, user_id: str):
+    """See tiktok_direct_service.resolve_tiktok_connection."""
+    from app.agents.social_media_manager.services.tiktok_direct_service import resolve_tiktok_connection
+    return await resolve_tiktok_connection(db, user_id)
+
+
+class TikTokPostSettingsRequest(BaseModel):
+    """The user's choices from the Post to TikTok screen (TikTok Content Sharing
+    Guidelines). privacy_level is required with no default; interactions are
+    off unless the user turned them on."""
+    title: str = ""
+    privacy_level: str
+    allow_comment: bool = False
+    allow_duet: bool = False
+    allow_stitch: bool = False
+    brand_organic: bool = False
+    brand_content: bool = False
+    description: str = ""   # photo posts only — the caption under the photo(s)
+
+
+class PublishTikTokPhotoDraftRequest(BaseModel):
+    draft_id: str
+    tiktok: TikTokPostSettingsRequest
+
+
 class PublishVideoDraftRequest(BaseModel):
     draft_id: str
     platform: str   # "instagram_reels" | "facebook_reels" | "tiktok"
     caption: Optional[str] = None
+    tiktok: Optional[TikTokPostSettingsRequest] = None   # required when platform == "tiktok"
 
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
-    model: str = "veo-3.1-generate-preview"
+    # Engineering-brief routing (§2): the caller picks an OUTCOME, never a raw
+    # model id — one of video_generation_service.OUTCOME_ROUTES's keys (e.g.
+    # "quick_video", "animate_product"). The actual model is an implementation
+    # detail resolved server-side, with its own brief-specified fallback.
+    outcome: str = "quick_video"
+    # Only consulted when the outcome routes to the talking-avatar model
+    # (currently "talking_dialogue") — one of video_generation_service.
+    # AVATAR_VOICES or .NIGERIAN_VOICE_REFS. Ignored by every other outcome.
+    avatar_voice: str = "Sarah"
 
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
@@ -149,6 +239,15 @@ class ContentGenerationRequest(BaseModel):
     brand_context: Optional[BrandContextRequest] = None
     reference_image: Optional[str] = None  # DEPRECATED: use reference_images. Kept for backward compatibility.
     reference_images: Optional[List[str]] = None  # base64 data URLs uploaded by user for contextual reference (multiple supported)
+    # Parallel to reference_images (same length, same order). Each entry: optional
+    # "label" (what this image IS — "product", "background", "logo" — fed into the
+    # multi-reference prompt when combining) and optional "remove_background" (per-
+    # image override; unset means the mode-based default: strip for a single image,
+    # keep as-is for multiple — see ImageContentService._generate_platform_image).
+    # Whether images get COMBINED into one output vs. only the first one used is not
+    # a separate flag — it's inferred from how many images the frontend actually
+    # sends: the user ticks which uploads to include, and the count IS the mode.
+    reference_image_meta: Optional[List[Dict[str, Any]]] = None
     slide_image_map: Optional[List[Optional[int]]] = None  # carousel only: per-slide index into reference_images (or null for no image). Defaults to cycling image N -> slide N when omitted.
     post_type: str = "feed"   # feed | carousel | story
     # Opt-in, develop-only experiment (default False everywhere): paste the real
@@ -173,6 +272,8 @@ class ApprovalRequest(BaseModel):
     schedule_option: str = "save_draft"  # immediate, schedule, save_draft
     scheduled_datetime: Optional[datetime] = None
     approval_notes: Optional[str] = None
+    # Required to schedule a TikTok image / carousel post: what the user chose on the Post to TikTok screen.
+    tiktok: Optional[TikTokPostSettingsRequest] = None
 
 class DenialRequest(BaseModel):
     draft_ids: List[str] = Field(..., min_items=1)
@@ -306,6 +407,14 @@ class BrandProfileRequest(BaseModel):
     # Localisation
     languages: Optional[List[str]] = None
     region: Optional[str] = None
+    # Fulfilment & operations (Uri Market Intelligence PRD §7) — feeds
+    # relevance scoring's fulfilment_feasibility component; left unset
+    # means "unknown," which scoring already treats as 0, never guessed.
+    stock_availability: Optional[str] = None   # e.g. "in_stock" | "low_stock" | "out_of_stock" | "made_to_order"
+    delivery_capability: Optional[str] = None  # free text, e.g. "same-day in Lagos, 3-5 days nationwide"
+    lead_time: Optional[str] = None            # e.g. "2-3 business days"
+    budget_ceiling: Optional[float] = None     # the business's own stated ceiling for acting on an opportunity
+    margin_band: Optional[str] = None          # "low" | "medium" | "high"
     # Meta
     onboarding_completed: Optional[bool] = False
     # Onboarding save-and-resume — the step's NAME (e.g. "targetCustomerDetail"),
@@ -348,6 +457,7 @@ class BrandProfileRequest(BaseModel):
     canvas_editor_enabled: Optional[bool] = None
     use_v3_prompts: Optional[bool] = None
 
+
 def _report_sdk_credit_cost(response: Response, ctx: dict, credits: int = 1) -> None:
     """
     For gateway API-key-authenticated requests only: report the credit-equivalent
@@ -363,10 +473,79 @@ def _report_sdk_credit_cost(response: Response, ctx: dict, credits: int = 1) -> 
     if ctx.get("auth_type") == "api_key":
         response.headers["X-URI-Credits-Consumed"] = str(credits)
 
-
 # ==============================================================================
 # CONTENT GENERATION ENDPOINTS
 # ==============================================================================
+
+class ExpandPromptRequest(BaseModel):
+    idea: str
+    platforms: List[str] = []
+    post_type: str = "feed"
+    num_slides: Optional[int] = None
+    include_images: bool = False  # ignored: every post gets a visual; the switch is set after the brief
+    style_override: Optional[List[str]] = None
+    override_cta: Optional[str] = None
+    reference_image_labels: Optional[List[str]] = None  # one entry per uploaded photo ("" if unlabelled)
+
+
+@router.post("/expand-prompt")
+async def expand_prompt(
+    request: ExpandPromptRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Turn a short content idea ("happy Mother's Day post") into a fuller
+    creative brief guided by the brand's Playbook and the chosen visual style.
+    Returned for the owner to review/edit — nothing is generated or charged."""
+    from app.agents.social_media_manager.services import prompt_expander
+
+    idea = (request.idea or "").strip()
+    if len(idea) < 3:
+        raise HTTPException(status_code=400, detail="Write a few words about the post first.")
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+    result = await prompt_expander.expand(
+        idea[:5000], brand_context, request.platforms, request.post_type, request.num_slides,
+        styles=request.style_override or None,
+        cta=(request.override_cta or "").strip() or None,
+        photos=[(l or "").strip()[:80] for l in (request.reference_image_labels or [])][:10] or None,
+    )
+    if not result:
+        raise HTTPException(status_code=502, detail="Jane couldn't expand that right now — try again in a moment.")
+    return UriResponse.get_single_data_response("expanded_prompt", result)
+
+
+class ExpandVideoPromptRequest(BaseModel):
+    idea: str
+    platform: str = ""
+    duration_seconds: Optional[int] = None
+
+
+@router.post("/expand-video-prompt")
+async def expand_video_prompt(
+    request: ExpandVideoPromptRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Same job as /expand-prompt above, for the "Describe it" video flow's own brief
+    box — a short video idea in, a fuller creative brief out, guided by the brand's
+    Playbook. Returned for the owner to review/edit — nothing is generated or charged."""
+    from app.agents.social_media_manager.services import prompt_expander
+
+    idea = (request.idea or "").strip()
+    if len(idea) < 3:
+        raise HTTPException(status_code=400, detail="Describe the video first.")
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+    result = await prompt_expander.expand_video(
+        idea[:5000], brand_context, request.platform, request.duration_seconds,
+    )
+    if not result:
+        raise HTTPException(status_code=502, detail="Jane couldn't expand that right now — try again in a moment.")
+    return UriResponse.get_single_data_response("expanded_prompt", result)
+
 
 @router.post("/generate-content")
 async def generate_content(
@@ -379,8 +558,6 @@ async def generate_content(
     """
     Generate AI-powered social media content with optional images.
 
-    **Authentication**: Accepts both JWT (Dashboard/Frontend) and API Key (SDK)
-
     Text content is always returned immediately.
     When include_images=True, images are generated in the background and
     saved to the draft — the frontend can pick them up via GET /content-calendar.
@@ -391,88 +568,76 @@ async def generate_content(
     """
     user_id = ctx["user_id"]
     active_brand_id = ctx["brand_id"]
+    # SDK (API key) requests are metered and billed by the SDK Gateway, not the
+    # per-user wallet — see _report_sdk_credit_cost. Same behaviour as prod.
     auth_type = ctx.get("auth_type", "jwt")
 
-    # Log auth type for debugging
-    print(f"\n{'='*80}")
-    print(f"📝 CONTENT GENERATION REQUEST")
-    print(f"   Auth Type: {auth_type}")
-    print(f"   User ID: {user_id[:12]}...")
-    print(f"   Brand ID: {active_brand_id[:12] if active_brand_id else 'None'}...")
-    print(f"   Platforms: {request.platforms}")
-    print(f"   Include Images: {request.include_images}")
-    print(f"{'='*80}\n")
-
-    # Carousels bill 1 credit per slide, not the flat 1-credit-per-generation
-    # rate everything else uses — computed once, up front, so the pre-check
-    # below and the actual deduction later can't drift out of sync with each
-    # other (a UI-facing slide-count picker offers 2-10; the service layer
-    # itself clamps to 2-10, so mirror that wider bound here for whatever the
-    # request actually carries).
-    post_type = request.post_type or "feed"
-    num_slides = max(2, min(10, request.num_slides or 3)) if post_type == "carousel" else 1
-    required_credits = num_slides if post_type == "carousel" else 1
+    print(
+        f"🖼️📥 [REF-IMG TRACE] incoming request: post_type={request.post_type!r} "
+        f"num_slides={request.num_slides!r} "
+        f"reference_image={'<set, len=' + str(len(request.reference_image)) + '>' if request.reference_image else None} "
+        f"reference_images_count={len(request.reference_images) if request.reference_images else 0} "
+        f"slide_image_map={request.slide_image_map!r}"
+    )
 
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
-        # Import services (needed later for credit deduction even if check is skipped)
+        # Check trial credits first, then paid credits
         from app.services.CreditService import credit_service
         from app.services.TrialService import trial_service
 
-        # Skip credit check for API key authentication (SDK Gateway handles request limits)
-        # Only check credits for JWT/dashboard users
-        is_trial_user = False
+        # Carousels bill 1 credit per slide — computed up front so the checks below
+        # and the deduction after generation agree (prod's pre-check, kept).
+        _pre_post_type = request.post_type or "feed"
+        _pre_num_slides = max(2, min(10, request.num_slides or 3)) if _pre_post_type == "carousel" else 1
+        required_credits = _pre_num_slides if _pre_post_type == "carousel" else 1
 
+        is_trial_user = False
         if auth_type != "api_key":
-            # Check trial credits first, then paid credits
             is_trial_user = await trial_service.has_active_trial(user_id)
 
-            if is_trial_user and required_credits > 1:
-                # has_active_trial only confirms >0 trial credits — fine for
-                # the flat 1-credit case, but a carousel can need more than
-                # is left in the trial pool. Without this, generation (and
-                # its real OpenAI cost) would proceed and the later
-                # deduct_trial_credit(amount=required_credits) would just
-                # fail its atomic sufficiency guard silently, leaving the
-                # user's trial balance untouched but their content already
-                # generated for free.
-                trial_status = await trial_service.get_trial_status(user_id)
-                if trial_status.credits_remaining < required_credits:
-                    return JSONResponse(
-                        status_code=402,
-                        content={
-                            "status": False,
-                            "responseCode": 402,
-                            "responseMessage": (
-                                f"This {num_slides}-slide carousel needs {required_credits} credits, "
-                                f"but only {trial_status.credits_remaining} trial credits remain. "
-                                "Choose fewer slides or upgrade to continue."
-                            ),
-                            "responseData": {
-                                "credits_remaining": trial_status.credits_remaining,
-                                "credits_required": required_credits,
-                                "upgrade_url": "/pricing"
-                            }
+        if auth_type != "api_key" and is_trial_user and required_credits > 1:
+            # has_active_trial only confirms >0 trial credits. Without this, a carousel's
+            # generation (and its real OpenAI cost) would proceed and the later
+            # deduct_trial_credit(amount=...) would fail its sufficiency guard silently,
+            # leaving the content generated for free. Prod fix, kept.
+            trial_status = await trial_service.get_trial_status(user_id)
+            if trial_status.credits_remaining < required_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": (
+                            f"This {_pre_num_slides}-slide carousel needs {required_credits} credits, "
+                            f"but only {trial_status.credits_remaining} trial credits remain. "
+                            "Choose fewer slides or upgrade to continue."
+                        ),
+                        "responseData": {
+                            "credits_remaining": trial_status.credits_remaining,
+                            "credits_required": required_credits,
+                            "upgrade_url": "/pricing"
                         }
-                    )
+                    }
+                )
 
-            if not is_trial_user:
-                # Paid user path — check subscription/bonus credits
-                has_credits = await credit_service.check_sufficient_credits(user_id, required=required_credits)
-                if not has_credits:
-                    # PRD 8: "You've run out of credits. Upgrade to continue."
-                    return JSONResponse(
-                        status_code=402,
-                        content={
-                            "status": False,
-                            "responseCode": 402,
-                            "responseMessage": "You've run out of credits. Upgrade to continue.",
-                            "responseData": {
-                                "credits_remaining": 0,
-                                "upgrade_url": "/pricing"
-                            }
+        if auth_type != "api_key" and not is_trial_user:
+            # Paid user path — check subscription/bonus credits for the full cost
+            has_credits = await credit_service.check_sufficient_credits(user_id, required=required_credits)
+            if not has_credits:
+                # PRD 8: "You've run out of credits. Upgrade to continue."
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": "You've run out of credits. Upgrade to continue.",
+                        "responseData": {
+                            "credits_remaining": 0,
+                            "upgrade_url": "/pricing"
                         }
-                    )
+                    }
+                )
 
         # ========== OPTION 1: PROGRESSIVE ENFORCEMENT ==========
         # Load the ACTIVE BRAND's profile (source of truth) — scoped by brand_id so
@@ -480,29 +645,27 @@ async def generate_content(
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
 
+        if not profile_data and auth_type == "api_key":
+            # API key (SDK) users: auto-create a minimal profile instead of blocking
+            minimal_profile_data = {
+                "brand_name": f"API User {user_id[:8]}",
+                "industry": "general_other",
+                "brand_colors": ["#C2185B", "#FFFEF2"],
+                "style_selections": ["lifestyle_natural"],
+                "region": "Global",
+                "onboarding_completed": True,
+                "created_via": "api_key_auto",
+            }
+            await BrandProfileService.save(user_id, minimal_profile_data, db, brand_id=active_brand_id)
+            print(f"✅ Auto-created minimal profile for API key user {user_id}")
+            profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+            profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+
         if not profile_data:
-            # For API key users, auto-create minimal profile instead of blocking
-            if ctx.get("auth_type") == "api_key":
-                minimal_profile_data = {
-                    "brand_name": f"API User {user_id[:8]}",
-                    "industry": "general_other",
-                    "brand_colors": ["#C2185B", "#FFFEF2"],
-                    "style_selections": ["lifestyle_natural"],
-                    "region": "Global",
-                    "onboarding_completed": True,
-                    "created_via": "api_key_auto",
-                }
-                await BrandProfileService.save(user_id, minimal_profile_data, db, brand_id=active_brand_id)
-                print(f"✅ Auto-created minimal profile for API key user {user_id}")
-                # Reload profile data
-                profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
-                profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-            else:
-                # JWT users must complete onboarding
-                return UriResponse.error_response(
-                    f"No brand profile found for user {user_id}. Please complete onboarding first.",
-                    code=400
-                )
+            return UriResponse.error_response(
+                f"No brand profile found for user {user_id}. Please complete onboarding first.",
+                code=400
+            )
 
         # Check for critical missing fields
         # Empty strings should be treated as missing
@@ -528,8 +691,8 @@ async def generate_content(
         # PROGRESSIVE ENFORCEMENT: Warn but allow generation with intelligent fallbacks
         if missing_fields:
             # Check if user acknowledged incomplete profile
-            # API key users auto-acknowledged (they use SDK, not frontend modal)
-            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False) or ctx.get("auth_type") == "api_key"
+            # API key users auto-acknowledged (they use the SDK, not the frontend modal)
+            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False) or auth_type == "api_key"
 
             if not acknowledged:
                 # Return warning response for frontend modal
@@ -571,50 +734,51 @@ async def generate_content(
             overrides = request.brand_context.dict(exclude_none=True)
             brand_context_dict = {**brand_context_dict, **overrides}
 
-        # post_type/num_slides/required_credits already computed up front (see above),
-        # before the credit-sufficiency checks, so both stay in sync.
+        post_type = request.post_type or "feed"
+        num_slides = max(2, min(10, request.num_slides or 3))
 
         # ── Reference images: normalise to a list, keep old single-image field working ──
         ref_images: List[str] = request.reference_images or (
             [request.reference_image] if request.reference_image else []
         )
+        print(f"🖼️📥 [REF-IMG TRACE] resolved ref_images_count={len(ref_images)}")
 
-        def _slide_reference_image(slide_index: int) -> Optional[str]:
-            """Which single reference image (if any) a given carousel slide should use.
+        def _slide_reference_index(slide_index: int) -> Optional[int]:
+            """Which index into ref_images (if any) a given carousel slide should use.
             Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
             (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
-            than slides)."""
+            than slides). Carousels stay one-image-per-slide — combining multiple
+            references into a single slide isn't part of this feature; that's what
+            slide_image_map already gives explicit per-slide control for."""
             if not ref_images:
+                print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: no ref_images available -> None")
                 return None
             if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
                 img_idx = request.slide_image_map[slide_index]
                 if img_idx is None:
+                    print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map explicitly maps to None")
                     return None
                 if 0 <= img_idx < len(ref_images):
-                    return ref_images[img_idx]
+                    print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map -> image #{img_idx}")
+                    return img_idx
+                print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map index {img_idx} out of range -> None")
                 return None
-            return ref_images[slide_index % len(ref_images)]
-
-        # ── Reference images: normalise to a list, keep old single-image field working ──
-        ref_images: List[str] = request.reference_images or (
-            [request.reference_image] if request.reference_image else []
-        )
+            picked = slide_index % len(ref_images)
+            print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: auto-cycle -> image #{picked}")
+            return picked
 
         def _slide_reference_image(slide_index: int) -> Optional[str]:
-            """Which single reference image (if any) a given carousel slide should use.
-            Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
-            (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
-            than slides)."""
-            if not ref_images:
+            idx = _slide_reference_index(slide_index)
+            return ref_images[idx] if idx is not None else None
+
+        def _slide_reference_meta(slide_index: int) -> Optional[List[Dict[str, Any]]]:
+            """The single-item meta list matching _slide_reference_image's pick, so a
+            slide's image still respects its own remove_background preference."""
+            idx = _slide_reference_index(slide_index)
+            meta = request.reference_image_meta or []
+            if idx is None or idx >= len(meta):
                 return None
-            if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
-                img_idx = request.slide_image_map[slide_index]
-                if img_idx is None:
-                    return None
-                if 0 <= img_idx < len(ref_images):
-                    return ref_images[img_idx]
-                return None
-            return ref_images[slide_index % len(ref_images)]
+            return [meta[idx]]
 
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
@@ -682,29 +846,41 @@ async def generate_content(
                     d["post_type"] = post_type
 
         # ==================== PRD 7.2: Credit Deduction ====================
-        # Deduct required_credits after successful generation (skip for API key users).
-        # PRD 3.1: 1 credit per campaign generation, except carousels, which
-        # bill 1 credit per slide (required_credits computed up front).
-        if result.get("status") and ctx.get("auth_type") != "api_key":
+        # Deduct credits after successful generation
+        # PRD 3.1: Text-only posts = 1 credit, Carousel = 1 credit per image
+        if result.get("status"):
             request_id = result.get("responseData", {}).get("request_id")
-            if request_id:
+            drafts = result.get("responseData", {}).get("drafts", [])
+
+            # Calculate credits to deduct based on content type
+            if post_type == "carousel":
+                # Carousel: 1 credit per slide/image (default 3 slides if not specified)
+                credits_to_deduct = len(drafts) if drafts else num_slides
+            else:
+                # Text-only posts (feed, story): 1 credit total
+                credits_to_deduct = 1
+
+            if auth_type == "api_key":
+                # No wallet deduction for SDK requests: report the cost to the gateway instead.
+                _report_sdk_credit_cost(response, ctx, credits=credits_to_deduct)
+            elif request_id:
                 if is_trial_user:
                     await trial_service.deduct_trial_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="campaign_generation",
-                        amount=required_credits,
+                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted {required_credits} trial credit(s) from user {user_id} for campaign {request_id}")
+                    print(f"✅ Deducted {credits_to_deduct} trial credit(s) from user {user_id} for campaign {request_id} (post_type={post_type})")
                 else:
                     await credit_service.deduct_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="campaign_generation",
                         retry_count=0,  # Initial generation (not a retry)
-                        amount=required_credits,
+                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted {required_credits} credit(s) from user {user_id} for campaign {request_id}")
+                    print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id} for campaign {request_id} (post_type={post_type})")
 
             # Notification PRD 4.2: Content created notification
             try:
@@ -722,8 +898,6 @@ async def generate_content(
                 )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
-        elif result.get("status") and ctx.get("auth_type") == "api_key":
-            _report_sdk_credit_cost(response, ctx, credits=required_credits)
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.
@@ -792,6 +966,7 @@ async def generate_content(
                                 brand_context=carousel_brand_context,
                                 db=db,
                                 reference_image=_slide_reference_image(slide_index),
+                                reference_image_meta=_slide_reference_meta(slide_index),
                                 post_type=post_type,
                                 slide_index=slide_index,
                                 image_model=request.image_model,
@@ -809,6 +984,8 @@ async def generate_content(
                             brand_context=brand_context_dict,
                             db=db,
                             reference_image=ref_images[0] if ref_images else None,
+                            reference_images=ref_images,
+                            reference_image_meta=request.reference_image_meta,
                             post_type=post_type,
                             image_model=request.image_model,
                             style_override=request.style_override,
@@ -825,6 +1002,7 @@ async def generate_content(
                         {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
                     )
                 _bg_image_tasks = []
+
             _BG_IMAGE_TASKS.update(_bg_image_tasks)
             for t in _bg_image_tasks:
                 t.add_done_callback(_BG_IMAGE_TASKS.discard)
@@ -841,13 +1019,13 @@ async def regenerate_content(
     draft_id: str,
     feedback: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Regenerate content with optional feedback"""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
-
+    
     try:
         result = await ApprovalWorkflowService.regenerate_content(
             db=db,
@@ -856,7 +1034,7 @@ async def regenerate_content(
             regeneration_feedback=feedback
         )
         return result
-
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 def _upload_slide_image_indices(
@@ -980,6 +1158,7 @@ async def upload_user_content(
 
         # Apply logo and/or CTA overlays if requested
         if add_logo or add_cta:
+            print(f"🖼️  Applying overlays: logo={add_logo}, cta={add_cta}")
             from ..services.image_content_service import ImageContentService
             import base64
             import requests
@@ -1325,61 +1504,96 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                 )
 
             if _d_ids:
-                # Attach uploaded images to drafts so they can be published
-                if post_type == "carousel":
-                    # For carousel: one slide per uploaded image, in the exact
-                    # shape both DraftCard (isCarousel = slides.length > 0) and
-                    # publish logic (approval_workflow_service reads draft.slides)
-                    # expect. A prior "carousel_images" field here was never read
-                    # by either, so uploaded carousels silently rendered/published
-                    # as a single post.
-                    slides = []
-                    for img_idx in _upload_slide_image_indices(len(media_urls), requested_num_slides, slide_image_map):
-                        url = media_urls[img_idx]
-                        slide = {"headline": "", "body": "", "image_url": url, "image_failed": False}
-                        bg = item_logo_backgrounds[img_idx] if img_idx < len(item_logo_backgrounds) else None
-                        if bg:
-                            slide["background_image_url"] = bg["background_url"]
-                            slide["logo_placement"] = bg["logo_placement"]
-                        slides.append(slide)
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "slides": slides,
-                    }
-                else:
-                    # For single post: use the first uploaded item as the main
-                    # media. DraftCard only renders a <video> element when
-                    # draft.video_url is set (isReel = post_type === 'reel' ||
-                    # !!draft.video_url) — anything else, including a video's own
-                    # URL, gets rendered in an <img> tag and fails to load. Route
-                    # video uploads to video_url so the existing player picks them
-                    # up correctly instead of showing as a broken image.
-                    first_url = media_urls[0] if media_urls else None
-                    is_first_video = first_url in video_urls if first_url else False
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "image_url": None if is_first_video else first_url,
-                        "video_url": first_url if is_first_video else None,
-                    }
-                    first_bg = item_logo_backgrounds[0] if item_logo_backgrounds and not is_first_video else None
-                    if first_bg:
-                        update_fields["background_image_url"] = first_bg["background_url"]
-                        update_fields["logo_placement"] = first_bg["logo_placement"]
+                # Attach uploaded images to drafts so they can be published.
+                # TikTok gets its own center-cropped-to-9:16 copies of any IMAGE
+                # uploads (see ImageContentService.crop_and_reupload_for_tiktok)
+                # — TikTok's own client auto-crops/letterboxes anything off-ratio
+                # when it actually posts, so this makes the draft preview match
+                # what goes live instead of a surprise crop later. Video uploads
+                # pass through untouched (PIL can't crop a video file). Every
+                # other platform keeps the original upload byte-for-byte.
+                drafts_list = _rd.get("drafts", [])
+                tiktok_media_urls = None
+                if any(d.get("platform") == "tiktok" for d in drafts_list):
+                    from ..services.image_content_service import ImageContentService
+                    tiktok_media_urls = [
+                        url if url in video_urls
+                        else await ImageContentService.crop_and_reupload_for_tiktok(url, user_id)
+                        for url in media_urls
+                    ]
 
-                # Mark drafts as user-uploaded and attach media URLs
-                await db["content_drafts"].update_many(
-                    {"id": {"$in": _d_ids}},
-                    {"$set": update_fields}
-                )
+                for d in drafts_list:
+                    draft_id = d.get("id")
+                    if not draft_id:
+                        continue
+                    is_tiktok_cropped = d.get("platform") == "tiktok" and tiktok_media_urls
+                    urls_for_platform = tiktok_media_urls if is_tiktok_cropped else media_urls
+                    # item_logo_backgrounds was captured against the ORIGINAL
+                    # (pre-crop) images, indexed to media_urls — TikTok's own
+                    # center-cropped copies have different dimensions, so a
+                    # saved pixel box wouldn't line up with them. Move Logo
+                    # just isn't offered on a TikTok draft from this flow; every
+                    # other platform's slides/image are byte-for-byte the
+                    # originals this geometry was computed against.
+                    backgrounds_for_platform = None if is_tiktok_cropped else item_logo_backgrounds
 
-                # Update in-memory draft objects
-                for d in _rd.get("drafts", []):
+                    if post_type == "carousel":
+                        # One slide per uploaded image, in the exact shape both
+                        # DraftCard (isCarousel = slides.length > 0) and publish
+                        # logic (approval_workflow_service reads draft.slides)
+                        # expect. A prior "carousel_images" field here was never
+                        # read by either, so uploaded carousels silently
+                        # rendered/published as a single post.
+                        #
+                        # KNOWN LIMITATION: slides only carry image_url — there's
+                        # no per-slide video_url in this schema or in DraftCard's
+                        # carousel rendering, so a video uploaded into a carousel
+                        # still ends up here and will fail to render. Fixing that
+                        # needs a per-slide video field added on the frontend too;
+                        # out of scope here.
+                        slides = []
+                        for i, img_idx in enumerate(
+                            _upload_slide_image_indices(len(urls_for_platform), requested_num_slides, slide_image_map)
+                        ):
+                            url = urls_for_platform[img_idx]
+                            slide = {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                            bg = backgrounds_for_platform[img_idx] if backgrounds_for_platform else None
+                            if bg:
+                                slide["background_image_url"] = bg["background_url"]
+                                slide["logo_placement"] = bg["logo_placement"]
+                            slides.append(slide)
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "slides": slides,
+                        }
+                    else:
+                        # For single post: use the first uploaded item as the main
+                        # media. DraftCard only renders a <video> element when
+                        # draft.video_url is set (isReel = post_type === 'reel' ||
+                        # !!draft.video_url) — anything else, including a video's
+                        # own URL, gets rendered in an <img> tag and fails to load.
+                        # Route video uploads to video_url so the existing player
+                        # picks them up correctly instead of showing as a broken
+                        # image.
+                        first_url = urls_for_platform[0] if urls_for_platform else None
+                        is_first_video = first_url in video_urls if first_url else False
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "image_url": None if is_first_video else first_url,
+                            "video_url": first_url if is_first_video else None,
+                        }
+                        first_bg = backgrounds_for_platform[0] if backgrounds_for_platform and not is_first_video else None
+                        if first_bg:
+                            update_fields["background_image_url"] = first_bg["background_url"]
+                            update_fields["logo_placement"] = first_bg["logo_placement"]
+
+                    await db["content_drafts"].update_one({"id": draft_id}, {"$set": update_fields})
                     d.update(update_fields)
 
         # Deduct credits (cheaper than full generation since no image gen)
@@ -1393,16 +1607,18 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="upload_user_content",
+                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted 1 trial credit from user {user_id}")
+                    print(f"✅ Deducted {credits_to_deduct} trial credit(s) from user {user_id}")
                 else:
                     await credit_service.deduct_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="upload_user_content",
                         retry_count=0,
+                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted 1 credit from user {user_id}")
+                    print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id}")
 
             # Notification
             try:
@@ -1457,6 +1673,26 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
             },
         )
 
+
+@router.get("/download-url")
+async def get_download_url(
+    url: str = Query(..., description="The media URL to download (must be one of our own S3 objects)"),
+    filename: str = Query(..., description="Filename the browser should save the download as"),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Replacement for Cloudinary's fl_attachment delivery-URL flag
+    (cloudinaryDownload.util.ts) — a plain S3 URL has no equivalent query-string
+    trick, so a short-lived presigned GET with ResponseContentDisposition is the
+    S3-native way to make the browser save a download under a clean name instead
+    of the raw object key. Falls back to the original URL (unsigned) if it isn't
+    one of our own S3 objects, so a caller can always just use whatever this
+    returns without a special case for "not an S3 URL"."""
+    from app.utils.s3_upload import presigned_download_url
+
+    signed = presigned_download_url(url, filename)
+    return UriResponse.get_single_data_response("download_url", {"url": signed or url})
+
+
 # ==============================================================================
 # SOCIAL ACCOUNT CONNECTION ENDPOINTS
 # ==============================================================================
@@ -1485,14 +1721,12 @@ async def initiate_social_connections(
 
 
 @router.get("/connect/facebook-direct/initiate")
-async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
+async def facebook_direct_initiate(source: Optional[str] = Query("settings"), rerequest: int = Query(0)):
     """
     Redirect the user's browser to Facebook's OAuth page to connect a Facebook Page
     directly (without Outstand). On completion, Facebook redirects to
     /connect/facebook-direct/callback.
     """
-    import urllib.parse
-
     app_id = settings.META_APP_ID
     if not app_id:
         raise HTTPException(status_code=500, detail="META_APP_ID not configured")
@@ -1510,15 +1744,31 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_manage_engagement",
         "pages_manage_metadata",
     ]
-    params = {
-        "client_id": app_id,
-        "redirect_uri": redirect_uri,
-        "scope": ",".join(scopes),
-        "response_type": "code",
-        "state": source or "settings",
-    }
-    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
-    return RedirectResponse(auth_url)
+    # Facebook never asks again for a permission the person once switched off, so a plain
+    # reconnect comes back without it every time. rerequest asks for exactly those again.
+    # The state carries it so the callback knows not to loop if they decline once more.
+    state = source or "settings"
+    extra = {"auth_type": "rerequest"} if rerequest else None
+    if rerequest:
+        state = f"{state}|rerequested"
+    return RedirectResponse(
+        build_meta_authorize_url(app_id, redirect_uri, scopes, state, settings.FACEBOOK_API_VERSION, extra)
+    )
+
+
+# What the inbox cannot work without: Meta refuses to deliver a Page's events at all
+# unless the token has both.
+INBOX_SCOPES = ("pages_manage_metadata", "pages_messaging")
+
+
+async def declined_scopes(client, graph_base: str, token: str) -> list[str]:
+    """Permissions the person switched off in Meta's dialog. A permission Meta never
+    offered (the app isn't allowed it) doesn't appear at all, which is a different fix."""
+    try:
+        r = await client.get(f"{graph_base}/me/permissions", params={"access_token": token})
+        return [p["permission"] for p in r.json().get("data", []) if p.get("status") == "declined"]
+    except Exception:
+        return []
 
 
 @router.get("/connect/facebook-direct/callback")
@@ -1539,7 +1789,12 @@ async def facebook_direct_callback(
     from datetime import timezone
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
+    rerequested = bool(state and state.endswith("|rerequested"))
+    if rerequested:
+        state = state[: -len("|rerequested")]
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
+    if state == "inbox":  # started from the inbox, which finishes the connection itself
+        base_redirect = f"{web_app_url}/workspace/?tab=messages&view=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -1583,6 +1838,15 @@ async def facebook_direct_callback(
             )
             ll_data = ll_resp.json()
             long_token = ll_data.get("access_token", short_token)
+
+            declined = [p for p in await declined_scopes(client, graph_base, long_token) if p in INBOX_SCOPES]
+            if declined and not rerequested:
+                print(f"[FBDirectOAuth] inbox permission(s) declined earlier: {declined} — asking again", flush=True)
+                again = f"{_base}/social-media/connect/facebook-direct/initiate?" + urllib.parse.urlencode(
+                    {"source": state or "settings", "rerequest": 1})
+                return RedirectResponse(again)
+            if declined:
+                print(f"[FBDirectOAuth] inbox permission(s) still declined after re-asking: {declined}", flush=True)
 
             # Step 3: get the user's Facebook Pages
             pages_resp = await client.get(
@@ -1666,6 +1930,137 @@ async def facebook_direct_finalize(
 
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
 
+
+# ── TikTok direct — Content Posting API via FILE_UPLOAD, bypassing Outstand.
+# Same 3-endpoint shape as facebook-direct above (initiate/callback/finalize),
+# additive alongside the existing Outstand-mediated TikTok connection — see
+# tiktok_direct_service.py's module docstring for why this exists now.
+
+@router.get("/connect/tiktok-direct/initiate")
+async def tiktok_direct_initiate(source: Optional[str] = Query("settings")):
+    """Redirect the user's browser to TikTok's OAuth page to connect their
+    TikTok account directly (without Outstand). On completion, TikTok
+    redirects to /connect/tiktok-direct/callback."""
+    from app.agents.social_media_manager.services.tiktok_direct_service import build_authorize_url
+
+    client_key = settings.TIKTOK_APP_CLIENT_KEY
+    if not client_key:
+        raise HTTPException(status_code=500, detail="TIKTOK_APP_CLIENT_KEY not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
+
+    return RedirectResponse(build_authorize_url(client_key, redirect_uri, source or "settings"))
+
+
+@router.get("/connect/tiktok-direct/callback")
+async def tiktok_direct_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """TikTok OAuth callback for direct connection. Exchanges the auth code
+    for access/refresh tokens, fetches the account's display name/avatar,
+    stores a pending connection, and redirects back to the workspace."""
+    import urllib.parse
+    from datetime import timezone, timedelta
+    from app.agents.social_media_manager.services.tiktok_direct_service import (
+        exchange_code_for_tokens,
+        fetch_user_info,
+    )
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace/?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_description or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
+
+    try:
+        tokens = await exchange_code_for_tokens(code, redirect_uri)
+        access_token = tokens["access_token"]
+        open_id = tokens.get("open_id", "")
+
+        user_info = await fetch_user_info(access_token)
+        display_name = user_info.get("display_name", "")
+        avatar_url = user_info.get("avatar_url", "")
+
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=int(tokens.get("expires_in", 7200)))
+        refresh_expires_in = tokens.get("refresh_expires_in")
+        conn_doc = {
+            "id": f"tt_{open_id}",
+            "user_id": None,               # set by finalize
+            "platform": "tiktok",
+            "connected_via": "tiktok_direct_oauth",
+            "open_id": open_id,
+            "access_token": access_token,
+            "refresh_token": tokens.get("refresh_token", ""),
+            "token_expires_at": expires_at.isoformat(),
+            **({"refresh_token_expires_at": (now + timedelta(seconds=int(refresh_expires_in))).isoformat()}
+               if refresh_expires_in is not None else {}),
+            "account_name": display_name,
+            "profile_picture_url": avatar_url,
+            "connection_status": "pending_user_match",
+            "connected_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        await db["social_connections"].update_one(
+            {"id": f"tt_{open_id}"},
+            # Connecting again is the fix for a connection flagged as needing a reconnect.
+            {"$set": conn_doc, "$unset": {"needs_reconnect": "", "reconnect_reason": "", "needs_reconnect_since": ""}},
+            upsert=True,
+        )
+        print(f"[TikTokDirectOAuth] ✅ Stored account '{display_name}' (open_id={open_id}) pending user match")
+
+        params_out = (
+            f"connected=tiktok_direct"
+            f"&tt_open_id={urllib.parse.quote(open_id)}"
+            f"&account_name={urllib.parse.quote(display_name)}"
+        )
+        return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[TikTokDirectOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/tiktok-direct/finalize")
+async def tiktok_direct_finalize(
+    tt_open_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Called by the frontend after the TikTok direct OAuth callback to
+    associate the pending connection with the authenticated user and active
+    brand — same shape as facebook_direct_finalize above."""
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
+
+    result = await db["social_connections"].update_one(
+        {"id": f"tt_{tt_open_id}"},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="TikTok connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("tiktok_connected", {"tt_open_id": tt_open_id})
 
 
 # ── Facebook Login for Business — the "hybrid page grant" (Ibukun's engineering
@@ -2004,8 +2399,6 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     /connect/instagram-direct/callback where we retrieve the linked Instagram
     Business Account from the user's Facebook Pages.
     """
-    import urllib.parse
-
     app_id = settings.META_APP_ID
     if not app_id:
         raise HTTPException(status_code=500, detail="META_APP_ID not configured")
@@ -2028,15 +2421,21 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_manage_engagement",
         "pages_manage_metadata",
     ]
-    params = {
-        "client_id": app_id,
-        "redirect_uri": redirect_uri,
-        "scope": ",".join(scopes),
-        "response_type": "code",
-        "state": source or "settings",
+    extra = {
+        # Live-reported 2026-09-21: on mobile Chrome (not an embedded/in-app
+        # browser), some users never reach our redirect_uri at all — this dialog
+        # is Facebook's own (Instagram uses Facebook Login), so it's exposed to
+        # the same known mobile behavior: when the Facebook app is installed, the
+        # OS can intercept the navigation as an App Link and hand off to the
+        # native app instead of rendering the web dialog, landing the user on
+        # their normal Facebook feed with no consent screen and no return trip to
+        # us. `display=page` explicitly requests the full-page WEB dialog — the
+        # correct mode for a server-side redirect flow like this one — instead of
+        # leaving Facebook/the OS to auto-detect, which is what invites the
+        # native-app handoff. NOT yet confirmed against a live affected device.
+        "display": "page",
     }
-    auth_url = "https://www.facebook.com/v20.0/dialog/oauth?" + urllib.parse.urlencode(params)
-    return RedirectResponse(auth_url)
+    return RedirectResponse(build_meta_authorize_url(app_id, redirect_uri, scopes, source or "settings", "v20.0", extra))
 
 
 @router.get("/connect/instagram-direct/callback")
@@ -2063,6 +2462,8 @@ async def instagram_direct_callback(
     # the finalizeInstagramDirect handler lives. /settings/social-accounts
     # does not exist as a route so the finalize call would never fire there.
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
+    if state == "inbox":  # started from the inbox, which finishes the connection itself
+        base_redirect = f"{web_app_url}/workspace/?tab=messages&view=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -2229,13 +2630,18 @@ async def instagram_direct_finalize(
     is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
 
     update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
-    if not is_personal:
+    update: dict = {"$set": update_fields}
+    if is_personal:
+        update["$unset"] = {"brand_id": ""}
+    else:
         update_fields["brand_id"] = brand_id
 
-    result = await db["social_connections"].update_one(
-        {"ig_user_id": ig_user_id},
-        {"$set": update_fields},
-    )
+    # The callback stores the fresh connection under id=ig_user_id. Matching on
+    # ig_user_id alone could land on an older record of the same account (another
+    # brand, a dead token) and leave the fresh one pending, so the inbox never saw it.
+    result = await db["social_connections"].update_one({"id": ig_user_id}, update)
+    if result.matched_count == 0:
+        result = await db["social_connections"].update_one({"ig_user_id": ig_user_id}, update)
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Instagram connection not found — try reconnecting")
 
@@ -2415,6 +2821,48 @@ async def outstand_oauth_callback(
     )
 
 
+@router.get("/connect/pending/{session_token}")
+async def get_pending_connection(
+    session_token: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(flexible_token),
+):
+    """
+    Step 2 of the social connection flow.
+
+    Returns the list of pages/accounts the user can connect for this session.
+    The frontend shows these to the user for selection before finalising.
+    Session tokens expire — call this promptly after the OAuth callback.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    return await SocialAccountService.get_pending_connection(session_token, db=db)
+
+
+@router.post("/connect/finalize")
+async def finalize_social_connection(
+    request: FinalizeConnectionRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """
+    Step 3 of the social connection flow (completes onboarding step 2).
+
+    Finalises the OAuth connection for the selected pages/accounts.
+    Stores the connected account IDs locally for publishing.
+    Call GET /connections after this to see all connected accounts.
+    """
+    return await SocialAccountService.finalize_connection(
+        db=db,
+        user_id=ctx["user_id"],
+        session_token=request.session_token,
+        selected_page_ids=request.selected_page_ids,
+        brand_id=ctx["brand_id"],
+    )
+
+
 @router.post("/connect/finalize-outstand-direct")
 async def finalize_outstand_direct(
     account_id: str,
@@ -2458,11 +2906,14 @@ async def finalize_outstand_direct(
     if not is_personal:
         doc["brand_id"] = brand_id
 
+    # Only an earlier Outstand connection is replaced. A direct Meta connection for the same
+    # platform carries the Page token the inbox needs, which Outstand never provides, so
+    # deleting it here silently stopped DMs and auto-replies for that brand.
     brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
     await db["social_connections"].delete_many({
         "$or": [
             {"id": account_id},
-            {**brand_scope, "platform": network},
+            {**brand_scope, "platform": network, "connected_via": "outstand"},
         ]
     })
     await db["social_connections"].insert_one(doc)
@@ -2472,48 +2923,6 @@ async def finalize_outstand_direct(
         "platform": network,
         "username": username,
     })
-
-
-@router.get("/connect/pending/{session_token}")
-async def get_pending_connection(
-    session_token: str,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
-):
-    """
-    Step 2 of the social connection flow.
-
-    Returns the list of pages/accounts the user can connect for this session.
-    The frontend shows these to the user for selection before finalising.
-    Session tokens expire — call this promptly after the OAuth callback.
-    """
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
-    return await SocialAccountService.get_pending_connection(session_token, db=db)
-
-
-@router.post("/connect/finalize")
-async def finalize_social_connection(
-    request: FinalizeConnectionRequest,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_flexible_brand_context),
-):
-    """
-    Step 3 of the social connection flow (completes onboarding step 2).
-
-    Finalises the OAuth connection for the selected pages/accounts.
-    Stores the connected account IDs locally for publishing.
-    Call GET /connections after this to see all connected accounts.
-    """
-    return await SocialAccountService.finalize_connection(
-        db=db,
-        user_id=ctx["user_id"],
-        session_token=request.session_token,
-        selected_page_ids=request.selected_page_ids,
-        brand_id=ctx["brand_id"],
-    )
 
 
 @router.get("/connections")
@@ -2635,6 +3044,41 @@ async def disconnect_facebook_direct(
     return {"status": True, "responseMessage": "Facebook page disconnected"}
 
 
+@router.delete("/connections/tiktok-direct")
+async def disconnect_tiktok_direct(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Disconnect a TikTok account connected via direct OAuth for the active brand.
+    """
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+
+    if is_personal:
+        delete_filter = {
+            "user_id": user_id,
+            "platform": "tiktok",
+            "connected_via": "tiktok_direct_oauth",
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        delete_filter = {"brand_id": brand_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth"}
+
+    result = await db["social_connections"].delete_one(delete_filter)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="TikTok connection not found")
+
+    return {"status": True, "responseMessage": "TikTok account disconnected"}
+
+
 # ==============================================================================
 # ONBOARDING ENDPOINTS
 # ==============================================================================
@@ -2642,7 +3086,7 @@ async def disconnect_facebook_direct(
 @router.get("/onboarding/status")
 async def get_onboarding_status(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Returns the user's onboarding completion state.
@@ -2651,7 +3095,7 @@ async def get_onboarding_status(
     step_2_complete — at least one social account connected
     current_step    — the step the user should be on (1, 2, or null if done)
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2666,7 +3110,7 @@ async def approve_content(
     request: ApprovalRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Approve content drafts with scheduling options
@@ -2676,7 +3120,7 @@ async def approve_content(
     - schedule: Schedule for specific time
     - save_draft: Just approve without publishing
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -2687,7 +3131,8 @@ async def approve_content(
             draft_ids=request.draft_ids,
             schedule_option=request.schedule_option,
             scheduled_datetime=request.scheduled_datetime,
-            approval_notes=request.approval_notes
+            approval_notes=request.approval_notes,
+            tiktok_settings=request.tiktok.model_dump() if request.tiktok else None,
         )
 
         return result
@@ -2701,7 +3146,7 @@ async def regenerate_draft_image(
     request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Regenerate the image for an existing draft using user feedback.
@@ -2712,7 +3157,7 @@ async def regenerate_draft_image(
     Clears the current image immediately (frontend shows shimmer),
     then generates a new image in the background incorporating the feedback.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2846,7 +3291,7 @@ async def edit_draft_image(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Edit image in-place using user feedback
@@ -2864,7 +3309,7 @@ async def edit_draft_image(
     """
     from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2901,7 +3346,7 @@ async def reposition_draft_logo(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Move/resize the logo on an already-generated draft's image — a plain
@@ -2915,7 +3360,7 @@ async def reposition_draft_logo(
     """
     from app.agents.social_media_manager.services.logo_reposition_service import LogoRepositionService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2946,7 +3391,7 @@ async def undo_draft_image_edit(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Undo last image edit and restore previous version
@@ -2957,7 +3402,7 @@ async def undo_draft_image_edit(
     """
     from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2996,13 +3441,13 @@ async def update_carousel_slide(
     slide_index: int,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Update text (headline/body) of a single carousel slide.
     Does NOT regenerate the image - only updates text.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -3071,13 +3516,13 @@ async def regenerate_carousel_slide_image(
     request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Regenerate the image for a single carousel slide.
     Optionally accepts feedback for adjustments.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -3179,13 +3624,13 @@ async def delete_carousel_slide(
     draft_id: str,
     slide_index: int,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Delete a single slide from a carousel.
     Minimum 2 slides required (can't delete if only 2 left).
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -3238,7 +3683,7 @@ async def reorder_carousel_slides(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Reorder carousel slides based on new index array.
@@ -3248,7 +3693,7 @@ async def reorder_carousel_slides(
         "new_order": [2, 0, 1, 3]  // New positions (0-indexed)
     }
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -3314,6 +3759,38 @@ async def reorder_carousel_slides(
     )
 
 
+class TikTokAutoAddMusicRequest(BaseModel):
+    enabled: bool
+
+
+@router.patch("/drafts/{draft_id}/tiktok-auto-add-music")
+async def set_tiktok_auto_add_music(
+    draft_id: str,
+    request: TikTokAutoAddMusicRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Toggle TikTok's automatic background-music pick for a single-image or
+    carousel draft (Music PRD MUS-PRD-01 §2.2/§8, resolved 2026-09-15):
+    TikTok's Content Posting API exposes no way to choose a specific track
+    for photo/carousel posts — auto_add_music is the ONLY music control that
+    exists there, and it's TikTok's own algorithmic pick, not ours. This just
+    persists the user's yes/no; approval_workflow_service.py reads it at
+    publish time and only forwards it for non-video TikTok drafts (Outstand's
+    own docs: the field is "ignored for videos" anyway)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["content_drafts"].update_one(
+        {"id": draft_id, "user_id": user_id},
+        {"$set": {"tiktok_auto_add_music": request.enabled, "updated_at": datetime.utcnow()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return {"status": True, "responseMessage": "Updated", "responseData": {"tiktok_auto_add_music": request.enabled}}
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
@@ -3346,14 +3823,14 @@ class SyncImageRequest(BaseModel):
 async def sync_image_across_drafts(
     request: SyncImageRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Copy images from a source draft to one or more target drafts (same user only).
     For carousel drafts: syncs all slide image_urls (targets must have the same slide count).
     For feed/story drafts: syncs the single image_url.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -3421,10 +3898,10 @@ async def sync_image_across_drafts(
 async def deny_content(
     request: DenialRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Deny content drafts with optional regeneration request"""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -3469,11 +3946,49 @@ async def unschedule_draft(
     return UriResponse.get_single_data_response("unschedule", {"draft_id": draft_id, "status": "draft"})
 
 
+@router.post("/drafts/{draft_id}/restore")
+async def restore_draft(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Move an archived draft (denied / replaced / publish_failed) back to draft status, clearing the error/denial state that put it there."""
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
+    draft = await db["content_drafts"].find_one({**scope, "id": draft_id})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("status") not in ("denied", "replaced", "publish_failed"):
+        raise HTTPException(status_code=400, detail="Only archived drafts can be restored")
+
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {
+            "$set": {
+                "status": "draft",
+                "user_id": user_id,  # ensure user_id is on the doc so fetchDrafts finds it
+                "updated_at": datetime.utcnow(),
+            },
+            "$unset": {
+                "error_message": "",
+                "publish_error_kind": "",
+                "publish_retry_count": "",
+                "denial_reason": "",
+                "platform_post_id": "",
+                "scheduled_date": "",
+            },
+        },
+    )
+    from app.domain.responses.uri_response import UriResponse
+    return UriResponse.get_single_data_response("restore", {"draft_id": draft_id, "status": "draft"})
+
+
 @router.put("/refine")
 async def refine_content(
     request: RefinementRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """
     Refine/edit content before approval
@@ -3484,7 +3999,7 @@ async def refine_content(
     - Add/remove media
     - Add refinement notes
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -3508,10 +4023,10 @@ async def refine_content(
 async def schedule_content(
     request: SchedulingRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Schedule approved content for future publishing"""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -3746,10 +4261,10 @@ async def get_content_analytics(
     platform: Optional[str] = None,
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Get content performance analytics"""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -4892,7 +5407,7 @@ async def get_account_metrics(
 async def debug_outstand_account_metrics(
     account_id: str,
     days: int = 30,
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Return raw Outstand account metrics response for debugging field mapping."""
     import time as _time
@@ -4910,7 +5425,7 @@ async def debug_outstand_account_metrics(
 @router.get("/debug/outstand-post/{post_id}")
 async def debug_outstand_post(
     post_id: str,
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Fetch the live status of an Outstand post by its ID."""
     try:
@@ -4924,7 +5439,7 @@ async def debug_outstand_post(
 @router.get("/debug/outstand-analytics/{post_id}")
 async def debug_outstand_analytics(
     post_id: str,
-    auth: dict = Depends(flexible_auth)
+    token: dict = Depends(flexible_token)
 ):
     """Return the raw Outstand analytics response for a post — shows exactly what fields are available."""
     try:
@@ -4938,10 +5453,10 @@ async def debug_outstand_analytics(
 @router.get("/debug/performance-raw")
 async def debug_performance_raw(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Show raw published drafts + their platform_post_id and outstand markers for this user."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     drafts = await db["content_drafts"].find(
@@ -4963,14 +5478,14 @@ async def debug_performance_raw(
 @router.get("/debug/connections-raw")
 async def debug_connections_raw(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Show the raw social_connections documents for the current user.
     Exposes connected_via, ig_user_id, page_id, and whether page_access_token is present.
     Used to diagnose Instagram/Facebook routing issues.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -5043,9 +5558,7 @@ async def get_draft(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_flexible_brand_context),
 ):
-    """Get a single draft by ID — scoped to the active brand.
-    **Authentication**: Accepts both JWT (Dashboard/Frontend) and API Key (SDK)
-    """
+    """Get a single draft by ID — scoped to the active brand."""
     user_id = ctx["user_id"]
     scope = _brand_scope(user_id, ctx["brand_id"])
 
@@ -5097,14 +5610,6 @@ async def update_draft(
     draft = await db["content_drafts"].find_one({**scope, "id": draft_id}, {"_id": 0})
     return UriResponse.get_single_data_response("draft", draft)
 
-
-# =====================================================
-# SDK CLIENT ADMIN — manage the end-users under this API key
-# =====================================================
-# Unlike every other endpoint in this file, these are NOT end-user scoped —
-# they authenticate at the API-key/developer level only (no X-End-User-ID
-# required) because this is the SDK client's own admin view over every
-# end-user provisioned under their key, not any single end-user's own data.
 
 @router.get("/sdk/end-users")
 async def list_sdk_end_users(
@@ -5186,7 +5691,7 @@ async def list_sdk_end_users(
 async def stream_draft_image(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     SSE stream — sends a `image_ready` event with the draft payload the moment
@@ -5197,7 +5702,7 @@ async def stream_draft_image(
         es.addEventListener('image_ready', e => { const draft = JSON.parse(e.data); es.close() })
         es.addEventListener('timeout', () => es.close())
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -5261,15 +5766,16 @@ async def test_endpoint():
 
 @router.get("/auto-generate/settings")
 async def get_auto_generate_settings(
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
 ):
-    """Get (or create) the auto-content generation settings for the current user."""
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Get (or create) the auto-content generation settings for the active brand.
+
+    Brand-scoped (not just user-scoped) — an agency user manages multiple
+    client brands under one login; settings/generation must stay isolated
+    per brand the same way Calendar and Brand Profile already are."""
     try:
-        doc = await AutoContentService.get_or_create_settings(user_id, db)
+        doc = await AutoContentService.get_or_create_settings(ctx["user_id"], db, ctx["brand_id"])
         return UriResponse.get_single_data_response("auto_generate_settings", doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -5278,18 +5784,15 @@ async def get_auto_generate_settings(
 @router.put("/auto-generate/settings")
 async def update_auto_generate_settings(
     request: AutoGenerateSettingsRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
 ):
-    """Update auto-content generation settings (upsert)."""
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Update auto-content generation settings (upsert), scoped to the active brand."""
     try:
         payload = request.dict(exclude_none=True)
         if request.brand_context:
             payload["brand_context"] = request.brand_context.dict(exclude_none=True)
-        doc = await AutoContentService.update_settings(user_id, payload, db)
+        doc = await AutoContentService.update_settings(ctx["user_id"], payload, db, ctx["brand_id"])
         return UriResponse.get_single_data_response("auto_generate_settings", doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -5298,8 +5801,8 @@ async def update_auto_generate_settings(
 @router.post("/auto-generate/connect-insights")
 async def connect_insights(
     request: ConnectInsightsRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
 ):
     """
     Persist the AiMediaReport generated by account tracking analysis.
@@ -5308,17 +5811,15 @@ async def connect_insights(
     can use industry, content themes, engagement drivers, and the weekly
     campaign calendar as richer context when generating posts.
     """
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
     try:
         await AutoContentService.save_analytics_context(
-            user_id=user_id,
+            user_id=ctx["user_id"],
             influencer_id=request.influencer_id,
             platform=request.platform,
             social_user_id=request.social_user_id,
             insights=request.insights,
             db=db,
+            brand_id=ctx["brand_id"],
         )
         return UriResponse.get_single_data_response(
             "connect_insights", {"saved": True, "platform": request.platform}
@@ -5330,17 +5831,14 @@ async def connect_insights(
 @router.post("/auto-generate/trigger")
 async def trigger_auto_generate(
     background_tasks: BackgroundTasks,
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
 ):
-    """Manually trigger auto-content generation for the current user."""
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-    background_tasks.add_task(_run_auto_generate_background, user_id, db)
+    """Manually trigger auto-content generation for the active brand."""
+    background_tasks.add_task(_run_auto_generate_background, ctx["user_id"], db, ctx["brand_id"])
     return UriResponse.get_single_data_response(
         "auto_generate_trigger",
-        {"message": "Auto-content generation started in background", "user_id": user_id},
+        {"message": "Auto-content generation started in background", "user_id": ctx["user_id"]},
     )
 
 
@@ -5499,21 +5997,16 @@ async def save_brand_profile(
     """Save or update the brand profile for the active brand."""
     user_id = ctx["user_id"]
     try:
-        # exclude_unset (not exclude_none): BrandProfileService.save() below
-        # decides whether to touch a field by checking `if field in data` —
-        # that's how it tells "the client explicitly cleared this" from "the
-        # client didn't send this at all". exclude_none collapsed that
-        # distinction: a field explicitly sent as null (e.g. logo_url after
-        # "Remove logo") was stripped out identically to a field that was
-        # simply never included, so save() never saw the clear and the old
-        # value just stayed in the database — confirmed live, the removed
-        # logo reappeared after every save. exclude_unset keeps any field
-        # that was actually present in the request body, null or not, while
-        # still excluding genuinely-omitted fields exactly as before.
+        print(f"🔍 PYDANTIC PARSED REQUEST: logo_position={repr(request.logo_position)}, logo_size={repr(request.logo_size)}, ideal_customer_profile={repr(request.ideal_customer_profile)}, primary_font={repr(request.primary_font)}, secondary_font={repr(request.secondary_font)}")
+        # exclude_unset (not exclude_none): BrandProfileService.save() decides whether to
+        # touch a field by checking `if field in data`. exclude_none dropped fields sent
+        # explicitly as null (e.g. logo_url after "Remove logo"), so the removed logo
+        # came back after every save — confirmed live on prod. Prod fix, kept.
         payload = request.dict(exclude_unset=True)
         if isinstance(payload.get("platform_tones"), dict):
             from ..services.brand_profile_service import normalize_platform_tones
             payload["platform_tones"] = normalize_platform_tones(payload["platform_tones"])
+        print(f"🔍 PAYLOAD AFTER exclude_none: logo_position={repr(payload.get('logo_position'))}, logo_size={repr(payload.get('logo_size'))}, ideal_customer_profile={repr(payload.get('ideal_customer_profile'))}, primary_font={repr(payload.get('primary_font'))}, secondary_font={repr(payload.get('secondary_font'))}")
         # Serialize nested Pydantic models to plain dicts
         if "guardrails" in payload and hasattr(payload["guardrails"], "dict"):
             payload["guardrails"] = payload["guardrails"].dict(exclude_none=True)
@@ -5868,7 +6361,7 @@ async def save_business_pulse(
 async def analyze_voice_samples(
     request: Dict[str, Any],
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_flexible_brand_context),
+    token: dict = Depends(flexible_token),
 ):
     """
     Analyze sample captions to extract voice patterns.
@@ -5884,7 +6377,9 @@ async def analyze_voice_samples(
     Returns the analysis and optionally updates the user's brand profile
     with merged voice settings.
     """
-    user_id = ctx["user_id"]
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
         sample_captions = request.get("sample_captions", [])
@@ -5951,13 +6446,13 @@ def _pick_rotating_cta(cta_styles_list: Optional[List[str]], rotation_index: int
     """The ONE way a CTA is chosen from a brand's cta_styles list — shared by
     every content-generation path that needs one.
 
-    Confirmed live (Oct 2026): four call sites each independently reimplemented
-    this. Three agreed on deterministic round-robin via cta_rotation_index;
-    the fourth (upload_user_content's inline "same logic as normal
-    generation" copy, which drifted from what it was commented to match)
-    used random.choice instead, so the same brand got a different CTA
+    Confirmed live (Oct 2026): five call sites each independently
+    reimplemented this. Four agreed on deterministic round-robin via
+    cta_rotation_index; the fifth (upload_user_content's inline "same logic
+    as normal generation" copy, which drifted from what it was commented to
+    match) used random.choice instead, so the same brand got a different CTA
     rotation behaviour depending on which upload path generated the post.
-    One function now, so the four can never drift again.
+    One function now, so the five can never drift again.
 
     Returns (chosen_cta_text, next_rotation_index_to_persist) — the caller
     only needs to persist next_rotation_index when it actually came from
@@ -5985,20 +6480,12 @@ def _resolve_platform_style_pool(bp: Dict[str, Any], platform: str) -> tuple:
     style/guide pool in bp's *_by_platform maps, returns a new dict with
     style_selections/style_prompt_fragments/selected_custom_guides/
     selected_custom_guides_v2/style_rotation_index substituted for that
-    platform's values, under the SAME keys the carousel/regular-post
+    platform's values, under the SAME keys _generate_image_bg's two
     selection branches already read via bp.get(...) — so those branches need
     zero further changes to become platform-aware, whether called for the
     brand default or an override. Falls back to bp's own (brand-wide) values
-    completely untouched when no override exists for this platform.
-
-    Confirmed live (Oct 2026): BrandProfileService.save and the request
-    models already accepted and persisted style_selections_by_platform /
-    selected_custom_guides_by_platform / selected_custom_guides_v2_by_platform
-    / style_rotation_index_by_platform — a brand could configure a
-    per-platform override, see it saved, and it would never once be read by
-    any generation path, since this resolution step didn't exist on prod at
-    all (dev has had it since the carousel-race-condition fix). Silently
-    ignored input is worse than an unsupported feature — this closes it.
+    completely untouched when no override exists for this platform — a
+    brand that never sets one up behaves identically to before this existed.
 
     No per-platform prompt-fragment freezing (yet) — style_prompt_fragments
     comes back empty for an override, which is an already-supported path
@@ -6065,7 +6552,9 @@ async def _resolve_carousel_shared_context(
 
     Returns a new dict (never mutates `brand_context` in place) since the same
     brand_context object is reused across other drafts/carousels in the same
-    request.
+    request. `platform` is needed for _resolve_platform_style_pool — a
+    carousel's slides all share one platform, so this is resolved once per
+    carousel just like the guide/CTA choice themselves.
     """
     _bc_brand_id = brand_context.get("brand_id", "")
     _bc_user_id = brand_context.get("user_id", "")
@@ -6075,10 +6564,13 @@ async def _resolve_carousel_shared_context(
 
     _bp = await db["brand_profiles"].find_one(
         _style_profile_scope,
-        {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
-         "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
-         "cta_rotation_index": 1, "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
-         "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1},
+        {
+            "style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
+            "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
+            "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
+            "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
+            "cta_rotation_index": 1,
+        },
     ) or {}
     _bp, _rotation_field_path = _resolve_platform_style_pool(_bp, platform)
 
@@ -6181,6 +6673,8 @@ async def _generate_image_bg(
     brand_context: Dict[str, Any],
     db: AsyncIOMotorDatabase,
     reference_image: Optional[str] = None,
+    reference_images: Optional[List[str]] = None,
+    reference_image_meta: Optional[List[Dict[str, Any]]] = None,
     post_type: str = "feed",
     slide_index: Optional[int] = None,
     image_model: Optional[str] = None,
@@ -6196,7 +6690,12 @@ async def _generate_image_bg(
     use_true_compositing: opt-in only, default False — every existing caller keeps
     today's behaviour unchanged. When True (and a reference_image is present),
     routes to ImageContentService._generate_platform_image_composited instead of
-    the standard AI-redraw path — see that method's docstring for why.
+    the standard AI-redraw path — see that method's docstring for why. (Not
+    combinable with reference_images having more than one entry — true
+    compositing is single-product only; see its own docstring.)
+    reference_images/reference_image_meta: see ImageContentService.
+    _generate_platform_image's docstring — more than one entry switches to the
+    multi-reference combine path there.
     For carousel posts, slide_index indicates which slide this image belongs to,
     and carousel_id ensures all slides share the same visual style.
     For story posts, uses the story (9:16) image spec.
@@ -6243,12 +6742,18 @@ async def _generate_image_bg(
 
             _bp = await db["brand_profiles"].find_one(
                 _style_profile_scope,
-                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
-                 "selected_custom_guides": 1, "selected_custom_guides_v2": 1, "style_selections_by_platform": 1,
-                 "selected_custom_guides_by_platform": 1, "selected_custom_guides_v2_by_platform": 1,
-                 "style_rotation_index_by_platform": 1},
+                {
+                    "style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
+                    "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
+                    "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
+                    "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
+                },
             ) or {}
+
+            # Per-platform override resolution — see _resolve_platform_style_pool.
             _bp, _rotation_field_path = _resolve_platform_style_pool(_bp, platform)
+            if _rotation_field_path != "style_rotation_index":
+                print(f"🎨 [{platform}] has its own style/guide override — using it instead of the brand default")
 
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
             _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
@@ -6386,12 +6891,18 @@ async def _generate_image_bg(
             # Regular post: check for custom guides (V1 + V2) first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
                 _style_profile_scope,
-                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
-                 "selected_custom_guides": 1, "selected_custom_guides_v2": 1, "style_selections_by_platform": 1,
-                 "selected_custom_guides_by_platform": 1, "selected_custom_guides_v2_by_platform": 1,
-                 "style_rotation_index_by_platform": 1},
+                {
+                    "style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
+                    "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
+                    "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
+                    "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
+                },
             ) or {}
+
+            # Per-platform override resolution — see _resolve_platform_style_pool.
             _bp, _rotation_field_path = _resolve_platform_style_pool(_bp, platform)
+            if _rotation_field_path != "style_rotation_index":
+                print(f"🎨 [{platform}] has its own style/guide override — using it instead of the brand default")
 
             # An on-the-fly style override always takes priority over custom guides too.
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
@@ -6522,10 +7033,6 @@ async def _generate_image_bg(
                 "brand_name": brand_context.get("brand_name", ""),
                 "logo_url": brand_context.get("logo_url", ""),
                 "logo_position": brand_context.get("logo_position", "bottom_right"),
-                # Was missing here — every V2 guide image used _overlay_logo's
-                # "small" default regardless of the brand's actual Logo Size
-                # setting, unlike the standard generation path below, which
-                # always reads this from the full brand_context.
                 "logo_size": brand_context.get("logo_size", "small"),
                 "logo_description": brand_context.get("logo_description", "brand logo"),
                 "brand_colors": brand_context.get("brand_colors") or [],
@@ -6615,6 +7122,8 @@ async def _generate_image_bg(
                     seed_content=seed_content,
                     brand_context=brand_context,
                     reference_image=reference_image,
+                    reference_images=reference_images,
+                    reference_image_meta=reference_image_meta,
                     image_type=image_type,
                     image_model=image_model,
                     slide_index=slide_index,
@@ -6837,13 +7346,13 @@ async def publish_content_background(db: AsyncIOMotorDatabase, user_id: str, dra
     except Exception as e:
         print(f"❌ Background publishing failed: {str(e)}")
 
-async def _run_auto_generate_background(user_id: str, db: AsyncIOMotorDatabase):
+async def _run_auto_generate_background(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None):
     """Background wrapper for auto-content generation (returns result via logs)."""
     try:
-        result = await AutoContentService.generate_for_user(user_id, db)
-        print(f"✅ Auto-generate complete for user={user_id}: {result}")
+        result = await AutoContentService.generate_for_user(user_id, db, brand_id)
+        print(f"✅ Auto-generate complete for user={user_id} brand={brand_id}: {result}")
     except Exception as e:
-        print(f"❌ Auto-generate failed for user={user_id}: {e}")
+        print(f"❌ Auto-generate failed for user={user_id} brand={brand_id}: {e}")
 
 
 async def _generate_blog_image_bg(
@@ -6945,11 +7454,21 @@ async def trigger_publish_scheduled(
     return result
 
 
+async def _video_brand_context(ctx: dict, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    """The whole Brand Playbook of the brand the user is working in (their own, or the agency client they
+    switched to), in the shape the Brand Brief reads. Video scripts used to get only name, industry, colours,
+    voice and region, so the owner's rules, audience, offer and promotions never reached them."""
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    return BrandProfileService.to_brand_context(profile_data)
+
+
 @router.post("/generate-storyboard")
 async def generate_storyboard(
     request: StoryboardRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Generate a GPT-4o Vision video storyboard from brand images.
@@ -6957,73 +7476,145 @@ async def generate_storyboard(
     Accepts up to 5 base64 image data URLs plus optional creative direction text.
     Returns a structured storyboard JSON with per-scene video prompts, motion
     descriptions, reference image indices, and optional text overlays.
+
+    Job-based (returns a job_id immediately, poll GET /storyboard-job/{job_id})
+    rather than the plain blocking call this used to be — that made this one
+    specific step (unlike frame/video generation, already job_id-based) lose
+    all in-flight work on a refresh. Mirrors generate-creative-storyboard's own
+    identical fix. See VideoStoryboardService.create_storyboard_job/
+    run_storyboard_job.
     """
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    profile_result = await BrandProfileService.get(user_id, db)
-    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-
-    brand_context = {
-        "brand_name": profile_data.get("brand_name", ""),
-        "industry": profile_data.get("industry", "general_other"),
-        "brand_colors": profile_data.get("brand_colors", []),
-        "brand_voice": profile_data.get("derived_voice", ""),
-        "region": profile_data.get("region", ""),
-    }
+    brand_context = await _video_brand_context(ctx, db)
 
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    result = await VideoStoryboardService.generate_storyboard(
-        brand_images=request.brand_images,
-        optional_text=request.optional_text,
-        brand_context=brand_context,
-        target_platform=request.target_platform,
-        target_duration_seconds=request.target_duration_seconds,
-        video_style=request.video_style,
+    job_id = await VideoStoryboardService.create_storyboard_job()
+    background_tasks.add_task(
+        VideoStoryboardService.run_storyboard_job,
+        job_id,
+        request.brand_images,
+        request.optional_text,
+        brand_context,
+        request.target_platform,
+        request.target_duration_seconds,
+        request.video_style,
     )
 
-    if not result.get("status"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Storyboard generation failed"))
+    return UriResponse.get_single_data_response("storyboard_job", {"job_id": job_id, "status": "generating"})
 
-    return UriResponse.get_single_data_response("storyboard", result["storyboard"])
+
+@router.get("/storyboard-job/{job_id}")
+async def get_storyboard_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll for storyboard-script generation progress (Upload Images flow)."""
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job = await VideoStoryboardService.get_storyboard_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Storyboard job not found")
+
+    return UriResponse.get_single_data_response("storyboard_job", job)
 
 
 @router.post("/generate-video-from-storyboard")
 async def generate_video_from_storyboard(
     request: VideoFromStoryboardRequest,
     background_tasks: BackgroundTasks,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
-    Start Veo 3.1 video generation for every scene in a storyboard.
+    Start video generation for every scene in a storyboard, routed by outcome
+    (engineering brief §2/§4) rather than a caller-chosen model — e.g.
+    "quick_video" routes to H3 Max Turbo with PixVerse V6 as its fallback.
     Returns a job_id immediately. Poll GET /video-job/{job_id} for progress.
     """
     from app.agents.social_media_manager.services.video_generation_service import (
         VideoGenerationService,
     )
 
-    auth.get("user_id")  # auth check
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    from app.agents.social_media_manager.services.video_pricing import PricingError
+    from app.agents.social_media_manager.services.video_generation_service import get_job
 
-    job_id = await VideoGenerationService.create_job(request.storyboard, request.model)
+    user_id = _get_user_id(token) or ""
+
+    # Credits are taken BEFORE any provider work starts (and the price comes from the scenes we are about to
+    # render, never from the client). A no-op while VIDEO_GENERATION_BILLING_MODE is "off".
+    try:
+        started = await billing.start(
+            user_id, request.storyboard, request.outcome, request.avatar_voice, idempotency_key
+        )
+    except PricingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except billing.BillingDeclined as e:
+        return JSONResponse(
+            status_code=402,
+            content={"status": False, "responseCode": 402, "responseMessage": e.message, "responseData": e.details},
+        )
+
+    if started["existing"]:
+        # The same request was already accepted (a double click, a retry): same job, nobody charged again.
+        existing = await get_job(started["job_id"]) or {}
+        return UriResponse.get_single_data_response(
+            "video_job",
+            {"job_id": started["job_id"], "status": existing.get("status", "queued"),
+             "total_scenes": existing.get("total_scenes", len(request.storyboard.get("scenes", []))),
+             "billing": started["billing"]},
+        )
+
+    try:
+        job_id = await VideoGenerationService.create_job(
+            request.storyboard, request.outcome, request.avatar_voice,
+            job_id=started["job_id"], user_id=user_id, billing=started["billing"],
+        )
+    except Exception:
+        # The job could not even be created after the credits were taken: give them straight back.
+        await billing.settle(started["job_id"], job={"total_scenes": len(request.storyboard.get("scenes", [])), "clips": []})
+        raise
     background_tasks.add_task(
-        VideoGenerationService.run_job,
+        VideoGenerationService.run_job_and_settle,
         job_id,
         request.storyboard,
         request.brand_images,
-        request.model,
+        request.outcome,
+        request.avatar_voice,
     )
-    return UriResponse.get_single_data_response(
-        "video_job",
-        {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))},
-    )
+    payload = {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))}
+    if started["billing"]:
+        payload["billing"] = started["billing"]
+    return UriResponse.get_single_data_response("video_job", payload)
+
+
+@router.post("/video-quote")
+async def video_quote(
+    request: VideoFromStoryboardRequest,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    What this storyboard would cost to render, in credits, and whether the customer can afford it. The same
+    server-side calculation the charge uses, so the price shown is the price taken. When video billing is off
+    this returns {"billing": "off"} and the UI shows no price.
+    """
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    from app.agents.social_media_manager.services.video_pricing import PricingError
+
+    user_id = _get_user_id(token) or ""
+    try:
+        quoted = await billing.quote(user_id, request.storyboard, request.outcome, request.avatar_voice)
+    except PricingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return UriResponse.get_single_data_response("video_quote", quoted)
 
 
 @router.get("/video-job/{job_id}")
 async def get_video_job(
     job_id: str,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Poll for video generation progress.
@@ -7033,11 +7624,21 @@ async def get_video_job(
     """
     from app.agents.social_media_manager.services.video_generation_service import get_job
 
-    auth.get("user_id")  # auth check
+    _get_user_id(token)  # auth check
 
     job = await get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # What was charged and what came back, so the screen can show it. Absent when the job was not charged.
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+
+    job.pop("user_id", None)
+    charged = await billing.for_job(job_id)
+    if charged:
+        job["billing"] = charged
+    else:
+        job.pop("billing", None)
 
     return UriResponse.get_single_data_response("video_job", job)
 
@@ -7046,7 +7647,7 @@ async def get_video_job(
 async def generate_storyboard_frames(
     request: StoryboardFramesRequest,
     background_tasks: BackgroundTasks,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start background generation of a unique frame image for each storyboard scene.
@@ -7054,7 +7655,7 @@ async def generate_storyboard_frames(
     """
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    auth.get("user_id")  # auth check
+    _get_user_id(token)  # auth check
 
     job_id = await VideoStoryboardService.create_frame_job(request.scenes)
     background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes, request.brand_images)
@@ -7068,12 +7669,12 @@ async def generate_storyboard_frames(
 @router.get("/storyboard-frame-job/{job_id}")
 async def get_storyboard_frame_job(
     job_id: str,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll for storyboard frame image generation progress."""
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    auth.get("user_id")  # auth check
+    _get_user_id(token)  # auth check
 
     job = await VideoStoryboardService.get_frame_job(job_id)
     if not job:
@@ -7082,10 +7683,153 @@ async def get_storyboard_frame_job(
     return UriResponse.get_single_data_response("frame_job", job)
 
 
+@router.post("/generate-creative-storyboard")
+async def generate_creative_storyboard(
+    request: CreativeStoryboardRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """
+    "Describe it" flow: write a creative_direction + scene-by-scene script
+    from a free-text brief (reference images optional, unlike /generate-
+    storyboard which requires 1-5). Frame images come from a separate call
+    to /generate-creative-frames below; once scenes carry frame_image_url,
+    the existing outcome-routed /generate-video-from-storyboard pipeline
+    picks up completely unchanged.
+
+    Job-based (returns a job_id immediately, poll GET /creative-storyboard-
+    job/{job_id}) rather than the plain blocking call this used to be — that
+    made this one specific step (unlike frame/video generation, already
+    job_id-based) lose all in-flight work on a refresh, with nothing to
+    resume. See VideoCreativeService.create_storyboard_job/run_storyboard_job.
+    """
+    brand_context = await _video_brand_context(ctx, db)
+
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
+
+    # Every storyboard run costs credits, taken BEFORE any writing starts (a no-op while billing is "off").
+    # Rewriting from an edited creative direction comes through here too, so it is charged like any other run.
+    try:
+        started = await billing.start_storyboard(ctx["user_id"], idempotency_key)
+    except billing.BillingDeclined as e:
+        return JSONResponse(
+            status_code=402,
+            content={"status": False, "responseCode": 402, "responseMessage": e.message, "responseData": e.details},
+        )
+
+    if started["existing"]:
+        # The same request was already accepted (a double click, a retry): same job, nobody charged again.
+        existing = await VideoCreativeService.get_storyboard_job(started["job_id"]) or {}
+        return UriResponse.get_single_data_response(
+            "storyboard_job",
+            {"job_id": started["job_id"], "status": existing.get("status", "generating"), "billing": started["billing"]},
+        )
+
+    try:
+        job_id = await VideoCreativeService.create_storyboard_job(started["job_id"])
+    except Exception:
+        # The job could not even be created after the credit was taken: give it straight back.
+        await billing.settle_storyboard(started["job_id"], False)
+        raise
+    background_tasks.add_task(
+        VideoCreativeService.run_storyboard_job,
+        job_id,
+        request.brief,
+        request.reference_images,
+        brand_context,
+        request.target_platform,
+        request.target_duration_seconds,
+        request.video_style,
+        request.creative_direction_override,
+    )
+
+    payload = {"job_id": job_id, "status": "generating"}
+    if started["billing"]:
+        payload["billing"] = started["billing"]
+    return UriResponse.get_single_data_response("storyboard_job", payload)
+
+
+@router.get("/storyboard-quote")
+async def storyboard_quote(
+    token: dict = Depends(JWTBearer()),
+):
+    """What writing a storyboard costs, and whether the customer can afford it. {"billing": "off"} when video
+    billing is off, and the UI shows no price."""
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+
+    user_id = _get_user_id(token) or ""
+    return UriResponse.get_single_data_response("storyboard_quote", await billing.quote_storyboard(user_id))
+
+
+@router.get("/creative-storyboard-job/{job_id}")
+async def get_creative_storyboard_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll for "describe it" storyboard-script generation progress."""
+    from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
+
+    _get_user_id(token)  # auth check
+
+    job = await VideoCreativeService.get_storyboard_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Storyboard job not found")
+
+    # What was charged and what came back. Absent when this run was not charged.
+    from app.agents.social_media_manager.services import video_generation_billing as billing
+    charged = await billing.for_job(job_id)
+    if charged:
+        job = {**job, "billing": charged}
+
+    return UriResponse.get_single_data_response("storyboard_job", job)
+
+
+@router.post("/generate-creative-frames")
+async def generate_creative_frames(
+    request: CreativeFramesRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Start background generation of consistent frame images for a creative
+    storyboard's scenes — each scene chains off the previous scene's own
+    generated image (or a user reference image for scene 1, or a from-
+    scratch generation if neither exists) rather than editing a fixed
+    uploaded photo by index. Writes to the SAME job collection as /generate-
+    storyboard-frames, so GET /storyboard-frame-job/{job_id} above polls
+    this too — no separate polling endpoint needed.
+    """
+    from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
+
+    # The scene images are drawn knowing whose video this is: its colours, and no invented brand names.
+    brand_context = await _video_brand_context(ctx, db)
+
+    job_id = await VideoCreativeService.create_frame_job(request.scenes)
+    background_tasks.add_task(
+        VideoCreativeService.run_frame_job, job_id, request.scenes, request.reference_images, brand_context
+    )
+
+    return UriResponse.get_single_data_response(
+        "frame_job",
+        {"job_id": job_id, "status": "generating", "total_scenes": len(request.scenes)},
+    )
+
+
+class MergeVideoRequest(BaseModel):
+    use_logo: bool = True  # the owner can switch their Brand Playbook logo off for a video
+
+
 @router.post("/merge-video-job/{job_id}")
 async def merge_video_job(
     job_id: str,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+    request: Optional[MergeVideoRequest] = None,
 ):
     """
     Merge all completed clips from a finished video job into a single video.
@@ -7094,7 +7838,7 @@ async def merge_video_job(
     from app.agents.social_media_manager.services.video_generation_service import get_job
     from app.agents.social_media_manager.services.video_merge_service import VideoMergeService
 
-    auth.get("user_id")  # auth check
+    _get_user_id(token)  # auth check
 
     job = await get_job(job_id)
     if not job:
@@ -7102,14 +7846,35 @@ async def merge_video_job(
     if job.get("status") != "complete":
         raise HTTPException(status_code=400, detail="Job is not complete yet")
 
-    clip_urls = [c["video_url"] for c in job.get("clips", []) if c.get("video_url")]
+    done = [c for c in job.get("clips", []) if c.get("video_url")]
+    clip_urls = [c["video_url"] for c in done]
     if not clip_urls:
         raise HTTPException(status_code=400, detail="No completed clips to merge")
 
+    # The owner's logo from the Brand Playbook goes on the finished video, unless they switched it off.
+    from app.agents.social_media_manager.services.video_logo_overlay import logo_from_brand_context
+    logo = None
+    if request is None or request.use_logo:
+        try:
+            logo = logo_from_brand_context(await _video_brand_context(ctx, db))
+        except Exception as e:
+            print(f"[VideoMerge] could not read the brand's logo, merging without it: {e}")
+
+    # Whatever goes wrong must leave as a proper error response. An exception that escapes here becomes a bare 500
+    # from outside the CORS layer, which the browser reports as a "CORS error" and hides the real reason.
+    from app.agents.social_media_manager.services.video_merge_service import VideoMergeError
     try:
-        merged_url = await VideoMergeService.merge_clips(clip_urls)
+        # Each scene's on-screen text is drawn onto its clip here, sharply, rather than baked into the picture.
+        merged_url = await VideoMergeService.merge_clips(clip_urls, [c.get("text_overlay") for c in done], logo)
+    except VideoMergeError as e:
+        print(f"[VideoMerge] job {job_id}: {e}", flush=True)
+        raise HTTPException(status_code=502, detail=f"The video could not be merged: {e}. Please try again.")
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"ffmpeg merge failed: {e.stderr.decode()[:300]}")
+        print(f"[VideoMerge] job {job_id}: ffmpeg failed: {(e.stderr or b'').decode(errors='replace')[-600:]}", flush=True)
+        raise HTTPException(status_code=500, detail="The video could not be merged (the video tool failed). Please try again.")
+    except Exception as e:
+        print(f"[VideoMerge] job {job_id}: unexpected {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail="The video could not be merged. Please try again.")
 
     return UriResponse.get_single_data_response("merged_video", {"merged_video_url": merged_url})
 
@@ -7128,62 +7893,41 @@ class GenerateVideoCaptionRequest(BaseModel):
 @router.post("/generate-video-caption")
 async def generate_video_caption(
     request: GenerateVideoCaptionRequest,
-    auth: dict = Depends(flexible_auth),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
-    Generate a platform-optimised social media caption for a merged video
-    using the storyboard's scene descriptions and brand context.
+    Generate a platform-optimised caption for a merged video, written from what the video is actually about
+    (its creative direction and each scene's on-screen text and spoken line) and from the Brand Playbook of the
+    brand the user is working in, then finished with the Playbook's word rules and call to action.
+    Moved off gpt-4o onto Gemini 3.5 Flash-Lite (same reasoning as generate_storyboard in
+    video_storyboard_service.py) — a pure short-text write with no image input.
     """
-    import openai as _openai
+    from google.genai import types as _genai_types
+    from app.agents.social_media_manager.services import video_caption
+    from app.agents.social_media_manager.services.video_storyboard_service import _gemini_client
 
-    auth.get("user_id")
+    if not _gemini_client:
+        raise HTTPException(status_code=503, detail="Caption generation is not configured.")
 
-    scenes = request.storyboard.get("scenes", [])
-    brand_context = request.storyboard.get("brand_context", {})
-    brand_name = brand_context.get("brand_name", "")
+    brand_context = await _video_brand_context(ctx, db)
     target_platform = request.platform or request.storyboard.get("target_platform", "instagram")
-    target_audience = request.storyboard.get("target_audience", "")
-    total_duration = request.storyboard.get("total_duration_seconds", 0)
+    prompt = video_caption.build_prompt(request.storyboard, target_platform, brand_context)
 
-    scene_lines = "\n".join(
-        f"Scene {s.get('scene_number', i + 1)}: {s.get('scene_description', s.get('description', ''))}"
-        for i, s in enumerate(scenes)
-    )
-
-    platform_guides = {
-        "instagram": "Instagram — max 2200 chars, conversational, 3–5 relevant hashtags at the end, 1–2 emojis in the body.",
-        "facebook":  "Facebook — max 500 chars, warm and conversational, 0–2 hashtags, no emoji overload.",
-        "tiktok":    "TikTok — punchy, max 150 chars, 3–5 trending hashtags, high-energy tone.",
-        "linkedin":  "LinkedIn — professional tone, 1–3 paragraphs, 3–5 industry hashtags, no excessive emojis.",
-    }
-    guide = platform_guides.get(target_platform, platform_guides["instagram"])
-
-    prompt = f"""You are a social media copywriter. Write a single ready-to-post caption for a video.
-
-PLATFORM: {target_platform.upper()}
-GUIDE: {guide}
-
-VIDEO INFO:
-- Brand: {brand_name or "the brand"}
-- Audience: {target_audience or "general"}
-- Duration: {total_duration}s
-- Scenes:
-{scene_lines}
-
-Rules:
-- Write ONLY the caption text — no labels, no explanation, no markdown wrapper.
-- Make it feel native to {target_platform}, not copy-paste generic.
-- Hashtags go at the very end, on a new line.
-- Do not include a trailing newline."""
-
-    client = _openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=600,
-        temperature=0.8,
-    )
-    caption = (response.choices[0].message.content or "").strip()
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: _gemini_client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(temperature=0.8, max_output_tokens=600),
+            ),
+        )
+    except Exception as e:
+        print(f"[VideoCaption] generation error: {e}", flush=True)
+        raise HTTPException(status_code=503, detail="Failed to generate caption.")
+    caption = video_caption.finish((response.text or "").strip(), brand_context)
     return UriResponse.get_single_data_response("caption", {"caption": caption})
 
 
@@ -7191,10 +7935,10 @@ Rules:
 async def save_video_draft(
     request: SaveVideoDraftRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Save a merged video as a draft for later posting."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -7233,10 +7977,10 @@ async def save_video_draft(
 @router.get("/video-drafts")
 async def list_video_drafts(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """List all saved video drafts for the current user."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -7253,7 +7997,7 @@ async def publish_video_draft(
     request: PublishVideoDraftRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start async publishing of a saved video draft to Instagram Reels or Facebook.
@@ -7261,7 +8005,7 @@ async def publish_video_draft(
     """
     from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -7284,12 +8028,20 @@ async def publish_video_draft(
 
     caption = request.caption if request.caption is not None else (draft.get("content") or "")
 
+    tiktok_settings = None
+    if request.platform == "tiktok" and request.tiktok:
+        from app.agents.social_media_manager.services.tiktok_direct_service import TikTokPostSettings
+        tiktok_settings = TikTokPostSettings(**request.tiktok.model_dump())
+        # The title the user edited on the Post to TikTok screen is the caption.
+        caption = tiktok_settings.title
+
     # Resolve connection.
     # instagram_reels → look for "instagram" direct connection
     # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
     #                   Instagram OAuth flow stores a Facebook Page access token that can
     #                   also be used to post videos to the Facebook Page.
-    # tiktok          → look for an Outstand-connected "tiktok" account (no direct API).
+    # tiktok          → prefer a direct-OAuth "tiktok" account (FILE_UPLOAD, bypasses
+    #                   Outstand); fall back to an Outstand-connected one.
     if request.platform == "instagram_reels":
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "instagram"},
@@ -7300,12 +8052,17 @@ async def publish_video_draft(
         if not conn.get("ig_user_id"):
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
     elif request.platform == "tiktok":
-        conn = await db["social_connections"].find_one(
-            {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
-            {"_id": 0, "outstand_account_id": 1},
-        )
-        if not conn or not conn.get("outstand_account_id"):
-            raise HTTPException(status_code=400, detail="No connected TikTok account found. Please connect your account first.")
+        # The post goes out however the account was connected: directly through TikTok
+        # login, or through Outstand. Either way the Post to TikTok screen's choices
+        # (privacy, interactions, disclosure) are required — nothing is defaulted.
+        _conn_type, conn = await _resolve_tiktok_connection(db, user_id)
+        if not conn:
+            raise HTTPException(
+                status_code=400,
+                detail="No connected TikTok account found. Connect one in Connected Accounts first.",
+            )
+        if not request.tiktok:
+            raise HTTPException(status_code=400, detail="TikTok post settings are required (privacy level, interactions).")
     else:  # facebook_reels
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "facebook"},
@@ -7330,30 +8087,191 @@ async def publish_video_draft(
         caption,
         conn,
         db,
+        tiktok_settings,
     )
 
     return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
 
 
+@router.post("/publish-tiktok-photo-draft")
+async def publish_tiktok_photo_draft(
+    request: PublishTikTokPhotoDraftRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Direct-post an image / carousel draft to TikTok with the user's choices from
+    the Post to TikTok screen (privacy, comments, disclosure). Returns a job_id
+    immediately; poll GET /video-publish-job/{job_id} for status.
+    """
+    from app.agents.social_media_manager.services import tiktok_media_proxy
+    from app.agents.social_media_manager.services.tiktok_direct_service import TikTokPostSettings
+    from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    draft = await db["content_drafts"].find_one({"id": request.draft_id, "user_id": user_id}, {"_id": 0})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.get("platform") != "tiktok":
+        raise HTTPException(status_code=400, detail="This draft isn't a TikTok post.")
+    if draft.get("video_url"):
+        raise HTTPException(status_code=400, detail="This is a video post; publish it from Saved Video Drafts.")
+
+    image_count = len(tiktok_media_proxy.draft_image_sources(draft))
+    if image_count == 0:
+        raise HTTPException(status_code=400, detail="This post has no image to publish.")
+
+    conn_type, conn = await _resolve_tiktok_connection(db, user_id)
+    if not conn:
+        raise HTTPException(
+            status_code=400,
+            detail="No connected TikTok account found. Connect one in Connected Accounts first.",
+        )
+
+    tiktok_settings = TikTokPostSettings(**request.tiktok.model_dump())
+    # Signed links on our own API: TikTok pulls from them directly (direct connections,
+    # which need a verified domain), and Outstand re-hosts from them (Outstand ones).
+    image_urls = tiktok_media_proxy.signed_urls(request.draft_id, image_count)
+
+    job_id = await VideoPublishService.create_job(request.draft_id, "tiktok", user_id)
+    runner = (
+        VideoPublishService.run_tiktok_photo_job
+        if conn_type == "direct"
+        else VideoPublishService.run_tiktok_photo_job_outstand
+    )
+    background_tasks.add_task(
+        runner,
+        job_id,
+        request.draft_id,
+        image_urls,
+        conn,
+        db,
+        tiktok_settings,
+        bool(draft.get("tiktok_auto_add_music")),
+    )
+    return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
+
+
+@router.get("/tiktok-media/{draft_id}/{filename}")
+async def serve_tiktok_media(
+    draft_id: str,
+    filename: str,
+    exp: int = Query(...),
+    sig: str = Query(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Public, signed image URL that TikTok PULLs photo-post images from (TikTok's
+    photo posting has no upload mode, and requires the URL be under a prefix
+    verified in the Developer Portal — see tiktok_media_proxy.py). The signature
+    and expiry are the only access control, so a bad or expired link is a 404.
+    """
+    from app.agents.social_media_manager.services import tiktok_media_proxy
+
+    stem, _, ext = filename.rpartition(".")
+    if ext.lower() != "jpg" or not stem.isdigit():
+        raise HTTPException(status_code=404, detail="Not found")
+    index = int(stem)
+    if not tiktok_media_proxy.verify(draft_id, index, exp, sig):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    draft = await db["content_drafts"].find_one({"id": draft_id}, {"_id": 0})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        jpeg = await tiktok_media_proxy.render_jpeg(draft, index)
+    except Exception as e:
+        print(f"[TikTokMedia] failed to render {draft_id}/{index}: {e}")
+        raise HTTPException(status_code=404, detail="Not found")
+    if jpeg is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
+
+
+@router.get("/connections/tiktok/creator-info")
+@router.get("/connections/tiktok-direct/creator-info")  # earlier path, kept for open pages
+async def get_tiktok_creator_info(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Creator info for the Post to TikTok screen, from whichever TikTok connection the
+    user has (direct TikTok login, or Outstand). TikTok requires it be fetched fresh
+    each time that screen renders: the account's nickname and avatar, the privacy
+    levels it may post with, which interactions it has disabled, and the longest
+    video it can post.
+    """
+    from app.agents.social_media_manager.services.outstand_service import OutstandService
+    from app.agents.social_media_manager.services.tiktok_direct_service import (
+        fetch_creator_info,
+        get_valid_tiktok_access_token,
+        TikTokDirectAPIError,
+    )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    conn_type, conn = await _resolve_tiktok_connection(db, user_id)
+    if not conn:
+        raise HTTPException(
+            status_code=400,
+            detail="No connected TikTok account found. Connect one in Connected Accounts first.",
+        )
+
+    try:
+        if conn_type == "direct":
+            access_token = await get_valid_tiktok_access_token(db, conn)
+            info = await fetch_creator_info(access_token)
+        else:
+            info = await OutstandService().get_tiktok_creator_info(conn["outstand_account_id"])
+    except (TikTokDirectAPIError, ValueError) as e:
+        # Creator info is capped at 20 requests a minute per token. Say so (429 + Retry-After),
+        # instead of a generic "couldn't load" the user would just keep retrying.
+        from app.agents.social_media_manager.services import rate_limit as rl
+        limited = rl.http_limit_response(e, "tiktok")
+        if limited:
+            status_code, message, headers = limited
+            raise HTTPException(status_code=status_code, detail=message, headers=headers)
+        raise HTTPException(status_code=502, detail=f"Couldn't load your TikTok account details: {e}")
+
+    return UriResponse.get_single_data_response("tiktok_creator_info", {
+        "connection_type": conn_type,
+        "creator_nickname": info.get("creator_nickname") or info.get("creator_username") or conn.get("account_name") or "",
+        "creator_username": info.get("creator_username") or "",
+        "creator_avatar_url": info.get("creator_avatar_url") or "",
+        "privacy_level_options": info.get("privacy_level_options") or [],
+        "comment_disabled": bool(info.get("comment_disabled")),
+        "duet_disabled": bool(info.get("duet_disabled")),
+        "stitch_disabled": bool(info.get("stitch_disabled")),
+        "max_video_post_duration_sec": info.get("max_video_post_duration_sec"),
+    })
+
+
 @router.get("/video-publish-job/{job_id}")
 async def get_video_publish_job(
     job_id: str,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll the status of a video publish job."""
-    from app.agents.social_media_manager.services.video_publish_service import get_publish_job
+    from app.agents.social_media_manager.services.video_publish_service import get_publish_job, public_job_view
 
-    auth.get("user_id")  # auth check
+    user_id = _get_user_id(token)
     job = await get_publish_job(job_id)
-    if not job:
+    # Someone else's job is "not found", not "forbidden": no reason to confirm the id exists.
+    if not job or not user_id or job.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Publish job not found")
-    return UriResponse.get_single_data_response("publish_job", job)
+    return UriResponse.get_single_data_response("publish_job", public_job_view(job))
 
 
 @router.post("/extract-image-text")
 async def extract_image_text(
     image_url: str = Query(..., description="URL of the image to extract text from"),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Extract text overlaid on an image using OpenAI Vision API.
@@ -7401,14 +8319,14 @@ async def extract_image_text(
 @router.post("/upload-custom-font")
 async def upload_custom_font(
     file: UploadFile = File(...),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Upload a custom font file (.ttf or .otf) for the user's brand.
     Typography System PRD - Phase 1: Custom Font Upload
     """
     try:
-        user_id = auth.get("user_id")
+        user_id = token.get("user_id")
 
         # Validate file type
         filename = file.filename.lower()
@@ -7449,7 +8367,7 @@ async def upload_custom_font(
 @router.post("/analyze-custom-font")
 async def analyze_custom_font(
     font_url: str = Query(..., description="Cloudinary URL of the uploaded font file"),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Analyze a custom font using GPT-4o-mini Vision API.
@@ -7491,7 +8409,7 @@ class BlogGenerationRequest(BaseModel):
 async def generate_blog_content(
     request: BlogGenerationRequest,
     background_tasks: BackgroundTasks,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -7508,7 +8426,7 @@ async def generate_blog_content(
     Blog Generator Demo - Phase 1
     """
     try:
-        user_id = auth.get("user_id")
+        user_id = _get_user_id(token)
         if not user_id:
             return UriResponse.error_response("User ID not found in token")
 
@@ -7633,12 +8551,12 @@ async def generate_blog_content(
 
 @router.get("/blog-drafts")
 async def get_blog_drafts(
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """Get all blog drafts for the authenticated user"""
     try:
-        user_id = auth.get("user_id")
+        user_id = _get_user_id(token)
         if not user_id:
             return UriResponse.error_response("User ID not found in token")
 
@@ -7662,12 +8580,12 @@ async def get_blog_drafts(
 @router.get("/blog-drafts/{draft_id}")
 async def get_blog_draft(
     draft_id: str,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """Get a single blog draft by ID (for polling image status)"""
     try:
-        user_id = auth.get("user_id")
+        user_id = _get_user_id(token)
         if not user_id:
             return UriResponse.error_response("User ID not found in token")
 
@@ -7857,12 +8775,12 @@ def _build_oai_messages(system_prompt: str, request: AgentChatRequest) -> list:
 @router.post("/agent/chat/upload")
 async def upload_chat_image(
     file: UploadFile = File(...),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
     from app.utils.s3_upload import upload_bytes
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -7890,7 +8808,7 @@ async def upload_chat_image(
 @router.post("/agent/chat/stream")
 async def agent_chat_stream(
     request: AgentChatRequest,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Streaming version of agent chat — returns SSE tokens as they arrive."""
@@ -7898,7 +8816,7 @@ async def agent_chat_stream(
     from app.core.config import settings
     from fastapi.responses import StreamingResponse as _StreamingResponse
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -7978,11 +8896,11 @@ async def agent_chat_stream(
 
 @router.get("/agent/chat/history")
 async def get_agent_chat_history(
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Return the last 100 persisted messages for this user."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -7996,11 +8914,11 @@ async def get_agent_chat_history(
 
 @router.delete("/agent/chat/history")
 async def clear_agent_chat_history(
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Archive (delete) the current conversation so the user starts fresh."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -8011,14 +8929,14 @@ async def clear_agent_chat_history(
 @router.post("/agent/chat")
 async def agent_chat(
     request: AgentChatRequest,
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """URI Agent in-app assistant — answers questions and navigates the user."""
     from app.services.AIService import AIService
     from app.domain.models.chat_model import ChatMessage, ChatModel
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -8106,7 +9024,7 @@ async def edit_video(
     platform: str = Form("instagram_reels"),
     enhancements: str = Form("{}"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Accept a raw video upload, run the Level 1 FFmpeg editing pipeline
@@ -8116,7 +9034,7 @@ async def edit_video(
     """
     from app.agents.social_media_manager.services.video_edit_service import VideoEditService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8187,10 +9105,10 @@ async def edit_video(
 async def get_edit_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll the status of a video editing job."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8211,7 +9129,7 @@ async def get_edit_video_job(
 @router.get("/video-polish-styles")
 async def list_video_polish_styles(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Return all available style presets for Video Polish."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -8221,7 +9139,7 @@ async def list_video_polish_styles(
 
 @router.get("/video-polish-caption-presets")
 async def list_caption_presets(
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Return all Reap caption style presets (system + user-created)."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -8237,7 +9155,7 @@ async def polish_video(
     language: str = Form("en-NG"),
     captions_preset: str = Form("system_beasty"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Accept a raw video upload, run the Video Polish clipping-API pipeline
@@ -8254,7 +9172,7 @@ async def polish_video(
             detail="Video Polish is not yet configured. Please add REAP_API_KEY to the server environment."
         )
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8296,12 +9214,12 @@ async def polish_video(
 async def get_polish_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll the status of a Video Polish job."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8319,7 +9237,7 @@ async def restyle_polish_video(
     new_style_preset: str = Form(...),
     language: str = Form("en-NG"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Re-polish an already-processed video with a different style preset.
@@ -8327,7 +9245,7 @@ async def restyle_polish_video(
     """
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8366,7 +9284,7 @@ async def polish_video_clip_action(
     source_language: str = Form("en"),
     target_language: str = Form("es"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Trigger a secondary action (reframe or dub) on a specific clip.
@@ -8375,7 +9293,7 @@ async def polish_video_clip_action(
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
     import uuid as _uuid
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8412,10 +9330,10 @@ async def polish_video_clip_action(
 async def get_polish_video_clip_action(
     action_job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a clip action job (reframe / dub) by its action_job_id."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8428,10 +9346,11 @@ async def get_polish_video_clip_action(
 
 # ── Video Editing Billing — pricing config ─────────────────────────────────
 # PRD §12 NFR: "The pricing rate should be configurable by an administrator
-# rather than permanently hard-coded." GET accepts either auth mode (SDK
-# clients need this too, to build their own cost previews); PATCH requires
-# a JWT-authenticated dashboard session on the BILLING_ADMIN_EMAILS
-# allowlist — an SDK API key is never treated as platform-admin.
+# rather than permanently hard-coded." GET is open to any authenticated user
+# (the frontend cost preview needs it); PATCH is gated behind the same
+# email allowlist Jane Ads' billing report uses (JANE_ADS_ADMIN_EMAILS) —
+# there's no separate "platform admin" concept in this codebase yet, and
+# introducing one is out of scope of this PRD.
 
 def _is_billing_admin(auth: dict) -> bool:
     if auth.get("auth_type") != "jwt":
@@ -8491,7 +9410,7 @@ async def produce_video(
     custom_music: Optional[UploadFile] = File(None),
     transition_style: str = Form("auto"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start a full video production job.
@@ -8510,7 +9429,7 @@ async def produce_video(
         duration_undetectable_response,
     )
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8536,7 +9455,10 @@ async def produce_video(
     # Video Editing Billing PRD §11: don't charge for a video whose duration
     # can't even be detected — that almost certainly means an invalid/corrupt
     # file the render pipeline would fail on anyway.
-    duration_seconds = probe_duration_strict(video_bytes)
+    # to_thread — probe_duration_strict shells out to ffprobe synchronously
+    # (up to a 30s timeout); called directly in this async handler, that
+    # blocks the whole event loop, including /health, for the duration.
+    duration_seconds = await asyncio.to_thread(probe_duration_strict, video_bytes)
     if duration_seconds is None:
         return JSONResponse(status_code=422, content=duration_undetectable_response())
 
@@ -8616,10 +9538,10 @@ async def produce_video(
 async def get_produce_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a video production job."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8637,10 +9559,10 @@ async def capture_video_frame(
     job_id: str,
     t: float = Query(default=0.0, ge=0.0),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Extract a JPEG frame at time t (seconds) from the produced video using ffmpeg."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8674,13 +9596,49 @@ async def capture_video_frame(
         raise HTTPException(status_code=500, detail="ffmpeg not available on server")
 
 
+@router.get("/video-frame")
+async def capture_video_frame_from_url(
+    video_url: str = Query(...),
+    t: float = Query(default=0.0, ge=0.0),
+    token: dict = Depends(JWTBearer()),
+):
+    """Same extraction as /produce-video-job/{id}/capture-frame, but generic over
+    any video URL rather than an old-pipeline job lookup — used by the brand
+    overlay position picker, which needs a real frame BEFORE a ZapCap render
+    exists yet (plan-time preview uses the stitched source video; post-render
+    adjustment uses the finished output — both are just a URL)."""
+    if not _get_user_id(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(t),
+                "-i", video_url,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if not result.stdout:
+            raise HTTPException(status_code=500, detail="ffmpeg produced no output")
+        return Response(content=result.stdout, media_type="image/jpeg")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Frame capture timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="ffmpeg not available on server")
+
+
 @router.post("/produce-video-job/{job_id}/start-render")
 async def start_produce_video_render(
     job_id: str,
     background_tasks: BackgroundTasks,
     payload: dict = Body(default={}),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Approve AI decisions and start the render phase.
@@ -8691,7 +9649,7 @@ async def start_produce_video_render(
     """
     from app.agents.social_media_manager.services.video_production_service import run_render_phase
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8738,7 +9696,7 @@ async def adjust_produce_video(
     body: AdjustVideoBody,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Re-render a completed video with light adjustments (caption colour, caption text edits).
@@ -8754,7 +9712,7 @@ async def adjust_produce_video(
     hook_text_color = body.hook_text_color
     hook_text_size = body.hook_text_size
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8855,7 +9813,7 @@ async def multi_clip_start(
     music_mood: str = Form("chill"),
     music_volume: float = Form(0.12),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start a multi-clip composition job.
@@ -8870,7 +9828,7 @@ async def multi_clip_start(
     import uuid as _uuid
     from app.agents.social_media_manager.services.multi_clip_service import run_multi_clip_ingest
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8933,14 +9891,14 @@ async def multi_clip_start(
 async def reset_multi_clip_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Reset a completed (ready/failed) job back to awaiting_order so the user can
     reorder clips and re-stitch without starting a new job.
     Clips, script, and settings are preserved.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8970,10 +9928,10 @@ async def reset_multi_clip_job(
 async def get_multi_clip_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a multi-clip composition job."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -8991,13 +9949,13 @@ async def reorder_multi_clip_job(
     job_id: str,
     payload: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Set the user's chosen clip order.
     Body: { "clip_ids": ["clip_abc", "clip_def", ...] }
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9039,13 +9997,13 @@ async def update_clip_position(
     clip_id: str,
     req: UpdateClipPositionRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Override the auto-detected subject_position for one clip.
     Persisted to DB so it's used at stitch time.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
     if req.subject_position not in ("left", "center", "right"):
@@ -9072,13 +10030,13 @@ async def drop_multi_clip(
     job_id: str,
     payload: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Mark a clip as dropped (excluded from stitch).
     Body: { "clip_id": "clip_abc", "dropped": true }
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9108,14 +10066,14 @@ async def stitch_multi_clip_job(
     job_id: str,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Trigger the render/stitch phase after the user has reviewed clip order and drops.
     """
     from app.agents.social_media_manager.services.multi_clip_service import run_multi_clip_stitch
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9146,7 +10104,7 @@ async def stitch_multi_clip_job(
 async def analyze_multi_clip_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     AI analyzes a stitched multi-clip video using existing clip transcripts/metadata
@@ -9156,7 +10114,7 @@ async def analyze_multi_clip_job(
     import json as _json
     from openai import AsyncOpenAI
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9257,7 +10215,7 @@ async def draft_product_script(
     job_id: str,
     req: DraftScriptRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Draft a short product video script from a user description using GPT-4o.
@@ -9266,7 +10224,7 @@ async def draft_product_script(
     """
     from app.agents.social_media_manager.services.multi_clip_service import _draft_product_script
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9306,7 +10264,7 @@ async def approve_product_script(
     req: ApproveScriptRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Save the approved script and kick off the vision-describe + ordering phase.
@@ -9314,7 +10272,7 @@ async def approve_product_script(
     """
     from app.agents.social_media_manager.services.multi_clip_service import run_product_vision_phase
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9547,6 +10505,55 @@ def _wrap_for_drawtext(text: str, video_width: int, fontsize: int) -> tuple:
     return "\n".join(lines[:2]), size
 
 
+async def _image_to_video_clip(
+    image_bytes: bytes,
+    duration_seconds: float,
+    width: int = 1080,
+    height: int = 1920,
+) -> Optional[bytes]:
+    """Turn a still image into a silent MP4 that holds the image for
+    duration_seconds — lets a photo drop into a b-roll slot the same way a
+    video clip does (ZapCap's customBrolls API takes clip URLs with a
+    startTime/endTime window; a raw image has no timeline of its own)."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+
+    duration_seconds = max(0.5, min(duration_seconds, 30.0))
+
+    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as imf:
+        imf.write(image_bytes)
+        image_tmp = imf.name
+
+    output_path = f"/tmp/img-broll-{_uuid.uuid4().hex[:8]}.mp4"
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", image_tmp,
+            "-t", str(duration_seconds),
+            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                   f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p",
+            "-r", "30",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=60)
+
+        if proc.returncode != 0:
+            print(f"[ImageToVideo] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            return None
+
+        with open(output_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in [image_tmp, output_path]:
+            try: _os.unlink(p)
+            except: pass
+
+
 async def _add_hook_text_overlay(
     video_url: str,
     hook_text: str,
@@ -9633,6 +10640,311 @@ async def _add_hook_text_overlay(
         return None
 
 
+_LOGO_POSITIONS = {
+    "top_left":     "10:10",
+    "top_right":    "W-w-10:10",
+    "bottom_left":  "10:H-h-10",
+    "bottom_right": "W-w-10:H-h-10",
+}
+
+
+def _overlay_timing_clause(timing: str, duration: float) -> str:
+    """Maps a plain timing choice to an ffmpeg drawtext/overlay `enable` clause.
+    'whole' returns '' (no clause — always on), matching how _add_hook_text_overlay
+    only sets `enable` when it actually wants a time window."""
+    if timing == "end":
+        start = max(duration - 4.0, 0.0)
+        return f":enable='between(t,{start:.2f},{duration:.2f})'"
+    if timing == "start":
+        return ":enable='between(t,0,3)'"
+    if timing == "last_few":
+        start = max(duration - 3.0, 0.0)
+        return f":enable='between(t,{start:.2f},{duration:.2f})'"
+    return ""  # 'whole'
+
+
+async def _add_brand_overlay(
+    video_url: str,
+    logo_url: Optional[str],
+    logo_position: str,
+    logo_timing: str,
+    contact_text: Optional[str],
+    contact_position: str,
+    contact_timing: str,
+    brand_name: str = "",
+    brand_color: str = "#CD1B78",
+    video_width: Optional[int] = None,
+    logo_size: str = "small",
+) -> Optional[str]:
+    """Download a finished video, burn a logo (or, if none on file, a text
+    wordmark of the brand name) plus an optional short contact line into it, and
+    re-upload. Same download → ffmpeg → reupload shape as _add_hook_text_overlay/
+    _mix_music_into_video — a compositing pass on the already-rendered output,
+    never touching ZapCap. Best-effort throughout: any single piece failing
+    (logo download, background removal, drawtext) falls back to skipping that
+    piece rather than blocking the whole render."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+    import httpx as _httpx
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+    from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+
+    if not logo_url and not contact_text and not brand_name:
+        return None
+
+    video_tmp = logo_tmp = text_tmp = contact_text_tmp = output_path = None
+    try:
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+        if video_resp.status_code != 200:
+            print(f"[BrandOverlay] video download failed {video_resp.status_code}", flush=True)
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_resp.content)
+            video_tmp = vf.name
+
+        probed = await _probe_clip(video_tmp)
+        actual_width = probed.get("width") or video_width or 1080
+        duration = probed.get("duration") or 0.0
+
+        # Resolve the logo — download it, and if it has no transparency and
+        # remove.bg is configured, best-effort clean it up first. Any failure
+        # here just means the plain original logo is used (with its own backing
+        # plate below for contrast), never blocks the render.
+        if logo_url:
+            resolved_logo_url = logo_url
+            try:
+                from PIL import Image
+                import io as _io
+                async with _httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    logo_probe_resp = await client.get(logo_url)
+                probe_img = Image.open(_io.BytesIO(logo_probe_resp.content))
+                has_alpha = probe_img.mode in ("RGBA", "LA") or (
+                    probe_img.mode == "P" and "transparency" in probe_img.info
+                )
+                if not has_alpha and _os.environ.get("REMOVEBG_API_KEY"):
+                    from app.utils.background_removal import remove_background
+                    cleaned_url = await remove_background(logo_url, method="removebg")
+                    if cleaned_url:
+                        resolved_logo_url = cleaned_url
+            except Exception as e:
+                print(f"[BrandOverlay] logo transparency check skipped: {e}", flush=True)
+
+            try:
+                async with _httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    logo_resp = await client.get(resolved_logo_url)
+                if logo_resp.status_code == 200:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as lf:
+                        lf.write(logo_resp.content)
+                        logo_tmp = lf.name
+            except Exception as e:
+                print(f"[BrandOverlay] logo download failed: {e}", flush=True)
+
+        ffmpeg_inputs = ["-i", video_tmp]
+        filters: list[str] = []
+        cur = "0:v"
+        input_idx = 1
+
+        if logo_tmp:
+            ffmpeg_inputs += ["-i", logo_tmp]
+            xy = _LOGO_POSITIONS.get(logo_position, _LOGO_POSITIONS["bottom_right"])
+            clause = _overlay_timing_clause(logo_timing, duration)
+            # Same small/medium/large -> % of frame width mapping as the
+            # image-overlay path (ImageContentService._overlay_logo) — this
+            # was hardcoded to a fixed 120px regardless of logo_size, which
+            # is why a brand's "large" logo choice never showed up any
+            # bigger in a video than "small" did.
+            logo_size_pct = {"small": 0.08, "medium": 0.12, "large": 0.16}.get(logo_size, 0.08)
+            logo_target_w = max(40, int(actual_width * logo_size_pct))
+            filters.append(f"[{input_idx}:v]scale={logo_target_w}:trunc(ow/a/2)*2,format=rgba[logo]")
+            filters.append(f"[{cur}][logo]overlay={xy}{clause}[v1]")
+            cur = "v1"
+            input_idx += 1
+        elif brand_name:
+            # No logo on file — a plain text wordmark of the business name stands
+            # in for it, same drawtext mechanism as the contact line below.
+            hex_color = (brand_color or "#CD1B78").lstrip("#")
+            if len(hex_color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in hex_color):
+                hex_color = "CD1B78"
+            with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as tf:
+                tf.write(brand_name[:40])
+                text_tmp = tf.name
+            xy = {
+                "top_left": "x=20:y=20", "top_right": "x=w-text_w-20:y=20",
+                "bottom_left": "x=20:y=h-th-20", "bottom_right": "x=w-text_w-20:y=h-th-20",
+            }.get(logo_position, "x=w-text_w-20:y=h-th-20")
+            clause = _overlay_timing_clause(logo_timing, duration)
+            filters.append(
+                f"[{cur}]drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                f"textfile={text_tmp}:fontsize=32:fontcolor=0x{hex_color}:{xy}{clause}:"
+                "box=1:boxcolor=white@0.6:boxborderw=8[v1]"
+            )
+            cur = "v1"
+
+        if contact_text:
+            with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as ctf:
+                ctf.write(contact_text[:60])
+                contact_text_tmp = ctf.name
+            y = "y=40" if contact_position == "top_center" else "y=h-th-40"
+            clause = _overlay_timing_clause(contact_timing, duration)
+            filters.append(
+                f"[{cur}]drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                f"textfile={contact_text_tmp}:fontsize=36:fontcolor=white:x=(w-text_w)/2:{y}{clause}:"
+                "box=1:boxcolor=black@0.55:boxborderw=14[vout]"
+            )
+            cur = "vout"
+
+        if not filters:
+            return None  # nothing to actually burn in
+
+        # Relabel the last filter's output to [vout] if it isn't already, so the
+        # -map below is always correct regardless of which branches ran.
+        if cur != "vout":
+            filters[-1] = filters[-1].replace(f"[{cur}]", "[vout]")
+            cur = "vout"
+
+        output_path = f"/tmp/brand-overlay-{_uuid.uuid4().hex[:8]}.mp4"
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", *ffmpeg_inputs,
+            "-filter_complex", ";".join(filters),
+            "-map", f"[{cur}]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "copy",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            print(f"[BrandOverlay] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            return None
+
+        with open(output_path, "rb") as f:
+            overlaid_bytes = f.read()
+
+        public_id = f"brand-overlay-{_uuid.uuid4().hex[:12]}"
+        return await _upload_to_cloudinary(overlaid_bytes, public_id)
+
+    except Exception as e:
+        print(f"[BrandOverlay] error: {e}", flush=True)
+        return None
+    finally:
+        for p in [video_tmp, logo_tmp, text_tmp, contact_text_tmp, output_path]:
+            if p:
+                try: _os.unlink(p)
+                except: pass
+
+
+async def _resolve_brand_overlay_context(
+    user_id: str, db: AsyncIOMotorDatabase, ctx: dict, contact_source: str, custom_contact_text: str
+) -> dict:
+    """Resolve a brand's logo/contact for the overlay from data already on
+    file — shared by zapcap_produce (submit time) and
+    /video-brand-overlay/adjust (post-render adjustment) so the two never
+    drift. Fails soft to an all-empty result; the caller's own try/except
+    (or _add_brand_overlay's own no-op-when-nothing-to-burn guard) handles
+    that gracefully."""
+    result = {"logo_url": None, "logo_size": "small", "contact_text": None, "brand_name": "", "brand_color": "#CD1B78"}
+    try:
+        active_brand_id = ctx["brand_id"]
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+        profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        brand_ctx = BrandProfileService.to_brand_context(profile_data)
+        result["logo_url"] = brand_ctx.get("logo_url") or None
+        result["logo_size"] = brand_ctx.get("logo_size") or "small"
+        result["brand_name"] = brand_ctx.get("brand_name") or ""
+        colors = brand_ctx.get("brand_colors") or []
+        result["brand_color"] = colors[0] if colors else "#CD1B78"
+
+        if contact_source == "custom":
+            result["contact_text"] = custom_contact_text.strip()[:60] or None
+        elif contact_source == "website":
+            result["contact_text"] = brand_ctx.get("default_link") or None
+        elif contact_source in ("whatsapp", "whatsapp_prefixed"):
+            from app.agents.jane_ads.whatsapp import get_brand_whatsapp, get_connected_whatsapp
+            # get_brand_whatsapp is the Jane+Ads-specific per-brand setting; most
+            # brands have never touched that settings screen, so fall back to
+            # whatever number the user connected at signup (users.whatsapp_phone)
+            # before giving up — the same fallback chain jane_ads/whatsapp.py's
+            # own module docstring intends, just never wired in here.
+            wa_number = await get_brand_whatsapp(db, active_brand_id) or await get_connected_whatsapp(db, user_id)
+            if wa_number:
+                # Digits-only (normalize_wa_number strips "+") is correct for a
+                # wa.me link, but reads wrong burned into video as visible text —
+                # display form always shows the leading "+".
+                display_number = f"+{wa_number}" if not wa_number.startswith("+") else wa_number
+                result["contact_text"] = f"Message us: {display_number}" if contact_source == "whatsapp_prefixed" else display_number
+    except Exception as e:
+        print(f"[BrandOverlay] context resolution failed, skipping: {e}", flush=True)
+    return result
+
+
+@router.post("/video-brand-overlay/adjust")
+async def video_brand_overlay_adjust(
+    job_id: str = Form(...),
+    logo_position: str = Form("bottom_right"),
+    logo_timing: str = Form("whole"),
+    contact_source: str = Form("none"),
+    custom_contact_text: str = Form(""),
+    contact_position: str = Form("bottom_center"),
+    contact_timing: str = Form("end"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Recompute the brand overlay against the job's stored
+    pre_overlay_output_url — a compositing-only pass, no ZapCap resubmission.
+    This is spec §9's "near-instant adjustment" goal, already true for free:
+    it's the same download->ffmpeg->reupload pattern hook-text/music/voiceover
+    already use, never a full re-render."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id, "user_id": user_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    base_url = job.get("pre_overlay_output_url") or job.get("final_output_url") or job.get("output_url")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="This video hasn't finished rendering yet")
+
+    resolved = await _resolve_brand_overlay_context(user_id, db, ctx, contact_source, custom_contact_text)
+
+    overlaid_url = await _add_brand_overlay(
+        base_url,
+        resolved["logo_url"],
+        logo_position,
+        logo_timing,
+        resolved["contact_text"],
+        contact_position,
+        contact_timing,
+        brand_name=resolved["brand_name"],
+        brand_color=resolved["brand_color"],
+        video_width=job.get("video_width"),
+        logo_size=resolved["logo_size"],
+    )
+    if not overlaid_url:
+        raise HTTPException(status_code=502, detail="Could not apply the overlay — please try again.")
+
+    await db["zapcap_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "final_output_url": overlaid_url,
+            "brand_overlay_enabled": True,
+            "logo_position": logo_position,
+            "logo_timing": logo_timing,
+            "brand_overlay_contact_text": resolved["contact_text"],
+            "contact_position": contact_position,
+            "contact_timing": contact_timing,
+        }},
+    )
+    return UriResponse.get_single_data_response("zapcap_job", {"output_url": overlaid_url})
+
+
 @router.post("/submagic-produce")
 async def submagic_produce(
     video: UploadFile = File(...),
@@ -9646,10 +10958,10 @@ async def submagic_produce(
     enable_music: bool = Form(False),
     custom_music: Optional[UploadFile] = File(None),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Upload a video to Submagic for AI-powered captioning and editing."""
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9679,7 +10991,9 @@ async def submagic_produce(
         raise HTTPException(status_code=400, detail="Empty video file")
 
     # Video Editing Billing PRD §11: don't charge if duration can't be detected.
-    duration_seconds = probe_duration_strict(video_bytes)
+    # to_thread — see produce_video's identical call for why (blocking
+    # ffprobe subprocess call freezing the whole event loop otherwise).
+    duration_seconds = await asyncio.to_thread(probe_duration_strict, video_bytes)
     if duration_seconds is None:
         return JSONResponse(status_code=422, content=duration_undetectable_response())
 
@@ -9734,7 +11048,22 @@ async def submagic_produce(
             if resp.status_code != 201:
                 print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
                 await refund_video_job(user_id, job_id, billing, reason="refund")
-                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+                # Live-confirmed real case: Submagic's own account ran dry
+                # (402 INSUFFICIENT_CREDITS) and this surfaced as a bare, misleading
+                # 502 "Bad Gateway" — looked like an infra outage, sent debugging in
+                # the wrong direction entirely, when it was really an external
+                # vendor billing issue with a clear message sitting right there in
+                # the response. Pass through Submagic's own status/message for any
+                # 4xx (a real, actionable client-side condition — bad credits, bad
+                # payload) instead of flattening everything into an opaque 502;
+                # keep 502 only for Submagic's own 5xx/unexpected failures, which
+                # genuinely are "the upstream is having a bad day."
+                try:
+                    submagic_message = resp.json().get("message") or resp.text
+                except Exception:
+                    submagic_message = resp.text
+                status = resp.status_code if 400 <= resp.status_code < 500 else 502
+                raise HTTPException(status_code=status, detail=f"Submagic error: {submagic_message}")
             project = resp.json()
     except _httpx.RequestError as exc:
         await refund_video_job(user_id, job_id, billing, reason="refund")
@@ -9779,12 +11108,12 @@ async def submagic_produce(
 async def get_submagic_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a Submagic production job for status and output URL."""
     from app.services.VideoBillingService import refund_video_job, VideoBillingResult
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9887,7 +11216,7 @@ async def _zapcap_headers() -> dict:
 
 
 @router.get("/zapcap-templates")
-async def zapcap_templates(auth: dict = Depends(flexible_auth)):
+async def zapcap_templates(token: dict = Depends(flexible_token)):
     import httpx
     headers = await _zapcap_headers()
     async with httpx.AsyncClient(timeout=20) as client:
@@ -9906,6 +11235,7 @@ async def zapcap_produce(
     output_mode: str = Form("composited"),
     quality: str = Form("standard"),
     enable_broll: str = Form("false"),
+    captions_enabled: str = Form("true"),
     enable_music: str = Form("false"),
     enable_hook_text: str = Form("false"),
     custom_hook_text: str = Form(""),
@@ -9918,8 +11248,16 @@ async def zapcap_produce(
     custom_broll_clips: List[UploadFile] = File(default=[]),
     custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
     custom_broll_estimated_duration: float = Form(60.0),
+    enable_brand_overlay: str = Form("false"),
+    logo_position: str = Form("bottom_right"),
+    logo_timing: str = Form("whole"),
+    contact_source: str = Form("none"),  # whatsapp | whatsapp_prefixed | website | custom | none
+    custom_contact_text: str = Form(""),
+    contact_position: str = Form("bottom_center"),
+    contact_timing: str = Form("end"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     import uuid as _uuid
     import httpx
@@ -9936,7 +11274,7 @@ async def zapcap_produce(
         duration_undetectable_response,
     )
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -9974,128 +11312,147 @@ async def zapcap_produce(
 
     headers = await _zapcap_headers()
 
-    # Upload video URL to ZapCap → get videoId.
-    # ZapCap fetches and validates the video from the URL before responding,
-    # so large files can take well over 60s — use a 5-minute timeout here.
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(
-            f"{_ZAPCAP_BASE}/videos/url",
-            json={"url": video_url},
-            headers=headers,
-        )
-        if r.status_code not in (200, 201):
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
-        zapcap_video_id = r.json().get("videoId") or r.json().get("id")
-        if not zapcap_video_id:
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
+    # Captions are ZapCap's core function — confirmed live against their own
+    # API validation that there is no way to suppress them (fontColor rejects
+    # an alpha channel, styleOptions.top is hard-capped at 80 to keep captions
+    # on-frame). So "captions off" means skipping ZapCap's render entirely —
+    # zapcap_job_status recognizes render_type="no_captions" and runs the SAME
+    # music/hook-text/brand-overlay chain a normal job gets after ZapCap
+    # completes, just starting from the raw uploaded video instead of ZapCap's
+    # captioned output. Cost: auto b-roll (ZapCap's transcription-driven
+    # placement) isn't available for these — it needs a transcript that only
+    # exists because ZapCap ran. Manual b-roll (upload + placement, in the
+    # post-render cleanup step) still works regardless.
+    captions_wanted = captions_enabled.lower() != "false"
+    zapcap_video_id: Optional[str] = None
+    zapcap_task_id: Optional[str] = None
 
-    # Build task payload with correct ZapCap field structure
-    export_settings: dict = {}
-    if output_mode == "transparent":
-        export_settings["outputMode"] = "transparent"
-        # ZapCap requires exportSettings.width/height whenever outputMode is
-        # "transparent" (confirmed against the live API: without them it
-        # 400s with "width and height are required when outputMode is
-        # transparent", which the client only ever saw as an opaque 502).
-        if probed_width and probed_height:
-            export_settings["width"] = probed_width
-            export_settings["height"] = probed_height
-        else:
-            # Never send a transparent task ZapCap will just reject — fail
-            # loudly here with a clear reason instead of a second opaque 502.
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(
-                status_code=422,
-                detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
+    if captions_wanted:
+        # Upload video URL to ZapCap → get videoId.
+        # ZapCap fetches and validates the video from the URL before responding,
+        # so large files can take well over 60s — use a 5-minute timeout here.
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(
+                f"{_ZAPCAP_BASE}/videos/url",
+                json={"url": video_url},
+                headers=headers,
             )
-    elif output_mode == "greenScreen":
-        export_settings["greenScreen"] = True
-    if quality != "standard":
-        export_settings["quality"] = quality
+            if r.status_code not in (200, 201):
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
+            zapcap_video_id = r.json().get("videoId") or r.json().get("id")
+            if not zapcap_video_id:
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
 
-    _CAPTION_RENDER_OPTIONS: dict = {
-        "bold": {
-            "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
-            "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
-            "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
-        },
-        "minimal": {
-            "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
-            "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
-        },
-        "animated": {
-            "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
-            "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
-            "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
-        },
-    }
+        # Build task payload with correct ZapCap field structure
+        export_settings: dict = {}
+        if output_mode == "transparent":
+            export_settings["outputMode"] = "transparent"
+            # ZapCap requires exportSettings.width/height whenever outputMode is
+            # "transparent" (confirmed against the live API: without them it
+            # 400s with "width and height are required when outputMode is
+            # transparent", which the client only ever saw as an opaque 502).
+            if probed_width and probed_height:
+                export_settings["width"] = probed_width
+                export_settings["height"] = probed_height
+            else:
+                # Never send a transparent task ZapCap will just reject — fail
+                # loudly here with a clear reason instead of a second opaque 502.
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(
+                    status_code=422,
+                    detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
+                )
+        elif output_mode == "greenScreen":
+            export_settings["greenScreen"] = True
+        if quality != "standard":
+            export_settings["quality"] = quality
 
-    task_payload: dict = {
-        "templateId": template_id,
-        "language": language,
-        "autoApprove": True,
-    }
-    if export_settings:
-        task_payload["exportSettings"] = export_settings
-    if caption_style in _CAPTION_RENDER_OPTIONS:
-        task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS[caption_style]
+        _CAPTION_RENDER_OPTIONS: dict = {
+            "bold": {
+                "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
+                "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
+                "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
+            },
+            "minimal": {
+                "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
+                "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
+            },
+            "animated": {
+                "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
+                "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
+                "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
+            },
+        }
 
-    # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
-    # customBrolls is mutually exclusive with brollPercent — don't set both.
-    if custom_broll_clips:
-        clip_urls = []
-        for i, clip in enumerate(custom_broll_clips):
-            clip_bytes = await clip.read()
-            url = await _upload_to_cloudinary(clip_bytes, f"broll-preprod-{job_id}-{i}")
-            clip_urls.append(url)
-            print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
+        task_payload: dict = {
+            "templateId": template_id,
+            "language": language,
+            "autoApprove": True,
+        }
+        if export_settings:
+            task_payload["exportSettings"] = export_settings
+        if caption_style in _CAPTION_RENDER_OPTIONS:
+            task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS[caption_style]
 
-        import json as _json_broll
-        if custom_broll_placements:
-            raw = _json_broll.loads(custom_broll_placements)
-            custom_brolls = [
-                {
-                    "startTime": round(float(p["startTime"]), 2),
-                    "endTime": round(float(p["startTime"]) + float(p["duration"]), 2),
-                    "url": clip_urls[int(p["clipIndex"])],
-                }
-                for p in raw
-                if int(p["clipIndex"]) < len(clip_urls)
-            ]
-            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips from explicit placements", flush=True)
-        else:
-            clip_duration = 4.0
-            n = len(clip_urls)
-            spread = custom_broll_estimated_duration / (n + 1)
-            custom_brolls = [
-                {"startTime": round(spread * (i + 1), 2), "endTime": round(spread * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
-                for i in range(n)
-            ]
-            custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
-            for c in custom_brolls:
-                c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
-            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips auto-spread over ~{custom_broll_estimated_duration}s", flush=True)
-        custom_brolls.sort(key=lambda c: c["startTime"])
-        task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
-    elif enable_broll.lower() == "true":
-        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+        # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
+        # customBrolls is mutually exclusive with brollPercent — don't set both.
+        if custom_broll_clips:
+            clip_urls = []
+            for i, clip in enumerate(custom_broll_clips):
+                clip_bytes = await clip.read()
+                url = await _upload_to_cloudinary(clip_bytes, f"broll-preprod-{job_id}-{i}")
+                clip_urls.append(url)
+                print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
 
-    # Submit task → get taskId
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
-            json=task_payload,
-            headers=headers,
-        )
-        if r.status_code not in (200, 201):
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
-        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
-        if not zapcap_task_id:
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+            import json as _json_broll
+            if custom_broll_placements:
+                raw = _json_broll.loads(custom_broll_placements)
+                custom_brolls = [
+                    {
+                        "startTime": round(float(p["startTime"]), 2),
+                        "endTime": round(float(p["startTime"]) + float(p["duration"]), 2),
+                        "url": clip_urls[int(p["clipIndex"])],
+                    }
+                    for p in raw
+                    if int(p["clipIndex"]) < len(clip_urls)
+                ]
+                print(f"[ZapCap/customBroll] {len(custom_brolls)} clips from explicit placements", flush=True)
+            else:
+                clip_duration = 4.0
+                n = len(clip_urls)
+                spread = custom_broll_estimated_duration / (n + 1)
+                custom_brolls = [
+                    {"startTime": round(spread * (i + 1), 2), "endTime": round(spread * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
+                    for i in range(n)
+                ]
+                custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
+                for c in custom_brolls:
+                    c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
+                print(f"[ZapCap/customBroll] {len(custom_brolls)} clips auto-spread over ~{custom_broll_estimated_duration}s", flush=True)
+            custom_brolls.sort(key=lambda c: c["startTime"])
+            task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
+        elif enable_broll.lower() == "true":
+            task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+
+        # Submit task → get taskId
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+                json=task_payload,
+                headers=headers,
+            )
+            if r.status_code not in (200, 201):
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+            zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+            if not zapcap_task_id:
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+    else:
+        if enable_broll.lower() == "true" or custom_broll_clips:
+            print(f"[ZapCap] captions_enabled=false — skipping auto/custom b-roll for job {job_id} (needs ZapCap's transcription, which didn't run)", flush=True)
 
     # Handle optional background music — either a user-uploaded MP3, or an
     # AI-picked track chosen by mapping the video's purpose to a mood.
@@ -10124,10 +11481,29 @@ async def zapcap_produce(
         music_url = _pick_music_url(mood)
         print(f"[ZapCap] AI-picked music for purpose={purpose} mood={mood} → {(music_url or '')[:60]}", flush=True)
 
+    # Brand overlay — resolve logo/contact NOW from data already on file (never
+    # asked for fresh). Resolved once at submit time and stored on the job doc
+    # so the completion branch below doesn't need to re-fetch brand context.
+    brand_overlay_logo_url = brand_overlay_contact_text = None
+    brand_overlay_name = ""
+    brand_overlay_color = "#CD1B78"
+    brand_overlay_logo_size = "small"
+    if enable_brand_overlay.lower() == "true":
+        resolved = await _resolve_brand_overlay_context(
+            user_id, db, ctx, contact_source, custom_contact_text
+        )
+        brand_overlay_logo_url = resolved["logo_url"]
+        brand_overlay_contact_text = resolved["contact_text"]
+        brand_overlay_name = resolved["brand_name"]
+        brand_overlay_color = resolved["brand_color"]
+        brand_overlay_logo_size = resolved["logo_size"]
+
     # Persist job
     await db["zapcap_jobs"].insert_one({
         "job_id": job_id,
         "user_id": user_id,
+        "render_type": "no_captions" if not captions_wanted else None,
+        "captions_enabled": captions_wanted,
         "zapcap_video_id": zapcap_video_id,
         "zapcap_task_id": zapcap_task_id,
         "template_id": template_id,
@@ -10142,6 +11518,16 @@ async def zapcap_produce(
         "hook_text_enabled": enable_hook_text.lower() == "true",
         "custom_hook_text": custom_hook_text.strip() or None,
         "hook_text_color": hook_text_color or "#ffffff",
+        "brand_overlay_enabled": enable_brand_overlay.lower() == "true",
+        "brand_overlay_logo_url": brand_overlay_logo_url,
+        "brand_overlay_contact_text": brand_overlay_contact_text,
+        "brand_overlay_name": brand_overlay_name,
+        "brand_overlay_color": brand_overlay_color,
+        "brand_overlay_logo_size": brand_overlay_logo_size,
+        "logo_position": logo_position,
+        "logo_timing": logo_timing,
+        "contact_position": contact_position,
+        "contact_timing": contact_timing,
         "video_url": video_url,
         "video_width": probed_width or None,
         "video_height": probed_height or None,
@@ -10169,16 +11555,154 @@ async def zapcap_produce(
     )
 
 
+# ── Voiceover (Ask Jane Video — MVP, no semantic shot-alignment yet) ──────────────
+
+@router.post("/video-voiceover/script")
+async def video_voiceover_script(
+    source_url: str = Form(""),
+    purpose: str = Form("general"),
+    user_note: str = Form(""),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Suggest a voiceover script grounded in the video's own transcript (if any),
+    the plan's purpose, and brand voice — a suggestion the user can freely ignore
+    (spec §4.4), never a requirement."""
+    from ..services.voiceover_service import generate_voiceover_script
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    active_brand_id = ctx["brand_id"]
+    profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+
+    # Best-effort: if this video already has a transcript on file from an earlier
+    # ZapCap render (source_url points at a completed zapcap_jobs.output_url), use
+    # it to ground the script in what's already being said/shown.
+    transcript_text = ""
+    if source_url:
+        existing = await db["zapcap_jobs"].find_one(
+            {"output_url": source_url}, sort=[("created_at", -1)]
+        )
+        if existing and existing.get("transcript_words"):
+            transcript_text = " ".join(w.get("text", "") for w in existing["transcript_words"]).strip()
+
+    script = await generate_voiceover_script(transcript_text, purpose, brand_context, user_note)
+    return UriResponse.get_single_data_response("voiceover_script", {"script": script or ""})
+
+
+@router.post("/video-voiceover/produce")
+async def video_voiceover_produce(
+    source_url: str = Form(...),
+    voiceover_audio: UploadFile = File(...),
+    keep_original_audio: str = Form("false"),
+    template_id: str = Form("beast"),
+    caption_style: str = Form("bold"),
+    enable_broll: str = Form("false"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Clean the recorded voiceover (cut filler/false-starts with crossfades), mix
+    it in as the video's primary audio track, then hand the result to the EXISTING
+    zapcap_produce path as its source_url — ZapCap re-transcribes and captions
+    whatever audio it's given, so caption regeneration (spec §8) needs no new code
+    here at all."""
+    import uuid
+    from ..services.voiceover_service import (
+        clean_voiceover_audio,
+        mix_voiceover_as_primary_audio,
+        upload_voiceover_audio,
+    )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_audio = await voiceover_audio.read()
+    cleaned_audio, cleaned_transcript = await clean_voiceover_audio(raw_audio)
+
+    mixed_url = await mix_voiceover_as_primary_audio(
+        video_url=source_url,
+        voiceover_audio=cleaned_audio,
+        keep_original_audio=keep_original_audio.lower() == "true",
+    )
+    if not mixed_url:
+        raise HTTPException(status_code=502, detail="Could not mix the voiceover into your video — please try again.")
+
+    voice_job_id = uuid.uuid4().hex
+    voiceover_audio_url = await upload_voiceover_audio(cleaned_audio, voice_job_id)
+
+    # Hand off to the existing, already-billed, already-polled ZapCap pipeline —
+    # same call handleRender already makes from the frontend, just with the
+    # voice-mixed video as the source instead of the raw stitched one.
+    result = await zapcap_produce(
+        video=None,
+        source_url=mixed_url,
+        template_id=template_id,
+        language="en",
+        output_mode="composited",
+        quality="standard",
+        enable_broll=enable_broll,
+        enable_music="false",
+        enable_hook_text="false",
+        custom_hook_text="",
+        hook_text_color="#ffffff",
+        caption_style=caption_style,
+        custom_music=None,
+        music_source="upload",
+        mute_original_audio="false",
+        purpose="general",
+        custom_broll_clips=[],
+        custom_broll_placements=None,
+        custom_broll_estimated_duration=60.0,
+        # zapcap_produce's Form(...) defaults only resolve when FastAPI itself
+        # handles the HTTP request — called directly like this, any omitted
+        # param stays the raw Form sentinel object (not a string), so every
+        # param it touches with e.g. .lower() must be passed explicitly.
+        enable_brand_overlay="false",
+        logo_position="bottom_right",
+        logo_timing="whole",
+        contact_source="none",
+        custom_contact_text="",
+        contact_position="bottom_center",
+        contact_timing="end",
+        db=db,
+        token=token,
+        ctx=ctx,
+    )
+    if not isinstance(result, dict):
+        # zapcap_produce returns a plain JSONResponse (not a dict) for its own
+        # error paths (e.g. insufficient credits, undetectable duration) — pass
+        # that straight through rather than treating it as a success payload.
+        return result
+    job_id = (result.get("responseData") or {}).get("job_id")
+    if job_id:
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "voiceover_audio_url": voiceover_audio_url,
+                "voiceover_transcript": cleaned_transcript,
+                "keep_original_audio": keep_original_audio.lower() == "true",
+            }},
+        )
+    return result
+
+
 @router.get("/zapcap-job/{job_id}")
 async def zapcap_job_status(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     import httpx
     from app.services.VideoBillingService import refund_video_job, VideoBillingResult
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -10251,6 +11775,83 @@ async def zapcap_job_status(
             "status": mapped,
             "output_url": ss_url or None,
             "failure_reason": "Shotstack render failed" if mapped == "failed" else None,
+        })
+
+    # ── No-captions jobs: no ZapCap task ever ran (captions can't be turned
+    # off on ZapCap's side — confirmed live, see zapcap_produce). Run the same
+    # music/hook-text/brand-overlay chain a normal job gets post-ZapCap, just
+    # starting from the raw uploaded video. Everything here is our own
+    # ffmpeg-based compositing, so it finishes synchronously on this one poll
+    # instead of needing further status checks.
+    if job.get("render_type") == "no_captions":
+        output_url = job["video_url"]
+
+        if job.get("music_url"):
+            print(f"[NoCaptions] mixing music into job {job_id}", flush=True)
+            mixed_url = await _mix_music_into_video(
+                output_url, job["music_url"], mute_original=bool(job.get("mute_original_audio"))
+            )
+            if mixed_url:
+                output_url = mixed_url
+                print(f"[NoCaptions] music mixed → {mixed_url[:60]}", flush=True)
+            else:
+                print(f"[NoCaptions] music mix failed — keeping video without music", flush=True)
+
+        # Hook text: only from user-provided text — there's no ZapCap
+        # transcript to auto-generate one from (that requires ZapCap's own
+        # transcription, which never ran for a no-captions job).
+        if job.get("hook_text_enabled") and job.get("custom_hook_text"):
+            try:
+                hook_text = job["custom_hook_text"]
+                print(f"[NoCaptions/HookText] using user-provided text for job {job_id}: '{hook_text}'", flush=True)
+                overlaid_url = await _add_hook_text_overlay(
+                    output_url, hook_text, job.get("video_width"), color=job.get("hook_text_color") or "#ffffff"
+                )
+                if overlaid_url:
+                    output_url = overlaid_url
+                    await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"hook_text": hook_text}})
+                    print(f"[NoCaptions/HookText] applied → {overlaid_url[:60]}", flush=True)
+                else:
+                    print(f"[NoCaptions/HookText] overlay failed — keeping video without hook text", flush=True)
+            except Exception as _e:
+                print(f"[NoCaptions/HookText] error: {_e}", flush=True)
+        elif job.get("hook_text_enabled"):
+            print(f"[NoCaptions/HookText] enabled but no custom_hook_text — skipping (no transcript available to auto-generate from)", flush=True)
+
+        if job.get("brand_overlay_enabled"):
+            try:
+                await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"pre_overlay_output_url": output_url}})
+                overlaid_url = await _add_brand_overlay(
+                    output_url,
+                    job.get("brand_overlay_logo_url"),
+                    job.get("logo_position") or "bottom_right",
+                    job.get("logo_timing") or "whole",
+                    job.get("brand_overlay_contact_text"),
+                    job.get("contact_position") or "bottom_center",
+                    job.get("contact_timing") or "end",
+                    brand_name=job.get("brand_overlay_name") or "",
+                    brand_color=job.get("brand_overlay_color") or "#CD1B78",
+                    video_width=job.get("video_width"),
+                    logo_size=job.get("brand_overlay_logo_size") or "small",
+                )
+                if overlaid_url:
+                    output_url = overlaid_url
+                    print(f"[NoCaptions/BrandOverlay] applied → {overlaid_url[:60]}", flush=True)
+                else:
+                    print(f"[NoCaptions/BrandOverlay] overlay failed or nothing to burn — keeping video as-is", flush=True)
+            except Exception as _e:
+                print(f"[NoCaptions/BrandOverlay] error: {_e}", flush=True)
+
+        final_url = output_url
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "completed", "output_url": final_url, "final_output_url": final_url}},
+        )
+        print(f"[NoCaptions] job {job_id} complete → {final_url[:60]}", flush=True)
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "completed",
+            "output_url": final_url,
+            "failure_reason": None,
         })
 
     headers = await _zapcap_headers()
@@ -10430,6 +12031,40 @@ async def zapcap_job_status(
             except Exception as _e:
                 print(f"[HookText] error: {_e}", flush=True)
 
+        # Brand overlay: logo + contact line. Chained last so it composites on
+        # top of whatever music/hook-text already produced. The URL going IN
+        # here is stored as pre_overlay_output_url — a later position/timing
+        # adjustment (POST /video-brand-overlay/adjust) recomposites from this
+        # clean base instead of stacking a second overlay on the first.
+        if job.get("brand_overlay_enabled"):
+            try:
+                await db["zapcap_jobs"].update_one(
+                    {"job_id": job_id}, {"$set": {"pre_overlay_output_url": output_url}}
+                )
+                overlaid_url = await _add_brand_overlay(
+                    output_url,
+                    job.get("brand_overlay_logo_url"),
+                    job.get("logo_position") or "bottom_right",
+                    job.get("logo_timing") or "whole",
+                    job.get("brand_overlay_contact_text"),
+                    job.get("contact_position") or "bottom_center",
+                    job.get("contact_timing") or "end",
+                    brand_name=job.get("brand_overlay_name") or "",
+                    brand_color=job.get("brand_overlay_color") or "#CD1B78",
+                    video_width=job.get("video_width"),
+                    logo_size=job.get("brand_overlay_logo_size") or "small",
+                )
+                if overlaid_url:
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id}, {"$set": {"final_output_url": overlaid_url}}
+                    )
+                    output_url = overlaid_url
+                    print(f"[BrandOverlay] applied → {overlaid_url[:60]}", flush=True)
+                else:
+                    print(f"[BrandOverlay] overlay failed or nothing to burn — keeping video as-is", flush=True)
+            except Exception as _e:
+                print(f"[BrandOverlay] error: {_e}", flush=True)
+
     return UriResponse.get_single_data_response("zapcap_job", {
         "status": status,
         "output_url": output_url,
@@ -10441,11 +12076,11 @@ async def zapcap_job_status(
 async def zapcap_job_transcript(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     import httpx
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -10498,20 +12133,28 @@ async def zapcap_job_rerender(
     job_id: str,
     body: dict,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     import uuid as _uuid2
     import httpx
     from datetime import datetime, timezone
     from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     job = await db["zapcap_jobs"].find_one({"job_id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
+    if job.get("render_type") == "no_captions":
+        # This job never ran through ZapCap (captions were off, so we skipped
+        # it entirely) — there's no ZapCap task to rerender word edits or
+        # b-roll against. B-roll placement needs ZapCap's transcription.
+        raise HTTPException(
+            status_code=422,
+            detail="This render has captions off, so there's no transcript to edit or b-roll to auto-place. Turn captions on and re-render to use word edits or auto b-roll."
+        )
 
     headers = await _zapcap_headers()
     zapcap_video_id = job["zapcap_video_id"]
@@ -10628,7 +12271,7 @@ async def zapcap_job_custom_broll(
     clips: List[UploadFile] = File(...),
     placements: str = Form(...),   # JSON: [{"clip_index": 0, "start_time": 3.5, "end_time": 7.5}]
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_token),
 ):
     """
     Re-render the ZapCap job with user-supplied b-roll clips at specified timestamps.
@@ -10638,13 +12281,14 @@ async def zapcap_job_custom_broll(
     """
     import uuid as _uuid3
     import json as _json
+    import re
     import httpx as _httpx_cb
     from datetime import datetime, timezone
     from app.agents.social_media_manager.services.video_production_service import (
         _upload_to_cloudinary as _upload_broll_clip,
     )
 
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -10664,18 +12308,33 @@ async def zapcap_job_custom_broll(
     if not placement_list:
         raise HTTPException(status_code=400, detail="No placements provided")
 
-    # Upload each clip to Cloudinary so ZapCap can fetch them via public URL
-    clip_urls: list[str] = []
+    # Videos upload straight to Cloudinary as before. Images have no timeline
+    # of their own — a b-roll slot needs something to actually play for its
+    # startTime→endTime window — so those are converted to a silent held-image
+    # video per placement (deferred until the placement loop below, since the
+    # duration comes from the placement, not the file).
+    _IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+    clip_urls: list[Optional[str]] = []
+    clip_bytes_list: list[bytes] = []
+    clip_is_image: list[bool] = []
     for i, clip_file in enumerate(clips):
         clip_bytes = await clip_file.read()
-        clip_url = await _upload_broll_clip(clip_bytes, f"broll-custom-{job_id}-{i}")
-        clip_urls.append(clip_url)
+        is_image = (clip_file.content_type in _IMAGE_TYPES) or bool(
+            re.search(r"\.(jpe?g|png|webp)$", clip_file.filename or "", re.IGNORECASE)
+        )
+        clip_bytes_list.append(clip_bytes)
+        clip_is_image.append(is_image)
+        if is_image:
+            clip_urls.append(None)  # resolved per-placement below
+        else:
+            clip_urls.append(await _upload_broll_clip(clip_bytes, f"broll-custom-{job_id}-{i}"))
 
     if not clip_urls:
         raise HTTPException(status_code=400, detail="No clips provided")
 
     # Map placements to ZapCap CustomBrollDto format
     # ZapCap constraint: overlapping brolls are not allowed; sort by startTime
+    _image_video_cache: dict[tuple[int, float], Optional[str]] = {}
     custom_brolls = []
     for p in sorted(placement_list, key=lambda x: float(x.get("start_time", 0))):
         idx = int(p.get("clip_index", 0))
@@ -10683,10 +12342,26 @@ async def zapcap_job_custom_broll(
             continue
         start = float(p.get("start_time", 0))
         end = float(p.get("end_time", start + 5.0))
+
+        if clip_is_image[idx]:
+            cache_key = (idx, round(end - start, 2))
+            if cache_key not in _image_video_cache:
+                converted_bytes = await _image_to_video_clip(clip_bytes_list[idx], end - start)
+                _image_video_cache[cache_key] = (
+                    await _upload_broll_clip(converted_bytes, f"broll-custom-{job_id}-{idx}-img")
+                    if converted_bytes else None
+                )
+            url = _image_video_cache[cache_key]
+            if not url:
+                print(f"[ZapCap/customBroll] image→video conversion failed for clip {idx} — skipping placement", flush=True)
+                continue
+        else:
+            url = clip_urls[idx]
+
         custom_brolls.append({
             "startTime": start,
             "endTime": end,
-            "url": clip_urls[idx],
+            "url": url,
         })
 
     if not custom_brolls:

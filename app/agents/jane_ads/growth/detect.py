@@ -162,6 +162,7 @@ def detect(rows: list[dict], ctx: dict) -> list[dict]:
         keep = set(recent_d) | set(base_d)
         ad_rows = [r for r in ad_rows if r.get("date") in keep]
     out.extend(_variant_findings(ad_rows))
+    out.extend(_underperformer_findings(ctx.get("verdicts") or [], ctx.get("ad_review") or []))
     return out
 
 
@@ -218,6 +219,21 @@ def _variant_findings(rows: list[dict]) -> list[dict]:
                       "weakest_ad": worst, "weakest": _round(eligible[worst]),
                       "cost_ratio": round(gap, 3), "p_value": round(p, 4)},
                      level="ad", entity_id=best)]
+
+
+def _underperformer_findings(verdicts: list[dict], ad_review: list[dict]) -> list[dict]:
+    """A running creative that has had a fair chance and is well off the business's
+    target, while another running ad is still worth keeping. Pausing the last good ad
+    would be pausing the campaign — the campaign-level rules handle that."""
+    status = {a.get("ad_id"): (a.get("status") or "").upper() for a in ad_review}
+    running = [v for v in verdicts if status.get(v["ad_id"], "ACTIVE") == "ACTIVE"]
+    weak = [v for v in running if v.get("status") == "underperforming"]
+    if not weak or len(weak) == len(running):
+        return []
+    return [_finding("creative_underperforming", "medium",
+                     {k: v.get(k) for k in ("ad_id", "spend_ngn", "results", "metric",
+                                            "cost_per_result_ngn", "target_ngn", "reason")},
+                     level="ad", entity_id=v["ad_id"]) for v in weak]
 
 
 def fingerprint(campaign_id: str, finding: dict) -> str:

@@ -1,0 +1,828 @@
+"""
+Uri Market Intelligence — API router (PRD §20).
+
+Thin by design: every endpoint validates brand ownership then delegates to
+scan_runner.py or a direct Mongo read. No business logic lives here.
+"""
+from __future__ import annotations
+
+import re
+import uuid
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+from app.dependencies import get_active_brand_context, get_db_dependency
+
+# aws/dev doesn't have get_flexible_brand_context (the API-key/SDK-aware brand
+# resolver added on aws/prod) yet — this feature is dev-only while testing and
+# only ever needs regular JWT auth, so get_active_brand_context (JWT-only,
+# already on dev) is the correct dependency here, not something to backport.
+get_flexible_brand_context = get_active_brand_context
+from app.domain.responses.uri_response import UriResponse
+from app.services.PostHogService import track_event
+
+from .models import (
+    AccessGrantRequest,
+    ActionBrief,
+    BriefCreateRequest,
+    DevelopmentUpdateRequest,
+    Evidence,
+    FeedbackOutcome,
+    FeedbackRequest,
+    InsightVersion,
+    KeywordSuggestionRequest,
+    MIAccessGrant,
+    MIAccessLevel,
+    PreferencesUpdateRequest,
+    ScanStatus,
+    SourceConfig,
+    Topic,
+    TopicCreateRequest,
+)
+from .access import can_manage_mi_access, require_mi_write_access
+from .budget import get_or_create_budget
+from .deletion import delete_evidence_cascade, delete_topic_cascade
+from .notification_delivery import get_or_create_preferences
+from .keyword_suggestion import suggest_keywords
+from .scan_runner import ADAPTER_REGISTRY, create_scan_run, execute_scan, preview_topic_coverage
+
+router = APIRouter(prefix="/market-intelligence", tags=["Market Intelligence"])
+
+
+async def _get_owned_topic(topic_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> dict:
+    topic_doc = await db["mi_topics"].find_one({"id": topic_id})
+    if not topic_doc:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    if topic_doc["brand_id"] != brand_id:
+        # Same response as "not found" — never confirm a topic exists for a
+        # brand that isn't the caller's (PRD §21: "No user may retrieve
+        # another tenant's insight by guessing an identifier").
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return topic_doc
+
+
+async def _get_owned_insight(insight_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> dict:
+    insight_doc = await db["mi_insights"].find_one({"id": insight_id})
+    if not insight_doc or insight_doc["brand_id"] != brand_id:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    return insight_doc
+
+
+STALE_SCAN_TIMEOUT_MINUTES = 10
+
+
+async def _self_heal_stale_scan(scan_doc: dict, db: AsyncIOMotorDatabase) -> dict:
+    """execute_scan()'s own crash-safety net (scan_runner.py) guarantees a
+    NEW scan always reaches a terminal status even if its pipeline raises —
+    but it can't help a run whose entire background task died some other
+    way (e.g. the worker process itself was killed or redeployed mid-run).
+    A caller polling GET /scans/{id} against a run that will genuinely
+    never change again would otherwise poll forever, which is exactly what
+    showed up as "scan is taking longer than expected" with nothing
+    actually running. Mirrors this codebase's existing self-heal-on-read
+    pattern for stale Jane Ads campaign status.
+
+    Deliberately does not cover a run stuck in QUEUED with no started_at at
+    all — that would mean the background task was scheduled but never
+    began, which realistically only happens if the process died in the gap
+    between accepting the request and starting the task; too rare to be
+    worth a second timestamp field for."""
+    non_terminal = {ScanStatus.QUEUED.value, ScanStatus.COLLECTING.value, ScanStatus.ANALYSING.value}
+    started_at = scan_doc.get("started_at")
+    if scan_doc.get("status") not in non_terminal or started_at is None:
+        return scan_doc
+    if datetime.utcnow() - started_at < timedelta(minutes=STALE_SCAN_TIMEOUT_MINUTES):
+        return scan_doc
+
+    healed_fields = {
+        "status": ScanStatus.FAILED.value,
+        "completed_at": datetime.utcnow(),
+        "gaps": (scan_doc.get("gaps") or []) + [
+            "scan did not complete within the expected time and was marked failed — please retry"
+        ],
+    }
+    await db["mi_scans"].update_one({"id": scan_doc["id"]}, {"$set": healed_fields})
+    scan_doc.update(healed_fields)
+    return scan_doc
+
+
+async def _get_owned_development(development_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> dict:
+    dev_doc = await db["mi_developments"].find_one({"id": development_id})
+    if not dev_doc or dev_doc["brand_id"] != brand_id:
+        raise HTTPException(status_code=404, detail="Development not found")
+    return dev_doc
+
+
+@router.get("/sources")
+async def list_sources(
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """PRD §8: 'The frontend obtains available controls from these
+    [capability] records' — real registered providers today, not a
+    hardcoded list the frontend has to keep in sync by hand. Grows
+    automatically the moment a real adapter is registered."""
+    sources = [adapter.capabilities().dict() for adapter in ADAPTER_REGISTRY.values()]
+    return UriResponse.get_list_data_response("source", sources)
+
+
+@router.post("/topics/suggest-keywords")
+async def suggest_topic_keywords(
+    body: KeywordSuggestionRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """PRD §9: 'Uri suggests keywords, related phrases and exclusions. The
+    owner reviews them before starting collection.' Read-only — never
+    creates anything; the frontend shows these as editable chips before
+    POSTing the actual topic."""
+    result = await suggest_keywords(body.question)
+    if result is None:
+        # Fail-open with the same simple heuristic create_topic falls back
+        # to, rather than blocking the flow on an LLM hiccup — the owner is
+        # reviewing these anyway.
+        fallback_keywords = [w.strip() for w in body.question.split() if len(w.strip()) > 3]
+        return UriResponse.get_single_data_response("suggestion", {"keywords": fallback_keywords, "excluded_keywords": []})
+    return UriResponse.get_single_data_response("suggestion", {"keywords": result.keywords, "excluded_keywords": result.excluded_keywords})
+
+
+@router.post("/topics/suggest-from-brand")
+async def suggest_topic_from_brand(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """A starter topic built from the brand's own Playbook (what it sells,
+    where its customers are, competitors, languages). Read-only — the owner
+    reviews and edits it in the New Topic form before anything is collected."""
+    from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+    from .brand_topic import suggest_brand_topic
+
+    res = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx.get("brand_id"))
+    profile = (res.get("responseData") or {}) if res.get("status") else {}
+    suggestion = await suggest_brand_topic(profile)
+    if suggestion is None:
+        return UriResponse.error_response(
+            "Your Brand Playbook doesn't say what you sell yet — add your brand and products there first.")
+    # Prefer what the business actually configured in Settings -> Listening
+    # location over the Playbook's own loose "customer_location" text (often
+    # a whole continent, e.g. "Africa", even once Settings has been set to a
+    # specific country) — confirmed live: this mismatch is why a Nigeria-
+    # scoped account kept getting new topics defaulted to "Africa."
+    from .listening.geo import location_scope_display_name
+    listening_profile = await db["mi_listening_profiles"].find_one({"brand_id": ctx.get("brand_id")})
+    real_location = location_scope_display_name((listening_profile or {}).get("location_scope") or {})
+    if real_location:
+        suggestion["geographic_scope"] = real_location
+    # Default to the cheapest real source that's set up on this server.
+    from app.core.config import settings
+    suggestion["sources"] = ["x"] if (settings.APIFY_API_TOKEN or "").strip() else ["mock"]
+    return UriResponse.get_single_data_response("suggestion", suggestion)
+
+
+def _normalize_topic_question(question: str) -> str:
+    """Collapse whitespace, case and trailing punctuation so "...online?"
+    and "...online" (confirmed live as two separate real topics) are
+    recognized as the same standing question."""
+    return re.sub(r"[\s?.!]+$", "", (question or "").strip().lower())
+
+
+@router.post("/topics")
+async def create_topic(
+    body: TopicCreateRequest,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    # No dedup check ever existed here — confirmed live, this account had
+    # the exact same question submitted twice (11 minutes apart) sitting
+    # as two separate topics, each independently collecting and spending
+    # its own budget. Creation is idempotent on the normalized question
+    # now: a near-identical re-submission returns the existing topic
+    # instead of spawning a duplicate (PRD never asked for two standing
+    # questions that are really the same one).
+    normalized = _normalize_topic_question(body.question)
+    async for existing in db["mi_topics"].find({"brand_id": ctx["brand_id"], "active": True}):
+        if _normalize_topic_question(existing.get("question", "")) == normalized:
+            existing.pop("_id", None)
+            return UriResponse.get_single_data_response("topic", existing, message="A topic with this question already exists.")
+
+    # PRD §9: "Uri suggests keywords... the owner reviews them before
+    # starting collection" — real suggestion now happens via
+    # POST /topics/suggest-keywords, reviewed client-side before this call;
+    # this fallback only fires if the caller genuinely sent nothing.
+    keywords = body.keywords or [w.strip() for w in body.question.split() if len(w.strip()) > 3]
+    topic = Topic(
+        id=str(uuid.uuid4()),
+        brand_id=ctx["brand_id"],
+        user_id=ctx["user_id"],
+        question=body.question,
+        keywords=keywords,
+        excluded_keywords=body.excluded_keywords,
+        sources=[SourceConfig(provider=p, platform=p) for p in body.sources],
+        geographic_scope=body.geographic_scope,
+        requested_days=body.requested_days,
+        keep_updating=body.keep_updating,
+        competitors=body.competitors,
+        languages=body.languages,
+        notification_sensitivity=body.notification_sensitivity,
+    )
+    await db["mi_topics"].insert_one(topic.dict())
+    track_event(ctx["user_id"], "topic_created", {
+        "brand_id": ctx["brand_id"], "topic_id": topic.id, "source_count": len(topic.sources),
+        "requested_days": topic.requested_days, "keep_updating": topic.keep_updating,
+    })
+    return UriResponse.get_single_data_response("topic", topic.dict())
+
+
+@router.get("/topics")
+async def list_topics(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    # Confirmed live UX bug: "Run scan" -> "Scanning..." -> "check back
+    # later" had no server-visible state behind it at all — the frontend
+    # only ever knew a scan was in progress via its OWN sessionStorage, so
+    # a new tab, a closed/reopened browser, or just coming back after the
+    # client gave up polling showed nothing: no "still running," no "it
+    # finished," no "it failed." Attaching each topic's own most recent
+    # scan here means ANY page load reflects real server state, not just
+    # whatever this one browser tab happened to remember.
+    cursor = db["mi_topics"].find({"brand_id": ctx["brand_id"]}).sort("created_at", -1)
+    topics = [doc async for doc in cursor]
+    for t in topics:
+        t.pop("_id", None)
+        latest_scan = await db["mi_scans"].find_one({"topic_id": t["id"]}, sort=[("started_at", -1)])
+        if latest_scan:
+            latest_scan.pop("_id", None)
+            latest_scan = await _attach_scan_result_summary(latest_scan, db)
+        t["latest_scan"] = latest_scan
+    return UriResponse.get_list_data_response("topic", topics)
+
+
+@router.delete("/topics/{topic_id}")
+async def delete_topic(
+    topic_id: str,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """No way to remove a topic existed anywhere in this product before
+    this endpoint — confirmed live, real exact-duplicate topics (the same
+    standing question, created minutes apart) had no way to be cleaned up.
+    Cascades into evidence, classifications, clusters, insights,
+    developments, scans, term stats and outbox entries — see deletion.py."""
+    result = await delete_topic_cascade(topic_id, ctx["brand_id"], db)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return UriResponse.get_single_data_response("deletion", result)
+
+
+@router.get("/budget")
+async def get_budget(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §23/§5 (G5): lets the business (or an operations analyst) see
+    this workspace's current monthly allowance, reservation and spend
+    before it becomes a surprise. Read-only — allowance changes aren't
+    exposed yet since role-based permissions (Owner vs Editor, PRD §21)
+    aren't implemented in this pilot, and letting any authenticated brand
+    member raise their own spending cap would defeat the control."""
+    budget = await get_or_create_budget(db, ctx["brand_id"])
+    budget.pop("_id", None)
+    return UriResponse.get_single_data_response("budget", budget)
+
+
+@router.get("/topics/{topic_id}/search-plan")
+async def get_search_plan(
+    topic_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """What this topic actually searches for: the variation groups, what it
+    has learned and retired, and how each term has performed so far."""
+    from . import query_planner
+
+    topic_doc = await _get_owned_topic(topic_id, ctx["brand_id"], db)
+    topic_doc.pop("_id", None)
+    topic = Topic(**topic_doc)
+    planned = bool(topic.search_plan)
+    plan = query_planner.assemble(topic)
+    stats = {}
+    async for row in db["mi_term_stats"].find({"topic_id": topic_id}):
+        stats[row["term"]] = {"seen": row.get("seen", 0), "useful": row.get("useful", 0)}
+    return UriResponse.get_single_data_response("search_plan", {
+        "planned": planned,
+        "groups": [{**g, "terms": [{"term": t, **stats.get(t, {"seen": 0, "useful": 0})} for t in g["terms"]]}
+                   for g in plan["groups"]],
+        "learned_terms": topic.learned_terms,
+        "retired_terms": topic.retired_terms,
+        "excluded": plan["excluded"],
+        "queries": len(plan["expressions"]),
+        "updated_at": topic.plan_updated_at,
+    })
+
+
+@router.get("/topics/{topic_id}/coverage-preview")
+async def get_topic_coverage_preview(
+    topic_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §9: 'Before running, show the accessible period, limits, collection
+    scope and estimated usage.' Called by the frontend before POSTing a scan —
+    uses the same clamp_requested_days logic execute_scan itself uses, so this
+    can never promise a period the scan doesn't actually honor."""
+    topic_doc = await _get_owned_topic(topic_id, ctx["brand_id"], db)
+    topic_doc.pop("_id", None)
+    topic = Topic(**topic_doc)
+    previews = await preview_topic_coverage(topic)
+    return UriResponse.get_list_data_response("coverage", [p.dict() for p in previews])
+
+
+@router.post("/topics/{topic_id}/scans")
+async def start_scan(
+    topic_id: str,
+    background_tasks: BackgroundTasks,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    topic_doc = await _get_owned_topic(topic_id, ctx["brand_id"], db)
+    topic_doc.pop("_id", None)
+    topic = Topic(**topic_doc)
+
+    run = await create_scan_run(topic, db)
+    # PRD §23/P0-15: a run that couldn't reserve its estimated cost is
+    # recorded (visibly, as BUDGET_LIMITED) but never actually executed —
+    # nothing here spends against a reservation that was never granted.
+    if run.status != ScanStatus.BUDGET_LIMITED:
+        background_tasks.add_task(execute_scan, topic, run.id, db)
+
+    track_event(ctx["user_id"], "scan_requested", {
+        "brand_id": ctx["brand_id"], "topic_id": topic_id, "scan_id": run.id, "status": run.status.value,
+    })
+    return UriResponse.get_single_data_response("scan", run.dict())
+
+
+_TERMINAL_SCAN_STATUSES = ("completed", "partial", "failed", "budget_limited")
+
+
+async def _attach_scan_result_summary(scan_doc: dict, db: AsyncIOMotorDatabase) -> dict:
+    """Confirmed live UX gap: "Run scan" -> "Scanning..." -> "Scan
+    complete" told the owner nothing about what was actually found or
+    where to look — the real payoff (Insights, Announced Events) lives on
+    two entirely different tabs with no link pointing there. Once a run
+    is done, this tells the caller exactly what it produced so the
+    frontend can show "found 3 new insights" with a direct link instead
+    of a toast that just disappears. Shared by GET /scans/{id} (polled
+    while a scan is running) and GET /topics' embedded latest_scan (read
+    on every later page load), so the payoff is visible however the page
+    was reached, not just to whichever tab happened to be open when the
+    scan finished."""
+    if scan_doc.get("status") not in _TERMINAL_SCAN_STATUSES:
+        return scan_doc
+    evidence_ids = [
+        e["id"] async for e in db["mi_evidence"].find({"collection_run_id": scan_doc["id"]}, {"id": 1})
+    ]
+    if not evidence_ids:
+        scan_doc["new_insight_count"] = 0
+        scan_doc["new_development_count"] = 0
+        return scan_doc
+    scan_doc["new_insight_count"] = await db["mi_insights"].count_documents(
+        {"topic_id": scan_doc["topic_id"], "status": "active", "evidence_ids": {"$in": evidence_ids}}
+    )
+    scan_doc["new_development_count"] = await db["mi_developments"].count_documents(
+        {"topic_id": scan_doc["topic_id"], "evidence_id": {"$in": evidence_ids}}
+    )
+    return scan_doc
+
+
+@router.get("/scans/{scan_id}")
+async def get_scan(
+    scan_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    scan_doc = await db["mi_scans"].find_one({"id": scan_id})
+    if not scan_doc or scan_doc["brand_id"] != ctx["brand_id"]:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    scan_doc = await _self_heal_stale_scan(scan_doc, db)
+    scan_doc.pop("_id", None)
+    scan_doc = await _attach_scan_result_summary(scan_doc, db)
+    return UriResponse.get_single_data_response("scan", scan_doc)
+
+
+@router.get("/insights")
+async def list_insights(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    # Ranked by relevance, confidence, then recency (PRD §13) — Mongo can't
+    # easily sort by a nested-document computed field across two dimensions
+    # at once here, so this sorts by relevance total first, confidence
+    # second, both already stored as plain ints on each document.
+    cursor = (
+        db["mi_insights"]
+        .find({"brand_id": ctx["brand_id"], "status": "active"})
+        .sort([("relevance.total", -1), ("confidence.total", -1), ("last_updated", -1)])
+    )
+    insights = [doc async for doc in cursor]
+    for i in insights:
+        i.pop("_id", None)
+    return UriResponse.get_list_data_response("insight", insights)
+
+
+@router.get("/insights/{insight_id}")
+async def get_insight(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    insight_doc = await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    insight_doc.pop("_id", None)
+    return UriResponse.get_single_data_response("insight", insight_doc)
+
+
+@router.get("/insights/{insight_id}/evidence")
+async def get_insight_evidence(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    insight_doc = await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    evidence_ids = insight_doc.get("evidence_ids", [])
+    cursor = db["mi_evidence"].find({"id": {"$in": evidence_ids}, "brand_id": ctx["brand_id"]})
+    evidence = [doc async for doc in cursor]
+    for e in evidence:
+        e.pop("_id", None)
+    track_event(ctx["user_id"], "evidence_opened", {
+        "brand_id": ctx["brand_id"], "insight_id": insight_id, "evidence_count": len(evidence),
+    })
+    return UriResponse.get_list_data_response("evidence", evidence)
+
+
+@router.get("/insights/{insight_id}/trace")
+async def get_insight_trace(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §16, P0-16: 'A finding can be traced to topic, collection,
+    evidence and model versions.' Walks the real chain stored on the
+    records themselves — evidence -> the scan(s) that collected it ->
+    provider run ids, and classification -> model/prompt versions — rather
+    than a separate log a change elsewhere could silently drift from."""
+    insight_doc = await _get_owned_insight(insight_id, ctx["brand_id"], db)
+
+    evidence_ids = insight_doc.get("evidence_ids", [])
+    evidence_docs = [
+        doc async for doc in db["mi_evidence"].find({"id": {"$in": evidence_ids}, "brand_id": ctx["brand_id"]})
+    ]
+    for e in evidence_docs:
+        e.pop("_id", None)
+
+    classification_docs = [
+        doc async for doc in db["mi_classifications"].find({"evidence_id": {"$in": evidence_ids}})
+    ]
+    for c in classification_docs:
+        c.pop("_id", None)
+
+    collection_run_ids = sorted({e.get("collection_run_id") for e in evidence_docs if e.get("collection_run_id")})
+    scan_docs = [doc async for doc in db["mi_scans"].find({"id": {"$in": collection_run_ids}})]
+    for s in scan_docs:
+        s.pop("_id", None)
+
+    model_versions = sorted({
+        f"{c.get('model_name')}@{c.get('prompt_version')}" for c in classification_docs if c.get("model_name")
+    })
+
+    trace = {
+        "insight_id": insight_id,
+        "insight_revision": insight_doc.get("revision"),
+        "topic_id": insight_doc.get("topic_id"),
+        "cluster_id": insight_doc.get("cluster_id"),
+        "evidence_ids": evidence_ids,
+        "collection_runs": scan_docs,
+        "classifications": classification_docs,
+        "model_versions": model_versions,
+    }
+    return UriResponse.get_single_data_response("trace", trace)
+
+
+@router.post("/insights/{insight_id}/feedback")
+async def submit_feedback(
+    insight_id: str,
+    body: FeedbackRequest,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    feedback = FeedbackOutcome(
+        id=str(uuid.uuid4()),
+        insight_id=insight_id,
+        user_id=ctx["user_id"],
+        verdict=body.verdict,
+        reason=body.reason,
+    )
+    await db["mi_feedback"].insert_one(feedback.dict())
+
+    # PRD §16: "Incorrect feedback opens a reason selector and queues review."
+    # "One user's dismissal must not globally suppress a public topic" — this
+    # only ever marks THIS insight for THIS tenant; it never touches the
+    # underlying evidence/cluster shared with any other brand.
+    if body.verdict.value == "not_relevant":
+        await db["mi_insights"].update_one({"id": insight_id}, {"$set": {"status": "dismissed"}})
+
+    track_event(ctx["user_id"], "feedback_submitted", {
+        "brand_id": ctx["brand_id"], "insight_id": insight_id, "verdict": body.verdict.value,
+    })
+    return UriResponse.get_single_data_response("feedback", feedback.dict())
+
+
+@router.delete("/evidence/{evidence_id}")
+async def delete_evidence(
+    evidence_id: str,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §21/§16, P0-14: 'removed evidence disappears from all serving
+    paths.' Cascades into classifications, clusters and insights — see
+    deletion.py for exactly what that means for each."""
+    result = await delete_evidence_cascade(evidence_id, ctx["brand_id"], db)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    return UriResponse.get_single_data_response("deletion", result)
+
+
+@router.get("/insights/{insight_id}/briefs")
+async def get_brief(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Read-only existence check — lets the frontend show "Create brief" vs
+    the editable draft without a GET ever creating one as a side effect.
+    Open to viewers too, same as every other read endpoint."""
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    existing = await db["mi_briefs"].find_one({"insight_id": insight_id})
+    if existing:
+        existing.pop("_id", None)
+    return UriResponse.get_single_data_response("brief", existing)
+
+
+@router.post("/insights/{insight_id}/briefs")
+async def create_brief(
+    insight_id: str,
+    body: BriefCreateRequest,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    insight_doc = await _get_owned_insight(insight_id, ctx["brand_id"], db)
+
+    # Idempotent: re-submitting the same insight_id returns the existing
+    # brief rather than creating a duplicate — PRD §25 P0-12.
+    existing = await db["mi_briefs"].find_one({"insight_id": insight_id})
+    if existing:
+        existing.pop("_id", None)
+        return UriResponse.get_single_data_response("brief", existing)
+
+    message = body.proposed_message or insight_doc.get("suggested_next_step") or ""
+    brief = ActionBrief(
+        id=str(uuid.uuid4()),
+        insight_id=insight_id,
+        insight_revision=insight_doc.get("revision", 1),
+        brand_id=ctx["brand_id"],
+        customer_need=insight_doc.get("business_implication", ""),
+        proposed_message=message,
+        evidence_ids=insight_doc.get("evidence_ids", []),
+    )
+    await db["mi_briefs"].insert_one(brief.dict())
+    track_event(ctx["user_id"], "brief_created", {"brand_id": ctx["brand_id"], "insight_id": insight_id, "brief_id": brief.id})
+    return UriResponse.get_single_data_response("brief", brief.dict())
+
+
+@router.patch("/insights/{insight_id}/briefs")
+async def update_brief(
+    insight_id: str,
+    body: BriefCreateRequest,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §13: 'Where a destination module is unavailable, save an editable
+    brief within Intelligence.' No real Jane Ads/content-calendar handoff
+    exists in this pilot yet (deliberately not rushed — the safe version of
+    that integration needs its own careful, separate work given the real
+    spend/publish risk either module carries), so this is that fallback
+    made complete: the brief this pilot DOES create must actually be
+    editable, not just create-once-and-done."""
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    existing = await db["mi_briefs"].find_one({"insight_id": insight_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="No brief exists for this insight yet")
+    if body.proposed_message is not None:
+        await db["mi_briefs"].update_one({"insight_id": insight_id}, {"$set": {"proposed_message": body.proposed_message}})
+        existing["proposed_message"] = body.proposed_message
+    existing.pop("_id", None)
+    return UriResponse.get_single_data_response("brief", existing)
+
+
+@router.get("/developments")
+async def list_developments(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    # Soonest event first; undated ("date to confirm") items sort last rather
+    # than first — Mongo puts missing/null fields first in an ascending sort
+    # by default, which would otherwise bury dated, actionable items under
+    # undated ones.
+    cursor = (
+        db["mi_developments"]
+        .find({"brand_id": ctx["brand_id"]})
+        .sort([("event_date", 1), ("last_updated", -1)])
+    )
+    developments = [doc async for doc in cursor]
+    for d in developments:
+        d.pop("_id", None)
+
+    # Backstop location filter — see development_location_conflicts' own
+    # docstring for why this exists alongside the collection-time fix in
+    # scan_runner.py (catches whatever was already collected before that
+    # fix, or whatever a source with no real geo lever let through).
+    from .listening.geo import development_location_conflicts, resolve_topic_location_hint
+    location_hint = await resolve_topic_location_hint(db, ctx["brand_id"])
+    expected_country = (location_hint or {}).get("country")
+    if expected_country:
+        developments = [
+            d for d in developments
+            if not development_location_conflicts(d.get("location"), expected_country)
+        ]
+
+    return UriResponse.get_list_data_response("development", developments)
+
+
+@router.get("/developments/{development_id}")
+async def get_development(
+    development_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    dev_doc = await _get_owned_development(development_id, ctx["brand_id"], db)
+    dev_doc.pop("_id", None)
+    return UriResponse.get_single_data_response("development", dev_doc)
+
+
+@router.patch("/developments/{development_id}")
+async def update_development(
+    development_id: str,
+    body: DevelopmentUpdateRequest,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §13: 'Postponement or cancellation updates the SAME item and any
+    linked preparation task' — this revises the existing Development record
+    in place, it never creates a new one."""
+    await _get_owned_development(development_id, ctx["brand_id"], db)
+    update_fields = {"status": body.status.value, "last_updated": datetime.utcnow()}
+    if body.event_date is not None:
+        update_fields["event_date"] = body.event_date
+    if body.verification_note is not None:
+        update_fields["verification_note"] = body.verification_note
+    await db["mi_developments"].update_one({"id": development_id}, {"$set": update_fields})
+    dev_doc = await _get_owned_development(development_id, ctx["brand_id"], db)
+    dev_doc.pop("_id", None)
+    return UriResponse.get_single_data_response("development", dev_doc)
+
+
+@router.get("/preferences")
+async def get_preferences(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §14: 'Users can mute a topic or type, snooze an insight, change
+    sensitivity, disable channels.'"""
+    prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+    prefs.pop("_id", None)
+    return UriResponse.get_single_data_response("preferences", prefs)
+
+
+@router.patch("/preferences")
+async def update_preferences(
+    body: PreferencesUpdateRequest,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+
+    update: dict = {"updated_at": datetime.utcnow()}
+    for field in (
+        "email_enabled", "timezone", "digest_hour_local",
+        "quiet_hours_start_local", "quiet_hours_end_local", "urgent_override",
+    ):
+        value = getattr(body, field)
+        if value is not None:
+            update[field] = value
+
+    muted_topics = set(prefs.get("muted_topic_ids", []))
+    if body.mute_topic_id:
+        muted_topics.add(body.mute_topic_id)
+    if body.unmute_topic_id:
+        muted_topics.discard(body.unmute_topic_id)
+    if body.mute_topic_id or body.unmute_topic_id:
+        update["muted_topic_ids"] = list(muted_topics)
+
+    muted_categories = set(prefs.get("muted_categories", []))
+    if body.mute_category:
+        muted_categories.add(body.mute_category.value)
+    if body.unmute_category:
+        muted_categories.discard(body.unmute_category.value)
+    if body.mute_category or body.unmute_category:
+        update["muted_categories"] = list(muted_categories)
+
+    await db["mi_preferences"].update_one({"user_id": ctx["user_id"], "brand_id": ctx["brand_id"]}, {"$set": update})
+    updated = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+    updated.pop("_id", None)
+    return UriResponse.get_single_data_response("preferences", updated)
+
+
+@router.post("/insights/{insight_id}/snooze")
+async def snooze_insight(
+    insight_id: str,
+    ctx: dict = Depends(require_mi_write_access),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §16: 'Snoozing suppresses delivery, not evidence updates' — the
+    insight stays active and visible in-app, this only stops future outbox
+    entries for it from actually sending (see notification_delivery.py)."""
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+    snoozed = set(prefs.get("snoozed_insight_ids", []))
+    snoozed.add(insight_id)
+    await db["mi_preferences"].update_one(
+        {"user_id": ctx["user_id"], "brand_id": ctx["brand_id"]},
+        {"$set": {"snoozed_insight_ids": list(snoozed), "updated_at": datetime.utcnow()}},
+    )
+    return UriResponse.get_single_data_response("preferences", {"snoozed_insight_ids": list(snoozed)})
+
+
+@router.get("/access")
+async def list_access_grants(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §21. Only an agency admin (for an agency-owned brand) or the
+    brand's own owner (for a personal brand) can see who's been
+    restricted — everyone else gets a plain 403, not a distinguishing
+    empty list."""
+    if not await can_manage_mi_access(db, ctx["brand_id"], ctx["user_id"]):
+        raise HTTPException(status_code=403, detail="Only the brand owner or an agency admin can manage access")
+    cursor = db["mi_access"].find({"brand_id": ctx["brand_id"]})
+    grants = [doc async for doc in cursor]
+    for g in grants:
+        g.pop("_id", None)
+        # Best-effort display info only (same join workspace_member_router.py
+        # uses) — a grant is still fully functional without it, so a missing
+        # user doc never breaks the list.
+        user_doc = await db.users.find_one({"userId": g["user_id"]})
+        if user_doc:
+            g["email"] = user_doc.get("email")
+            g["user_name"] = f"{user_doc.get('first_name', '')} {user_doc.get('last_name', '')}".strip() or None
+    return UriResponse.get_list_data_response("access", grants)
+
+
+@router.post("/access")
+async def set_access_grant(
+    body: AccessGrantRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Setting level=FULL deletes any restriction rather than storing a
+    redundant row — FULL is simply what "no record" already means (see
+    access.py), so a grant document only ever exists to restrict someone."""
+    if not await can_manage_mi_access(db, ctx["brand_id"], ctx["user_id"]):
+        raise HTTPException(status_code=403, detail="Only the brand owner or an agency admin can manage access")
+
+    user_doc = await db.users.find_one({"email": body.email})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail=f"No Uri account found for {body.email}")
+    target_user_id = user_doc["userId"]
+    if target_user_id == ctx["user_id"] and body.level == MIAccessLevel.VIEW_ONLY:
+        raise HTTPException(status_code=400, detail="You can't restrict your own access")
+
+    if body.level == MIAccessLevel.FULL:
+        await db["mi_access"].delete_one({"brand_id": ctx["brand_id"], "user_id": target_user_id})
+        return UriResponse.get_single_data_response("access", {"user_id": target_user_id, "level": "full"})
+
+    grant = MIAccessGrant(
+        id=str(uuid.uuid4()), brand_id=ctx["brand_id"], user_id=target_user_id,
+        level=body.level, granted_by=ctx["user_id"],
+    )
+    await db["mi_access"].update_one(
+        {"brand_id": ctx["brand_id"], "user_id": target_user_id},
+        {"$set": grant.dict()},
+        upsert=True,
+    )
+    return UriResponse.get_single_data_response("access", grant.dict())
+
+
+# Listening Intelligence (market-level listening -> recommendation cards).
+from .listening.router import router as _listening_router  # noqa: E402
+
+router.include_router(_listening_router)

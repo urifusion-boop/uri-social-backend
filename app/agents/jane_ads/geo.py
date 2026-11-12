@@ -446,6 +446,17 @@ def bare_place_answer(text: str) -> str:
     return _REGION_ALIASES.get(name, name.title())
 
 
+def regions_named_in(text: str) -> list[str]:
+    """Every state or major city named anywhere in `text`, in the order named."""
+    hay = re.sub(r"[^a-z\s'-]", " ", (text or "").lower().replace("\u2019", "'"))
+    found: list[tuple[int, str]] = []
+    for name in sorted(_NG_REGIONS, key=len, reverse=True):
+        for m in re.finditer(rf"(?<![a-z]){re.escape(name)}(?![a-z])", hay):
+            found.append((m.start(), _REGION_ALIASES.get(name, name.title())))
+            hay = hay[:m.start()] + " " * len(name) + hay[m.end():]
+    return list(dict.fromkeys(n for _, n in sorted(found)))
+
+
 def whole_area_answer(text: str) -> str:
     """A client reply that settles the geography as one whole area: "all of Lagos",
     "Lagos statewide", or just "Lagos" — or several: "Lagos and Abuja"."""
@@ -533,6 +544,18 @@ async def build_geo_plan(
 
     return GeoPlan(mode=mode, city=city, pins=pins,
                    explanation=_explain(mode, city, pins))
+
+
+def places_named_in(text: str) -> list[str]:
+    """Every known neighbourhood named in `text`, in the order named, longest match
+    first so "lekki phase 1" is one place, not "lekki" too."""
+    hay = f" {(text or '').lower()} "
+    found: list[tuple[int, str]] = []
+    for name in sorted(_LAGOS_PLACES, key=len, reverse=True):
+        for m in re.finditer(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", hay):
+            found.append((m.start(), name.title()))
+            hay = hay[:m.start()] + " " * len(name) + hay[m.end():]
+    return list(dict.fromkeys(n for _, n in sorted(found)))
 
 
 def place_named_in(text: str) -> Optional[str]:

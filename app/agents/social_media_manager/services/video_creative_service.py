@@ -1,0 +1,669 @@
+import asyncio
+import base64
+import json
+import re
+import uuid
+from io import BytesIO
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from app.database import get_db
+from app.services.AIService import client as openai_client
+from app.utils.s3_upload import upload_bytes
+from app.agents.social_media_manager.services.video_styles import style_from_brief
+from app.agents.social_media_manager.services.video_text_overlay import SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES
+from app.agents.social_media_manager.services.people_consistency import (
+    IDENTITY_LOCK,
+    PEOPLE_ON_SCREEN_RULES,
+    PEOPLE_RULES_PLACEHOLDER,
+    scene_has_people,
+)
+from app.agents.social_media_manager.services.video_storyboard_service import (
+    VideoStoryboardService,
+    VIDEO_STYLE_DIRECTIVES,
+    _frame_jobs_collection,
+)
+
+
+def _creative_storyboard_jobs_collection():
+    return get_db()["creative_storyboard_jobs"]
+
+
+# Script + creative-direction writing for the "describe it" flow — a GPT text
+# model, not gpt-image-2 (that one only generates/edits images). gpt-5.4
+# matches the existing precedent for creative long-form text generation in
+# this codebase (see auto_content_service.py's content-seed writer); unlike
+# video_storyboard_service.py's Gemini Flash-Lite step (a grounded, "read
+# these real photos and extract structured scenes" task), this one is an
+# imaginative, from-a-brief task — a different shape that doesn't fit the
+# same cheap-extraction justification, so it stays on a full text model.
+SCRIPT_MODEL = "gpt-5.4"
+
+_SYSTEM_PROMPT = """You are a creative director and scriptwriter for short-form social video ads.
+
+You receive:
+  1. A free-text brief describing what the video should be about.
+  2. Optional reference images (brand/product/person photos) — there may be none at all; you are inventing the visual world from the brief, not grounded in real photos the way a photo-first storyboard tool would be.
+  3. Brand context: name, industry, color palette, voice, region, target platform.
+  4. A VIDEO STYLE directive — follow it strictly for camera, pacing, transitions, and energy.
+
+Your job: invent a complete creative concept, then produce a JSON script that fully embodies the selected video style.
+
+Rules:
+- creative_direction: 2-4 sentences stating the overall concept — the story being told, the mood, the strategy, why it will work for this brief. Write this BEFORE the scenes, as the thing the scenes exist to serve.
+- Brand colours are an accent, not a filter. Use them where they make sense: the logo, the product and its packaging, uniforms, signage, on-screen text, graphics, text cards and the closing call to action. Everything else — locations, skin, food, sky, nature, furniture, backgrounds — takes natural, realistic colours chosen for the mood of that scene, and the colour world should change from scene to scene. Never wash a whole scene in the brand colours.
+- video_prompt fields must be a COMPLETE, self-sufficient visual description an image generator can draw from scratch — specify subject, setting, framing, lighting, and motion in full; never assume prior context.
+- APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
+- reference_image_index: 0 if reference images were supplied and this scene draws on them, otherwise 0 (unused placeholder — frame generation for this flow chains scene-to-scene for consistency instead of picking by index).
+- text_overlay is a short on-screen caption/tagline string (8 words or fewer), or null. The editor draws it, sharply, onto the finished video: NEVER describe lettering, captions, titles or text cards inside a video_prompt (a text_card shot is a clean, plain or brand-coloured backdrop that the caption is laid over).
+{{SCREEN_TEXT_RULES}}
+- shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
+
+CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
+continuous story and must read that way end to end:
+- The whole script needs a clear through-line: scene 1 hooks/sets up, the
+  middle scenes build or demonstrate, the final scene pays off with a CTA or
+  resolution — never a sequence of unrelated vignettes sharing only a style.
+- Subject/setting continuity: once a scene establishes a specific subject,
+  product, person, or setting, describe that SAME subject again in every
+  later scene's video_prompt (full visual description, not a shorthand
+  reference) so an image generator chaining from the previous scene's frame
+  stays consistent — unless the narrative deliberately cuts away, which must
+  be an intentional story beat, not a random switch.
+- Each scene's motion/video_prompt should read as a natural continuation of
+  the previous scene's action and energy, as if one camera/story is flowing
+  forward, not disconnected clips stitched together after the fact.
+- continuity_note: one short phrase stating how this scene follows directly
+  from the previous one (for scene 1, how it sets up what follows).
+- dialogue: ONLY when this video features a person speaking on camera
+  (testimonial/direct-to-camera/talking-head content). Write ONE continuous
+  spoken script for that speaker and split it naturally across scenes — scene
+  1's words must lead directly into scene 2's, like one take cut into pieces,
+  never separate unrelated lines. If no one speaks on camera in a scene, set
+  dialogue to null.
+  GOOD example (one sentence flowing across the cut):
+    scene 1 dialogue: "I used to spend hours every week"
+    scene 2 dialogue: "just trying to figure out what to post."
+  BAD example (two unrelated statements, never do this):
+    scene 1 dialogue: "Welcome to my shop!"
+    scene 2 dialogue: "Buy now and save 20%."
+
+STRUCTURED BRIEF — when the brief has headed lines (CONCEPT, STYLE, PERSON, SETTING, LOOK, SCENE n, SOUND, CLOSE, AVOID),
+it was written for you; follow it exactly instead of re-inventing it:
+- Each "SCENE n (a-bs):" line is scene n, in that order. Its action is that scene's video_prompt, written out in full.
+- "Says exactly: "..."" is that scene's dialogue: use the words WORD FOR WORD. Do not shorten, paraphrase, correct or add to
+  them. A scene with no "Says exactly" has dialogue null.
+- "Caption: "..."" is that scene's text_overlay, word for word. A scene with no Caption has text_overlay null.
+- PERSON describes each person on screen: copy that description word for word into the video_prompt of every scene they
+  appear in. SETTING and LOOK apply to every scene: put them into every video_prompt.
+- NO PERSON line means NO people on screen: show the product only (at most a hand holding it). Never add a person, face
+  or model the brief did not describe, and never give such a scene the "lifestyle" shot_type (use product_hero,
+  brand_close_up or transition), because that shot type makes the picture model add a person.
+- STYLE names the video style. SOUND and CLOSE describe the voice, music and call to action. AVOID lists words and things
+  that must not appear in any scene, caption or spoken line.
+- Anything the brief does not say, you decide, following the rules above.
+If the brief has no such lines, treat it as a free-text idea.
+
+{{PEOPLE_RULES}}
+
+OUTCOME — also choose which kind of video will render this concept best (suggested_outcome, ONE slug from the list)
+and say why in outcome_reason: one short plain sentence a customer can read, naming no AI models or tools. Choose
+the CHEAPEST type that fully delivers the creative direction; step up only when the concept truly needs it.
+  quick_video          everyday default: simple scenes, product or lifestyle shots, gentle camera moves (cheapest)
+  animate_product      one product or photo brought to life with camera movement (cheapest)
+  social_video         fast, trend-style cuts for social feeds (cheapest)
+  high_quality         premium, polished hero shots where the look matters most (a little more)
+  complex_cinematic    hard motion, several subjects or demanding scene-to-scene coherence (a little more)
+  talking_dialogue     ONLY when a person speaks on camera: the script has dialogue (about 2x the price)
+  advanced_references  ONLY when reference images are supplied and the video must stay exactly consistent with
+                       them (about 3x the price) — never for a concept written from words alone
+
+Return ONLY valid JSON — no markdown fences, no explanation:
+{
+  "creative_direction": "<2-4 sentence overall creative concept>",
+  "video_style": "<the exact style slug you picked, e.g. clean_commercial — echo it back even if it was given to you>",
+  "suggested_outcome": "<one outcome slug from the list above>",
+  "outcome_reason": "<one short plain sentence: why this video type suits the creative direction>",
+  "total_duration_seconds": <int>,
+  "target_platform": "<string>",
+  "aspect_ratio": "9:16",
+  "scenes": [
+    {
+      "scene_number": <int>,
+      "duration_seconds": <int>,
+      "shot_type": "<product_hero|lifestyle|brand_close_up|text_card|transition>",
+      "motion": "<plain-English camera/subject motion description>",
+      "video_prompt": "<complete, self-sufficient motion-aware prompt for the image/video model>",
+      "reference_image_index": 0,
+      "text_overlay": <string or null>,
+      "continuity_note": "<how this scene follows the previous one>",
+      "dialogue": <string spoken on camera this scene, or null>
+    }
+  ]
+}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES).replace(SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES)
+
+
+VIDEO_OUTCOMES = (
+    "quick_video", "animate_product", "social_video", "high_quality", "complex_cinematic",
+    "talking_dialogue", "advanced_references",
+)
+
+
+def validated_outcome(storyboard: Dict[str, Any], has_reference_images: bool) -> None:
+    """Keep the model's outcome suggestion only if it can actually work, and fix it if it cannot. The customer
+    still chooses; this only decides what is preselected.
+      - a script with spoken dialogue always needs talking_dialogue (nothing else speaks the lines);
+      - talking_dialogue without any dialogue has nothing to say, so it is dropped;
+      - advanced_references needs reference images, so without them it steps down to high_quality;
+      - anything that is not a real outcome is dropped (the app then falls back to the style's own pick)."""
+    scenes = storyboard.get("scenes") or []
+    has_dialogue = any(isinstance(sc, dict) and str(sc.get("dialogue") or "").strip() for sc in scenes)
+    pick = storyboard.get("suggested_outcome")
+    if has_dialogue:
+        if pick != "talking_dialogue":
+            storyboard["outcome_reason"] = "Someone speaks on camera, and only this type turns the lines into real speech."
+        storyboard["suggested_outcome"] = "talking_dialogue"
+        return
+    if pick == "advanced_references" and not has_reference_images:
+        pick = storyboard["suggested_outcome"] = "high_quality"
+        storyboard["outcome_reason"] = "A polished look suits this concept, and no reference images were supplied."
+    if pick not in VIDEO_OUTCOMES or pick == "talking_dialogue":
+        storyboard.pop("suggested_outcome", None)
+        storyboard.pop("outcome_reason", None)
+        return
+    reason = str(storyboard.get("outcome_reason") or "").strip()
+    if reason:
+        storyboard["outcome_reason"] = reason[:300]
+    else:
+        storyboard.pop("outcome_reason", None)
+
+
+class VideoCreativeService:
+
+    @staticmethod
+    async def generate_creative_storyboard(
+        brief: str,
+        reference_images: List[str],
+        brand_context: Dict[str, Any],
+        target_platform: str = "instagram_reels",
+        target_duration_seconds: int = 15,
+        video_style: Optional[str] = None,
+        creative_direction_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Write a creative_direction + scene-by-scene script from a free-text
+        brief (reference images optional). Frame images are generated
+        separately and consistently via create_frame_job/run_frame_job below
+        — once scenes carry frame_image_url, the existing outcome-routed
+        fal.ai generation pipeline (video_generation_service.py) picks up
+        from there completely unchanged.
+
+        video_style: pass an explicit slug to force one (matches the upload-
+        first flow's behavior); leave None (the describe-it UI's default) and
+        the model picks whichever of VIDEO_STYLE_DIRECTIVES best fits the
+        brief itself, returned in the storyboard's own "video_style" field so
+        the choice is visible rather than a silent internal decision.
+
+        creative_direction_override: when the user has hand-edited a
+        previously-generated creative_direction and wants scenes rewritten to
+        match it, pass the edited text here — the model is told to use it
+        VERBATIM (not invent its own) and write scenes that execute that
+        exact concept. Leave None for a fresh/first generation, where the
+        model writes its own creative_direction from the brief.
+        """
+        if not brief or not brief.strip():
+            return {"status": False, "error": "Describe what the video should be about."}
+
+        reference_images = reference_images[:5]
+        target_duration_seconds = max(5, min(target_duration_seconds, 60))
+        num_scenes = max(1, round(target_duration_seconds / 5))
+
+        brand_colors = brand_context.get("brand_colors") or []
+        color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
+        brand_name = brand_context.get("brand_name") or "this brand"
+        industry = brand_context.get("industry") or "general"
+        region = brand_context.get("region") or ""
+        voice = brand_context.get("brand_voice") or ""
+        platform_label = target_platform.replace("_", " ").title()
+
+        preamble_lines = [
+            f"Brief: {brief.strip()}",
+            f"Brand: {brand_name}",
+            f"Industry: {industry}",
+            f"Target platform: {platform_label}",
+            f"Video length: {target_duration_seconds}s total | {num_scenes} scenes (~5s each)",
+            "Aspect ratio: 9:16 vertical",
+        ]
+        if color_str:
+            preamble_lines.append(f"Brand colors (accents where they make sense — logo, product, packaging, graphics, text; NOT the colour of every scene): {color_str}")
+        if voice:
+            preamble_lines.append(f"Brand voice: {voice}")
+        if region:
+            preamble_lines.append(f"Market/region: {region}")
+        if reference_images:
+            preamble_lines.append(
+                f"\n{len(reference_images)} reference image(s) attached below — use them to inform "
+                "subject/product appearance, but you are still writing complete, self-sufficient "
+                "video_prompt descriptions for each scene, not relying on the images being re-shown later."
+            )
+        else:
+            preamble_lines.append(
+                "\nNo reference images supplied — invent the entire visual world from the brief and brand context."
+            )
+        if creative_direction_override and creative_direction_override.strip():
+            preamble_lines.append(
+                "\nCREATIVE DIRECTION — ALREADY DECIDED, DO NOT CHANGE IT:\n"
+                f"{creative_direction_override.strip()}\n"
+                "Write scenes that execute this exact concept. Return it VERBATIM, unchanged, as "
+                "\"creative_direction\" in your JSON — do not rewrite, summarize, or improve it."
+            )
+        preamble_lines.append(f"\nGenerate exactly {num_scenes} scenes totalling {target_duration_seconds}s.")
+
+        # An explicit style (the customer swapped it) wins. Otherwise a structured brief that names one ("STYLE: Viral Fast
+        # Cut.", written by the prompt expander) is taken as given, in code, instead of leaving it to the model to guess.
+        if not video_style:
+            video_style = style_from_brief(brief)
+        forced_style = VIDEO_STYLE_DIRECTIVES.get(video_style) if video_style else None
+        if forced_style:
+            system_prompt = f"{_SYSTEM_PROMPT}\n\n{forced_style}"
+        else:
+            # No style given — list every available style in full and let the
+            # model choose whichever best fits the brief, applying only that
+            # one's rules. Each block is tagged with its own slug so the model
+            # can echo an exact, valid key back in "video_style" rather than
+            # deriving one from prose.
+            all_styles = "\n\n".join(
+                f"STYLE SLUG: {slug}\n{directive}" for slug, directive in VIDEO_STYLE_DIRECTIVES.items()
+            )
+            system_prompt = (
+                f"{_SYSTEM_PROMPT}\n\n"
+                "VIDEO STYLE — CHOOSE ONE: no style was specified. Read the brief and brand "
+                "context, pick exactly ONE of the styles below that best fits the brief's "
+                "subject, tone, and goal, then apply ONLY that style's rules to every scene. "
+                "Return its exact STYLE SLUG value as \"video_style\" in your JSON.\n\n"
+                f"{all_styles}"
+            )
+
+        # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
+        # language), who it's for, what the business offers and what's on now —
+        # video scripts used to get only name, industry, region, voice and colours.
+        from . import brand_brief
+        _platform = brand_brief.video_platform(target_platform)
+        brand_context = brand_brief.for_platform(brand_context, _platform)
+        _brief = brand_brief.build(brand_context, sections=("rules", "voice", "audience", "offer", "pulse"),
+                                   platform=_platform, kind="video")
+        if _brief:
+            preamble_lines.append("")
+            # The brief is about WORDS. video_prompt goes to the video model and must stay
+            # plain-English and visual, or rules/promotions get rendered into the footage.
+            preamble_lines.append(
+                "The BRAND BRIEF below governs the words people will read or hear — every "
+                "text_overlay — and which ideas the video is built around. Each video_prompt "
+                "stays a plain-English VISUAL description: never write rules, promotions, prices "
+                "or brand copy into a video_prompt."
+            )
+            preamble_lines.append(_brief)
+        preamble_lines.append("")
+        preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+        content: List[Dict[str, Any]] = [{"type": "text", "text": "\n".join(preamble_lines)}]
+        for img in reference_images:
+            content.append({"type": "image_url", "image_url": {"url": img}})
+
+        try:
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model=SCRIPT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": content},
+                    ],
+                    temperature=0.8,
+                    # gpt-5.4 rejects max_tokens outright — live-confirmed
+                    # 2026-10-02: "Unsupported parameter: 'max_tokens' is not
+                    # supported with this model. Use 'max_completion_tokens'
+                    # instead." The one other gpt-5.4 call site in this
+                    # codebase (auto_content_service.py) never hit this
+                    # because it never passes a token limit at all. Doubled
+                    # from 3000 — duration now goes up to 60s (12 scenes,
+                    # same scene-count increase as video_storyboard_service.py).
+                    max_completion_tokens=6000,
+                    response_format={"type": "json_object"},
+                ),
+            )
+        except Exception as e:
+            print(f"[VideoCreativeService] script generation error: {type(e).__name__}: {e}", flush=True)
+            return {"status": False, "error": "Failed to generate creative storyboard."}
+
+        raw = (response.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        try:
+            storyboard = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Creative storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
+            return {"status": False, "error": "Failed to parse creative storyboard from model response."}
+
+        # The model can still use a banned word (a style's own instructions say "transformation"). Ask once for a
+        # clean rewrite of the same script; what is still left afterwards is removed below.
+        found = brand_brief.script_violations(storyboard, brand_context, direction=not creative_direction_override)
+        if found:
+            try:
+                retry = await loop.run_in_executor(
+                    None,
+                    lambda: openai_client.chat.completions.create(
+                        model=SCRIPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": content},
+                            {"role": "assistant", "content": raw},
+                            {"role": "user", "content": (
+                                f"Your script used words this brand has banned: {', '.join(found)}. Rewrite the complete "
+                                "JSON with the same story, scenes and structure, but without any form of those words "
+                                "(including endings like -ation, -ing, -ly). Return ONLY the JSON.")},
+                        ],
+                        temperature=0.4,
+                        max_completion_tokens=6000,
+                        response_format={"type": "json_object"},
+                    ),
+                )
+                retried = json.loads(re.sub(r"\s*```$", "", re.sub(
+                    r"^```(?:json)?\s*", "", (retry.choices[0].message.content or "").strip())))
+                if isinstance(retried, dict) and retried.get("scenes"):
+                    storyboard = retried
+            except Exception as e:  # keep the first script; the removal below still guarantees the rule
+                print(f"[VideoCreativeService] banned-word rewrite failed: {type(e).__name__}: {e}", flush=True)
+
+        # The Playbook's word rules, guaranteed on what viewers read and hear. Before the owner's own
+        # edited direction is put back below, so their wording is never rewritten.
+        brand_brief.enforce_video_script(storyboard, brand_context)
+
+        # Forced style: trust our own value over whatever the model echoed.
+        # Inferred style: trust the model's pick only if it's a real slug —
+        # a hallucinated one would otherwise silently fall through to no
+        # style directive at all on any later regeneration of this storyboard.
+        if forced_style:
+            storyboard["video_style"] = video_style
+        elif storyboard.get("video_style") not in VIDEO_STYLE_DIRECTIVES:
+            print(f"[VideoCreativeService] model returned unknown video_style "
+                  f"{storyboard.get('video_style')!r}, defaulting to clean_commercial")
+            storyboard["video_style"] = "clean_commercial"
+
+        # Forced creative_direction: trust the user's exact edited text over
+        # whatever the model echoed back, same reasoning as forced_style above.
+        if creative_direction_override and creative_direction_override.strip():
+            storyboard["creative_direction"] = creative_direction_override.strip()
+
+        validated_outcome(storyboard, bool(reference_images))
+
+        return {"status": True, "storyboard": storyboard}
+
+    # ── Job wrapper around generate_creative_storyboard above — this step was
+    #    a plain blocking request-response (unlike frame/video generation,
+    #    already job_id+background_tasks based) so a refresh while it was
+    #    still running lost the in-flight work entirely, with no job to
+    #    resume. Same create/run/get shape as create_frame_job/run_frame_job
+    #    below, its own Mongo collection since a storyboard-generation job and
+    #    a frame-generation job are different things with different lifetimes. ──
+
+    @staticmethod
+    async def create_storyboard_job(job_id: Optional[str] = None) -> str:
+        job_id = job_id or uuid.uuid4().hex
+        await _creative_storyboard_jobs_collection().insert_one({
+            "job_id": job_id,
+            "status": "generating",
+            "storyboard": None,
+            "error": None,
+        })
+        return job_id
+
+    @staticmethod
+    async def run_storyboard_job(
+        job_id: str,
+        brief: str,
+        reference_images: List[str],
+        brand_context: Dict[str, Any],
+        target_platform: str = "instagram_reels",
+        target_duration_seconds: int = 15,
+        video_style: Optional[str] = None,
+        creative_direction_override: Optional[str] = None,
+    ) -> None:
+        try:
+            result = await VideoCreativeService.generate_creative_storyboard(
+                brief=brief,
+                reference_images=reference_images,
+                brand_context=brand_context,
+                target_platform=target_platform,
+                target_duration_seconds=target_duration_seconds,
+                video_style=video_style,
+                creative_direction_override=creative_direction_override,
+            )
+        except Exception as e:  # never leave a charged job "generating" forever
+            print(f"[VideoCreativeService] storyboard job {job_id} crashed: {type(e).__name__}: {e}", flush=True)
+            result = {"status": False, "error": "Creative storyboard generation failed. Please try again."}
+        # The credit for this run is kept if a storyboard came out and given back if not. Settled BEFORE the job
+        # is marked finished, so the screen that sees "failed" already sees the refund. A no-op when this run
+        # was never charged (billing off).
+        try:
+            from app.agents.social_media_manager.services import video_generation_billing as billing
+            await billing.settle_storyboard(job_id, bool(result.get("status")))
+        except Exception as e:
+            print(f"[VideoCreativeService] settling storyboard job {job_id} failed: {type(e).__name__}: {e}", flush=True)
+        if result.get("status"):
+            await _creative_storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "complete", "storyboard": result["storyboard"]}},
+            )
+        else:
+            await _creative_storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "failed", "error": result.get("error", "Creative storyboard generation failed")}},
+            )
+
+    @staticmethod
+    async def get_storyboard_job(job_id: str) -> Optional[Dict[str, Any]]:
+        return await _creative_storyboard_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
+
+    # ── Frame generation — reuses VideoStoryboardService's own job collection
+    #    and shape (same storyboard_frame_jobs doc, same GET /storyboard-frame-
+    #    job/{job_id} polling endpoint) so the frontend's existing polling code
+    #    works unchanged. What differs is per-scene generation: instead of
+    #    editing a fixed uploaded brand photo by index, each scene chains off
+    #    the PREVIOUS scene's own generated frame (or a user reference image
+    #    for scene 1, or a from-scratch generation if neither exists) — that
+    #    chain is what keeps the subject/setting visually consistent across
+    #    scenes when there's no single real photo to anchor every edit to. ──
+
+    @staticmethod
+    async def create_frame_job(scenes: list) -> str:
+        return await VideoStoryboardService.create_frame_job(scenes)
+
+    @staticmethod
+    async def run_frame_job(job_id: str, scenes: list, reference_images: List[str] = None,
+                            brand_context: Optional[Dict[str, Any]] = None) -> None:
+        col = _frame_jobs_collection()
+        reference_images = reference_images or []
+        prev_image_url: Optional[str] = None
+        # The first frame that shows a person. Every later frame with people copies their faces from it as
+        # well as from the previous frame: chaining only off the previous frame re-draws a face from a
+        # re-drawn copy each time, and by scene 4 it is a different person.
+        identity_url: Optional[str] = None
+        for scene in scenes:
+            # A scene with no frame cannot become a clip at all, so a failed picture gets one more try.
+            url = None
+            for _attempt in range(2):
+                url = await VideoCreativeService._generate_scene_frame(
+                    scene, reference_images, prev_image_url, brand_context, identity_url)
+                if url:
+                    break
+            if url:
+                prev_image_url = url
+                if identity_url is None and scene_has_people(scene):
+                    identity_url = url
+                await col.update_one(
+                    {"job_id": job_id},
+                    {"$push": {"frames": {
+                        "scene_number": scene.get("scene_number"),
+                        "frame_image_url": url,
+                    }}},
+                )
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "complete"}})
+
+    @staticmethod
+    def _frame_branding(brand_context: Optional[Dict[str, Any]], on_screen_text: str = "") -> str:
+        from . import brand_brief
+        return brand_brief.frame_branding_rules(brand_context, on_screen_text)
+
+    # What the picture model is told to do with the owner's photos. A frame need not show the product, so this
+    # only governs where it does appear.
+    _REFERENCE_FIDELITY = (
+        "Wherever the product, packaging, place or person from the owner's photos appears in this frame, it must "
+        "look exactly like the photo: the same shape, colours, label, proportions and details. Do not redesign "
+        "or substitute it."
+    )
+    MAX_OWNER_PHOTOS = 3   # photos handed to each frame (the writer still sees all of them)
+
+    @staticmethod
+    def _owner_photos(reference_images: Optional[List[str]]) -> List[bytes]:
+        """The owner's uploaded photos as image bytes, at most MAX_OWNER_PHOTOS; one that cannot be read is skipped."""
+        photos: List[bytes] = []
+        for ref in (reference_images or []):
+            if len(photos) >= VideoCreativeService.MAX_OWNER_PHOTOS:
+                break
+            try:
+                photos.append(VideoStoryboardService._decode_brand_image(ref))
+            except Exception as e:
+                print(f"[CreativeFrame] a supplied photo could not be read and was skipped: {e}")
+        return photos
+
+    @staticmethod
+    async def _generate_scene_frame(
+        scene: dict, reference_images: List[str], prev_image_url: Optional[str],
+        brand_context: Optional[Dict[str, Any]] = None,
+        identity_url: Optional[str] = None,
+    ) -> Optional[str]:
+        try:
+            shot = scene.get("shot_type", "").replace("_", " ")
+            video_prompt = scene.get("video_prompt", "")
+            motion = scene.get("motion", "")
+            continuity = scene.get("continuity_note") or ""
+            text = scene.get("text_overlay") or ""
+
+            prompt = (
+                f"Cinematic storyboard frame, {shot} shot. "
+                f"{video_prompt} "
+                f"Camera movement: {motion}. "
+                + (f"Continuity with the surrounding scenes: {continuity}. " if continuity else "")
+                # The scene's on-screen text is drawn onto the finished clip by ffmpeg (video_text_overlay.py): an
+                # image model's lettering is misspelt and the clip model then smears it. So none goes in the picture.
+                + ("The on-screen text is added in editing, so draw NO text, captions, titles or lettering of your own in the "
+                "picture, and keep the lower third of the frame calm and uncluttered. " if text else "")
+                + "Photorealistic, dramatic lighting. Vertical 9:16 composition. "
+                # The picture model draws only what it is told: without this it invents a brand on every box.
+                + VideoCreativeService._frame_branding(brand_context, "")
+            )
+
+            loop = asyncio.get_running_loop()
+
+            async def _edit(images: List[bytes], text: str):
+                files = [VideoCreativeService._as_file(b) for b in images]
+                return await loop.run_in_executor(
+                    None,
+                    lambda: openai_client.images.edit(
+                        image=files if len(files) > 1 else files[0],
+                        model="gpt-image-2",
+                        prompt=text,
+                        n=1,
+                        size="1024x1536",
+                        quality="medium",
+                    ),
+                )
+
+            # The owner's own photos (the product, the packaging, the place, themselves). EVERY frame is drawn
+            # with them in view, not just scene 1: a frame drawn only from the previous frame is a copy of a copy,
+            # and the product drifts away from the real photo by scene 2.
+            owner_photos = VideoCreativeService._owner_photos(reference_images)
+
+            if prev_image_url:
+                # Chain off the previous scene's own output — this is what
+                # keeps subject/setting/style consistent scene-to-scene.
+                img_bytes = await VideoCreativeService._download_image_bytes(prev_image_url)
+                chained_prompt = (
+                    "Keep the same subject, setting, and visual style as this image — "
+                    "this is the next moment in the same continuous scene. " + prompt
+                )
+                # Besides the previous frame: for a frame with people, the first frame they appeared in; and the
+                # owner's photos, so faces and the real product are copied from the source, not from a copy.
+                people = scene_has_people(scene)
+                extras: List[bytes] = []
+                if people and identity_url and identity_url != prev_image_url:
+                    extras.append(await VideoCreativeService._download_image_bytes(identity_url))
+                extras += owner_photos
+
+                if extras:
+                    try:
+                        resp = await _edit(
+                            [img_bytes] + extras,
+                            "Image 1 is the previous moment of this same continuous scene: keep its setting and "
+                            "visual style. The other image(s) are the real references: the owner's own photos "
+                            "and/or the first frame a person appeared in. " + VideoCreativeService._REFERENCE_FIDELITY
+                            + (" " + IDENTITY_LOCK if people else "") + " " + prompt,
+                        )
+                    except Exception as e:
+                        # The extra references are a bonus; never lose the frame over them.
+                        print(f"[CreativeFrame] Scene {scene.get('scene_number')}: references "
+                              f"failed ({e}); redrawing from the previous frame only")
+                        resp = await _edit([img_bytes], chained_prompt)
+                else:
+                    resp = await _edit([img_bytes], chained_prompt)
+            elif owner_photos:
+                grounded_prompt = (
+                    "The attached image(s) are the owner's real photos. Keep the real subject, product, and visual "
+                    "identity from them exactly as shown. " + VideoCreativeService._REFERENCE_FIDELITY + " " + prompt
+                )
+                try:
+                    resp = await _edit(owner_photos, grounded_prompt)
+                except Exception as e:
+                    if len(owner_photos) == 1:
+                        raise
+                    print(f"[CreativeFrame] Scene {scene.get('scene_number')}: {len(owner_photos)} photos "
+                          f"failed together ({e}); drawing from the first only")
+                    resp = await _edit(owner_photos[:1], grounded_prompt)
+            else:
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda: openai_client.images.generate(
+                        model="gpt-image-2",
+                        prompt=prompt,
+                        n=1,
+                        size="1024x1536",
+                        quality="medium",
+                    ),
+                )
+
+            out_bytes = base64.b64decode(resp.data[0].b64_json)
+            url = await upload_bytes(
+                out_bytes,
+                folder="uri-social/storyboard-frames",
+                resource_type="image",
+            )
+            return url
+        except Exception as e:
+            print(f"[CreativeFrame] Scene {scene.get('scene_number')} frame failed: {e}")
+            return None
+
+    @staticmethod
+    async def _download_image_bytes(url: str) -> bytes:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.content
+
+    @staticmethod
+    def _as_file(img_bytes: bytes):
+        f = BytesIO(img_bytes)
+        f.name = "reference.png"
+        return f

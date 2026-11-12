@@ -13,11 +13,34 @@ from datetime import datetime
 from bson import ObjectId
 
 from app.dependencies import get_db_dependency, flexible_auth
+from app.core.auth_bearer import JWTBearer
 from app.domain.responses.uri_response import UriResponse
 
 from ..services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
 router = APIRouter(tags=["Custom Visual Guides V2"])
+
+
+def _get_user_id(token: dict) -> str | None:
+    """Extract user_id from JWT payload"""
+    if not isinstance(token, dict):
+        return None
+
+    # flat keys
+    for k in ("user_id", "userId", "id", "sub"):
+        v = token.get(k)
+        if v:
+            return str(v)
+
+    # nested claims
+    claims = token.get("claims") or {}
+    if isinstance(claims, dict):
+        for k in ("userId", "user_id", "id", "sub"):
+            v = claims.get(k)
+            if v:
+                return str(v)
+
+    return None
 
 
 # ============================================================================
@@ -47,7 +70,7 @@ class GenerateWithV2GuideRequest(BaseModel):
 async def upload_reference_image_v2(
     request: UploadReferenceImageV2Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Upload and process reference image for Custom Visual Guide V2.
@@ -67,7 +90,7 @@ async def upload_reference_image_v2(
     Returns:
         Guide preview with style profile summary
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -124,7 +147,7 @@ async def upload_reference_image_v2(
 async def get_user_guides_v2(
     status: Optional[str] = Query("active", description="Filter by status: active | archived"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Get all Custom Visual Guides V2 for the authenticated user.
@@ -132,7 +155,7 @@ async def get_user_guides_v2(
     Returns:
         List of V2 guides with style profile summaries
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -181,7 +204,7 @@ async def get_user_guides_v2(
 async def get_guide_detail_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Get detailed information for a specific Custom Visual Guide V2.
@@ -189,7 +212,7 @@ async def get_guide_detail_v2(
     Returns:
         Complete guide data including full style profile JSON
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -229,11 +252,74 @@ async def get_guide_detail_v2(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/social-media/custom-guides-v2/{guide_id}")
+async def archive_guide_v2(
+    guide_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
+):
+    """
+    Archive (soft delete) a Custom Visual Guide V2.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        # 1. Archive the guide in database
+        result = await db["custom_visual_guides"].update_one(
+            {"_id": ObjectId(guide_id), "user_id": user_id, "version": "v2"},
+            {
+                "$set": {
+                    "status": "archived",
+                    "archived_at": datetime.utcnow(),
+                }
+            }
+        )
+
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
+
+        # 2. Remove from brand profile's selected_custom_guides_v2 array
+        await db["brand_profiles"].update_one(
+            {"user_id": user_id},
+            {"$pull": {"selected_custom_guides_v2": guide_id}}
+        )
+        print(f"[V2] Removed guide {guide_id} from user {user_id}'s selected_custom_guides_v2")
+
+        # 2b. Also remove it from every platform's own override, if any (VSG
+        # plan). $pull can't target every key of an arbitrary-keyed dict in
+        # one operator, so this is a read-modify-write instead of a second
+        # $pull — a deleted guide must not keep silently applying to a
+        # platform just because that lookup lives in a different field.
+        _profile_doc = await db["brand_profiles"].find_one(
+            {"user_id": user_id}, {"selected_custom_guides_v2_by_platform": 1}
+        )
+        _by_platform = (_profile_doc or {}).get("selected_custom_guides_v2_by_platform") or {}
+        if any(guide_id in (ids or []) for ids in _by_platform.values()):
+            _cleaned = {k: [g for g in (v or []) if g != guide_id] for k, v in _by_platform.items()}
+            await db["brand_profiles"].update_one(
+                {"user_id": user_id},
+                {"$set": {"selected_custom_guides_v2_by_platform": _cleaned}}
+            )
+            print(f"[V2] Also removed guide {guide_id} from per-platform overrides: {list(_by_platform.keys())}")
+
+        return UriResponse.create_response(
+            entity_name="Custom Visual Guide V2",
+            data={"archived": True},
+            message="Custom Visual Guide V2 archived successfully"
+        )
+
+    except Exception as e:
+        print(f"[V2 API] ❌ Error archiving V2 guide: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/social-media/custom-guides-v2/{guide_id}/reanalyze")
 async def reanalyze_guide_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Re-run GPT-4o Vision style extraction on an existing guide's reference
@@ -245,7 +331,7 @@ async def reanalyze_guide_v2(
     extraction-prompt improvement on a guide that was already analyzed, or
     to retry a guide whose style was misclassified the first time.
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -276,57 +362,11 @@ async def reanalyze_guide_v2(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/social-media/custom-guides-v2/{guide_id}")
-async def archive_guide_v2(
-    guide_id: str,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
-):
-    """
-    Archive (soft delete) a Custom Visual Guide V2.
-    """
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
-    try:
-        # 1. Archive the guide in database
-        result = await db["custom_visual_guides"].update_one(
-            {"_id": ObjectId(guide_id), "user_id": user_id, "version": "v2"},
-            {
-                "$set": {
-                    "status": "archived",
-                    "archived_at": datetime.utcnow(),
-                }
-            }
-        )
-
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
-
-        # 2. Remove from brand profile's selected_custom_guides_v2 array
-        await db["brand_profiles"].update_one(
-            {"user_id": user_id},
-            {"$pull": {"selected_custom_guides_v2": guide_id}}
-        )
-        print(f"[V2] Removed guide {guide_id} from user {user_id}'s selected_custom_guides_v2")
-
-        return UriResponse.create_response(
-            entity_name="Custom Visual Guide V2",
-            data={"archived": True},
-            message="Custom Visual Guide V2 archived successfully"
-        )
-
-    except Exception as e:
-        print(f"[V2 API] ❌ Error archiving V2 guide: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.post("/social-media/custom-guides-v2/generate")
 async def generate_with_v2_guide(
     request: GenerateWithV2GuideRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Generate image using Custom Visual Guide V2 + art director meta-prompt.
@@ -352,7 +392,7 @@ async def generate_with_v2_guide(
             "style_profile_used": str
         }
     """
-    user_id = auth.get("user_id")
+    user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 

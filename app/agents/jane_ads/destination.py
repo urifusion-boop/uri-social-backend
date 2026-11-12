@@ -328,10 +328,12 @@ def image_cta(destination_type: DestinationType) -> str:
     return _IMAGE_CTAS.get(destination_type, _IMAGE_CTAS[DEFAULT_DESTINATION])
 
 
-# What Meta is told to optimise for, per destination. Every ad is a link ad, so this
-# is always link clicks — but naming the actual place is what makes the plan card
+# What the platform is told to optimise for, per destination. Every ad is a link ad, so
+# this is always link clicks — but naming the actual place is what makes the plan card
 # readable, and hard-coding WhatsApp here put "WhatsApp link clicks / most likely to
-# message you" on a website campaign. Live-reported.
+# message you" on a website campaign. Live-reported. The reason text is a %s template so
+# the actual delivering platform gets named (this used to say "Meta" unconditionally,
+# which read wrong on a TikTok-bound plan).
 _OPTIMIZATION = {
     DestinationType.WHATSAPP: ("WhatsApp link clicks",
         "%s optimises delivery toward people most likely to tap through and message you."),
@@ -344,12 +346,30 @@ _OPTIMIZATION = {
 }
 
 
-def optimization_for(destination_type: DestinationType, platform_label: str = "Meta") -> tuple[str, str]:
+def optimization_for(destination_type: DestinationType, platform_label: str = "Meta",
+                     objective=None) -> tuple[str, str]:
     """The plan card's OPTIMIZATION row — its value and its reason. `platform_label` names
     the platform actually delivering the ad (defaults to "Meta" so every pre-existing call
-    site keeps its exact wording unless it opts in to naming a different platform)."""
+    site keeps its exact wording unless it opts in to naming a different platform).
+    An Awareness campaign on Meta optimises for reach wherever the tap goes."""
+    if getattr(objective, "value", objective) == "awareness" and platform_label.startswith("Meta"):
+        return "Reach", "Meta shows your ad to as many people in your audience as it can."
     value, reason_template = _OPTIMIZATION.get(destination_type, _OPTIMIZATION[DEFAULT_DESTINATION])
     return value, reason_template % platform_label
+
+
+_URL_IN_TEXT = re.compile(r"(?:https?://|www\.)[^\s,;()<>\[\]]+", re.I)
+_NOT_A_WEBSITE = ("wa.me", "whatsapp.com", "ig.me", "instagram.com", "facebook.com", "fb.com")
+
+
+def website_in_text(text: str) -> str:
+    """The first website address the client typed, if any. A chat or social link is a
+    different destination, so it never counts."""
+    for match in _URL_IN_TEXT.finditer(text or ""):
+        url = match.group(0).rstrip(".!?:'\"")
+        if not any(host in url.lower() for host in _NOT_A_WEBSITE):
+            return url
+    return ""
 
 
 def clicks_label(destination_type: DestinationType) -> str:

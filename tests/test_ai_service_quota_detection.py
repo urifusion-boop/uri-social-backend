@@ -62,12 +62,7 @@ def test_insufficient_quota_is_detected_even_though_it_is_also_a_rate_limit_erro
     monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
 
     result = run(AIService.chat_completion(_request()))
-    # This message's wording is prod's own pre-existing copy, kept as-is when this
-    # fix was ported over (merge/quota-alerts-to-prod) — only the detection order
-    # and the alert call are the actual fix; the text was never the bug.
-    assert result == {
-        "error": "Content generation is temporarily unavailable. Our team has been notified and will resolve this shortly."
-    }
+    assert result == {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
 
 
 def test_a_plain_rate_limit_with_no_quota_wording_still_gets_the_generic_message(monkeypatch):
@@ -75,7 +70,7 @@ def test_a_plain_rate_limit_with_no_quota_wording_still_gets_the_generic_message
     monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
 
     result = run(AIService.chat_completion(_request()))
-    assert result == {"error": "We're experiencing high demand right now. Please try again in a few moments."}
+    assert result == {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
 
 
 def test_insufficient_quota_raises_the_platform_alert(monkeypatch):
@@ -97,6 +92,41 @@ def test_insufficient_quota_raises_the_platform_alert(monkeypatch):
     assert captured["kind"] == "openai_insufficient_quota"
     assert "out of credit" in captured["title"].lower()
     assert "Content Calendar" in captured["detail"] and "Social Listening" in captured["detail"]
+
+
+def test_the_alert_detail_shows_openai_s_plain_sentence_not_the_raw_dict(monkeypatch):
+    """Live-found: the admin dashboard/email used to show the raw Python
+    dict repr of the error inline — technical, ugly, not user-friendly.
+    The detail text must carry OpenAI's own human sentence instead."""
+    captured = {}
+
+    async def fake_raise_alert(db, kind, title, detail, now=None):
+        captured.update(detail=detail)
+
+    from app.services import platform_alerts
+    import app.database as database_module
+    monkeypatch.setattr(platform_alerts, "raise_alert", fake_raise_alert)
+    monkeypatch.setattr(database_module, "get_db", lambda: object())
+
+    real_shaped_error = (
+        "Error code: 429 - {'error': {'message': 'You have no credits remaining. Add credits to "
+        "continue using the API at https://platform.openai.com/settings/organization/billing/.', "
+        "'type': 'insufficient_quota', 'param': None, 'code': 'credit_balance_exhausted'}}"
+    )
+    exc = _FakeRateLimitError(real_shaped_error)
+    monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
+
+    run(AIService.chat_completion(_request()))
+
+    assert "You have no credits remaining" in captured["detail"]
+    assert "{'error'" not in captured["detail"]  # the raw dict repr is gone
+    assert "credit_balance_exhausted" not in captured["detail"]
+
+
+def test_friendly_message_falls_back_to_the_raw_text_when_unparseable():
+    assert ai_service_module._friendly_openai_message("totally unexpected error shape") == (
+        "totally unexpected error shape"
+    )
 
 
 def test_a_plain_rate_limit_never_raises_the_platform_alert(monkeypatch):
@@ -126,9 +156,7 @@ def test_a_broken_alert_path_never_breaks_the_actual_ai_error_response(monkeypat
     monkeypatch.setattr(ai_service_module.client.chat.completions, "create", _raise(exc))
 
     result = run(AIService.chat_completion(_request()))  # must not raise
-    assert result == {
-        "error": "Content generation is temporarily unavailable. Our team has been notified and will resolve this shortly."
-    }
+    assert result == {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
 
 
 def test_structured_chat_completion_has_the_same_fix(monkeypatch):

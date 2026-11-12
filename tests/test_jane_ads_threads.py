@@ -96,3 +96,26 @@ def test_seed_message_rebuilds_brief_from_campaign():
 
 def test_seed_message_falls_back_when_nothing_stored():
     assert seed_message_from_campaign({}) == "Run another ad like my last one"
+
+
+def test_the_picked_audience_is_remembered_for_the_thread_only():
+    from app.agents.jane_ads.threads import chosen_audience, create_thread, remember_audience
+    from tests.test_jane_ads_growth import mongomock_motor, run
+    db = mongomock_motor.AsyncMongoMockClient()["threads"]
+    t = run(create_thread(db, "b1", "u1"))["thread_id"]
+    other = run(create_thread(db, "b1", "u1"))["thread_id"]
+    run(remember_audience(db, "b1", t, variant={"rank": 1, "audience_segment": "gym owners"}))
+    assert run(chosen_audience(db, "b1", t))["variant"]["audience_segment"] == "gym owners"
+    assert run(chosen_audience(db, "b1", other)) == {}
+    assert run(chosen_audience(db, "b2", t)) == {} and run(chosen_audience(db, "b1", "")) == {}
+
+
+def test_a_step_passed_with_no_picker_stays_passed():
+    from app.agents.jane_ads.threads import chosen_audience, create_thread, remember_audience
+    from tests.test_jane_ads_growth import mongomock_motor, run
+    db = mongomock_motor.AsyncMongoMockClient()["threads"]
+    t = run(create_thread(db, "b1", "u1"))["thread_id"]
+    run(remember_audience(db, "b1", t, passed=True))
+    assert run(chosen_audience(db, "b1", t))["passed"] is True
+    run(remember_audience(db, "b1", t))
+    assert run(chosen_audience(db, "b1", t))["passed"] is True

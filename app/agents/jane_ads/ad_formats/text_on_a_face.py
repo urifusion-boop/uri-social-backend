@@ -38,11 +38,19 @@ enforced as guards, not just documented:
    structural enforcement as Testimonial + Offer's permission_on_file: a
    required parameter with no default, not an implicit yes.
 
-4. "Text over skin tones is where legibility fails first — solid plate or
+4. WordsInSomeoneElsesMouth — a line across a face reads as that person
+   speaking. The statement is composed (the owner's position), so the face
+   must be the owner's or their team's (`speaker="owner"`). Over a
+   customer's face, an invented first-person line is a fabricated
+   testimonial: allowed only when the exact words are the customer's own,
+   found verbatim in `customer_words`.
+
+5. "Text over skin tones is where legibility fails first — solid plate or
    hard outline only." Enforced by construction: this module has no code
    path that draws text without first drawing the `field` plate beneath
    it — there is no floating-text option to reach for by mistake.
 """
+import re
 from typing import Dict, Tuple
 
 from ._content_guards import mentions_disallowed_personal_topic, presumes_viewer_attribute
@@ -58,9 +66,9 @@ FORMAT = AdFormatDef(
     asset_source="upload",  # upload_as_is only — never generate (§1.2)
     layers_used="L4",
     brand_mark="optional",  # VSG-01-PROMPTS v2 §6.7
-    requires=["real_customer_photo"],  # Requirement.REAL_CUSTOMER_PHOTO — a generated
-                                        # face paired with a first-person statement is a
-                                        # misleading representation (§1.2)
+    requires=["real_customer_photo"],  # a REAL person with consent — the orchestrator
+                                        # further narrows this to an owner/team photo,
+                                        # since the line is composed in the owner's voice
 )
 
 _FONT_STATEMENT = 48  # bold, prominent, above the §1.6 floor — checked against the
@@ -90,6 +98,32 @@ class DisallowedPersonalTopic(ValueError):
     pass
 
 
+class WordsInSomeoneElsesMouth(ValueError):
+    """A composed line across a customer's face presents words they never
+    said as theirs."""
+    pass
+
+
+SPEAKERS = ("owner", "customer")
+
+
+def _normalise(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _check_speaker(statement: str, speaker: str, customer_words: str) -> None:
+    if speaker not in SPEAKERS:
+        raise WordsInSomeoneElsesMouth(f"unknown speaker {speaker!r} — must be one of {SPEAKERS}")
+    if speaker == "owner":
+        return
+    said = _normalise(statement)
+    if not said or said not in _normalise(customer_words):
+        raise WordsInSomeoneElsesMouth(
+            f"statement {statement!r} is not in this customer's own words — a line across "
+            "a customer's face must be something they actually said"
+        )
+
+
 class TextNotOneLine(ValueError):
     """§2.7: 'One short line.' A face is not a paragraph surface — text
     that would wrap to more than one line at this plate's width/font is
@@ -112,19 +146,25 @@ def build_document(
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
     brand_logo_url: str = None,
+    *,
+    speaker: str = "owner",
+    customer_words: str = "",
 ) -> Dict:
     """
     photo_url: a real, permission-cleared close-up portrait — never
     generated (§1.2). Framing (eyes in the upper third) is a caller-side
     photography guarantee this module can't verify from a URL alone.
     statement: the seller's own position or an observed situation, one
-    short line — see the three hard-check guards in the module docstring.
+    short line — see the hard-check guards in the module docstring.
+    speaker: whose face this is — "owner" (the owner or their team) or
+    "customer", in which case `customer_words` must contain the statement.
     """
     if not permission_on_file:
         raise PermissionNotOnFile(
             "owner or consenting customer permission must be on file before this "
             "renders (§2.7) — pass permission_on_file=True only once confirmed"
         )
+    _check_speaker(statement, speaker, customer_words)
     if mentions_disallowed_personal_topic(statement):
         raise DisallowedPersonalTopic(
             f"statement {statement!r} touches health, body, finances or personal "
@@ -144,7 +184,8 @@ def build_document(
     _check_one_line(lines)
 
     plate_height = int(_FONT_STATEMENT * 1.8)
-    plate_y = int(height * 0.52)
+    # Below the face, not across it: a line over someone's mouth reads as a gag.
+    plate_y = int(height * 0.72)
 
     layers = []
     z = 0

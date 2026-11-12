@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.agents.social_media_manager.services import publish_confirmation as pc
+from app.services import brand_notifier as bn
 
 # Outstand's own words for Vchain's failed posts (production, October 2026).
 VCHAIN_ERROR = ("Error publishing post to Facebook: Failed to upload Facebook photo: 400 - Error validating access "
@@ -124,12 +125,6 @@ def _setup(submitted_minutes_ago=2, slow=False):
 def _quiet_notifications(monkeypatch):
     sent = []
 
-    class _NS:
-        async def notify_connection_disconnected(self, user_id, platform=""):
-            sent.append(("disconnected", platform))
-    import app.services.NotificationService as ns_mod
-    monkeypatch.setattr(ns_mod, "notification_service", _NS())
-
     async def fake_notify(db, draft, published, message=""):
         sent.append((published, message))
     monkeypatch.setattr(pc, "_notify", fake_notify)
@@ -171,12 +166,34 @@ class TestExplain:
     def test_expired_facebook_login_says_reconnect(self):
         info = pc.explain("facebook", VCHAIN_ERROR)
         assert info["reconnect"]
+        assert info["category"] == "known"
         assert "Reconnect Facebook in Connected Accounts" in info["message"]
 
     def test_other_errors_keep_the_networks_words(self):
         info = pc.explain("linkedin", "Content is a duplicate")
         assert not info["reconnect"]
+        assert info["category"] == "unknown"
         assert "LinkedIn" in info["message"] and "duplicate" in info["message"]
+
+    def test_lost_page_admin_rights_gets_its_own_accurate_message_not_the_generic_one(self):
+        # Live-reported: MEEQAT TRAVELS AND TOURS LTD's Facebook post failed
+        # this way. The generic "reconnect" message would be misleading here
+        # (reconnecting with the same now-demoted account hits this exact
+        # error again) — this needs its own specific explanation.
+        raw = ("Failed to upload Facebook photo: 400 - The user must be an administrator, editor, or moderator "
+               "of the page in order to impersonate it.")
+        info = pc.explain("facebook", raw)
+        assert info["reconnect"] is True
+        assert info["category"] == "known"
+        assert "no longer an admin, editor or moderator" in info["message"]
+        assert "connection has expired" not in info["message"]
+
+    def test_confirm_your_identity_does_not_ask_to_reconnect(self):
+        raw = "Failed to upload Facebook photo: 400 - Confirm your identity before you can publish as this Page."
+        info = pc.explain("facebook", raw)
+        assert info["reconnect"] is False
+        assert info["category"] == "content"
+        assert "confirm your identity" in info["message"].lower()
 
 
 class TestConfirm:
@@ -189,44 +206,55 @@ class TestConfirm:
         assert "Reconnect Facebook" in saved["error_message"]
         assert saved["network_error"] == VCHAIN_ERROR
         conns = {c["id"]: c for c in db["social_connections"].docs}
-        assert conns["c1"]["connection_status"] == "disconnected"   # prod's reconnect prompt
-        assert conns["c2"]["connection_status"] == "active"         # the other brand's page is untouched
-        assert ("disconnected", "facebook") in _quiet_notifications
-        assert (False, saved["error_message"]) in _quiet_notifications
+        assert conns["c1"].get("needs_reconnect") is True
+        assert not conns["c2"].get("needs_reconnect")          # the other brand's page is untouched
+        assert _quiet_notifications == [(False, saved["error_message"])]
 
     def test_unrecognized_error_does_not_flag_reconnect_on_one_failure(self, _quiet_notifications):
-        # A single occurrence of an error we've never catalogued must not
-        # trigger "reconnect your account" — it could just be this one post.
         db, draft = _setup()
         answer = {"post": {"publishedAt": None, "socialAccounts": [
             {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
         ]}}
         assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "failed"
-        assert db["social_connections"].docs[0]["connection_status"] == "active"
-        assert ("disconnected", "facebook") not in _quiet_notifications
+        assert not db["social_connections"].docs[0].get("needs_reconnect")
 
     def test_unrecognized_error_flags_reconnect_once_it_keeps_happening(self, _quiet_notifications):
         # The same uncatalogued error, repeated on the same connection, is a
-        # real pattern — this must escalate even though no one has written a
-        # pattern for this exact error text yet, instead of staying silent
-        # forever just because nobody's catalogued it.
+        # real pattern — it must escalate even though nobody's written a
+        # pattern for this exact text, instead of being silently ignored
+        # forever.
         db, draft = _setup()
         answer = {"post": {"publishedAt": None, "socialAccounts": [
             {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
         ]}}
-        from app.agents.social_media_manager.services.approval_workflow_service import UNKNOWN_FAILURE_ESCALATION_THRESHOLD
-        for i in range(UNKNOWN_FAILURE_ESCALATION_THRESHOLD):
+        result = None
+        for _ in range(pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD):
             draft["status"] = pc.CONFIRMING  # each call re-confirms as if resubmitted/re-polled
             result = _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
         assert result == "failed"
-        assert db["social_connections"].docs[0]["connection_status"] == "disconnected"
-        assert ("disconnected", "facebook") in _quiet_notifications
+        assert db["social_connections"].docs[0].get("needs_reconnect") is True
 
-    def test_live_marks_published(self, _quiet_notifications):
+    def test_a_success_in_between_resets_the_unrecognized_failure_count(self, _quiet_notifications):
         db, draft = _setup()
+        answer = {"post": {"publishedAt": None, "socialAccounts": [
+            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
+        ]}}
+        for _ in range(pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD - 1):
+            draft["status"] = pc.CONFIRMING
+            _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD - 1
+        live = {"post": {"publishedAt": "2026-10-15T09:01:00Z", "socialAccounts": [{"status": "published"}]}}
+        draft["status"] = pc.CONFIRMING
+        assert _run(pc.confirm(db, draft, outstand=_Outstand(live), now=NOW)) == "published"
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 0
+
+    def test_live_marks_published_and_clears_a_reconnect_flag(self, _quiet_notifications):
+        db, draft = _setup()
+        db["social_connections"].docs[0]["needs_reconnect"] = True
         answer = {"post": {"publishedAt": "2026-10-15T09:01:00Z", "socialAccounts": [{"status": "published"}]}}
         assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "published"
         assert db["content_drafts"].docs[0]["status"] == "published"
+        assert "needs_reconnect" not in db["social_connections"].docs[0]
         assert _quiet_notifications == [(True, "")]
 
     def test_still_going_is_never_called_failed(self, _quiet_notifications):
@@ -257,7 +285,7 @@ class TestConfirm:
         saved = db["content_drafts"].docs[0]
         assert saved["status"] == "publish_failed"
         assert "couldn't confirm" in saved["error_message"]
-        assert db["social_connections"].docs[0]["connection_status"] == "active"
+        assert not db["social_connections"].docs[0].get("needs_reconnect")
 
     def test_outstand_down_just_waits(self, _quiet_notifications):
         db, draft = _setup()
@@ -298,5 +326,35 @@ class TestSubmitHelpers:
         db, draft = _setup()
         msg = _run(pc.failed_on_submit(db, draft, {"outstand_account_id": "acc1"}, f"Outstand publish failed: {VCHAIN_ERROR}"))
         assert "Reconnect Facebook" in msg
-        assert db["social_connections"].docs[0]["connection_status"] == "disconnected"
-        assert (False, msg) in _quiet_notifications
+        assert db["social_connections"].docs[0]["needs_reconnect"] is True
+        assert _quiet_notifications == [(False, msg)]
+
+
+class _MotorLikeDB(_DB):
+    """A real Motor database raises if it is used as a boolean ("Database objects do not implement
+    truth value testing"); a plain dict never does, which is how this went unnoticed."""
+
+    def __bool__(self):
+        raise NotImplementedError("Database objects do not implement truth value testing or bool().")
+
+
+class TestARealDatabaseIsNeverTestedForTruth:
+    def test_an_unclassified_failure_still_counts_against_the_connection_and_notifies(self, _quiet_notifications):
+        db, draft = _setup()
+        db = _MotorLikeDB(db)
+        msg = _run(pc.failed_on_submit(db, draft, {"outstand_account_id": "acc1"}, "something nobody has seen before"))
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 1
+        assert _quiet_notifications == [(False, msg)]  # the owner is told; bookkeeping did not abort first
+
+    def test_a_successful_publish_resets_the_counter(self):
+        db, draft = _setup()
+        db["social_connections"].docs[0]["consecutive_publish_failures"] = 2
+        _run(pc._record_publish_success(_MotorLikeDB(db), draft))
+        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 0
+
+
+class TestFailureAlertIsAlwaysOn:
+    def test_post_failed_reaches_the_owner_whatever_they_picked(self):
+        assert bn.channels_for("post_failed", bn.preferences({})) == ["email"]
+        only_weekly = bn.preferences({"notification_events": ["Weekly performance report"], "notification_channel": "Slack"})
+        assert bn.channels_for("post_failed", only_weekly) == ["slack"]

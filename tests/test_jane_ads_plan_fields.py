@@ -57,6 +57,13 @@ def test_daily_spend_is_editable_and_destination_is_not():
     assert fields["destination"]["editable"] is False
 
 
+def test_editing_the_caption_cannot_remove_a_paid_partnership_label():
+    plan = _plan()
+    plan.creative.provenance = {"path": "ugc", "ugc_kind": "paid_creator", "disclosure": "Paid partnership"}
+    plan, _, _, _ = _run(apply_edits(plan, _req(), {"caption": "Fresh bread, delivered before 8am."}))
+    assert plan.creative.primary_text == "Fresh bread, delivered before 8am.\n\nPaid partnership."
+
+
 def test_editing_the_caption_is_what_launches():
     plan, req, applied, rejected = _run(apply_edits(
         _plan(), _req(), {"caption": "Fresh bread, delivered before 8am."}))
@@ -260,6 +267,146 @@ def test_shortening_the_run_is_a_valid_way_to_clear_the_floor():
     assert sorted(applied) == ["budget_ngn", "days"]
     assert req.budget_ngn == 4000
     assert plan.platforms[0].days == 2
+
+
+def _tiktok_plan(**over):
+    over.setdefault("platforms", [PlatformPlan(
+        platform=Platform.TIKTOK, budget_ngn=100000, days=5, variants=1,
+        test_scope=ABTestScope.NONE)])
+    return _plan(**over)
+
+
+# ── TikTok: which targeting fields are real ─────────────────────────────────
+# Live-caught 2026-09-23, revised 2026-09-25: locations/interests/gender/
+# placement/age used to render on a TikTok plan whether or not TikTok's own
+# launch step actually used them — it didn't use any of them, so editing them
+# was a no-op dressed up as a real edit. adapters/tiktok.py now genuinely uses
+# location/gender/age (confirmed against TikTok's own API reference), so those
+# three are real again for TikTok; interests and placement stay Meta-only
+# (interests have no TikTok mapping wired up yet, placement has no TikTok
+# equivalent at all).
+
+def test_describe_shows_real_tiktok_targeting_but_not_meta_only_fields():
+    # interests joined locations/gender/age as real for TikTok 2026-09-25
+    # (resolved against TikTok's own /tool/interest_category/) — only
+    # placement has no TikTok equivalent at all and stays hidden.
+    fields = {f["key"]: f for f in describe(_tiktok_plan(), _req())}
+    for key in ("locations", "interests", "gender", "age_min", "age_max"):
+        assert key in fields, f"{key} should be real (and shown) for TikTok now"
+    assert "placement" not in fields, "placement has no TikTok equivalent and must stay hidden"
+    assert "TikTok" in fields["interests"]["help"]
+    # Still real, still shown: TikTok's ad_text/budget/schedule are genuinely used.
+    assert "caption" in fields
+    assert "budget_ngn" in fields
+
+
+def test_describe_still_shows_all_meta_targeting_fields_for_a_meta_plan():
+    # Regression: the TikTok branch must not have narrowed Meta's own fields.
+    fields = {f["key"]: f for f in describe(_plan(), _req())}
+    for key in ("locations", "interests", "gender", "placement", "age_min", "age_max"):
+        assert key in fields
+    assert "tiktok_audience_note" not in fields
+
+
+def test_daily_spend_help_names_tiktoks_own_floor_not_metas():
+    fields = {f["key"]: f for f in describe(_tiktok_plan(), _req())}
+    assert "TikTok" in fields["daily_spend"]["help"]
+    assert "31,000" in fields["daily_spend"]["help"]
+    assert "Meta" not in fields["daily_spend"]["help"]
+
+
+def test_apply_edits_rejects_placement_on_a_tiktok_plan():
+    # placement has no TikTok equivalent at all — this must be refused without
+    # attempting any network call. Interests is tested separately below now
+    # that it's real for TikTok too.
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"placement": "instagram_only"}))
+    assert applied == []
+    assert len(rejected) == 1
+    assert "TikTok" in rejected[0]
+
+
+def test_apply_edits_interests_refused_without_tiktok_credentials():
+    # No monkeypatch on the Meta lookups here — if this reached
+    # _validated_interests it would try a real network call and the test
+    # would hang/error, which is itself proof the platform branch is right.
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"interests": ["Fashion"]}))
+    assert applied == []
+    assert "TikTok isn't configured" in rejected[0]
+
+
+def test_apply_edits_resolves_tiktok_interests_via_interest_category_not_meta(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        assert advertiser_id == "adv123"
+        assert access_token == "tiktok-tok"
+        return [{"name": "Education", "interest_category_id": "10"}], []
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_interests", _fake_resolve)
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"interests": ["Education"]},
+        tiktok_advertiser_id="adv123", tiktok_access_token="tiktok-tok",
+    ))
+    assert rejected == []
+    assert applied == ["interests"]
+    entry = plan.audience_targeting["flexible_spec"][0]
+    assert entry["interests"] == [{"id": "10", "name": "Education"}]
+
+
+def test_apply_edits_applies_gender_and_age_on_a_tiktok_plan():
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"gender": "women", "age_min": 25, "age_max": 45}))
+    assert rejected == []
+    assert sorted(applied) == ["age_max", "age_min", "gender"]
+    assert plan.audience_targeting["genders"] == [2]
+    assert plan.audience_targeting["age_min"] == 25
+    assert plan.audience_targeting["age_max"] == 45
+
+
+def test_apply_edits_resolves_tiktok_locations_via_tool_region_not_meta(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        assert advertiser_id == "adv123"
+        assert access_token == "tiktok-tok"
+        return [{"name": "Ikeja", "location_id": "2001"}], []
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_locations", _fake_resolve)
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"locations": ["Ikeja"]},
+        tiktok_advertiser_id="adv123", tiktok_access_token="tiktok-tok",
+    ))
+    assert rejected == []
+    assert applied == ["locations"]
+    assert [p.name for p in plan.geo.pins] == ["Ikeja"]
+
+
+def test_apply_edits_location_edit_refused_without_tiktok_credentials():
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"locations": ["Ikeja"]}))
+    assert applied == []
+    assert "TikTok isn't configured" in rejected[0]
+
+
+def test_apply_edits_uses_tiktoks_daily_floor_not_metas():
+    # ₦100,000 / 10 days = ₦10,000/day — clears Meta's ₦1,610 floor easily, but sits
+    # well under TikTok's real ₦31,000 floor. Must be refused for a TikTok plan.
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"days": 10}))
+    assert applied == []
+    assert "TikTok" in rejected[0]
+    assert "31,000" in rejected[0]
+
+
+def test_apply_edits_accepts_a_budget_days_pair_that_clears_tiktoks_real_floor():
+    # ₦45,000 / 1 day = ₦45,000/day — clears TikTok's ₦31,000 floor and stays under
+    # the fixture's ₦50,000 brand cap. Uses a req whose budget matches (the default
+    # _req() carries the unrelated ₦20,000 base fixture value).
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(budget_ngn=45000), {"days": 1}))
+    assert rejected == []
+    assert applied == ["days"]
+    assert plan.platforms[0].days == 1
 
 
 def test_duration_is_not_pinned_to_the_default():

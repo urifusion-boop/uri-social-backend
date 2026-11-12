@@ -609,7 +609,13 @@ async def redeem_access_code(
     # enforced here, not just hidden in the UI, so this can't be bypassed by
     # anyone who gets hold of the code string. Case-insensitive to match how
     # each address was normalized on creation/update.
-    assigned_emails = access_code.get("assigned_emails") or []
+    # A handful of codes predate the single-email -> roster migration
+    # (commit 8438595e) and were never backfilled, so they still carry the
+    # old assigned_to_email field — without this fallback, that assignment
+    # silently stops being enforced and the code becomes redeemable by
+    # anyone who gets hold of the string.
+    legacy_email = access_code.get("assigned_to_email")
+    assigned_emails = access_code.get("assigned_emails") or ([legacy_email] if legacy_email else [])
     if assigned_emails and user_email.lower() not in [e.lower() for e in assigned_emails]:
         raise HTTPException(status_code=403, detail="This code is reserved for specific people")
     max_redemptions = access_code.get("max_redemptions")

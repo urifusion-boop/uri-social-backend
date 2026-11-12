@@ -307,6 +307,101 @@ def violations(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
     return find_banned(text, banned_words(bc))
 
 
+# Natural-sounding fallback for each word in CaptionValidatorService.BANNED_WORDS —
+# used only by strip_banned_words() below, the last-resort, no-model guarantee
+# that runs after every AI rewrite attempt. A prompt-based retry can still fail
+# to comply (confirmed live: "effortlessly" shipped in a real carousel slide
+# even after a rewrite was specifically asked to remove "effortless" — the
+# retry mechanism only ever kept "whichever draft had fewer issues," never
+# guaranteed zero). This map makes the word physically impossible to ship,
+# independent of what any model does.
+_BANNED_WORD_FALLBACK: Dict[str, str] = {
+    "elevate": "improve", "curated": "selected", "seamless": "smooth",
+    "premium": "quality", "bespoke": "custom", "artisanal": "handmade",
+    "handcrafted": "handmade", "meticulously": "carefully", "next-level": "better",
+    "game-changer": "big help", "must-have": "useful", "cutting-edge": "modern",
+    "innovative": "smart", "revolutionary": "major", "transformative": "powerful",
+    "unparalleled": "rare", "synergy": "teamwork", "leverage": "use",
+    "holistic": "complete", "paradigm": "approach", "drumroll": "",
+    "spoiler alert": "", "plot twist": "turn", "pro tip": "tip",
+    "here's the thing": "truth is", "here's why": "here is why",
+    "let that sink in": "think about that", "read that again": "",
+    "can we talk about": "let's talk about", "let's normalize": "let's accept",
+    "i said what i said": "", "understood the assignment": "", "chef's kiss": "great",
+    "transform": "improve", "unlock": "get", "discover": "see", "journey": "process",
+    "empower": "help", "unleash": "use", "supercharge": "boost", "harness": "use",
+    "delve": "look", "dive into": "look at", "deep dive": "closer look",
+    "next level": "better", "skyrocket": "grow fast", "effortless": "simple",
+    "navigate the": "handle the",
+}
+
+
+# A few BANNED_WORD_FALLBACK entries are adjectives whose -ly adverb form is
+# irregular, not "word+ly" ("effortlessly", not "effortlessly" -> "simplely").
+# Confirmed live: the exact bug this backstop exists for was "...all in one
+# place, effortlessly." — worth getting the adverb right since it's the one
+# shape real text keeps using.
+_BANNED_ADVERB_FALLBACK: Dict[str, str] = {
+    "effortless": "simply",
+    "seamless": "smoothly",
+}
+
+
+def _word_strip_pattern(word: str) -> "re.Pattern":
+    """Case-insensitive, word-boundary-safe: matches the word/phrase plus any
+    trailing letters (so banning "effortless" also catches "effortlessly"),
+    without matching mid-word ("ok" must never hit "book"). Simpler and
+    case-insensitive on purpose — unlike banned_pattern() above, which assumes
+    an already-lowercased haystack and is tuned for *detecting* custom brand
+    words, this one *rewrites* real, mixed-case text."""
+    return re.compile(r"(?<!\w)" + re.escape(word.strip().lower()) + r"[a-z]*", re.IGNORECASE)
+
+
+def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None, universal: bool = True) -> str:
+    """Guarantee, with certainty (no model involved): the text that comes out
+    contains none of CaptionValidatorService.BANNED_WORDS and none of
+    `extra_words` (a brand's own custom list), in any form. This is the floor
+    enforce() applies after every AI rewrite — a model can still fail to
+    comply with a correction prompt; this cannot fail to comply, because
+    nothing here calls a model at all.
+
+    universal=False keeps only the brand's own words: the built-in list is about caption clichés, and its
+    swaps ("transformation" -> "improve") read wrongly in other writing, e.g. a video's creative direction."""
+    if not text:
+        return text
+    from .caption_validator_service import CaptionValidatorService
+    words = (list(CaptionValidatorService.BANNED_WORDS) if universal else []) + [
+        str(w) for w in (extra_words or []) if str(w).strip()]
+    out = text
+    for word in words:
+        key = word.strip().lower()
+        if not key:
+            continue
+        # The brand's own words are removed, never swapped: a swap table written for caption clichés turns
+        # "a transformation story" into "an improve story".
+        default = _BANNED_WORD_FALLBACK.get(key, "") if universal else ""
+        adverb = _BANNED_ADVERB_FALLBACK.get(key) if universal else None
+
+        def _sub(m: "re.Match") -> str:
+            if adverb and m.group(0).lower().endswith("ly") and not key.endswith("ly"):
+                return adverb
+            return default
+
+        out = _word_strip_pattern(word).sub(_sub, out)
+    if out == text:
+        return text
+    # Tidy the punctuation/spacing artifacts a removal or swap can leave behind.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"[ \t]+([,.!?;:])", r"\1", out)
+    out = re.sub(r",\s*,", ",", out)
+    out = re.sub(r",\s*\.", ".", out)
+    out = re.sub(r"\band\s*,", ",", out, flags=re.IGNORECASE)
+    out = re.sub(r",?\s*\band\s*\.", ".", out, flags=re.IGNORECASE)
+    out = re.sub(r"(?m)^[ \t]*,[ \t]*", "", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
+
+
 # ── 1b. After writing: check, then enforce ───────────────────────────────────
 # Asking for a rule is not the same as getting it. On dev, with every rule in
 # the prompt, captions still came back with an invented "Over 70% of small
@@ -512,16 +607,20 @@ def audit(text: str, bc: Optional[Dict[str, Any]], sources: str = "") -> List[Di
     return issues
 
 
-def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) -> str:
+def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True, universal: bool = True) -> str:
     """The rules that can be guaranteed without a model. Runs last, so whatever
     the writer or the rewrite did, these hold on what is saved:
       • "no emojis" — every emoji is removed
+      • no banned word ships, in any form — universal list and the brand's
+        own custom list alike, even if every AI rewrite attempt missed one
+        (confirmed live: they can)
       • the brand's call-to-action closes the piece (append_cta=False where a
         line can't simply be added, e.g. a tweet thread)."""
     bc = bc or {}
     out = text or ""
     if emoji_mode(bc) == "no":
         out = strip_emojis(out)
+    out = strip_banned_words(out, banned_words(bc), universal=universal)
     if append_cta and out.strip() and not has_cta(out, bc):
         cta = ctas(bc)[0].strip()
         if cta[-1:] not in ".!?":
@@ -530,6 +629,80 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
     elif append_cta and out.strip():
         out = cta_last(out, bc)
     return out
+
+
+def script_violations(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]], direction: bool = True) -> List[str]:
+    """The brand's own banned words found in the words a viewer will read or hear (and the creative direction)."""
+    words = banned_words(bc)
+    if not words or not isinstance(storyboard, dict):
+        return []
+    texts = [str(scene.get(k) or "") for scene in storyboard.get("scenes") or [] if isinstance(scene, dict)
+             for k in ("text_overlay", "dialogue")]
+    if direction:
+        texts.append(str(storyboard.get("creative_direction") or ""))
+    return find_banned(" ".join(texts), words)
+
+
+def _brand_name(bc: Optional[Dict[str, Any]]) -> str:
+    return str((bc or {}).get("brand_name") or "").strip()
+
+
+def visual_branding_rule(bc: Optional[Dict[str, Any]]) -> str:
+    """For the script writer: what may be written into a video_prompt about brands, logos and lettering.
+    Without it the picture model invents one ("Lagos Luxe Beauty" on every box and uniform)."""
+    name = _brand_name(bc)
+    allowed = f'The only brand name that may appear anywhere in the video is "{name}". ' if name else ""
+    return (
+        "BRANDS IN THE PICTURES: " + allowed + "Never invent or name any other brand, shop, company, logo or slogan "
+        "in a video_prompt. Describe packaging, uniforms, mugs, signs, screens and documents as plain and "
+        "unbranded, with no readable words, unless the lettering is the brand's own name."
+    )
+
+
+def frame_branding_rules(bc: Optional[Dict[str, Any]], allowed_text: str = "") -> str:
+    """For the picture model, appended to every scene image prompt: the brand's own colours, and no invented
+    brand names, logos or lettering anywhere in the frame."""
+    name = _brand_name(bc)
+    colors = ", ".join(str(c) for c in ((bc or {}).get("brand_colors") or [])[:4])
+    parts = []
+    if colors:
+        parts.append(
+            f"Brand colours ({colors}) belong on the brand's own product, packaging, uniforms, signage and graphics. "
+            "The rest of the frame — setting, skin, food, sky, nature, backgrounds — uses natural colours that suit "
+            "the mood; do not tint the whole frame in the brand palette."
+        )
+    only = f'any lettering is exactly "{name}"' if name else "there is no lettering at all"
+    parts.append(
+        "Do NOT invent or show any brand, shop, company or product name, logo or slogan. Packaging, uniforms, "
+        "mugs, bags, signs, screens and documents are plain and unbranded with no readable words, unless "
+        + only + (f' or exactly the on-screen text given ("{allowed_text}")' if allowed_text else "") + "."
+    )
+    return " ".join(parts)
+
+
+def video_platform(target_platform: str) -> str:
+    """The social platform behind a video target ("instagram_reels" -> "instagram", "youtube_shorts" -> "youtube")."""
+    return _platform_key(str(target_platform or "").split("_")[0])
+
+
+def enforce_video_script(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]], direction: bool = True) -> Dict[str, Any]:
+    """The Playbook rules a model can still break, guaranteed on the words a viewer will read or hear: each
+    scene's on-screen text and spoken line (and the creative direction, unless the owner wrote it themselves).
+    None of the brand's own banned words and, under "no emojis", no emoji gets through. The built-in caption-cliché
+    list is NOT applied here: its swaps ("transformation" -> "improve") garble a video's wording.
+    video_prompt is left alone: it describes pictures, not words."""
+    if not isinstance(storyboard, dict) or not bc:
+        return storyboard
+    for scene in storyboard.get("scenes") or []:
+        if not isinstance(scene, dict):
+            continue
+        for key in ("text_overlay", "dialogue"):
+            if isinstance(scene.get(key), str) and scene[key].strip():
+                scene[key] = enforce(scene[key], bc, append_cta=False, universal=False)
+    if direction and isinstance(storyboard.get("creative_direction"), str):
+        storyboard["creative_direction"] = enforce(
+            storyboard["creative_direction"], bc, append_cta=False, universal=False)
+    return storyboard
 
 
 def cta_last(text: str, bc: Optional[Dict[str, Any]]) -> str:

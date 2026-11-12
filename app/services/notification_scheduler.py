@@ -93,6 +93,27 @@ def _run_async(job_id: str, coro_func):
         print("⚠️ Main event loop not available — skipping scheduled job")
 
 
+def _brand_alert_job(job_id: str, fn_name: str):
+    """Brand Playbook alerts (app/services/brand_alert_jobs.py) — only brands
+    that switched the alert on in their Playbook are notified."""
+    async def _run():
+        from app.database import get_db
+        from app.services import brand_alert_jobs
+        result = await getattr(brand_alert_jobs, fn_name)(get_db())
+        print(f"🔔 {job_id}: {result}")
+    _run_async(job_id, _run)
+
+
+def _job_google_ads_link_reminders():
+    """A day after a Google Ads link request that's still waiting, remind the owner once."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.google_ads_connection import remind_pending_links
+        result = await remind_pending_links(get_db())
+        print(f"🔔 google_ads_link_reminders: {result}")
+    _run_async("google_ads_link_reminders", _run)
+
+
 def _job_publish_confirmations():
     """Posts Outstand accepted but hasn't confirmed live yet: ask what happened,
     mark them published or failed (with the reason), and flag expired logins."""
@@ -103,6 +124,17 @@ def _job_publish_confirmations():
         if result["published"] or result["failed"] or result["pending"]:
             print(f"🔎 publish_confirmations: {result}")
     _run_async("publish_confirmations", _run)
+
+
+def _job_sweep_publish_jobs():
+    """Publish jobs whose worker went away mid-publish (a restart) are failed with a clear message
+    instead of showing "uploading" forever."""
+    async def _run():
+        from app.agents.social_media_manager.services import video_publish_service
+        marked = await video_publish_service.mark_stale_jobs()
+        if marked:
+            print(f"🧹 sweep_publish_jobs: marked {marked} interrupted publish job(s) as failed")
+    _run_async("sweep_publish_jobs", _run)
 
 
 def _job_connection_health_check():
@@ -116,17 +148,6 @@ def _job_connection_health_check():
         result = await connection_health_check.check_all_connections(get_db())
         print(f"🔌 connection_health_check: {result}")
     _run_async("connection_health_check", _run)
-
-
-def _brand_alert_job(job_id: str, fn_name: str):
-    """Brand Playbook alerts (app/services/brand_alert_jobs.py) — only brands
-    that switched the alert on in their Playbook are notified."""
-    async def _run():
-        from app.database import get_db
-        from app.services import brand_alert_jobs
-        result = await getattr(brand_alert_jobs, fn_name)(get_db())
-        print(f"🔔 {job_id}: {result}")
-    _run_async(job_id, _run)
 
 
 def _job_weekly_reports():
@@ -225,6 +246,140 @@ def _job_jane_ads_billing():
         result = await reconcile_ad_spend_charges(db)
         print(f"💳 Jane Ads billing: {result}")
     _run_async("jane_ads_billing", _run)
+
+
+def _job_video_billing_reaper():
+    """Give back credits for video / storyboard runs that a server restart cut short (see
+    video_generation_billing.reap_stranded). A no-op while video billing is off."""
+    async def _run():
+        from app.agents.social_media_manager.services import video_generation_billing as billing
+        if billing.mode() != "on":
+            return
+        result = await billing.reap_stranded()
+        if result.get("storyboards") or result.get("videos") or result.get("needs_review"):
+            print(f"💳 Video billing reaper: {result}")
+    _run_async("video_billing_reaper", _run)
+
+
+def _job_market_intelligence_scheduled_scans():
+    """Uri Market Intelligence scheduled collection (PRD §18) — hourly check
+    of active keep_updating topics. Dev-only feature (see the module's own
+    docstrings); import-guarded so this job is a silent no-op rather than an
+    hourly error log anywhere the market_intelligence package doesn't exist."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.scheduler import run_scheduled_market_intelligence_scans
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await run_scheduled_market_intelligence_scans(db)
+        print(f"🔎 Market Intelligence scheduled scans: {result}")
+    _run_async("market_intelligence_scheduled_scans", _run)
+
+
+def _job_market_intelligence_outbox():
+    """Uri Market Intelligence immediate-notification delivery worker (PRD
+    §14) — drains queued immediate outbox entries every 15 minutes. Same
+    import-guard rationale as the scan job above."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.notification_delivery import process_outbox
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await process_outbox(db)
+        print(f"📬 Market Intelligence outbox: {result}")
+    _run_async("market_intelligence_outbox", _run)
+
+
+def _job_listening_cycle():
+    """Listening Intelligence: collect due markets, read new posts, detect
+    signals and write each business's recommendation cards. Hourly tick;
+    each market is only collected when its own cadence is due."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.cycle import run_cycle
+        except ImportError:
+            return
+        from app.database import get_db
+        result = await run_cycle(get_db())
+        print(f"👂 Listening cycle: markets={len(result.get('markets', []))} cards={result.get('cards')} "
+              f"alerts={result.get('alerts')} {result.get('note') or ''}")
+    _run_async("listening_cycle", _run)
+
+
+def _job_market_intelligence_digests():
+    """Uri Market Intelligence daily digest delivery (PRD §14) — runs
+    hourly and only actually sends for recipients whose configured digest
+    hour matches the current hour in their own timezone."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.notification_delivery import send_daily_digests
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await send_daily_digests(db)
+        print(f"📰 Market Intelligence digests: {result}")
+    _run_async("market_intelligence_digests", _run)
+
+
+def _job_listening_weekly_digest():
+    """Listening Intelligence weekly digest (PRD §10) — runs daily; the
+    claim is per ISO week, so whichever day's tick gets there first for a
+    brand sends it and every later tick that week is a no-op."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.digest import send_weekly_digests
+            from app.agents.market_intelligence.listening.config import get_config
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        cfg = await get_config(db)
+        result = await send_weekly_digests(db, cfg)
+        print(f"👂📰 Listening weekly digest: {result}")
+    _run_async("listening_weekly_digest", _run)
+
+
+def _job_market_intelligence_inquiry_expiry():
+    """Uri Market Intelligence purchase-inquiry expiry/re-scoring (PRD
+    §12) — hourly. An inquiry insight is written once at compose time and
+    never revised afterward the way a cluster-backed insight is, so
+    nothing else in this codebase keeps an active inquiry's urgency flag
+    (or its active status at all, once its 48h window closes) correct as
+    wall-clock time moves on. Same import-guard rationale as the other
+    Market Intelligence jobs above."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.insight_expiry import expire_stale_inquiries
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await expire_stale_inquiries(db)
+        print(f"⏳ Market Intelligence inquiry expiry: {result}")
+    _run_async("market_intelligence_inquiry_expiry", _run)
+
+
+def _job_listening_retention():
+    """Listening Intelligence retention (PRD §12, §15) — daily. Deletes
+    items and readings past the configured retention window; everything
+    derived (topic counts, the topic graph, cards) is kept long-term."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.listening.retention import enforce_retention
+            from app.agents.market_intelligence.listening.config import get_config
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        cfg = await get_config(db)
+        result = await enforce_retention(db, cfg)
+        print(f"👂🗑️ Listening retention: {result}")
+    _run_async("listening_retention", _run)
 
 
 def _job_publish_scheduled_content():
@@ -337,6 +492,14 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Video credits: every 10 minutes, return credits for runs a restart cut short.
+    _scheduler.add_job(
+        _job_video_billing_reaper,
+        CronTrigger(minute="*/10"),
+        id="video_billing_reaper",
+        **_JOB_DEFAULTS,
+    )
+
     # Growth Intelligence hourly, offset from billing so the two don't share Meta's
     # rate limit in the same minute.
     _scheduler.add_job(
@@ -396,19 +559,93 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
-    # reconcile_published_posts is NOT yet registered on an automatic cron —
-    # deliberately. It's new, unvalidated against real production data, and
-    # on a match it writes a customer-visible status change and fires a real
-    # notification. Trigger it manually first via the Admin page ("Reconcile
-    # Facebook/Outstand Publishes" in admin_router.py's
-    # POST /api/admin/social-media/reconcile-published-posts) and confirm its
-    # behavior against real drafts before adding it here on a schedule.
+    # Uri Market Intelligence scheduled collection (PRD §18) — hourly,
+    # offset from the top of the hour. Dev-only feature; import-guarded
+    # inside the job itself (see _job_market_intelligence_scheduled_scans).
+    _scheduler.add_job(
+        _job_market_intelligence_scheduled_scans,
+        CronTrigger(minute=20),
+        id="market_intelligence_scheduled_scans",
+        **_JOB_DEFAULTS,
+    )
+
+    # Uri Market Intelligence immediate-notification delivery (PRD §14) —
+    # every 15 minutes, so an "act soon" or qualified-inquiry alert doesn't
+    # sit queued for up to an hour. Dev-only; import-guarded.
+    _scheduler.add_job(
+        _job_market_intelligence_outbox,
+        CronTrigger(minute="*/15"),
+        id="market_intelligence_outbox",
+        **_JOB_DEFAULTS,
+    )
+
+    # Uri Market Intelligence daily digests (PRD §14) — hourly; the job
+    # itself only sends for recipients whose digest hour matches now.
+    # Dev-only; import-guarded.
+    _scheduler.add_job(
+        _job_market_intelligence_digests,
+        CronTrigger(minute=45),
+        id="market_intelligence_digests",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence: hourly tick, per-market cadence decides real work.
+    _scheduler.add_job(
+        _job_listening_cycle,
+        CronTrigger(minute=35),
+        id="listening_cycle",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence weekly digest: daily tick, the weekly claim
+    # inside the job itself decides whether anything actually sends.
+    _scheduler.add_job(
+        _job_listening_weekly_digest,
+        CronTrigger(hour=9, minute=10),
+        id="listening_weekly_digest",
+        **_JOB_DEFAULTS,
+    )
+
+    # Uri Market Intelligence purchase-inquiry expiry/re-scoring (PRD §12) —
+    # hourly, so the urgent badge and the active list stay correct as
+    # inquiries age past their freshness window instead of only being
+    # right at the moment they were first composed. Dev-only; import-guarded.
+    _scheduler.add_job(
+        _job_market_intelligence_inquiry_expiry,
+        CronTrigger(minute=55),
+        id="market_intelligence_inquiry_expiry",
+        **_JOB_DEFAULTS,
+    )
+
+    # Listening Intelligence retention: daily, off-peak.
+    _scheduler.add_job(
+        _job_listening_retention,
+        CronTrigger(hour=3, minute=15),
+        id="listening_retention",
+        **_JOB_DEFAULTS,
+    )
+
+    # Google Ads: one reminder when a link request is still waiting a day later.
+    _scheduler.add_job(
+        _job_google_ads_link_reminders,
+        CronTrigger(minute=20),
+        id="google_ads_link_reminders",
+        **_JOB_DEFAULTS,
+    )
 
     # Confirm that accepted posts actually reached the network.
     _scheduler.add_job(
         _job_publish_confirmations,
         CronTrigger(minute="*/2"),
         id="publish_confirmations",
+        **_JOB_DEFAULTS,
+    )
+
+    # Fail publish jobs whose worker restarted mid-publish, so they don't spin forever.
+    _scheduler.add_job(
+        _job_sweep_publish_jobs,
+        CronTrigger(minute="*/10"),
+        id="sweep_publish_jobs",
         **_JOB_DEFAULTS,
     )
 
@@ -422,7 +659,7 @@ def start_notification_scheduler():
     )
 
     _scheduler.start()
-    print("📅 Notification scheduler started with 15 jobs")
+    print("📅 Notification scheduler started with 24 jobs")
 
 
 def stop_notification_scheduler():

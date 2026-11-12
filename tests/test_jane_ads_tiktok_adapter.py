@@ -18,8 +18,6 @@ import pytest
 from app.agents.jane_ads.adapters.tiktok import (
     TikTokAdsAdapter,
     TikTokAdsAPIError,
-    _force_jpg_delivery,
-    _force_tiktok_video_ratio,
     _resolve_tiktok_interests,
     _resolve_tiktok_locations,
     _tiktok_age_groups_for,
@@ -31,7 +29,6 @@ from app.agents.jane_ads.adapters.tiktok import (
     _tiktok_location_names,
     _tiktok_schedule_days,
     _tiktok_schedule_has_ended,
-    _video_thumbnail_url,
 )
 from app.agents.jane_ads.models import (
     ABTestScope,
@@ -133,6 +130,30 @@ def _adapter(db=None) -> TikTokAdsAdapter:
     return TikTokAdsAdapter(db or FakeDb(), advertiser_id="adv123", access_token="tok")
 
 
+@pytest.fixture(autouse=True)
+def _media_normalization_passthrough():
+    """ensure_jpg/ensure_tiktok_video do a real download + ffmpeg/PIL pass + S3
+    re-upload (see tiktok_media.py) — none of that belongs in these adapter tests,
+    which mock httpx.AsyncClient for the TikTok API calls only (and would otherwise
+    have that same mock's queued responses consumed by the media functions' own
+    internal .get() calls, corrupting the sequence). Default every test to an
+    identity pass-through; the handful of tests about media normalization itself
+    override this with their own patch, which takes precedence for their duration."""
+    with patch("app.agents.jane_ads.adapters.tiktok.ensure_jpg", new=AsyncMock(side_effect=lambda url: url)), \
+         patch("app.agents.jane_ads.adapters.tiktok.ensure_tiktok_video", new=AsyncMock(side_effect=lambda url: url)):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_behaviour_targeting_lookups():
+    """The video / creator / hashtag audience lookups are extra GETs, which would consume this file's fixed-order
+    queued responses. They have their own tests in test_jane_ads_tiktok_behavior_targeting.py."""
+    from app.agents.jane_ads.adapters.tiktok_behavior_targeting import BehaviorTargeting
+    with patch("app.agents.jane_ads.adapters.tiktok.resolve_behavior_targeting",
+               new=AsyncMock(return_value=BehaviorTargeting())):
+        yield
+
+
 # campaign(POST), video upload(POST), cover image upload(POST), ad group(POST),
 # identity lookup(GET), ad(POST) — 6 calls total. Identity lookup replaced the
 # old logo-upload+identity-create POST pair after TikTok deprecated Custom
@@ -142,14 +163,15 @@ def _adapter(db=None) -> TikTokAdsAdapter:
 # image_ids entry ("You must upload an image."), even though it's video-only.
 _HAPPY_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
     {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
-    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"identity_list": [
         {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
          "username": "uri.creative", "display_name": "uricreative"},
     ]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+    {"code": 0, "message": "OK"},  # ad/status/update, which keeps the new ad off
 ]
 
 
@@ -357,7 +379,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert result.campaign_id == "111"
     assert result.ad_ids == {"b1": "333"}
     assert result.platforms == [Platform.TIKTOK]
-    assert mock_client.post.call_count == 5
+    assert mock_client.post.call_count == 6
     assert mock_client.get.call_count == 1
 
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
@@ -368,15 +390,15 @@ def test_launch_campaign_happy_path_full_call_sequence():
     # warm up — the HEAD pre-fetch must not fire needlessly.
     assert mock_client.head.call_count == 0
 
-    video_json = mock_client.post.call_args_list[1].kwargs["json"]
+    video_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert video_json["upload_type"] == "UPLOAD_BY_URL"
     assert video_json["video_url"] == "https://cdn.example.com/clip.mp4"
 
-    cover_json = mock_client.post.call_args_list[2].kwargs["json"]
+    cover_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert cover_json["upload_type"] == "UPLOAD_BY_URL"
     assert cover_json["image_url"] == "https://cdn.example.com/cover.jpg"
 
-    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert adgroup_json["operation_status"] == "DISABLE"
     assert adgroup_json["budget"] == 70_000
     assert adgroup_json["campaign_id"] == "111"
@@ -409,15 +431,16 @@ def test_launch_campaign_happy_path_full_call_sequence():
     # A second launch must reuse the cached identity — no repeat lookup call.
     mock_client2 = _mock_client([
         {"code": 0, "message": "OK", "data": {"campaign_id": "444"}},
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "555"}},
         {"code": 0, "message": "OK", "data": [{"video_id": "vid_000", "video_cover_url": "https://cdn.example.com/cover2.jpg"}]},
         {"code": 0, "message": "OK", "data": {"image_id": "img_000"}},
-        {"code": 0, "message": "OK", "data": {"adgroup_id": "555"}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["666"]}},
+        {"code": 0, "message": "OK"},  # ad/status/update
     ])
     with patch("httpx.AsyncClient") as MockClient2:
         MockClient2.return_value.__aenter__.return_value = mock_client2
         _run(adapter.launch_campaign(_plan(business_id="b2"), _auth()))
-    assert mock_client2.post.call_count == 5
+    assert mock_client2.post.call_count == 6
     assert mock_client2.get.call_count == 0
     ad_json_2 = mock_client2.post.call_args_list[4].kwargs["json"]
     assert ad_json_2["creatives"][0]["identity_id"] == "identity_777"
@@ -430,23 +453,23 @@ def test_launch_campaign_happy_path_full_call_sequence():
 
 
 def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
-    # campaign(POST), video(POST), cover(POST), region lookup(GET), interest
-    # lookup(GET), adgroup(POST), identity(GET), ad(POST) — the two new lookups
-    # land between the creative upload and adgroup/create, exactly where
-    # they're inserted in launch_campaign, since _mock_client's .get/.post
-    # share one response queue.
+    # region lookup(GET), interest lookup(GET), campaign(POST), adgroup(POST),
+    # video(POST), cover(POST), identity(GET), ad(POST), ad status(POST). The lookups
+    # come first because the ad group needs them, and _mock_client's .get/.post share
+    # one response queue.
     responses = [
-        {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
-        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
-        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         _REGION_TREE_RESPONSE,
         _INTEREST_CATEGORIES_RESPONSE,
+        {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
         {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
+        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         {"code": 0, "message": "OK", "data": {"identity_list": [
             {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
              "username": "uri.creative", "display_name": "uricreative"},
         ]}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+        {"code": 0, "message": "OK"},  # ad/status/update
     ]
     db = FakeDb()
     adapter = _adapter(db)
@@ -463,10 +486,10 @@ def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
         result = _run(adapter.launch_campaign(plan, _auth()))
 
     assert result.campaign_id == "111"
-    assert mock_client.post.call_count == 5
+    assert mock_client.post.call_count == 6
     assert mock_client.get.call_count == 3  # region lookup + interest lookup + identity lookup
 
-    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert adgroup_json["location_ids"] == ["2001"]  # Ikeja, resolved
     assert adgroup_json["gender"] == "GENDER_FEMALE"
     assert adgroup_json["age_groups"] == ["AGE_25_34", "AGE_35_44", "AGE_45_54"]
@@ -480,14 +503,15 @@ def test_launch_campaign_omits_interest_category_ids_when_none_given():
     # an interest lookup call, and must not send the key rather than an empty list.
     responses = [
         {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
         {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
         {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
-        {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
         {"code": 0, "message": "OK", "data": {"identity_list": [
             {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
              "username": "uri.creative", "display_name": "uricreative"},
         ]}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+        {"code": 0, "message": "OK"},  # ad/status/update
     ]
     adapter = _adapter()
     with patch("httpx.AsyncClient") as MockClient:
@@ -497,7 +521,7 @@ def test_launch_campaign_omits_interest_category_ids_when_none_given():
 
     assert result.campaign_id == "111"
     assert mock_client.get.call_count == 1  # identity lookup only
-    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert "interest_category_ids" not in adgroup_json
 
 
@@ -511,15 +535,16 @@ def test_launch_campaign_omits_interest_category_ids_when_none_given():
 # as "The source of this post is invalid" before this was added.
 _CAROUSEL_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"image_id": "img_a"}},
     {"code": 0, "message": "OK", "data": {"image_id": "img_b"}},
-    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"identity_list": [
         {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
          "username": "uri.creative", "display_name": "uricreative"},
     ]}},
     {"code": 0, "message": "OK", "data": {"musics": [{"music_id": "music_999", "name": "Upbeat Track"}]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+    {"code": 0, "message": "OK"},  # ad/status/update, which keeps the new ad off
 ]
 
 
@@ -543,12 +568,12 @@ def test_launch_campaign_carousel_happy_path():
         result = _run(adapter.launch_campaign(_carousel_plan(), _auth()))
 
     assert result.campaign_id == "111"
-    assert mock_client.post.call_count == 5
+    assert mock_client.post.call_count == 6
     assert mock_client.get.call_count == 2  # identity lookup + music lookup
 
-    img1_json = mock_client.post.call_args_list[1].kwargs["json"]
+    img1_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert img1_json["image_url"] == "https://cdn.example.com/a.jpg"
-    img2_json = mock_client.post.call_args_list[2].kwargs["json"]
+    img2_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert img2_json["image_url"] == "https://cdn.example.com/b.jpg"
 
     music_params = mock_client.get.call_args_list[1].kwargs["params"]
@@ -563,137 +588,63 @@ def test_launch_campaign_carousel_happy_path():
     assert "video_id" not in creative
 
 
-def test_launch_campaign_carousel_forces_jpg_on_cloudinary_urls():
-    # Live-caught 2026-09-22: a real WEBP upload got "Invalid params: image cannot
-    # be decoded" from TikTok, which only accepts JPG/PNG for Carousel Ads. Every
-    # slide's URL sent to TikTok must carry Cloudinary's f_jpg delivery
-    # transformation, regardless of the stored file's real format.
+def test_launch_campaign_carousel_sends_ensure_jpgs_normalized_urls():
+    # ensure_jpg (tiktok_media.py) replaced the old Cloudinary f_jpg delivery-URL
+    # trick with a real local WEBP->JPEG conversion + S3 re-upload — this just
+    # proves the adapter calls it per slide and sends TikTok whatever URL it hands
+    # back, not the original. Real conversion behavior is covered in
+    # test_jane_ads_tiktok_media.py.
     adapter = _adapter()
     plan = _carousel_plan(
         creative=AdCreative(
             image_url="",
             is_video=False,
             carousel_image_urls=[
-                "https://res.cloudinary.com/demo/image/upload/v1700000000/uri-ads/a.webp",
-                "https://res.cloudinary.com/demo/image/upload/v1700000000/uri-ads/b.webp",
+                "https://cdn.example.com/a.webp",
+                "https://cdn.example.com/b.webp",
             ],
         )
     )
-    with patch("httpx.AsyncClient") as MockClient:
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.tiktok.ensure_jpg",
+               new=AsyncMock(side_effect=lambda url: url.replace(".webp", ".jpg"))) as mock_ensure_jpg:
         mock_client = _mock_client(list(_CAROUSEL_RESPONSES))
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(plan, _auth()))
 
-    img1_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert img1_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/a.webp"
-    img2_json = mock_client.post.call_args_list[2].kwargs["json"]
-    assert img2_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/b.webp"
+    assert mock_ensure_jpg.call_args_list[0].args[0] == "https://cdn.example.com/a.webp"
+    assert mock_ensure_jpg.call_args_list[1].args[0] == "https://cdn.example.com/b.webp"
+    img1_json = mock_client.post.call_args_list[2].kwargs["json"]
+    assert img1_json["image_url"] == "https://cdn.example.com/a.jpg"
+    img2_json = mock_client.post.call_args_list[3].kwargs["json"]
+    assert img2_json["image_url"] == "https://cdn.example.com/b.jpg"
 
 
-def test_force_jpg_delivery_inserts_transformation_on_cloudinary_urls():
-    assert _force_jpg_delivery("https://res.cloudinary.com/demo/image/upload/v1/uri-ads/x.webp") == (
-        "https://res.cloudinary.com/demo/image/upload/f_jpg/v1/uri-ads/x.webp"
-    )
-
-
-def test_force_jpg_delivery_is_a_noop_on_non_cloudinary_urls():
-    # Must never raise or mangle a URL shape it doesn't recognise.
-    assert _force_jpg_delivery("https://cdn.example.com/a.jpg") == "https://cdn.example.com/a.jpg"
-    assert _force_jpg_delivery("") == ""
-
-
-def test_force_tiktok_video_ratio_inserts_transformation_on_cloudinary_urls():
-    assert _force_tiktok_video_ratio("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.mp4") == (
-        "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1/uri-ads/clip.mp4"
-    )
-
-
-def test_force_tiktok_video_ratio_is_a_noop_on_non_cloudinary_urls():
-    # Must never raise or mangle a URL shape it doesn't recognise.
-    assert _force_tiktok_video_ratio("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
-    assert _force_tiktok_video_ratio("") == ""
-
-
-def test_video_thumbnail_url_swaps_extension_to_jpg_on_cloudinary_urls():
-    assert _video_thumbnail_url("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.mp4") == (
-        "https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.jpg"
-    )
-
-
-def test_video_thumbnail_url_is_a_noop_on_non_cloudinary_or_extensionless_urls():
-    # Must never raise or mangle a URL shape it doesn't recognise.
-    assert _video_thumbnail_url("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
-    assert _video_thumbnail_url("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip") == (
-        "https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip"
-    )
-    assert _video_thumbnail_url("") == ""
-
-
-def test_launch_campaign_forces_tiktok_ratio_on_cloudinary_video():
-    # Live-caught 2026-09-22: a real uploaded video (480x848 - close to but not
-    # exactly 9:16) got "Cannot be delivered to TikTok: Video ratio must be
-    # 16:9/1:1/9:16" in TikTok Ads Manager, even though the ad itself was created
-    # successfully. The video URL sent to TikTok must carry Cloudinary's
-    # c_fill,ar_9:16,g_auto delivery transformation, regardless of the source
-    # file's real dimensions.
+def test_launch_campaign_video_sends_ensure_tiktok_videos_normalized_url():
+    # ensure_tiktok_video (tiktok_media.py) replaced the old Cloudinary
+    # c_fill,ar_9:16,g_auto + HEVC->MP4 delivery-URL tricks with a real local
+    # ffmpeg crop/transcode + S3 re-upload. This just proves the adapter calls it
+    # with the plan's source URL and sends TikTok whatever URL comes back — no
+    # warm-up wait needed any more since the normalized file is already sitting on
+    # S3 by the time we return it (unlike Cloudinary's on-demand transcode, which
+    # needed the old _wait_for_cloudinary_video poll). Real crop/transcode
+    # behavior is covered in test_jane_ads_tiktok_media.py.
     adapter = _adapter()
     plan = _plan(creative=AdCreative(
-        image_url="https://res.cloudinary.com/demo/video/upload/v1700000000/uri-ads/clip.mp4",
+        image_url="https://cdn.example.com/clip.mov",
         is_video=True, headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
     ))
-    with patch("httpx.AsyncClient") as MockClient:
+    normalized_url = "https://s3.example.com/uri-ads/tiktok-normalized/vid-abc123.mp4"
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.tiktok.ensure_tiktok_video",
+               new=AsyncMock(return_value=normalized_url)) as mock_ensure_video:
         mock_client = _mock_client(list(_HAPPY_RESPONSES))
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(plan, _auth()))
 
-    # Live-caught 2026-09-22, part 2: TikTok's own fetch then failed with "video
-    # upload: Failed to fetch url data" — Cloudinary transcodes a video
-    # transformation on its first request, which can outrun TikTok's fetch
-    # timeout for a derivative nobody has requested before. The adapter must warm
-    # the EXACT SAME transformed URL itself first, before TikTok ever sees it.
-    assert mock_client.head.call_count == 1
-    warmed_url = mock_client.head.call_args_list[0].args[0]
-    assert warmed_url == "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
-
-    video_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert video_json["video_url"] == (
-        "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
-    )
-
-
-def test_launch_campaign_video_warm_up_timeout_does_not_block_the_launch():
-    # Best-effort: a slow/failed warm-up must not sink an otherwise-real launch —
-    # TikTok's own fetch may still land on a transcode that finished moments later.
-    import httpx as httpx_module
-
-    adapter = _adapter()
-    plan = _plan(creative=AdCreative(
-        image_url="https://res.cloudinary.com/demo/video/upload/v1700000000/uri-ads/clip.mp4",
-        is_video=True, headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
-    ))
-    with patch("httpx.AsyncClient") as MockClient:
-        mock_client = _mock_client(list(_HAPPY_RESPONSES))
-        mock_client.head = AsyncMock(side_effect=httpx_module.TimeoutException("timed out"))
-        MockClient.return_value.__aenter__.return_value = mock_client
-        with patch("app.agents.jane_ads.adapters.tiktok._VIDEO_READY_PAUSE_S", 0):
-            result = _run(adapter.launch_campaign(plan, _auth()))
-
-    assert result.campaign_id == "111"
-    from app.agents.jane_ads.adapters.tiktok import _VIDEO_READY_ATTEMPTS
-    assert mock_client.head.call_count == _VIDEO_READY_ATTEMPTS
-
-
-def test_a_video_still_transcoding_is_waited_for_and_sent_as_mp4():
-    # Live 2026-10-30: a 55MB iPhone .MOV was still transcoding (Cloudinary 423) when
-    # TikTok fetched it — "video upload: Failed to fetch url data".
-    from app.agents.jane_ads.adapters.tiktok import _as_mp4, _wait_for_cloudinary_video
-    client = MagicMock()
-    client.head = AsyncMock(side_effect=[MagicMock(status_code=423), MagicMock(status_code=200)])
-    with patch("app.agents.jane_ads.adapters.tiktok._VIDEO_READY_PAUSE_S", 0):
-        _run(_wait_for_cloudinary_video(client, "u"))
-    assert client.head.call_count == 2
-    assert _as_mp4("https://res.cloudinary.com/d/video/upload/c_fill/v1/uri-ads/clip.MOV").endswith("/clip.mp4")
-    assert _as_mp4("https://cdn.example.com/clip.mov") == "https://cdn.example.com/clip.mov"
+    assert mock_ensure_video.call_args_list[0].args[0] == "https://cdn.example.com/clip.mov"
+    video_json = mock_client.post.call_args_list[2].kwargs["json"]
+    assert video_json["video_url"] == normalized_url
 
 
 def test_launch_campaign_carousel_raises_clearly_when_no_music_found():
@@ -786,13 +737,11 @@ def test_launch_campaign_raises_on_tiktok_error():
 
 def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_original_error():
     adapter = _adapter()
-    # Campaign + video + cover image upload succeed, ad group creation fails ->
+    # The campaign succeeds, ad group creation fails ->
     # rollback should DELETE the already-created campaign, and the ORIGINAL
     # error (not a rollback error) propagates.
     responses = [
         {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
-        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
-        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         {"code": 40002, "message": "ad group rejected: invalid location_ids"},
         {"code": 0, "message": "OK"},  # the rollback's own DELETE-status call
     ]
@@ -802,7 +751,7 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
         with pytest.raises(TikTokAdsAPIError, match="ad group rejected"):
             _run(adapter.launch_campaign(_plan(), _auth()))
 
-    rollback_json = mock_client.post.call_args_list[4].kwargs["json"]
+    rollback_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert rollback_json["operation_status"] == "DELETE"
     assert rollback_json["campaign_ids"] == ["111"]
     # Live-caught 2026-09-22: the URL itself had campaign/update/status/ — a real
@@ -810,7 +759,7 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
     # earlier this session deleting real diagnostic campaigns). The JSON-body
     # assertions above would pass against either path, which is exactly how this
     # shipped unnoticed — assert the actual URL too.
-    rollback_url = mock_client.post.call_args_list[4].args[0]
+    rollback_url = mock_client.post.call_args_list[2].args[0]
     assert rollback_url.endswith("/campaign/status/update/")
 
 
@@ -915,6 +864,7 @@ def test_fetch_campaign_summary_active_campaign():
     with patch("httpx.AsyncClient") as MockClient:
         mock_client = _mock_client([
             {"code": 0, "message": "OK", "data": {"list": [{"operation_status": "ENABLE"}]}},
+            {"code": 0, "message": "OK", "data": {"list": []}},  # the ad's delivery status
             {"code": 0, "message": "OK", "data": {"list": [{"metrics": {
                 "impressions": "1000", "reach": "800", "clicks": "20", "spend": "5000",
             }}]}},
@@ -1233,8 +1183,8 @@ def test_fetch_adgroup_schedule_derives_daily_rate_from_the_total_budget():
             "data": {"list": [{
                 "adgroup_id": "222", "operation_status": "ENABLE",
                 "budget": 217000.0, "budget_mode": "BUDGET_MODE_TOTAL",
-                "schedule_start_time": "2026-09-20 10:00:00",
-                "schedule_end_time": "2026-09-27 10:00:00",
+                "schedule_start_time": "2099-09-20 10:00:00",
+                "schedule_end_time": "2099-09-27 10:00:00",
             }]},
         }])
         MockClient.return_value.__aenter__.return_value = mock_client

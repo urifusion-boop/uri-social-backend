@@ -6,9 +6,32 @@ import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+import httpx
+
+from app.core.config import settings
 from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.s3_upload import upload_bytes
+
+# Storyboard WRITING (this step only — frame images below stay on gpt-image-2,
+# scene animation stays on Veo/Kling/Seedance) moved off gpt-5.4 onto Gemini
+# 3.5 Flash-Lite: same multimodal-in/JSON-out shape this call already needs
+# (read brand images, follow a style directive, return structured scenes),
+# at roughly 1/8th the per-token cost — see video_generation_service.py's
+# identical fail-soft client-init pattern, reused here rather than duplicated
+# differently.
+from .people_consistency import PEOPLE_ON_SCREEN_RULES, PEOPLE_RULES_PLACEHOLDER
+from .video_text_overlay import SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    _gemini_client = genai.Client(api_key=settings.GOOGLE_GEMINI_API_KEY)
+except Exception as _e:
+    _gemini_client = None
+    print(f"[VideoStoryboardService] google-genai init failed: {_e}")
+
+STORYBOARD_MODEL = "gemini-3.5-flash-lite"
 
 _SYSTEM_PROMPT = """You are a creative director specialising in short-form social video for brands.
 
@@ -21,13 +44,43 @@ You receive:
 Your job: study the brand images carefully, then produce a JSON video storyboard that fully embodies the selected video style.
 
 Rules:
-- The brand color palette MUST dominate every scene — no other colors allowed.
+- Brand colours are an accent, not a filter. Use them where they make sense: the logo, the product and its packaging, uniforms, signage, on-screen text, graphics, text cards and the closing call to action. Everything else — locations, skin, food, sky, nature, furniture, backgrounds — takes natural, realistic colours chosen for the mood of that scene, and the colour world should change from scene to scene. Never wash a whole scene in the brand colours.
 - video_prompt fields must be motion-aware: describe exactly what moves, camera direction, speed, and lighting.
 - APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
 - reference_image_index tells which supplied image becomes the first frame of that clip (0-based).
-- Each scene must work as a self-contained 3–5 second moment.
-- text_overlay is a short on-screen caption/tagline string, or null.
+- text_overlay is a short on-screen caption/tagline string (8 words or fewer), or null. The editor draws it, sharply, onto the finished video: NEVER describe lettering, captions, titles or text cards inside a video_prompt (a text_card shot is a clean, plain or brand-coloured backdrop that the caption is laid over).
+{{SCREEN_TEXT_RULES}}
 - shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
+
+CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
+continuous story and must read that way end to end:
+- The whole storyboard needs a clear through-line: scene 1 hooks/sets up, the
+  middle scenes build or demonstrate, the final scene pays off with a CTA or
+  resolution — never a sequence of unrelated vignettes sharing only a style.
+- Subject continuity: once a scene establishes a specific product, person, or
+  setting, later scenes must keep featuring that SAME subject — reuse the same
+  reference_image_index for the same subject across scenes — unless the
+  narrative deliberately cuts away (e.g. a before/after contrast), which must
+  be an intentional story beat, not a random switch.
+- Each scene's motion/video_prompt should read as a natural continuation of
+  the previous scene's action and energy, as if one camera/story is flowing
+  forward, not disconnected clips stitched together after the fact.
+- continuity_note: one short phrase stating how this scene follows directly
+  from the previous one (for scene 1, how it sets up what follows).
+- dialogue: ONLY when this video features a person speaking on camera
+  (testimonial/direct-to-camera/talking-head content). Write ONE continuous
+  spoken script for that speaker and split it naturally across scenes — scene
+  1's words must lead directly into scene 2's, like one take cut into pieces,
+  never separate unrelated lines. If no one speaks on camera in a scene, set
+  dialogue to null.
+  GOOD example (one sentence flowing across the cut):
+    scene 1 dialogue: "I used to spend hours every week"
+    scene 2 dialogue: "just trying to figure out what to post."
+  BAD example (two unrelated statements, never do this):
+    scene 1 dialogue: "Welcome to my shop!"
+    scene 2 dialogue: "Buy now and save 20%."
+
+{{PEOPLE_RULES}}
 
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
@@ -42,10 +95,12 @@ Return ONLY valid JSON — no markdown fences, no explanation:
       "motion": "<plain-English camera/subject motion description>",
       "video_prompt": "<full motion-aware prompt for the video model>",
       "reference_image_index": <int 0-based>,
-      "text_overlay": <string or null>
+      "text_overlay": <string or null>,
+      "continuity_note": "<how this scene follows the previous one>",
+      "dialogue": <string spoken on camera this scene, or null>
     }
   ]
-}"""
+}""".replace(PEOPLE_RULES_PLACEHOLDER, PEOPLE_ON_SCREEN_RULES).replace(SCREEN_TEXT_PLACEHOLDER, SCREEN_TEXT_RULES)
 
 VIDEO_STYLE_DIRECTIVES: Dict[str, str] = {
     "clean_commercial": """VIDEO STYLE — CLEAN COMMERCIAL:
@@ -72,7 +127,7 @@ Apply a cinematic, high-fashion luxury aesthetic throughout.
 Apply a high-energy, social-native fast-cut aesthetic throughout.
 • Camera: handheld energy, quick zoom-ins, snap pans, 360° spins around product; unpredictable angles keep it fresh.
 • Pacing: cut every 0.5–1.5 seconds; match cuts to a strong beat; first 2 seconds must hook immediately.
-• Color grading: saturated, punchy, high contrast; brand colors popped to maximum vibrancy.
+• Color grading: saturated, punchy, high contrast; brand-coloured elements (product, graphics, text) popped to maximum vibrancy.
 • Composition: product fills the frame; tight crops; exaggerated close-ups.
 • Text overlays: bold, large, center-frame; 1–3 words per scene; animated (pop-on or slide-in).
 • Transitions: whip pans, zoom transitions, glitch cuts — high kinetic energy.
@@ -131,7 +186,7 @@ Prioritise atmosphere and emotional resonance over product information.
 Use dynamic, physics-defying visuals to make the product look spectacular.
 • Camera: orbiting 360° rotation around the hero product; extreme close-up fly-throughs along product surface; dramatic upward reveal from below; slow-motion splashes or bursts of brand-colored particles.
 • Pacing: fast movement with sudden freeze-frames on the most dramatic angles.
-• Color grading: high contrast, deep blacks, hyper-saturated brand colors; light trails and glow effects.
+• Color grading: high contrast, deep blacks, hyper-saturated brand-coloured product and glow accents; light trails and glow effects.
 • Composition: product isolated against solid dark or gradient backgrounds; multiple product angles layered.
 • Text overlays: product name in bold as a climactic reveal; key feature callouts with short animated labels.
 • Transitions: instant cut at peak energy moments; burst/flash transitions.
@@ -146,6 +201,9 @@ Create the feel of an authentic user-generated or interview-style testimonial.
 • Composition: person occupies 60% of frame; product visible but not forced into foreground.
 • Text overlays: quote highlights as bold lower-thirds; result stat or name/title for social proof.
 • Transitions: jump cuts (intentionally casual) or simple cross-dissolve.
+• Dialogue: this is a talking-head video — write ONE continuous spoken script for the
+  on-camera speaker and populate every scene's `dialogue` field with its segment of that
+  script, in order, as if it's one uninterrupted take cut into scenes.
 • Energy: honest and relatable — the viewer should think "that could be me." """,
 
     "menu_showcase": """VIDEO STYLE — MENU SHOWCASE:
@@ -163,7 +221,7 @@ Make every scene look so good the viewer gets hungry.
 Build urgency and excitement that escalates scene by scene.
 • Camera: each scene zooms in slightly tighter than the last — start wide, end extreme close-up on product; quick snap zooms on key moments.
 • Pacing: deliberately increase cut speed across scenes (scene 1: 4s, scene 2: 3s, scene 3: 2s, final: 1s flash); final scene holds on product.
-• Color grading: pumped saturation; brand colors pushed to max; subtle red/warm vignette to signal urgency.
+• Color grading: pumped saturation; brand-coloured elements pushed to max; subtle red/warm vignette to signal urgency.
 • Composition: countdown number or timer element visible in corner; product dominant in frame.
 • Text overlays: bold countdown numbers each scene ("3…", "2…", "1…"); CTA on final frame ("Available now", "Limited drop", "Shop today").
 • Transitions: fast whip cuts, flash frames between countdown moments.
@@ -173,6 +231,10 @@ Build urgency and excitement that escalates scene by scene.
 
 def _frame_jobs_collection():
     return get_db()["storyboard_frame_jobs"]
+
+
+def _storyboard_jobs_collection():
+    return get_db()["storyboard_jobs"]
 
 
 class VideoStoryboardService:
@@ -187,10 +249,23 @@ class VideoStoryboardService:
         return base64.b64decode(encoded)
 
     @staticmethod
-    async def _generate_scene_frame(scene: dict, brand_images: List[str]) -> Optional[str]:
+    async def _generate_scene_frame(
+        scene: dict, brand_images: List[str], chained_frame_url: Optional[str] = None
+    ) -> Optional[str]:
         """
         Edit the reference brand image for this scene using gpt-image-2 so the frame
         is faithfully grounded in the real brand visual rather than hallucinated.
+
+        chained_frame_url: when a PRIOR scene already established this same subject
+        (same reference_image_index — see run_frame_job), pass that scene's own
+        generated frame here instead of re-deriving fresh from the original brand
+        photo. Each independent edit of the same source photo is its own generative
+        draw — same nominal subject, but gpt-image-2 can render a visibly different
+        face/outfit/hair each time. Editing forward from the LAST generated frame
+        instead compounds the same likeness scene to scene, the standard trick for
+        keeping a consistent character across a sequence with a single-image-edit
+        model. Falls back to the original brand photo if the chained frame can't be
+        downloaded, rather than failing the whole scene over a transient fetch error.
         """
         try:
             ref_idx = scene.get("reference_image_index", 0)
@@ -198,18 +273,32 @@ class VideoStoryboardService:
                 return None
 
             ref_idx = max(0, min(ref_idx, len(brand_images) - 1))
-            img_bytes = VideoStoryboardService._decode_brand_image(brand_images[ref_idx])
+            img_bytes: Optional[bytes] = None
+            if chained_frame_url:
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        resp = await client.get(chained_frame_url)
+                        resp.raise_for_status()
+                        img_bytes = resp.content
+                except Exception as e:
+                    print(f"[StoryboardFrame] chained frame fetch failed ({e}), using original brand photo")
+            if img_bytes is None:
+                img_bytes = VideoStoryboardService._decode_brand_image(brand_images[ref_idx])
 
             shot = scene.get("shot_type", "").replace("_", " ")
             video_prompt = scene.get("video_prompt", "")
             motion = scene.get("motion", "")
             text = scene.get("text_overlay") or ""
+            continuity = scene.get("continuity_note") or ""
 
             prompt = (
                 f"Cinematic storyboard frame, {shot} shot. "
                 f"{video_prompt} "
                 f"Camera movement: {motion}. "
-                + (f'On-screen text: "{text}". ' if text else "")
+                + (f"Continuity with the surrounding scenes: {continuity}. " if continuity else "")
+                # Drawn onto the finished clip by ffmpeg (video_text_overlay.py), not by the image model.
+                + ("The on-screen text is added in editing, so draw NO text, captions, titles or lettering of your own in the "
+                "picture, and keep the lower third of the frame calm and uncluttered. " if text else "")
                 + "Keep the brand product, colors, and visual identity exactly as shown. "
                 "Photorealistic, dramatic lighting. Vertical 9:16 composition."
             )
@@ -253,12 +342,30 @@ class VideoStoryboardService:
 
     @staticmethod
     async def run_frame_job(job_id: str, scenes: list, brand_images: List[str] = None) -> None:
-        """Background task: generate one frame image per scene, store progressively."""
+        """Background task: generate one frame image per scene, store progressively.
+
+        Scenes are already processed in order (needed for the chaining below, not
+        just incidental) — when a later scene shares a reference_image_index with
+        an earlier one (the storyboard's own signal that it's the SAME subject —
+        see generate_storyboard's continuity rules), its frame is edited forward
+        from that earlier scene's own generated frame instead of the raw brand
+        photo again, so the same likeness compounds across scenes rather than each
+        one being an independent, visually-driftable draw from the same source."""
         col = _frame_jobs_collection()
         brand_images = brand_images or []
+        last_frame_by_subject: Dict[int, str] = {}
         for scene in scenes:
-            url = await VideoStoryboardService._generate_scene_frame(scene, brand_images)
+            ref_idx = scene.get("reference_image_index", 0)
+            # A scene with no frame cannot become a clip at all, so a failed picture gets one more try.
+            url = None
+            for _attempt in range(2):
+                url = await VideoStoryboardService._generate_scene_frame(
+                    scene, brand_images, chained_frame_url=last_frame_by_subject.get(ref_idx)
+                )
+                if url:
+                    break
             if url:
+                last_frame_by_subject[ref_idx] = url
                 await col.update_one(
                     {"job_id": job_id},
                     {"$push": {"frames": {
@@ -273,6 +380,14 @@ class VideoStoryboardService:
         return await _frame_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
 
     @staticmethod
+    def _brand_image_mime(img_data: str) -> str:
+        """Best-effort mime type from a data URL prefix; jpeg default matches
+        what _decode_brand_image already assumes for a bare base64 string."""
+        if img_data.startswith("data:") and ";base64," in img_data:
+            return img_data.split(";base64,", 1)[0][len("data:"):] or "image/jpeg"
+        return "image/jpeg"
+
+    @staticmethod
     async def generate_storyboard(
         brand_images: List[str],
         optional_text: Optional[str],
@@ -282,15 +397,22 @@ class VideoStoryboardService:
         video_style: Optional[str] = "clean_commercial",
     ) -> Dict[str, Any]:
         """
-        Send brand images + optional creative text to GPT-4o Vision.
+        Send brand images + optional creative text to Gemini 3.5 Flash-Lite
+        (moved off gpt-5.4 — this call is read-images-then-write-structured-JSON,
+        exactly the "simple data extraction" shape Flash-Lite is built for, at
+        roughly 1/8th the per-token cost; the actual media generation steps below
+        — frame stills, scene animation — are untouched and stay on their own
+        models, since Flash-Lite has no image/video output capability at all).
         Returns a structured storyboard JSON dict. Frame images are generated
         separately via the /generate-storyboard-frames background job.
         """
         if not brand_images:
             return {"status": False, "error": "At least one brand image is required."}
+        if not _gemini_client:
+            return {"status": False, "error": "Storyboard generation is not configured."}
 
         brand_images = brand_images[:5]
-        target_duration_seconds = max(5, min(target_duration_seconds, 30))
+        target_duration_seconds = max(5, min(target_duration_seconds, 60))
         num_scenes = max(1, round(target_duration_seconds / 5))
 
         brand_colors = brand_context.get("brand_colors") or []
@@ -309,7 +431,7 @@ class VideoStoryboardService:
             f"Aspect ratio: 9:16 vertical",
         ]
         if color_str:
-            preamble_lines.append(f"Brand colors (STRICT — must dominate every scene): {color_str}")
+            preamble_lines.append(f"Brand colors (accents where they make sense — logo, product, packaging, graphics, text; NOT the colour of every scene): {color_str}")
         if voice:
             preamble_lines.append(f"Brand voice: {voice}")
         if region:
@@ -327,46 +449,75 @@ class VideoStoryboardService:
         if style_directive:
             system_prompt = f"{_SYSTEM_PROMPT}\n\n{style_directive}"
 
-        # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
-        # language), who it's for, what the business offers and what's on now —
-        # video scripts used to get only name, industry, region, voice and colours.
-        from . import brand_brief
-        _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), kind="video")
-        if _brief:
+        # Everything from here down — decoding each real uploaded image, building
+        # the multimodal request, and the actual model call — is wrapped in ONE
+        # try/except. It used to only wrap the generate_content() call itself, which
+        # left image decoding (base64.b64decode on whatever the browser actually
+        # sent) able to raise unhandled straight through the router with no fail-
+        # soft response at all — live-confirmed 2026-09-30: a real attempt against
+        # a real uploaded photo produced no POST access-log line whatsoever (only
+        # the OPTIONS preflight), meaning the request never got as far as sending
+        # ANY response back, unlike a clean model-call failure which does log a
+        # normal 400. A malformed/unexpected data URL from a real upload is a much
+        # more plausible trigger for that than a network blip on this endpoint
+        # specifically. Broadening the guard makes every real failure a logged,
+        # clean 400 instead of a request that just vanishes.
+        try:
+            # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
+            # language), who it's for, what the business offers and what's on now —
+            # video scripts used to get only name, industry, region, voice and colours.
+            from . import brand_brief
+            _platform = brand_brief.video_platform(target_platform)
+            brand_context = brand_brief.for_platform(brand_context, _platform)
+            _brief = brand_brief.build(brand_context, sections=("rules", "voice", "audience", "offer", "pulse"),
+                                       platform=_platform, kind="video")
+            if _brief:
+                preamble_lines.append("")
+                # The brief is about WORDS. video_prompt goes to the video model and must stay
+                # plain-English and visual, or rules/promotions get rendered into the footage.
+                preamble_lines.append(
+                    "The BRAND BRIEF below governs the words people will read or hear — every "
+                    "text_overlay — and which ideas the video is built around. Each video_prompt "
+                    "stays a plain-English VISUAL description: never write rules, promotions, prices "
+                    "or brand copy into a video_prompt."
+                )
+                preamble_lines.append(_brief)
             preamble_lines.append("")
-            # The brief is about WORDS. video_prompt goes to the video model and must stay
-            # plain-English and visual, or rules/promotions get rendered into the footage.
-            preamble_lines.append(
-                "The BRAND BRIEF below governs the words people will read or hear — every "
-                "text_overlay — and which ideas the video is built around. Each video_prompt "
-                "stays a plain-English VISUAL description: never write rules, promotions, prices "
-                "or brand copy into a video_prompt."
-            )
-            preamble_lines.append(_brief)
-        content: List[Dict] = [{"type": "text", "text": "\n".join(preamble_lines)}]
+            preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+            contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
 
-        for i, img_data in enumerate(brand_images):
-            url = img_data if img_data.startswith("data:") else f"data:image/jpeg;base64,{img_data}"
-            content.append({"type": "text", "text": f"Image {i} (use reference_image_index={i}):"})
-            content.append({"type": "image_url", "image_url": {"url": url, "detail": "high"}})
+            for i, img_data in enumerate(brand_images):
+                contents.append(genai_types.Part.from_text(text=f"Image {i} (use reference_image_index={i}):"))
+                img_bytes = VideoStoryboardService._decode_brand_image(img_data)
+                mime = VideoStoryboardService._brand_image_mime(img_data)
+                contents.append(genai_types.Part.from_bytes(data=img_bytes, mime_type=mime))
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ]
-
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4",
-                messages=messages,
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
                 temperature=0.7,
-                max_completion_tokens=2000,
-            ),
-        )
+                # 3000 was already close to the ceiling for a 6-scene (30s)
+                # storyboard once continuity_note/dialogue were added to each
+                # scene. Duration now goes up to 60s (12 scenes) — doubled
+                # the budget rather than risk the same truncated-JSON failure
+                # at the new, larger size.
+                max_output_tokens=6000,
+                response_mime_type="application/json",
+            )
 
-        raw = response.choices[0].message.content.strip()
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _gemini_client.models.generate_content(
+                    model=STORYBOARD_MODEL,
+                    contents=contents,
+                    config=config,
+                ),
+            )
+        except Exception as e:
+            print(f"[VideoStoryboardService] storyboard generation error: {type(e).__name__}: {e}", flush=True)
+            return {"status": False, "error": "Failed to generate storyboard."}
+
+        raw = (response.text or "").strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
 
@@ -376,4 +527,60 @@ class VideoStoryboardService:
             print(f"Storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
             return {"status": False, "error": "Failed to parse storyboard from model response."}
 
+        # The Playbook's word rules, guaranteed on what viewers read and hear.
+        brand_brief.enforce_video_script(storyboard, brand_context)
+
         return {"status": True, "storyboard": storyboard}
+
+    # ── Job wrapper around generate_storyboard above — this step was a plain
+    #    blocking request-response (unlike frame/video generation, already
+    #    job_id+background_tasks based), so a refresh while it was still running
+    #    lost the in-flight work entirely, with nothing to resume. Same shape as
+    #    VideoCreativeService's create_storyboard_job/run_storyboard_job (the
+    #    "Describe It" flow's equivalent fix), own Mongo collection since a
+    #    storyboard-generation job and a frame-generation job are different
+    #    things with different lifetimes. ──
+
+    @staticmethod
+    async def create_storyboard_job() -> str:
+        job_id = uuid.uuid4().hex
+        await _storyboard_jobs_collection().insert_one({
+            "job_id": job_id,
+            "status": "generating",
+            "storyboard": None,
+            "error": None,
+        })
+        return job_id
+
+    @staticmethod
+    async def run_storyboard_job(
+        job_id: str,
+        brand_images: List[str],
+        optional_text: Optional[str],
+        brand_context: Dict[str, Any],
+        target_platform: str = "instagram_reels",
+        target_duration_seconds: int = 15,
+        video_style: Optional[str] = "clean_commercial",
+    ) -> None:
+        result = await VideoStoryboardService.generate_storyboard(
+            brand_images=brand_images,
+            optional_text=optional_text,
+            brand_context=brand_context,
+            target_platform=target_platform,
+            target_duration_seconds=target_duration_seconds,
+            video_style=video_style,
+        )
+        if result.get("status"):
+            await _storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "complete", "storyboard": result["storyboard"]}},
+            )
+        else:
+            await _storyboard_jobs_collection().update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "failed", "error": result.get("error", "Storyboard generation failed")}},
+            )
+
+    @staticmethod
+    async def get_storyboard_job(job_id: str) -> Optional[Dict[str, Any]]:
+        return await _storyboard_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})

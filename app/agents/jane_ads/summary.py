@@ -116,7 +116,14 @@ def build_campaign_summary(
     # receives: the card must describe the ad that really ships.
     pins = plan.geo.pins if plan.geo else []
     where = ", ".join(p.name for p in pins)
+    if not where and plan.geo and plan.geo.fallback_area:
+        # A whole-state plan has no pins by design; it still targets that state, not Nigeria.
+        where = f"All of {plan.geo.fallback_area}"
     who = (audience_text or "").strip()
+    if "_" in who and " " not in who:
+        # A targeting label ("small_business_owners_in_marketing_overwhelm") is not
+        # something to show a client.
+        who = who.replace("_", " ").capitalize()
     interests = [
         i.get("name", "") for spec in (plan.audience_targeting.get("flexible_spec") or [])
         for i in (spec.get("interests") or []) if i.get("name")
@@ -136,14 +143,16 @@ def build_campaign_summary(
             reason="No specific area given, so we target broadly — tell me a city to focus the spend.",
         )
 
-    # Platforms — the resolved behaviour is why we landed here.
-    plat_label = ", ".join(_PLATFORM_LABELS.get(p.platform, p.platform.value) for p in plan.platforms)
-    # The short name the reasons use ("Meta", "TikTok") — plat_label is the display value and
-    # reads "Meta (Instagram & Facebook)", which would be wrong inside a sentence.
-    short_label = ", ".join(_SHORT_PLATFORM_NAMES.get(p.platform, p.platform.value) for p in plan.platforms)
+    # Platforms — the resolved behaviour is why we landed here. The reason names the
+    # actual chosen platform's feed rather than assuming Meta, so a TikTok-bound plan
+    # doesn't read "Meta's feed placements fit best" right under a "TikTok" value.
+    from .adapters.google_visual import PLACEMENT_LABELS
+    _placement = PLACEMENT_LABELS.get((plan.google_keyword_context or {}).get("placement") or "search")
+    plat_label = ", ".join(_placement if p.platform == Platform.GOOGLE else
+                           _PLATFORM_LABELS.get(p.platform, p.platform.value) for p in plan.platforms)
     platforms = ReasonedValue(
         value=plat_label,
-        reason=(f"Your customers discover businesses like yours by scrolling, so {short_label}'s feed "
+        reason=(f"Your customers discover businesses like yours by scrolling, so {plat_label}'s feed "
                 f"placements fit best." if plan.behaviour.value == "discover"
                 else f"Chosen for a '{plan.behaviour.value}' buying pattern."),
     )
@@ -162,20 +171,39 @@ def build_campaign_summary(
             reason=f"Your {_naira(total_budget)} is split across platforms by where it should work hardest.",
         )
 
-    # Duration — days, with the Meta daily-floor reasoning that set it.
+    # Duration — days, with the daily-floor reasoning that set it. Named after the actual
+    # delivering platform(s) rather than assuming Meta — a single-platform plan gets the
+    # cleaner singular phrasing that already shipped for this exact reason elsewhere.
     daily = total_budget / days if days else total_budget
-    duration = ReasonedValue(
-        value=_days_label(days),
-        reason=(f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear {short_label}'s "
-                f"minimum daily budget so the ad actually delivers, without stretching too thin."),
-    )
+    # Google Search is paid per click, not per view: what a day buys is clicks,
+    # and below ~10 a day Search can't learn which searches work. Say that
+    # honestly instead of the feed-ad "clears the minimum" line.
+    google_placement = (plan.google_keyword_context or {}).get("placement") or "search"
+    is_search = (bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
+                 and google_placement == "search")
+    if is_search:
+        from .adapters.google import _DEFAULT_ESTIMATED_CPC_NGN, _MIN_USEFUL_CLICKS_PER_DAY
+        clicks_a_day = daily / _DEFAULT_ESTIMATED_CPC_NGN
+        enough = clicks_a_day >= _MIN_USEFUL_CLICKS_PER_DAY
+        duration_reason = (
+            f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — roughly {clicks_a_day:.0f} "
+            + ("clicks a day, enough for Google to learn which searches bring customers." if enough else
+               f"click{'s' if round(clicks_a_day) != 1 else ''} a day, fewer than the "
+               f"~{_MIN_USEFUL_CLICKS_PER_DAY:.0f} Search needs to learn — fine for a test.")
+        )
+    else:
+        duration_reason = (f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear "
+                           f"{plat_label}'s minimum daily budget so the ad actually delivers, without "
+                           f"stretching too thin.")
+    duration = ReasonedValue(value=_days_label(days), reason=duration_reason)
 
-    # Optimization — what Meta is told to get you, named after where the tap actually
-    # lands. Was hard-coded to WhatsApp, which read "WhatsApp link clicks / most likely
-    # to message you" on a campaign pointing at a website.
+    # Optimization — what the platform is told to get you, named after where the tap
+    # actually lands. Was hard-coded to WhatsApp, which read "WhatsApp link clicks / most
+    # likely to message you" on a campaign pointing at a website. platform_label keeps
+    # this from also hard-coding "Meta" when the plan is TikTok-bound.
     from .destination import clicks_label, coerce_type, optimization_for
     _dest = coerce_type(getattr(plan, "destination_type", "") or "")
-    _opt_value, _opt_reason = optimization_for(_dest, platform_label=short_label)
+    _opt_value, _opt_reason = optimization_for(_dest, platform_label=plat_label, objective=plan.objective)
     optimization = ReasonedValue(value=_opt_value, reason=_opt_reason)
 
     # Estimates. Audience size = Meta's addressable pool for the targeting (real data,
@@ -187,6 +215,15 @@ def build_campaign_summary(
     leads = plan.estimated_conversations
     if not leads and price_per_result_ngn:
         leads = max(1, round(total_budget / price_per_result_ngn))
+    if is_search:
+        # Clicks from Google's cost per click; the feed-ad per-result price
+        # doesn't apply to Search.
+        clicks = round(total_budget / _DEFAULT_ESTIMATED_CPC_NGN)
+        estimates.estimated_clicks = clicks
+        if clicks:
+            estimates.estimated_leads = max(1, round(clicks * ASSUMED_LEAD_RATE))
+            estimates.cost_per_result_ngn = round(total_budget / estimates.estimated_leads, 2)
+        leads = 0
     if leads:
         estimates.estimated_leads = leads
         estimates.estimated_clicks = max(leads, round(leads / ASSUMED_LEAD_RATE))

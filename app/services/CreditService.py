@@ -118,7 +118,8 @@ class CreditService:
         low_credit_warning = total_remaining <= 3
 
         return CreditBalanceResponse(
-            total_credits=wallet.total_credits + trial_credits_included,
+            has_had_plan=bool(wallet.subscription_tier) or await self.has_had_plan(user_id),
+            total_credits=wallet.total_credits,
             credits_used=wallet.credits_used,
             credits_remaining=total_remaining,
             subscription_tier=wallet.subscription_tier,
@@ -129,6 +130,17 @@ class CreditService:
             low_credit_warning=low_credit_warning,
             trial_credits_included=trial_credits_included
         )
+
+    async def has_had_plan(self, user_id: str) -> bool:
+        """Has this user ever had a plan or bought credits — a subscription,
+        a credit purchase or bonus, or a redeemed access code? A trial alone
+        doesn't count. (An access-code plan ends when its credits run out, so
+        the wallet's current tier alone can't answer this.)"""
+        if await self.credit_transactions_collection.find_one(
+            {"user_id": user_id, "type": {"$in": ["allocation", "bonus"]}}, {"_id": 1}
+        ):
+            return True
+        return bool(await self.db["access_code_redemptions"].find_one({"user_id": user_id}, {"_id": 1}))
 
     async def create_wallet(
         self,
@@ -143,6 +155,7 @@ class CreditService:
             user_id=user_id,
             bonus_credits=0,
             subscription_credits=total_credits,
+            frozen_credits=0,
             total_credits=total_credits,
             credits_used=0,
             credits_remaining=total_credits,
@@ -173,6 +186,7 @@ class CreditService:
                 user_id=user_id,
                 bonus_credits=bonus_amount,
                 subscription_credits=0,
+                frozen_credits=0,
                 total_credits=bonus_amount,
                 credits_used=0,
                 credits_remaining=bonus_amount,
@@ -341,7 +355,7 @@ class CreditService:
         campaign_id: str,
         reason: str = "campaign_generation",
         retry_count: int = 0,
-        amount: int = 1  # NEW: Support deducting multiple credits (video editing bills 4/8/12+ per job)
+        amount: int = 1  # NEW: Support deducting multiple credits (for carousel)
     ) -> bool:
         """
         Deduct N credits from user balance (default 1)
@@ -357,7 +371,7 @@ class CreditService:
         Legacy users (without wallet) are not deducted - backward compatibility
 
         Args:
-            amount: Number of credits to deduct (default=1)
+            amount: Number of credits to deduct (default=1, for carousel can be N slides)
 
         Returns:
             bool: True if deduction successful, False if insufficient credits
@@ -569,8 +583,12 @@ class CreditService:
         """
         Allocate credits to user after successful payment
         PRD 6.3: On success: Assign credits, Activate subscription
-        PRD 5.2: Subscription credits reset every billing cycle (no rollover)
-        Bonus credits are preserved and consumed first
+
+        Credit Rollover Logic (like mobile data):
+        - On RENEWAL (before expiry): Unused subscription credits roll over + new credits added
+        - On RE-SUBSCRIPTION (after expiry): Old credits frozen, only new credits allocated
+        - Frozen credits remain visible but unusable
+        - Bonus credits always preserved (never freeze)
         """
         existing_wallet = await self.get_user_wallet(user_id)
 
@@ -578,27 +596,46 @@ class CreditService:
             # Existing subscriber - renewal or upgrade
             balance_before = existing_wallet.credits_remaining
 
-            # Get current bonus and subscription credits
+            # Get current credits breakdown
             current_bonus = getattr(existing_wallet, 'bonus_credits', 0)
             current_subscription = getattr(existing_wallet, 'subscription_credits', 0)
+            current_frozen = getattr(existing_wallet, 'frozen_credits', 0)
             current_used = existing_wallet.credits_used
+
+            # Check if subscription expired (next_renewal date passed)
+            now = datetime.utcnow()
+            next_renewal = existing_wallet.next_renewal or now
+            subscription_expired = now > next_renewal
 
             # Check if this is a renewal (same tier) or new purchase
             is_renewal = existing_wallet.subscription_tier == tier_id
 
-            if is_renewal:
-                # Monthly renewal: Reset subscription credits, preserve bonus credits
-                new_bonus = current_bonus
-                new_subscription = credits
+            if subscription_expired:
+                # Subscription LAPSED - freeze old subscription credits, start fresh
+                # Like mobile data: expired credits become unusable but visible
+                frozen_amount = current_subscription  # Move unused subscription credits to frozen
+                new_frozen = current_frozen + frozen_amount
+                new_subscription = credits  # Only new credits, no rollover
+                new_bonus = current_bonus  # Bonus never freezes
                 new_used = 0  # Reset usage counter
-            else:
-                # New purchase/upgrade: Keep bonus, add new subscription credits
+                print(f"⚠️ Subscription expired for {user_id}. Froze {frozen_amount} credits. New allocation: {credits}")
+            elif is_renewal:
+                # On-time RENEWAL - roll over unused subscription credits + add new
+                new_frozen = current_frozen  # Keep existing frozen (doesn't unfreeze)
+                new_subscription = current_subscription + credits  # Rollover + new credits
                 new_bonus = current_bonus
-                new_subscription = credits
+                new_used = 0  # Reset usage counter
+                print(f"✅ On-time renewal for {user_id}. Rolled over {current_subscription} + added {credits} = {new_subscription}")
+            else:
+                # UPGRADE/DOWNGRADE - keep current subscription credits + add new
+                new_frozen = current_frozen
+                new_subscription = current_subscription + credits
+                new_bonus = current_bonus
                 new_used = current_used  # Keep existing usage
+                print(f"🔄 Plan change for {user_id}. Current {current_subscription} + new {credits} = {new_subscription}")
 
-            # Calculate totals
-            new_total = new_bonus + new_subscription
+            # Calculate totals (frozen credits NOT included in usable credits)
+            new_total = new_bonus + new_subscription  # Frozen not counted
             new_remaining = new_total - new_used
 
             await self.user_credits_collection.update_one(
@@ -607,6 +644,7 @@ class CreditService:
                     "$set": {
                         "bonus_credits": new_bonus,
                         "subscription_credits": new_subscription,
+                        "frozen_credits": new_frozen,
                         "total_credits": new_total,
                         "credits_used": new_used,
                         "credits_remaining": new_remaining,
@@ -712,39 +750,52 @@ class CreditService:
         Atomic (single find_one_and_update), matching deduct_credit()'s
         pattern, so a concurrent refund/deduction can't read a stale amount.
         """
-        updated = await self.user_credits_collection.find_one_and_update(
-            {"user_id": user_id},
-            [
+        # Compare-and-swap with plain update operators, exactly like deduct_credit(): read the balance, compute
+        # the new one, write it back only if the balance is still what was read, and retry if someone else
+        # changed it in between. This used to be an update PIPELINE (array-form find_one_and_update), which our
+        # DocumentDB clusters (older than 5.0) reject outright ("Failed to parse update") - the same failure
+        # deduct_credit() was rewritten to avoid. A refund that throws is a customer who paid for nothing.
+        updated = None
+        for _attempt in range(8):
+            wallet = await self.user_credits_collection.find_one(
+                {"user_id": user_id},
+                {"subscription_credits": 1, "bonus_credits": 1, "credits_used": 1},
+            )
+            if not wallet:
+                # No wallet for this user - never subscribed, nothing to refund into.
+                return False
+            sub = wallet.get("subscription_credits") or 0
+            bonus = wallet.get("bonus_credits") or 0
+            used = wallet.get("credits_used") or 0
+            bonus_after = bonus + amount
+            remaining_after = sub + bonus_after
+            match_filter = {
+                "user_id": user_id,
+                "subscription_credits": (
+                    sub if wallet.get("subscription_credits") is not None else {"$in": [None, sub]}
+                ),
+                "bonus_credits": (
+                    bonus if wallet.get("bonus_credits") is not None else {"$in": [None, bonus]}
+                ),
+            }
+            updated = await self.user_credits_collection.find_one_and_update(
+                match_filter,
                 {
                     "$set": {
-                        "bonus_credits": {
-                            "$add": [{"$ifNull": ["$bonus_credits", 0]}, amount]
-                        },
-                        "credits_used": {
-                            "$max": [
-                                {"$subtract": [{"$ifNull": ["$credits_used", 0]}, amount]},
-                                0,
-                            ]
-                        },
-                    }
-                },
-                {
-                    "$set": {
-                        "total_credits": {
-                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
-                        },
-                        "credits_remaining": {
-                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
-                        },
+                        "bonus_credits": bonus_after,
+                        "credits_used": max(used - amount, 0),
+                        "total_credits": remaining_after,
+                        "credits_remaining": remaining_after,
                         "updated_at": datetime.utcnow(),
                     }
                 },
-            ],
-            return_document=ReturnDocument.AFTER,
-        )
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                break
 
         if not updated:
-            # No wallet for this user — never subscribed, nothing to refund into.
+            # Lost every race under contention: report it so the caller can follow up, rather than guess.
             return False
 
         balance_after = updated["credits_remaining"]
@@ -767,6 +818,142 @@ class CreditService:
         )
 
         return True
+
+    async def admin_set_subscription(
+        self,
+        user_id: str,
+        plan_tier_id: str,
+        credits_monthly: int,
+        duration_days: int,
+        notes: Optional[str] = None,
+    ) -> UserCreditWallet:
+        """
+        Directly grant a user a subscription tier — the actual "assign this
+        user a plan" action, distinct from admin_adjust_credits above.
+        Adjusting bonus_credits was never meant to imply a plan change (a
+        support credit and a plan upgrade are different things), which is
+        why topping a user up to 20 credits via that endpoint alone never
+        made the admin panel stop showing "free".
+
+        Writes subscription_tier/subscription_credits/dates exactly like a
+        real purchase or an access-code redemption would (see
+        admin_router.redeem_access_code) — SubscriptionService.expire_subscriptions()
+        already lapses ANY wallet past its end_date back to free regardless
+        of how it got its tier, so day `duration_days` falls back to free
+        automatically through that existing mechanism; no new cron job.
+
+        subscription_source="admin_grant" (not "access_code") deliberately
+        keeps this OUT of deduct_credit's access-code-specific "auto-revoke
+        the instant credits hit 0" rule — an admin grant behaves like a paid
+        plan for that purpose: the tier stays until end_date even if its
+        credits run out first.
+
+        credits_remaining/total_credits are never set directly here —
+        get_user_wallet() always recomputes them as bonus_credits +
+        subscription_credits on read, exactly like the access-code grant
+        path already relies on.
+        """
+        now = datetime.utcnow()
+        end_date = now + timedelta(days=duration_days)
+        wallet = await self.get_user_wallet(user_id)
+        balance_before = wallet.credits_remaining if wallet else 0
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "subscription_tier": plan_tier_id,
+                    "subscription_credits": credits_monthly,
+                    "subscription_source": "admin_grant",
+                    "billing_cycle": "monthly",
+                    "start_date": now,
+                    "end_date": end_date,
+                    "next_renewal": None,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "bonus_credits": 0,
+                    "frozen_credits": 0,
+                    "credits_used": 0,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+
+        bonus_credits = wallet.bonus_credits if wallet else 0
+        balance_after = bonus_credits + credits_monthly
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=credits_monthly,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                reason="admin_adjustment",
+                notes=(
+                    f"Granted '{plan_tier_id}' plan for {duration_days} days"
+                    + (f" — {notes}" if notes else "")
+                ),
+                created_at=now,
+            ).dict(exclude_none=True)
+        )
+
+        return await self.get_user_wallet(user_id)
+
+    async def admin_clear_subscription(self, user_id: str, notes: Optional[str] = None) -> UserCreditWallet:
+        """
+        Revert a user to free — the undo for admin_set_subscription (e.g. the
+        wrong tier was picked). Mirrors exactly what
+        SubscriptionService.expire_subscriptions() does to a wallet whose
+        end_date has passed: clears the subscription fields, keeps
+        bonus_credits untouched.
+        """
+        now = datetime.utcnow()
+        wallet = await self.get_user_wallet(user_id)
+        balance_before = wallet.credits_remaining if wallet else 0
+        bonus_credits = wallet.bonus_credits if wallet else 0
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "subscription_tier": None,
+                    "subscription_credits": 0,
+                    "subscription_source": None,
+                    "billing_cycle": "monthly",
+                    "start_date": None,
+                    "end_date": None,
+                    "next_renewal": None,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "bonus_credits": 0,
+                    "frozen_credits": 0,
+                    "credits_used": 0,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=0,
+                balance_before=balance_before,
+                balance_after=bonus_credits,
+                reason="admin_adjustment",
+                notes="Cleared subscription — reverted to free" + (f" — {notes}" if notes else ""),
+                created_at=now,
+            ).dict(exclude_none=True)
+        )
+
+        return await self.get_user_wallet(user_id)
 
 
 # Singleton instance

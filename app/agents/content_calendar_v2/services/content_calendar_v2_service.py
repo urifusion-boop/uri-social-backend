@@ -125,6 +125,7 @@ async def _backoff_if_rate_limited(error: Any) -> None:
     if _is_rate_limited(error):
         await asyncio.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
 
+
 MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
 MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN = 3   # the brand picked Reels/video in its Playbook
 MIN_CAROUSEL_FORMATS_PER_WEEK = 1   # business requirement (Oct 2026): 1-2 carousels per week
@@ -574,6 +575,130 @@ def _resolve_series_name(name: Optional[str], brand_name: str, industry: str) ->
     return name.replace("[Brand]", brand_name).replace("[Industry]", industry)
 
 
+# ── Step 3b — Listening-sourced candidates (Listening PRD §18) ─────────────
+# NOT the TrendDataService/PerformanceAnalyticsService this file's module
+# docstring bans upstream of candidate generation — those are fabricated/
+# simulated placeholders and real post-performance numbers respectively,
+# exactly the kind of signal that could corrupt autonomous ideation with
+# something false. A Listening card is the opposite: a real, evidence-gated
+# customer signal from this exact business's own market, already passed
+# through its own confidence/relevance gates and fabrication-rejecting
+# validator (market_intelligence/listening/personalize.py) before it ever
+# reaches here. This function does no ideation and calls no model — it only
+# reshapes already-real, already-validated fields into the candidate-concept
+# shape, so it carries zero fabrication risk into the pool it's added to.
+# ad_test cards are skipped: there's no content format for them here, and
+# turning one into a post would misrepresent what it actually is.
+_LISTENING_TERRITORY_BY_TYPE = {
+    "recurring_need": "A_PROBLEM",
+}
+_LISTENING_FORMAT_BY_ACTION_TYPE = {"video": "video", "carousel": "carousel", "faq": "image", "post": "image"}
+
+
+async def _listening_candidate_concepts(
+    db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[str], limit: int = 6,
+) -> List[Dict[str, Any]]:
+    from app.models.brand_account import BrandAccount
+    resolved_brand_id = brand_id or BrandAccount.personal_brand_id(user_id)
+    now = datetime.utcnow()
+    out: List[Dict[str, Any]] = []
+    cursor = db["mi_listen_cards"].find(
+        {"brand_id": resolved_brand_id, "status": {"$in": ["new", "shown", "saved"]}, "expires_at": {"$gt": now}}
+    ).sort([("scores.total", -1)]).limit(limit * 2)  # headroom for ad_test skips
+    async for card in cursor:
+        action = card.get("action") or {}
+        if action.get("type") == "ad_test" or not action.get("platforms"):
+            continue
+        out.append({
+            "territory": _LISTENING_TERRITORY_BY_TYPE.get(card.get("type"), "C_CURIOSITY"),
+            "subject": card.get("topic_name") or card.get("topic", ""),
+            "angle": "The Customer's Question",
+            "creative_device": {"category": "conversational", "device": "Customer question"},
+            "format_hint": _LISTENING_FORMAT_BY_ACTION_TYPE.get(action.get("type"), "image"),
+            "objective": "engagement",
+            "audience_segment": (card.get("why") or "")[:80] or "customers already asking about this",
+            "concept_name": action.get("title") or card.get("topic_name") or card.get("topic", ""),
+            "series_name": None,
+            "source": "listening",
+            "source_card_id": card.get("id"),
+            "listening_brief": {
+                "observation": card.get("observation"),
+                "hook": action.get("hook"),
+                "outline": action.get("outline"),
+                "cta": action.get("cta"),
+            },
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ── Step 3c — Repurposing candidates (PRD §23) ──────────────────────────────
+# No asset-library/repurposing infrastructure exists anywhere in this
+# codebase (confirmed — see _get_existing_assets_summary's docstring above),
+# so there's no literal "founder interview" or "customer testimonial" raw
+# asset to chain the PRD's worked examples from. What IS real and already
+# queryable: this brand's own past APPROVED drafts — genuine content the
+# business already put out, often with real media already generated. PRD
+# §23's actual goal ("recognize when one source can generate multiple
+# pieces... reduces production burden") maps onto that directly: seed a new
+# angle/format this cycle from a real proven post instead of starting from
+# nothing. Same zero-fabrication-risk shape as _listening_candidate_concepts
+# — real text in, nothing invented — which is why it reuses that function's
+# "listening_brief" grounding field rather than inventing a parallel one.
+_REPURPOSE_FORMAT_BY_POST_TYPE = {
+    # The new format this cycle, given what the source post already was —
+    # never repeats the same format back (that's not repurposing, that's
+    # a duplicate), and always something genuinely producible from the
+    # existing media (PRD §17's "production feasibility" factor).
+    "image": "carousel",      # break the same proven idea into steps
+    "carousel": "image",      # distill it to one punchy quote/graphic
+    "video": "carousel",      # turn a video's key moments into a carousel
+}
+_MIN_REPURPOSE_SOURCE_WORDS = 8   # shorter than this isn't real "source material"
+
+
+async def _repurposing_candidate_concepts(
+    db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[str], limit: int = 4,
+) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+    query.update({
+        "approval_status": "approved",
+        "content": {"$exists": True, "$ne": ""},
+        "$or": [{"has_image": True}, {"video_url": {"$exists": True, "$ne": None}}],
+    })
+    out: List[Dict[str, Any]] = []
+    cursor = db["content_drafts"].find(query).sort([("created_at", -1)]).limit(limit * 4)
+    async for draft in cursor:
+        content = str(draft.get("content") or "").strip()
+        if len(content.split()) < _MIN_REPURPOSE_SOURCE_WORDS:
+            continue
+        new_format = _REPURPOSE_FORMAT_BY_POST_TYPE.get(draft.get("post_type") or "image", "image")
+        out.append({
+            "territory": "E_PROOF",
+            "subject": "A proven idea, retold",
+            "angle": "The Comparison" if new_format == "carousel" else "The Unexpected Truth",
+            # Deliberately NOT "story"/"conversational"+"talking_head" —
+            # _assign_format treats those as unconditional video overrides,
+            # which would silently discard new_format below.
+            "creative_device": {"category": "visual", "device": "Repurposed asset"},
+            "format_hint": new_format,
+            "objective": "engagement",
+            "audience_segment": "an audience that already responded to this once",
+            "concept_name": f"Repurposed: {content[:60]}",
+            "series_name": None,
+            "source": "repurposed",
+            "source_draft_id": draft.get("id"),
+            "listening_brief": {
+                "observation": f"A real post this business already published: \"{content[:300]}\"",
+                "hook": None, "outline": None, "cta": None,
+            },
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
 def _concept_pool_avoid_block(concepts: List[Dict[str, Any]]) -> str:
@@ -979,6 +1104,9 @@ async def _score_candidates(
         )
 
     async def _score_chunk(chunk: List[Dict[str, Any]], offset: int) -> List[Any]:
+        # Stagger concurrent chunks slightly rather than firing all of them
+        # in the same instant (see _CHUNK_STAGGER_SECONDS's module comment).
+        await asyncio.sleep((offset // CANDIDATE_CHUNK_SIZE) * _CHUNK_STAGGER_SECONDS)
         listing = "\n".join(
             f"{i}: territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}, "
             f"device={(c.get('creative_device') or {}).get('device')}, format_hint={c.get('format_hint')}, "
@@ -1013,6 +1141,8 @@ Return ONLY a valid JSON array of exactly {len(chunk)} objects, index-aligned
                 messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
             )
             response = await AIService.chat_completion(ai_request)
+            if isinstance(response, dict) and response.get("error"):
+                raise ValueError(response["error"])
             raw = response.choices[0].message.content.strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
@@ -1316,6 +1446,19 @@ def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_asse
 # Labels with no calendar format (Poll, Live session) allow nothing extra.
 _PLAYBOOK_FORMATS: Dict[str, Tuple[str, ...]] = {
     "reels / short video": ("video", "product_video", "ai_video"),
+    # Live-reported (Gloria, staging): a brand's stored preferred_formats had
+    # a bare "video" entry — not a label the current Playbook UI even offers
+    # (ALL_FORMATS in WorkspaceDashboard.tsx only has "Reels / Short video"),
+    # almost certainly left over from an older version of that picker. With
+    # no matching key here it silently contributed nothing: _allowed_formats
+    # came back as if the brand had picked no formats at all, so instead of
+    # getting the "brand explicitly wants video" cap (3/week,
+    # MAX_VIDEO_FORMATS_PER_WEEK_WHEN_CHOSEN) it got the generic default
+    # (1/week) — exactly backwards for a brand whose one stored preference
+    # is video. Recognized as the same alias rather than only fixing it by
+    # migrating old data, since nothing stops another stray value like this
+    # from being written the same way again.
+    "video": ("video", "product_video", "ai_video"),
     "story": ("video", "product_video", "ai_video"),
     "carousel posts": ("carousel",),
     "static image": ("image",),
@@ -1489,6 +1632,8 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
             temperature=0.8,
         )
         response = await AIService.chat_completion(ai_request)
+        if isinstance(response, dict) and response.get("error"):
+            raise ValueError(response["error"])
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -1583,13 +1728,28 @@ def _scrub_slots(item: Dict[str, Any]):
 
 async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
     """Rewords every text in the plan that still uses a generic AI word.
-    Returns how many texts were changed. Never raises."""
-    from app.agents.social_media_manager.services.brand_brief import find_banned
+    Returns how many texts were changed. Never raises.
+
+    Confirmed live (Oct 2026): a real plan's own stored caption shipped
+    "...Uri Social's innovative solutions" — "innovative" is banned
+    everywhere else (CaptionValidatorService.BANNED_WORDS, the list the
+    draft pipeline enforces with a hard, no-model-involved guarantee via
+    brand_brief.enforce()) but this plan-level scrub only ever checked
+    GENERIC_AI_WORDS, a narrower 20-word list. The user's own priority on
+    this (explicit): these words "should not be seen at all" — not just at
+    draft time, at the plan-preview stage too, since that's what's shown
+    before a draft is ever created. Checks the full union now, and
+    strip_banned_words() is the same zero-model guarantee the draft
+    pipeline already has, applied here as the final backstop."""
+    from app.agents.social_media_manager.services.brand_brief import find_banned, strip_banned_words
+    from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+
+    all_banned_words = list(dict.fromkeys(GENERIC_AI_WORDS + CaptionValidatorService.BANNED_WORDS))
 
     todo = []
     for item in items:
         for get, put in _scrub_slots(item):
-            if find_banned(get(), GENERIC_AI_WORDS):
+            if find_banned(get(), all_banned_words):
                 todo.append((get, put))
     if not todo:
         return 0
@@ -1598,7 +1758,7 @@ async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
         texts = {str(i): get() for i, (get, _) in enumerate(batch)}
         prompt = (
             "Reword each text below so it uses none of these words in any form "
-            f"(\"transforms\", \"discovering\" count too): {', '.join(GENERIC_AI_WORDS)}.\n"
+            f"(\"transforms\", \"discovering\" count too): {', '.join(all_banned_words)}.\n"
             "Say the specific, plain thing instead. Keep the meaning, length, tone, language, "
             "line breaks, emojis and hashtags. Change nothing else.\n\n"
             "Return ONLY valid JSON mapping each id to its reworded text.\n\n"
@@ -1609,6 +1769,8 @@ async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
                 messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
             )
             response = await AIService.chat_completion(ai_request)
+            if isinstance(response, dict) and response.get("error"):
+                raise ValueError(response["error"])
             raw = response.choices[0].message.content.strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
@@ -1627,8 +1789,15 @@ async def _scrub_generic_words(items: List[Dict[str, Any]]) -> int:
         for i, (get, put) in enumerate(batch):
             new = out.get(str(i))
             text = new if isinstance(new, str) and new.strip() else get()
-            if find_banned(text, GENERIC_AI_WORDS):
+            if find_banned(text, all_banned_words):
                 text = _plain_words(text)
+            # Absolute guarantee, same as the draft pipeline: whatever the
+            # reword did or didn't catch, no banned word survives this.
+            # GENERIC_AI_WORDS has two entries strip_banned_words()'s own
+            # default list doesn't ("game-changing", "in today's") — pass
+            # them explicitly so the guarantee covers the same union this
+            # function detects on, not a subset of it.
+            text = strip_banned_words(text, GENERIC_AI_WORDS)
             if text != get():
                 put(text)
                 changed += 1
@@ -1727,14 +1896,15 @@ async def _llm_diversity_check(items: List[Dict[str, Any]], brand: Optional[Dict
         context_line = f"\n{brand_name}'s actual customer reality includes: " + "; ".join(psych_bits)
 
     listing = "\n".join(
-        f"{i}: {it.get('title', '')} — {it.get('hook', '')}"
+        f"{i}: {it.get('title', '')} — {it.get('hook', '')} — "
+        f"{((it.get('exact_copy') or {}).get('caption') or '')[:140]}"
         for i, it in enumerate(items)
     )
     prompt = f"""Below are {len(items)} social media post ideas for {brand_name}.{context_line}
 
 {listing}
 
-Flag an index for regeneration if EITHER is true:
+Flag an index for regeneration if ANY of these is true:
 A) DUPLICATE — substantially the SAME underlying idea reworded as another
    index in the list (not just sharing a territory — genuinely the same
    angle/message).
@@ -1744,6 +1914,16 @@ B) GENERIC — the idea fails ANY of these: (1) this exact headline could
    customers (their real pain points, needs, objections, or reasons they
    buy — not just the product category), (3) this business's actual
    customer would not recognise themselves in it.
+C) CRUTCH WORD — this item leans on the same go-to benefit word or phrase
+   (e.g. "simplify"/"simplifies", "boost", "effortless", "seamless") that
+   keeps reappearing across several OTHER items in this list as their
+   payoff word, instead of each idea finding its own specific language.
+   One or two items sharing a word is normal; a word becoming the list's
+   default answer is the problem — read the whole list first to judge this,
+   not any single item alone. Do NOT flag ordinary topical words that
+   legitimately recur because they're what the business actually is
+   (the brand name, "marketing", the industry, the audience) — only a
+   lazy, interchangeable benefit word standing in for real specificity.
 
 Return ONLY a JSON array of indexes to regenerate, e.g. [4, 11] or [] if none
 qualify. Be conservative — only flag a clear case, not a borderline one.
@@ -1753,6 +1933,8 @@ qualify. Be conservative — only flag a clear case, not a borderline one.
             messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.3,
         )
         response = await AIService.chat_completion(ai_request)
+        if isinstance(response, dict) and response.get("error"):
+            raise ValueError(response["error"])
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
@@ -1930,6 +2112,26 @@ def _generic_words_used(idea: Dict[str, Any]) -> List[str]:
     return [str(w) for w in find_banned(_reader_text(idea), GENERIC_AI_WORDS)]
 
 
+def _fabricated_claims_used(idea: Dict[str, Any], brand: Dict[str, Any]) -> List[str]:
+    """PRD §31 — must never fabricate a statistic, named testimonial/citation,
+    price, discount, or guarantee. Until now this was prompt-only
+    (_generate_final_copy's "never fabricate... write around missing
+    specifics" instruction) — the same risk class the banned-word list was
+    before brand_brief.enforce() existed: an instruction a model can still
+    miss under pressure to hit everything else asked of it, not a guarantee.
+    Reuses the exact deterministic detector single-post generation already
+    relies on in production (unverified_numbers/unverified_sources), checked
+    against everything the writer actually had available: the brand profile
+    itself (so a real price_range or business_pulse figure isn't flagged)
+    plus any real Listening evidence attached to this specific item."""
+    from app.agents.social_media_manager.services.brand_brief import unverified_numbers, unverified_sources
+    text = _reader_text(idea)
+    sources = (json.dumps(brand, default=str, ensure_ascii=False) + " "
+               + json.dumps(idea.get("listening_brief") or {}, default=str, ensure_ascii=False))
+    return [f'number: "{p}"' for p in unverified_numbers(text, sources)] + \
+           [f'citation: "{s}"' for s in unverified_sources(text, sources)]
+
+
 def _validate_item_v2(
     idea: Dict[str, Any],
     is_carousel: bool,
@@ -2051,6 +2253,32 @@ async def _generate_final_copy(
             return f"CAROUSEL — ~{c.get('carousel_slide_count', 3)} slides (2-3 allowed)"
         return str(c.get("format", "image"))
 
+    def _listening_line(c: Dict[str, Any]) -> str:
+        # This concept isn't a brainstormed idea — it's grounded in something
+        # real: either a Listening opportunity measured in this business's
+        # own market, or a real post this business already published being
+        # repurposed into a new angle/format (PRD §23 — see
+        # _listening_candidate_concepts / _repurposing_candidate_concepts).
+        # Ground the copy in these actual facts rather than reinventing
+        # generic supporting detail; still write it fresh — evidence to
+        # build from, not copy verbatim.
+        brief = c.get("listening_brief") or {}
+        source = c.get("source")
+        if source not in ("listening", "repurposed") or not brief:
+            return ""
+        label = ("REAL CUSTOMER EVIDENCE (this is genuinely true, measured in this business's own market"
+                 if source == "listening" else
+                 "REAL PAST CONTENT (a post this business actually published before, now being repurposed "
+                 "into a different format/angle — do not contradict it or invent beyond it")
+        parts = [f"{label} — ground the copy in it): {brief.get('observation', '')}"]
+        if brief.get("hook"):
+            parts.append(f"A hook already considered worth testing: \"{brief['hook']}\"")
+        if brief.get("outline"):
+            parts.append("Points already identified as worth covering: " + "; ".join(brief["outline"]))
+        if brief.get("cta"):
+            parts.append(f"CTA direction already matched to this business's goal: \"{brief['cta']}\"")
+        return "\n  " + " ".join(parts)
+
     def _assigned_fact(day_index: int) -> Optional[Tuple[str, str]]:
         if not psychology_facts:
             return None
@@ -2079,6 +2307,7 @@ async def _generate_final_copy(
         + (f"\n  BRAND KEY DATE: this post is about {c['key_date']['label']} ({c['key_date']['date']}) — "
            f"make it the subject of the post, by name." if c.get("key_date")
            else (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else ""))
+        + _listening_line(c)
         for i, c in enumerate(concepts_chunk)
     )
 
@@ -2559,6 +2788,31 @@ async def _build_plan_doc(
     if not candidates:
         raise RuntimeError("Content Calendar V2 generation failed — no candidate concepts produced.")
 
+    # Step 3b — real, evidence-backed Listening opportunities join the same
+    # pool and compete on identical scoring terms (Listening PRD §18:
+    # "insight-backed post suggestions; brief passed directly into
+    # generation") — see _listening_candidate_concepts's docstring for why
+    # this isn't the performance/trend data banned above.
+    try:
+        listening_candidates = await _listening_candidate_concepts(db, user_id, brand_id)
+    except Exception as exc:
+        print(f"[CalendarV2] listening candidates skipped ({exc})", flush=True)
+        listening_candidates = []
+    if listening_candidates:
+        print(f"[CalendarV2] {len(listening_candidates)} listening-sourced candidate(s) added to the pool", flush=True)
+        candidates = candidates + listening_candidates
+
+    # Step 3c — real past content repurposed into a new angle/format this
+    # cycle (PRD §23) — see _repurposing_candidate_concepts's docstring.
+    try:
+        repurposing_candidates = await _repurposing_candidate_concepts(db, user_id, brand_id)
+    except Exception as exc:
+        print(f"[CalendarV2] repurposing candidates skipped ({exc})", flush=True)
+        repurposing_candidates = []
+    if repurposing_candidates:
+        print(f"[CalendarV2] {len(repurposing_candidates)} repurposing candidate(s) added to the pool", flush=True)
+        candidates = candidates + repurposing_candidates
+
     # Step 4 — score (9 named dims, no performance/trend fields — enforced in code)
     scored = await _score_candidates(candidates, brand, framework, creative_memory)
 
@@ -2585,6 +2839,9 @@ async def _build_plan_doc(
     chunk_starts = list(range(0, PLAN_DAYS, CONTENT_CHUNK_SIZE))
 
     async def _run_chunk(chunk_start_idx: int) -> List[Dict[str, Any]]:
+        # Stagger concurrent chunks slightly rather than firing all of them
+        # in the same instant (see _CHUNK_STAGGER_SECONDS's module comment).
+        await asyncio.sleep((chunk_start_idx // CONTENT_CHUNK_SIZE) * _CHUNK_STAGGER_SECONDS)
         chunk = formatted[chunk_start_idx:chunk_start_idx + CONTENT_CHUNK_SIZE]
         try:
             return await _generate_final_copy(
@@ -2637,9 +2894,13 @@ async def _build_plan_doc(
     # Items that still use a generic AI word after the per-chunk retry get the
     # regeneration pass too, rather than shipping with only a warning.
     generic_flagged = [it.get("day_index") for it in all_items if _generic_words_used(it)]
-    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged) | set(generic_flagged))
+    # PRD §31 hard rule — a fabricated stat/testimonial/citation is not a
+    # style problem to warn about, it's a false claim; it gets the same
+    # forced regeneration as everything else here, never a shrug.
+    fabrication_flagged = [it.get("day_index") for it in all_items if _fabricated_claims_used(it, brand)]
+    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged) | set(generic_flagged) | set(fabrication_flagged))
     print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration "
-          f"({len(generic_flagged)} for generic words)", flush=True)
+          f"({len(generic_flagged)} for generic words, {len(fabrication_flagged)} for possibly-fabricated claims)", flush=True)
 
     # Step 12 — regenerate flagged items only, one bounded pass
     regenerated_day_indices: set = set()
@@ -2857,6 +3118,20 @@ async def _build_plan_doc(
 
 # ── Regeneration with versioning (diverges from v1's overwrite-in-place) ───────
 
+# PRD §46 — the written text vs. the visual direction, the two halves
+# "copy only" and "creative only" each keep the other side of untouched.
+# "hook" is narrower still: just the opening line, not the rest of the copy.
+_REGEN_COPY_FIELDS = (
+    "title", "description", "hook", "key_points", "caption_direction",
+    "keywords", "cta", "video_idea", "exact_copy", "carousel",
+)
+_REGEN_CREATIVE_FIELDS = (
+    "ai_image_prompt", "design_style", "layout_direction", "visual_metaphor",
+    "required_assets", "designer_execution_notes",
+)
+_VALID_REGEN_SCOPES = {"full", "hook", "copy", "creative", "format"}
+
+
 async def regenerate_item_v2(
     plan_id: str,
     item_index: int,
@@ -2864,7 +3139,14 @@ async def regenerate_item_v2(
     db: AsyncIOMotorDatabase,
     brand_id: Optional[str] = None,
     reason: str = "",
+    regen_scope: str = "full",
+    new_format: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if regen_scope not in _VALID_REGEN_SCOPES:
+        raise ValueError(f"Unknown regenerate scope {regen_scope!r} — must be one of {sorted(_VALID_REGEN_SCOPES)}")
+    if regen_scope == "format" and not new_format:
+        raise ValueError("new_format is required when scope is 'format'")
+
     scope = _cal_v2_scope(user_id, brand_id)
     plan = await db[COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0})
     if not plan:
@@ -2887,19 +3169,23 @@ async def regenerate_item_v2(
     # format fixed — a manual regenerate re-executes final-copy only,
     # same "don't reinterpret the concept" rule the auto-regen path follows.
     device = item.get("creative_device") or {}
-    slide_count = len(((item.get("carousel") or {}).get("slides")) or []) or 3
+    original_format = item.get("format", "image")
+    # "format" scope is a deliberate override — every other scope keeps the
+    # item's already-approved format exactly as it was.
+    effective_format = new_format if regen_scope == "format" else original_format
+    slide_count = (len(((item.get("carousel") or {}).get("slides")) or []) or 3) if effective_format == "carousel" else 3
     concept = {
         "territory": item.get("territory", ""),
         "subject": item.get("subject", ""),
         "angle": item.get("creative_angle", ""),
         "creative_device": {"category": device.get("category", ""), "device": device.get("device", "")},
-        "format_hint": item.get("format", "image"),
+        "format_hint": effective_format,
         "objective": item.get("primary_kpi", "engagement"),
         "audience_segment": brand.get("target_audience", ""),
         "concept_name": item.get("creative_concept_name", ""),
         "day_index": item_index,
         "date": item.get("date", ""),
-        "format": item.get("format", "image"),
+        "format": effective_format,
         "carousel_slide_count": slide_count,
     }
 
@@ -2929,38 +3215,65 @@ async def regenerate_item_v2(
         "creative_concept_name",
     ]
     snapshot = {f: item.get(f) for f in editable_fields}
-    version_entry = {"snapshot": snapshot, "edited_at": datetime.utcnow().isoformat(), "reason": reason}
+    version_entry = {"snapshot": snapshot, "edited_at": datetime.utcnow().isoformat(),
+                      "reason": reason, "scope": regen_scope}
 
-    update_fields = {
-        "items.$[it].title": new_idea.get("title", ""),
-        "items.$[it].description": new_idea.get("description", ""),
-        "items.$[it].hook": new_idea.get("hook", ""),
-        "items.$[it].key_points": new_idea.get("key_points", []),
-        "items.$[it].caption_direction": new_idea.get("caption_direction", ""),
-        "items.$[it].keywords": new_idea.get("keywords", []),
-        "items.$[it].cta": new_idea.get("cta", ""),
-        "items.$[it].video_idea": new_idea.get("video_idea", {}),
-        "items.$[it].exact_copy": new_idea.get("exact_copy") or {},
-        "items.$[it].carousel": new_idea.get("carousel") if is_carousel else None,
-        "items.$[it].ai_image_prompt": new_idea.get("ai_image_prompt", ""),
-        "items.$[it].creative_direction": {
+    # Every field the regeneration COULD touch, keyed plainly (not yet
+    # prefixed with the Mongo "items.$[it]." path) so scope can filter this
+    # down before anything is sent to the DB.
+    all_candidate_fields: Dict[str, Any] = {
+        "title": new_idea.get("title", ""),
+        "description": new_idea.get("description", ""),
+        "hook": new_idea.get("hook", ""),
+        "key_points": new_idea.get("key_points", []),
+        "caption_direction": new_idea.get("caption_direction", ""),
+        "keywords": new_idea.get("keywords", []),
+        "cta": new_idea.get("cta", ""),
+        "video_idea": new_idea.get("video_idea", {}),
+        "exact_copy": new_idea.get("exact_copy") or {},
+        "carousel": new_idea.get("carousel") if is_carousel else None,
+        "ai_image_prompt": new_idea.get("ai_image_prompt", ""),
+        "creative_direction": {
             "visual_style": new_idea.get("design_style", ""),
             "mood": (new_idea.get("creative_direction") or {}).get("mood", ""),
             "color_note": (new_idea.get("creative_direction") or {}).get("color_note", ""),
             "composition_note": new_idea.get("layout_direction", ""),
             "central_visual_idea": new_idea.get("central_visual_idea", ""),
         },
-        "items.$[it].design_style": new_idea.get("design_style", ""),
-        "items.$[it].layout_direction": new_idea.get("layout_direction", ""),
-        "items.$[it].visual_metaphor": new_idea.get("visual_metaphor", ""),
-        "items.$[it].required_assets": new_idea.get("required_assets", []),
-        "items.$[it].designer_execution_notes": new_idea.get("designer_execution_notes", ""),
-        "items.$[it].reasoning": new_idea.get("reasoning") or item.get("reasoning", ""),
-        "items.$[it].creative_concept_name": new_idea.get("creative_concept_name") or item.get("creative_concept_name", ""),
-        "items.$[it].regenerated_count": item.get("regenerated_count", 0) + 1,
-        "items.$[it].last_regenerated_reason": "manual",
-        "updated_at": datetime.utcnow().isoformat(),
+        "design_style": new_idea.get("design_style", ""),
+        "layout_direction": new_idea.get("layout_direction", ""),
+        "visual_metaphor": new_idea.get("visual_metaphor", ""),
+        "required_assets": new_idea.get("required_assets", []),
+        "designer_execution_notes": new_idea.get("designer_execution_notes", ""),
     }
+
+    # PRD §46 — which half of the regeneration actually lands, per scope.
+    # "full" and "format" touch everything (a format conversion needs a
+    # genuinely different structure — a carousel needs slides, a video
+    # needs a video_idea — so it can't keep the old copy or direction).
+    if regen_scope == "hook":
+        # Narrowest level: just the opening line. exact_copy is merged so
+        # the existing caption/hashtags survive untouched, only the headline
+        # — the copy's own expression of the hook — changes with it.
+        fields_to_apply = {
+            "hook": all_candidate_fields["hook"],
+            "exact_copy": {**(item.get("exact_copy") or {}), "headline": (all_candidate_fields["exact_copy"] or {}).get("headline", "")},
+        }
+    elif regen_scope == "copy":
+        fields_to_apply = {k: all_candidate_fields[k] for k in _REGEN_COPY_FIELDS}
+    elif regen_scope == "creative":
+        fields_to_apply = {k: all_candidate_fields[k] for k in _REGEN_CREATIVE_FIELDS}
+        fields_to_apply["creative_direction"] = all_candidate_fields["creative_direction"]
+    else:  # "full" or "format"
+        fields_to_apply = all_candidate_fields
+
+    update_fields = {f"items.$[it].{k}": v for k, v in fields_to_apply.items()}
+    update_fields["items.$[it].format"] = effective_format
+    update_fields["items.$[it].reasoning"] = new_idea.get("reasoning") or item.get("reasoning", "")
+    update_fields["items.$[it].creative_concept_name"] = (
+        new_idea.get("creative_concept_name") or item.get("creative_concept_name", ""))
+    update_fields["items.$[it].regenerated_count"] = item.get("regenerated_count", 0) + 1
+    update_fields["items.$[it].last_regenerated_reason"] = f"manual:{regen_scope}"
 
     # Recompute the diversity/quality flags against the rest of the plan —
     # before this fix, a manual regenerate never touched diversity_check or
@@ -2970,7 +3283,7 @@ async def regenerate_item_v2(
     # actually was, because nothing ever recomputed it. Cheap/deterministic
     # (the same check the initial plan generation already uses), not a
     # second LLM round-trip for a single-item action.
-    merged_item = {**item, **{k: v for k, v in new_idea.items() if k not in ("day_index", "date")}, "format": concept["format"]}
+    merged_item = {**item, **fields_to_apply, "format": effective_format}
     full_items = sorted(
         (merged_item if it["day_index"] == item_index else it for it in plan["items"]),
         key=lambda it: it["day_index"],
@@ -2985,12 +3298,21 @@ async def regenerate_item_v2(
     update_fields["items.$[it].creative_quality_review_note"] = (
         _anti_boring_check([merged_item], brand_name=brand.get("brand_name", "")).get(0)
     )
+    update_fields["updated_at"] = datetime.utcnow().isoformat()
 
     await db[COLLECTION].update_one(
         {**scope, "plan_id": plan_id},
         {"$set": update_fields, "$push": {"items.$[it].version_history": version_entry}},
         array_filters=[{"it.day_index": item_index}],
     )
+    if regen_scope == "format" and original_format != effective_format:
+        # carousel_slots is a derived summary array at the plan level
+        # (used elsewhere to quickly locate carousel items without
+        # scanning every item) — keep it in sync with the format change.
+        if effective_format == "carousel":
+            await db[COLLECTION].update_one({**scope, "plan_id": plan_id}, {"$addToSet": {"carousel_slots": item_index}})
+        elif original_format == "carousel":
+            await db[COLLECTION].update_one({**scope, "plan_id": plan_id}, {"$pull": {"carousel_slots": item_index}})
     return await db[COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0})
 
 

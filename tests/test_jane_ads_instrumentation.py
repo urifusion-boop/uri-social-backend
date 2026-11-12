@@ -58,6 +58,45 @@ def test_override_dedupes_repeated_platforms():
     assert [p.platform for p in overridden.platforms] == [Platform.META]
 
 
+def test_override_to_tiktok_rewrites_the_platform_named_in_the_explanation():
+    # The explanation is written for the platform Jane picked on her own. A TikTok
+    # request used to keep "I chose Instagram + Facebook because ..." under a plan that
+    # runs on TikTok.
+    res = choose_platform(_req(budget_ngn=20_000), 20_000, 20_000)
+    plan = res.plan.model_copy(update={
+        "explanation": "Focus on Lagos hubs. I chose Instagram + Facebook because your customers "
+                       "discover this by scrolling, your budget is small so I'm focusing on one platform."
+    })
+    assert [p.platform for p in plan.platforms] == [Platform.META]
+
+    overridden = apply_platform_override(plan, [Platform.TIKTOK])
+
+    assert "I chose TikTok because" in overridden.explanation
+    assert "Instagram" not in overridden.explanation
+    assert "Facebook" not in overridden.explanation
+    # Only the platform changed: the geography sentence and the reasoning survive.
+    assert overridden.explanation.startswith("Focus on Lagos hubs.")
+    assert "discover this by scrolling" in overridden.explanation
+
+
+def test_override_back_to_meta_rewrites_a_tiktok_explanation():
+    res = choose_platform(_req(budget_ngn=20_000), 20_000, 20_000)
+    tiktok_plan = apply_platform_override(res.plan, [Platform.TIKTOK]).model_copy(update={
+        "explanation": "I chose TikTok because your customers discover this by scrolling."
+    })
+
+    overridden = apply_platform_override(tiktok_plan, [Platform.META])
+
+    assert "I chose Instagram + Facebook because" in overridden.explanation
+    assert "TikTok" not in overridden.explanation
+
+
+def test_override_leaves_an_unrelated_explanation_alone():
+    res = choose_platform(_req(budget_ngn=20_000), 20_000, 20_000)
+    plan = res.plan.model_copy(update={"explanation": "A custom note with no platform sentence."})
+    assert apply_platform_override(plan, [Platform.TIKTOK]).explanation == "A custom note with no platform sentence."
+
+
 def test_override_rejects_empty_choice():
     res = choose_platform(_req(), 10_000, 10_000)
     with pytest.raises(ValueError):
@@ -120,3 +159,14 @@ def test_logs_are_scoped_per_business():
     assert len(_run(svc.overrides_for("b1"))) == 1
     assert len(_run(svc.overrides_for("b2"))) == 1
     assert _run(svc.overrides_for("b1"))[0].user_platforms == [Platform.GOOGLE]
+
+
+def test_client_chosen_platform_is_not_described_as_janes_choice():
+    from app.agents.jane_ads.decision_engine import as_client_choice
+    res = choose_platform(_req(budget_ngn=20_000), 20_000, 20_000)
+    plan = res.plan.model_copy(update={
+        "explanation": "I chose Instagram + Facebook because your customers discover this by scrolling."
+    })
+
+    assert as_client_choice(plan).explanation == (
+        "You picked Instagram + Facebook, and it fits: your customers discover this by scrolling.")

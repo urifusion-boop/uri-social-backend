@@ -34,7 +34,6 @@ and the draft-summary mapping are pure and unit-tested.
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from typing import Any, Optional
 
@@ -159,7 +158,9 @@ def _logo_reserve_directive(bc: dict) -> str:
     position = (bc.get("logo_position") or "bottom_right").replace("_", " ")
     return (
         f" Leave the {position} corner visually clear (no faces, text, or busy detail "
-        "there) — a brand logo will be composited onto that corner afterward."
+        "there) — a brand logo will be composited onto that corner afterward. Don't mark "
+        "that corner in any way (no dotted or dashed lines, outline, box, border or placeholder) — "
+        "it must look like ordinary background."
     )
 
 
@@ -303,8 +304,9 @@ def _strip_leaked_terms(text: str, leaked: list[str]) -> str:
     silently) — remove the exact phrase and tidy up double spaces/punctuation."""
     import re as _re
     for term in leaked:
-        text = _re.sub(_re.escape(term), "", text, flags=_re.IGNORECASE)
-    return _re.sub(r"\s{2,}", " ", text).strip(" ,.-")
+        text = _re.sub(rf"\b{_re.escape(term)}\b", "", text, flags=_re.IGNORECASE)
+    text = _re.sub(r"\s{2,}", " ", text).strip(" ,.-:")
+    return text[:1].upper() + text[1:]
 
 
 def _zone_a_block(geo_target: str, audience_segment: str, interest_category: str, goal: str,
@@ -454,8 +456,9 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     hasn't been updated keeps today's Meta/Instagram framing byte-for-byte). Before
     this, the prompt told the model it was writing a "Meta/Instagram ad" regardless
     of which platform the campaign actually launches on, so a TikTok campaign still
-    got Meta-toned copy and a staged-photoshoot image brief. See
-    _register_rules_block for what actually changes.
+    got Meta-toned copy and a staged-photoshoot image brief — the platform decision
+    made upstream by decision_engine.choose_platform never reached the creative
+    step at all. See _register_rules_block for what actually changes.
 
     Two-zone brief (creative brief spec §2): DELIVERY CONTEXT (geo/audience — never
     written) is kept separate from MESSAGE (what the ad actually says), backed by a
@@ -497,10 +500,10 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
            f"{service_area}\n" if service_area else "")
         + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
-    ad_label = "TikTok" if platform == "tiktok" else "Meta/Instagram"
+    ad_label = "TikTok" if platform == "tiktok" else "Google Search" if platform == "google" else "Meta/Instagram"
     # TikTok's own feed is dominated by phone-shot, unstaged footage — an obviously
     # art-directed brand photoshoot reads as an ad and gets scrolled past. Meta's
-    # image brief stays exactly as it was.
+    # image brief stays exactly as it was (still additive-only per platform).
     image_style_bit = (
         " Lean toward a native, candid, phone-shot feel — a real moment caught in "
         "the middle of happening, not a staged studio photoshoot — the way a "
@@ -603,7 +606,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
 
 async def write_shoot_script(business_name: str, category: str, goal: str,
                              video_recommendation_reason: str, description: str = "",
-                             brand_context: Optional[dict] = None,
+                             brand_context: Optional[dict] = None, filmed_by: str = "",
                              platform: str = "meta") -> ShootScript:
     """Path C (PRD §4.1): when a video was recommended over the (photo-only)
     AI generator, write a short, phone-filmable shoot script instead — no crew or
@@ -622,10 +625,16 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
         f"{category or 'local business'}) whose goal is {goal}. Why video: "
         f"{video_recommendation_reason}.{(' ' + brand_bits) if brand_bits else ''}\n"
-        f"Context: {description or 'none'}\n"
-        "The business owner will film this themselves on a phone — no crew, no "
-        "equipment, no editing skill assumed. Keep it to 3-5 short shots totalling "
-        "15-30 seconds.\n"
+        f"What this ad promotes: {description or 'none'}\n"
+        "If that names a specific product or offer, the script is about it — the brand "
+        "details above only set tone and rules, never swap in a different product.\n"
+        f"{filmed_by or 'The business owner will film this themselves.'} It is filmed on a "
+        "phone — no crew, no equipment, no editing skill assumed. Write every direction "
+        "for that person. Keep it to 3-5 short shots totalling 15-30 seconds.\n"
+        "That text may also hold the ad's budget, duration and target areas. They are "
+        "how the ad runs, not what the customer is told: never put them in the script, "
+        "and only quote a price stated as the product's price. Don't invent ingredients, "
+        "benefits or results that aren't stated.\n"
         "Return JSON with:\n"
         "- hook_line: the first ~2 seconds — what's said or shown to stop someone "
         "scrolling\n"
@@ -671,24 +680,27 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
 
 # ── Source 1: GENERATE — brand data, direct controlled image call ────────────
 
-def cloudinary_upload_signature(public_id: str) -> Optional[dict]:
-    """A presigned S3 PUT for one upload into the uri-ads folder — handed to the
-    browser so a large video goes straight to S3 instead of relayed through us.
-    Name kept for its one caller (router.py's /creative/upload-signature) —
-    response shape changed from Cloudinary's signed-form-fields to a single
-    {put_url, public_url} pair; the frontend's upload call needed updating to
-    match (a plain PUT of the raw file body to put_url, not a multipart POST)."""
+def s3_upload_signature(public_id: str, ext: str = "mp4") -> Optional[dict]:
+    """A presigned S3 PUT URL for one upload into the uri-ads folder — used
+    server-side and handed to the browser so a large video goes straight to S3
+    instead of through us."""
     from app.utils.s3_upload import presigned_put_url
-    result = presigned_put_url(folder="uri-ads", public_id=public_id, ext="mp4")
-    return {"put_url": result["put_url"], "public_url": result["public_url"]}
+    try:
+        return presigned_put_url("uri-ads", public_id, ext=ext)
+    except Exception as e:
+        print(f"[Creative] presigned PUT error: {e}", flush=True)
+        return None
 
 
 async def _upload_bytes_to_cloudinary(
     file_bytes: bytes, public_id: str,
     resource_type: str = "image", ext: str = "png", content_type: str = "image/png",
 ) -> Optional[str]:
-    """Upload to S3 — works for both images (GENERATE's gpt-image-1 stills) and
-    videos (a user's own uploaded ad video). Name kept for its callers below."""
+    """Upload to S3 under uri-ads/. Works for both images (GENERATE's gpt-image-1
+    stills) and videos (a user's own uploaded ad video) — name kept for its two
+    existing call sites, same drop-in-replacement convention established across the
+    rest of this migration (ext/content_type are unused now; S3 sniffs its own
+    extension from the bytes)."""
     from app.utils.s3_upload import upload_bytes
     try:
         return await upload_bytes(file_bytes, folder="uri-ads", resource_type=resource_type, public_id=public_id)
@@ -741,8 +753,11 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
     already uses for its own recompositing; not new image-generation work, just reuse.
 
     `platform` ("meta" | "tiktok", matching write_ad_copy's own values) — the content
-    engine has its own "tiktok" preset (ImageContentService); a TikTok ad's image
-    gets that preset, not an Instagram one."""
+    engine has its own "tiktok" preset (ImageContentService); was unconditionally
+    labeled "instagram" regardless of the ad's actual destination until this fix
+    (confirmed live 2026-10-19), which only mattered cosmetically since image_type
+    "story" already forces the right 9:16 shape either way, but a TikTok ad's image
+    deserves the TikTok preset, not an Instagram one, on principle."""
     if not (content or "").strip():
         return None
     bc = brand_context or {}
@@ -770,7 +785,7 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
             try:
                 image_url = await upload_base64(image_url, folder="uri-social/jane-ads")
             except Exception as e:
-                print(f"[Creative] S3 upload failed, cannot use for a Meta ad: {e}", flush=True)
+                print(f"[Creative] Upload failed, cannot use for a Meta ad: {e}", flush=True)
                 return None
         return image_url
     except Exception as e:
@@ -995,6 +1010,29 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
     )
 
 
+async def search_ad_creative(
+    business_name: str, category: str, goal: str = "messages", description: str = "",
+    user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
+    behaviour: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
+    geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
+    destination_cta: str = "",
+) -> AdCreative:
+    """The creative for a Google SEARCH ad: Jane's headline and description,
+    voice-matched to the Brand Playbook like every other ad — and no image,
+    because a search ad is text. Nothing is generated, so it costs no content
+    credit. The adapter turns this into the 3+ headlines and 2+ descriptions
+    Google requires (adapters/google.rsa_assets)."""
+    brand_context = await get_brand_context(user_id, db, brand_id) if db is not None and user_id else {}
+    copy = await write_ad_copy(business_name, category, goal, description, brand_context,
+                               city, behaviour, service_area, audience_segment, who_its_for,
+                               geo_pockets=geo_pockets, destination_type=destination_type, platform="google")
+    ad = assemble_creative(copy, "", source=CreativeSource.GENERATE, is_video=False,
+                           service_area=service_area, destination_type=destination_type,
+                           destination_cta=destination_cta)
+    ad.video_recommendation = ""    # "a video would work better" means nothing for a text ad
+    return ad
+
+
 # ── The three entry points ────────────────────────────────────────────────────
 
 async def generate_ad_creative(
@@ -1004,7 +1042,8 @@ async def generate_ad_creative(
     who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     budget_ngn: float = 0.0, destination_type: str = DEFAULT_DESTINATION.value,
     destination_cta: str = "", vsg01_format_id: Optional[str] = None,
-    platform: str = "meta",
+    platform: str = "meta", exclude_format_ids: Optional[list[str]] = None,
+    image_layout: str = "",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -1057,12 +1096,14 @@ async def generate_ad_creative(
     # VSG-01's format library is Meta-shaped (1080x1080 square — see
     # vsg01_orchestrator.py's own _CANVAS_SIZE comment) with zero TikTok
     # awareness anywhere in that module. Never attempt it for a TikTok-bound
-    # campaign, regardless of the flag, until it has real vertical/TikTok format support.
+    # campaign, regardless of the flag, until it has real vertical/TikTok
+    # format support — confirmed live 2026-10-19: nothing here previously
+    # checked platform at all.
     if db is not None and settings.JANE_ADS_VSG01_ENABLED and platform != "tiktok":
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
-            forced_format_id=vsg01_format_id,
+            forced_format_id=vsg01_format_id, exclude_format_ids=exclude_format_ids,
         )
         if vsg01_result is not None:
             image_url = await _upload_bytes_to_cloudinary(
@@ -1083,7 +1124,10 @@ async def generate_ad_creative(
         # from the brand's real ad destination, not the brand playbook's generic one.
         image_brand_context = {**(brand_context or {}),
                                "override_cta": image_cta(coerce_type(destination_type))}
-        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt, platform=platform)
+        # When no format rendered, the layout has to reach the picture directly: the copy
+        # writer's scene idea alone comes back the same structure every time.
+        seed = f"{image_layout} Scene: {copy.image_prompt}" if image_layout else copy.image_prompt
+        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=seed, platform=platform)
         # Caption LAST, matched to the actual generated image (vision) so it references the
         # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
         # original copy if the vision pass fails. Skipped for a VSG-01 render above — that
@@ -1159,7 +1203,9 @@ async def creative_from_upload(
     vsg01_result = None
     final_image_url = image_url
     # VSG-01's format library is Meta-shaped with zero TikTok awareness — see
-    # generate_ad_creative's matching guard above.
+    # generate_ad_creative's matching guard above. This path wasn't even behind
+    # settings.JANE_ADS_VSG01_ENABLED, so it was live for any attested upload
+    # regardless of platform until this check — confirmed live 2026-10-19.
     if db is not None and not is_video and asset_attestation and platform != "tiktok":
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(

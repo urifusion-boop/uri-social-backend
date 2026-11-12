@@ -243,20 +243,20 @@ def test_assemble_creative_recommendation_suppressed_when_already_video():
 # ── generate_ad_image: base64 must never reach a Meta ad (live-diagnosed) ──────
 # The shared content engine (ImageContentService._generate_platform_image) returns a
 # raw base64 data: URL, not a hosted one — every OTHER caller of that engine uploads
-# it to Cloudinary first. generate_ad_image didn't, so a real ad launch failed with
-# Meta's generic "code=1, unknown error" because Meta's crawler can't fetch a data URI.
+# it first. generate_ad_image didn't, so a real ad launch failed with Meta's generic
+# "code=1, unknown error" because Meta's crawler can't fetch a data URI.
 
-def test_generate_ad_image_uploads_base64_result_to_cloudinary():
+def test_generate_ad_image_uploads_base64_result_to_s3():
     fake_engine_result = {"status": True, "responseData": {"image_url": "data:image/webp;base64,AAAA"}}
     with patch(
         "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
         new=AsyncMock(return_value=fake_engine_result),
     ), patch(
-        "app.utils.cloudinary_upload.upload_base64",
-        new=AsyncMock(return_value="https://res.cloudinary.com/df8ckaeam/image/upload/v1/uri-social/jane-ads/x.png"),
+        "app.utils.s3_upload.upload_base64",
+        new=AsyncMock(return_value="https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-social/jane-ads/x.png"),
     ) as mock_upload:
         url = _run(generate_ad_image("a vibrant workspace"))
-    assert url == "https://res.cloudinary.com/df8ckaeam/image/upload/v1/uri-social/jane-ads/x.png"
+    assert url == "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-social/jane-ads/x.png"
     mock_upload.assert_called_once()
     assert mock_upload.call_args.args[0] == "data:image/webp;base64,AAAA"
 
@@ -266,13 +266,13 @@ def test_generate_ad_image_passes_through_an_already_hosted_url():
     with patch(
         "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
         new=AsyncMock(return_value=fake_engine_result),
-    ), patch("app.utils.cloudinary_upload.upload_base64", new=AsyncMock()) as mock_upload:
+    ), patch("app.utils.s3_upload.upload_base64", new=AsyncMock()) as mock_upload:
         url = _run(generate_ad_image("a vibrant workspace"))
     assert url == "https://cdn.example.com/already-hosted.png"
     mock_upload.assert_not_called()
 
 
-def test_generate_ad_image_returns_none_when_cloudinary_upload_fails():
+def test_generate_ad_image_returns_none_when_upload_fails():
     # A base64 data URL is guaranteed to fail Meta's ad creation — better to fall back
     # to copy-only (the established, already-tested failure path) than hand it over.
     fake_engine_result = {"status": True, "responseData": {"image_url": "data:image/webp;base64,AAAA"}}
@@ -280,8 +280,8 @@ def test_generate_ad_image_returns_none_when_cloudinary_upload_fails():
         "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
         new=AsyncMock(return_value=fake_engine_result),
     ), patch(
-        "app.utils.cloudinary_upload.upload_base64",
-        new=AsyncMock(side_effect=Exception("cloudinary down")),
+        "app.utils.s3_upload.upload_base64",
+        new=AsyncMock(side_effect=Exception("upload service down")),
     ):
         url = _run(generate_ad_image("a vibrant workspace"))
     assert url is None
@@ -486,6 +486,62 @@ def test_write_ad_copy_video_recommendation_parsed():
         copy = _run(write_ad_copy("Zumba Studio", "fitness classes"))
     assert copy.video_recommended is True
     assert copy.video_recommendation_reason == "movement sells this"
+
+
+# ── platform threading: TikTok gets its own framing, Meta stays exactly as before ─
+
+def test_write_ad_copy_defaults_to_meta_instagram_framing():
+    generic = {"headline": "h", "primary_text": "p", "image_prompt": "p",
+              "video_recommended": False, "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy("Test Biz", "bags"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write a Meta/Instagram ad for" in prompt
+    assert "write like a real Nigerian business owner texting a customer on WhatsApp" in prompt
+    assert "TikTok" not in prompt
+
+
+def test_write_ad_copy_platform_tiktok_changes_the_prompt_not_just_a_label():
+    generic = {"headline": "h", "primary_text": "p", "image_prompt": "p",
+              "video_recommended": False, "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy("Test Biz", "bags", platform="tiktok"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write a TikTok ad for" in prompt
+    assert "Meta/Instagram" not in prompt
+    # Register changes to a native-creator voice, not the WhatsApp-texting one.
+    assert "native TikTok creator's own caption" in prompt
+    assert "write like a real Nigerian business owner texting a customer on WhatsApp" not in prompt
+    # The image brief also nudges toward a native/candid look, not a staged photoshoot.
+    assert "phone-shot feel" in prompt
+    # The shared discipline (price honesty, forbidden words, mandatory CTA) is not lost.
+    assert "REQUIRED: the last sentence is a direct ask" in prompt
+    assert "Never use:" in prompt
+
+
+def test_write_ad_copy_for_image_platform_tiktok_changes_the_prompt():
+    generic = {"headline": "h", "primary_text": "p", "video_recommended": False,
+              "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy_for_image("a product on a table", "Test Biz", "bags", platform="tiktok"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write the copy for a TikTok ad for" in prompt
+    assert "Meta/Instagram" not in prompt
+    assert "native TikTok creator's own caption" in prompt
+
+
+def test_write_ad_copy_for_image_defaults_to_meta_instagram_framing():
+    generic = {"headline": "h", "primary_text": "p", "video_recommended": False,
+              "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy_for_image("a product on a table", "Test Biz", "bags"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write the copy for a Meta/Instagram ad for" in prompt
+    assert "TikTok" not in prompt
 
 
 # ── write_ad_copy_for_image: same leakage/register treatment (upload/draft path) ─

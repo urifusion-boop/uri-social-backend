@@ -39,10 +39,49 @@ def test_linked_or_non_whatsapp_gives_no_warning(monkeypatch):
     assert _run(preflight.whatsapp_warning(_plan(dest="website"))) == []
 
 
-def test_public_id_is_read_from_a_cloudinary_video_url():
-    assert preflight._public_id("https://res.cloudinary.com/x/video/upload/v123/uri-ads/clip.mp4") == "uri-ads/clip"
-    assert preflight._public_id("https://res.cloudinary.com/x/video/upload/c_fill,ar_9:16/v1/uri-ads/clip.mp4") == "uri-ads/clip"
-    assert preflight._public_id("https://example.com/a.mp4") == ""
+def test_video_facts_reads_a_real_video_over_http_via_ffprobe():
+    # video_facts used to go through Cloudinary's admin API by public_id; it now
+    # runs ffprobe directly against the URL, so this works the same for any
+    # hosting provider (S3 included) instead of just Cloudinary — confirmed here
+    # against a tiny real HTTP-served test file rather than a mocked API call.
+    import http.server
+    import socketserver
+    import subprocess
+    import tempfile
+    import threading
+
+    proc = subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", "color=c=blue:s=480x854:d=1.0",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", "-f", "mp4",
+         "-movflags", "frag_keyframe+empty_moov", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        with open(f"{d}/clip.mp4", "wb") as f:
+            f.write(proc.stdout)
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=d, **kw)
+
+            def log_message(self, *a):
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                facts = _run(preflight.video_facts(f"http://127.0.0.1:{port}/clip.mp4"))
+            finally:
+                httpd.shutdown()
+
+    assert facts == {"width": 480, "height": 854, "duration": 1.0, "format": "mp4"}
+
+
+def test_video_facts_returns_none_for_an_unreachable_url():
+    assert _run(preflight.video_facts("http://127.0.0.1:1/missing.mp4")) is None
+    assert _run(preflight.video_facts("")) is None
 
 
 def test_video_problems():

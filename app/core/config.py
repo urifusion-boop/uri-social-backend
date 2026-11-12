@@ -48,8 +48,11 @@ class Settings(BaseSettings):
     # business portfolios, a system-user token with the WhatsApp permissions.
     WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID: str = ""
     WHATSAPP_SYSTEM_TOKEN: str = ""
-    META_WEBHOOK_VERIFY_TOKEN: str = ""
     META_SYSTEM_TOKEN: str = ""
+    # The string Meta echoes back during the webhook subscription handshake. Ours to
+    # choose; it only proves the endpoint is the one we configured. Event authenticity
+    # comes from the X-Hub-Signature-256 HMAC, not from this.
+    META_WEBHOOK_VERIFY_TOKEN: str = ""
     # URI's own Meta Business Manager id — owned by Ibukun. Until this is set,
     # the ads page-connect flow still runs and stores the page token; only the
     # final "grant URI's Business Manager ADVERTISE access" step is skipped.
@@ -107,8 +110,17 @@ class Settings(BaseSettings):
     # Google Gemini (Nano Banana 2 image generation)
     GOOGLE_GEMINI_API_KEY: Optional[str] = None
 
+    # Apify — Market Intelligence (social listening) collection actors
+    APIFY_API_TOKEN: Optional[str] = None
+
     # fal.ai image/video generation
     FAL_API_KEY: Optional[str] = None
+
+    # YarnGPT hosted text-to-speech API (https://yarngpt.ai/api-docs) for Nigerian-voice talking
+    # videos. The key comes from the Account page at yarngpt.ai. Unset = the older voice-cloning
+    # path is used for those voices, exactly as before.
+    YARNGPT_API_URL: str = "https://api.yarngpt.ai"
+    YARNGPT_API_KEY: Optional[str] = None
 
     # Pexels stock video API (b-roll fetch for video production)
     PEXELS_API_KEY: Optional[str] = None
@@ -148,6 +160,12 @@ class Settings(BaseSettings):
     # a JSON API error, which is what actually broke create-account/link-existing on
     # staging. Bump this periodically; check developers.google.com/google-ads/api/docs/sunset-dates.
     GOOGLE_ADS_API_VERSION: str = "v24"
+    # Has Google verified URI's OAuth app for the Google Ads scope? Until it has,
+    # "Continue with Google" shows Google's red "hasn't verified this app" screen
+    # to everyone, so the app leads with the Customer ID route and warns about the
+    # screen instead of sending people into it cold. Set to true once Google's
+    # verification is approved (Google Cloud → OAuth consent screen).
+    GOOGLE_ADS_OAUTH_VERIFIED: bool = False
 
     # TikTok Marketing API (Jane + Ads, Phase 1 — see app/agents/jane_ads/adapters/tiktok.py)
     # Unlike Meta/Google, Phase 1 does NOT run ads from the brand's own TikTok presence
@@ -173,6 +191,15 @@ class Settings(BaseSettings):
     # (production default) once TIKTOK_ADS_ADVERTISER_ID is a real, funded
     # account.
     TIKTOK_ADS_API_BASE: str = "https://business-api.tiktok.com"
+
+    # TikTok Login Kit + Content Posting API — the "urisocial" app's own
+    # credentials, distinct from TIKTOK_ADS_* above (a separate TikTok product/
+    # app entirely). Powers direct organic posting (FILE_UPLOAD mode — no
+    # domain verification needed, unlike PULL_FROM_URL) as an alternative to
+    # the existing Outstand-mediated TikTok connection. See
+    # app/agents/social_media_manager/services/tiktok_direct_service.py.
+    TIKTOK_APP_CLIENT_KEY: str = ""
+    TIKTOK_APP_CLIENT_SECRET: str = ""
 
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
     # Production: Always use live mode for real payments
@@ -253,6 +280,15 @@ class Settings(BaseSettings):
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 
+    # Video Editing Billing PRD §4: credits charged per billable minute of
+    # final video edited (rounded up to the next full minute). Configurable
+    # via env var rather than hard-coded in the billing logic.
+    VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
+
+    # Credits for AI video generation (see video_generation_billing.py). off = free, as before;
+    # shadow = record what would be charged without charging; on = charge. Prices: video_pricing.py.
+    VIDEO_GENERATION_BILLING_MODE: str = "off"
+
     # jane-whatsapp-reply — shared secret this backend presents (as
     # X-Internal-Service) when proxying support-team requests to jane's own
     # /internal/* endpoints (see app/services/JaneEscalationClient.py). Must match
@@ -263,10 +299,12 @@ class Settings(BaseSettings):
     JANE_WA_BASE_URL: str = "https://jane-whatsapp.urisocial.com"
 
     # Bypass flags for local development
-    # VSG-01's composited ad formats (Us vs Them, Borrowed Interface, Problem/Solution,
-    # etc.) are typographic layouts DRAWN by the ad_formats library, not images from the
-    # content engine normal posts use. Off by default until deliberately turned on for
-    # a given environment.
+    # VSG-01's composited ad formats (Us vs Them, Borrowed Interface, Problem/Solution)
+    # are typographic layouts DRAWN by the ad_formats library, not images from the
+    # content engine normal posts use. Off by default: the drawn output was reported as
+    # visually poor next to the generated imagery, so ads fall through to
+    # generate_ad_image() as before. Flip to true to put the format library back in
+    # front — nothing about it is removed, only skipped (see creative.py step 10).
     JANE_ADS_VSG01_ENABLED: bool = False
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
@@ -299,10 +337,17 @@ class Settings(BaseSettings):
     # (all-users ad spend / margin). Overridable by the env var of the same name;
     # the default seeds the current admins so the report works without server config.
     JANE_ADS_ADMIN_EMAILS: str = "shorekoya@gmail.com,urisocialingsight@gmail.com"
+    # Comma-separated emails with global admin access (admin_router.py) — the
+    # bootstrap allowlist, always valid regardless of DB state. A user's own
+    # is_admin Mongo flag (grantable from the admin UI itself) is the other,
+    # DB-driven path in; either grants access. Ported from aws/prod, which
+    # never had this env var either — same default-seed convention as
+    # JANE_ADS_ADMIN_EMAILS above, so the panel works without server config.
+    ADMIN_EMAILS: str = "urisocialingsight@gmail.com,ujahnaomi104@gmail.com"
     # Comma-separated emails that receive platform-wide operational alerts
     # (app/services/platform_alerts.py) — infrastructure/account failures
     # like the OpenAI account running out of credit, not per-user issues.
-    # Deliberately separate from ADMIN_EMAILS (above): that list also grants
+    # Deliberately separate from ADMIN_EMAILS: that list also grants
     # admin-panel API access, which is a different, bigger decision than
     # "should this address get notified when something breaks."
     PLATFORM_ALERT_EMAILS: str = "hello@urisocial.com,urisocialingsight@gmail.com,urifusion@gmail.com"

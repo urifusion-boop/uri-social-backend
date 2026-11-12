@@ -29,7 +29,7 @@ import openai
 from app.core.config import settings
 
 from . import constants as C
-from .jane_consultant import ConsultantBrief
+from .jane_consultant import ConsultantBrief, client_named_areas
 from .models import PlanVariant, PlanVariantSet, StrategyCitation
 from .retrieval import RetrievalResult
 
@@ -39,6 +39,12 @@ class PlanVariantsUnavailableError(Exception):
     masquerades as 'only one plan exists', since that's a real, meaningful
     finding the client should be able to trust."""
 
+
+
+# The model numbers its pick by its own draft order ("I'd go with the second one"),
+# but the cards are re-sorted by rank, so the pick always shows as Plan 1.
+_ORDINAL_PICK = re.compile(r"\bthe (first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th) (one|option|plan)\b",
+                           re.IGNORECASE)
 
 def max_selectable_plans(budget_ngn: float) -> tuple[int, str]:
     """How many audience variants this budget can actually support without
@@ -106,7 +112,7 @@ def _variant_fields_block() -> str:
         "what they have).\n"
         "recommendation_reason: argue for the top-ranked variant using ITS OWN "
         "trade_off and why_this_could_work, in the voice of a media buyer talking "
-        "to the client directly — e.g. \"I'd go with the second one. Bigger jobs, "
+        "to the client directly — e.g. \"I'd go with the homeowners planning new builds. Bigger jobs, "
         "and you said the new builds are where your good work comes from.\" Never "
         "just assert it's best without a reason tied to their actual business.\n"
         "Never invent a specific number (no \"est. 58 conversions\", no \"₦380 per "
@@ -302,6 +308,9 @@ async def generate_plan_variants(
     # accounts are Nigerian), yet the cards offered "Nairobi, Johannesburg, Cairo" —
     # places the campaign would never run. Live, 2026-10-30.
     nationwide = not whole_area and (parsed.geo_mode or "").strip().lower() == "non_local"
+    # Asked for Lekki, the client was shown a Lekki plan, then picked an audience card
+    # whose own pockets (Admiralty Way, Ikate) replaced it on the final plan.
+    named = [] if whole_area else client_named_areas(parsed)
     variants: list[PlanVariant] = []
     for i, v in enumerate(raw_variants[:5], start=1):
         if not isinstance(v, dict):
@@ -312,7 +321,7 @@ async def generate_plan_variants(
             who_its_for=str(v.get("who_its_for", "")).strip(),
             audience_segment=str(v.get("audience_segment", "")).strip(),
             geo_pockets=([f"All of {parsed.city}"] if whole_area else ["All of Nigeria"] if nationwide else
-                         [str(g).strip() for g in (v.get("geo_pockets") or []) if str(g).strip()]),
+                         named or [str(g).strip() for g in (v.get("geo_pockets") or []) if str(g).strip()]),
             trigger=str(v.get("trigger", "")).strip(),
             why_this_could_work=str(v.get("why_this_could_work", "")).strip(),
             trade_off=str(v.get("trade_off", "")).strip(),
@@ -329,6 +338,10 @@ async def generate_plan_variants(
                 v.recommended = False
             variants[0].recommended = True
 
+    reason = str(data.get("recommendation_reason", "")).strip()
+    top = next((i for i, v in enumerate(variants, start=1) if v.recommended), 1)
+    reason = _ORDINAL_PICK.sub(f"Plan {top}", reason)
+
     budget = parsed.budget_ngn or 0.0
     max_selectable, selection_rule_reason = max_selectable_plans(budget)
     if variants:
@@ -340,7 +353,7 @@ async def generate_plan_variants(
 
     return PlanVariantSet(
         variants=variants,
-        recommendation_reason=str(data.get("recommendation_reason", "")).strip(),
+        recommendation_reason=reason,
         max_selectable=max_selectable,
         selection_rule_reason=selection_rule_reason,
         corpus_coverage=(corpus.coverage if corpus else "none"),

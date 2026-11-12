@@ -25,7 +25,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
-from .geo import place_named_in, whole_area_answer
+from .geo import place_named_in, places_named_in, regions_named_in, whole_area_answer
 from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
@@ -327,13 +327,25 @@ async def consult(message: str, business_name: str = "", category: str = "",
                   known_budget: Optional[float] = None,
                   history: Optional[list[dict]] = None,
                   offering: str = "",
-                  stated_audience: str = "") -> ConsultantBrief:
+                  stated_audience: str = "",
+                  objective_label: str = "",
+                  budget_override: Optional[float] = None,
+                  platform_label: str = "") -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
     time. Raises NlUnavailableError if the model call fails — same contract as
     nl.py's parse_message, so an outage never masquerades as a 'need more info'
-    follow-up (the caller surfaces it as a clear 503 instead)."""
+    follow-up (the caller surfaces it as a clear 503 instead).
+
+    budget_override — a multi-platform campaign's per-platform budget split,
+    computed by the frontend and never typed into `message` as text (see
+    router.py's budget_ngn_override). Live-confirmed: without this, the
+    consultant has no way to see that figure (client_stated_budget only reads
+    `message`/`history`) and asks the client for a budget on every platform's
+    plan anyway, even though it was already decided and sent as a real
+    number — defeating the whole point of planning several platforms from
+    one brief. Settles the budget exactly like a client-typed figure does."""
     if not settings.jane_ads_openai_key:
         raise NlUnavailableError("OPENAI_API_KEY is not configured")
     if not (message or "").strip():
@@ -341,7 +353,30 @@ async def consult(message: str, business_name: str = "", category: str = "",
             return ConsultantBrief(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
         return ConsultantBrief(business_name=business_name, category=category)
 
+    # A budget the client typed anywhere in this thread settles it. The remembered spend
+    # from a PAST campaign is then withheld from the model entirely: offered alongside a
+    # stated figure, it asked "last time you spent ₦130,000, want to do the same?" of a
+    # client who had just said ₦30,000. Live-reported, repeatedly.
+    settled_budget = budget_override or client_stated_budget(message, history)
+    if settled_budget:
+        known_budget = None
+
     known_bits = []
+    if objective_label:
+        known_bits.append(
+            f"the client already chose this campaign's objective: {objective_label} — that "
+            f"IS the goal, decided. Do not ask what the goal is or offer other goals"
+        )
+    if platform_label:
+        known_bits.append(
+            f"the client already chose to run this on {platform_label} — decided. "
+            f"Do not ask which platform or channel to use"
+        )
+    if settled_budget:
+        known_bits.append(
+            f"the client's budget for THIS campaign is ₦{settled_budget:,.0f} — decided. "
+            f"Set budget_ngn to {int(settled_budget)} and never ask about the budget"
+        )
     if business_name:
         known_bits.append(f"business name: {business_name}")
     if category:
@@ -374,12 +409,21 @@ async def consult(message: str, business_name: str = "", category: str = "",
     # Ikeja, Victoria Island and Surulere" over a plan card that correctly read "All of
     # Lagos". Live-caught in the UI. Telling the model up front is the only way the
     # sentence it writes agrees with the plan it produces.
-    whole_now = _whole_area_answered(message)
+    client_words = _client_words(message, history, stated_audience)
+    whole_now = _whole_area_answered(message) or _broad_area(client_words)
     if whole_now:
         known_bits.append(
             f"the client has asked to cover ALL of {whole_now} — that IS the geography, "
             f"already decided. Say so in stated_plan ('all of {whole_now}'), do not name "
             f"neighbourhoods or pockets inside it, and do not ask which areas to focus on"
+        )
+
+    named = [] if whole_now else places_named_in(client_words)
+    if named:
+        known_bits.append(
+            f"the client named the area(s) to target: {_listed(named)} — that IS the "
+            f"geography, already decided. Target exactly those, add no others, and do not "
+            f"ask which areas or pockets to focus on"
         )
 
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
@@ -438,7 +482,19 @@ async def consult(message: str, business_name: str = "", category: str = "",
         raise NlUnavailableError(str(e)) from e
 
     brief = _coerce(data, business_name, category)
-    return _enforce_hard_requirements(brief, message, history or [], known_budget)
+    broad = "" if _hyper_local(client_words, brief.geo_areas) else (
+        _broad_area(client_words) or ", ".join(regions_named_in(brief.city)))
+    if settled_budget:
+        brief = brief.model_copy(update={"budget_ngn": settled_budget})
+        if brief.clarify and _is_about_budget(brief.clarify):
+            brief = brief.model_copy(update={
+                "clarify": _without_budget_questions(brief.clarify),
+                "missing": [m for m in (brief.missing or []) if not _is_about_budget(m)],
+            })
+    brief = _enforce_hard_requirements(brief, message, history or [], known_budget, broad)
+    if not brief.clarify and not brief.whole_area:
+        brief = _named_areas_only(brief, client_words)
+    return brief
 
 
 _AFFIRMATIVE_WORDS = {
@@ -457,6 +513,36 @@ def _latest_user_reply(message: str) -> str:
     # Sentence ends only — a full stop inside "urisocial.com" or "₦2.5k" isn't one.
     pieces = [p.strip() for p in re.split(r"\.(?:\s+|$)", (message or "").strip()) if p.strip()]
     return pieces[-1].lower() if pieces else ""
+
+
+def _client_words(message: str, history: Optional[list[dict]], stated_audience: str = "") -> str:
+    """Everything the client typed in this conversation, and nothing Jane wrote."""
+    turns = [t.get("content", "") for t in (history or []) if t.get("role") == "user"]
+    return " . ".join([message or "", stated_audience or "", *turns])
+
+
+def _hyper_local(client_words: str, areas: list[dict]) -> bool:
+    """True when the client named a neighbourhood themselves, not just a state or city."""
+    if place_named_in(client_words):
+        return True
+    low = (client_words or "").lower()
+    return any(
+        name and name in low and not regions_named_in(name)
+        for name in ((a.get("name") or "").strip().lower() for a in (areas or []))
+    )
+
+
+def _broad_area(client_words: str) -> str:
+    """The states or cities to cover whole, when the client named only those.
+
+    A client who says "Lagos, Abuja and Ibadan" has not asked for Victoria Island,
+    the CBD and Ring Road. Jane picked pockets anyway, every time, so a broad brief
+    came back narrowed to three neighbourhoods. Unless the client names a
+    neighbourhood, the whole state is the target. Live-reported, repeatedly.
+    """
+    if place_named_in(client_words):
+        return ""
+    return ", ".join(regions_named_in(client_words))
 
 
 def _whole_area_answered(message: str) -> str:
@@ -494,7 +580,9 @@ _NUM = r"\d[\d,]*(?:\.\d+)?"
 _STATED_AMOUNT = re.compile(
     rf"(?:₦|\bngn\b|\bn(?=\d))\s*({_NUM})\s*([km])?"   # ₦20,000 / N20k / NGN 50000
     rf"|\b({_NUM})\s*([km])\b"                            # 20k / 5k / 1.5m
-    r"|\b(\d{4,})\b",                                     # bare 20000
+    r"|\b(\d{4,})\b"                                      # bare 20000
+    r"|\b(\d{1,3}(?:,\d{3})+)\b(?!\s*(?:customers|people|leads|followers|clients"
+    r"|sales|orders|views|messages|users|visitors|likes))",  # bare 30,000
     re.I,
 )
 
@@ -510,7 +598,7 @@ def stated_budget_ngn(reply: str) -> Optional[float]:
 
     found: list[float] = []
     for m in _STATED_AMOUNT.finditer(reply or ""):
-        digits = m.group(1) or m.group(3) or m.group(5)
+        digits = m.group(1) or m.group(3) or m.group(5) or m.group(6)
         suffix = m.group(2) or m.group(4) or ""
         if not digits:
             continue
@@ -519,6 +607,101 @@ def stated_budget_ngn(reply: str) -> Optional[float]:
             found.append(v)
     uniq = sorted(set(found))
     return uniq[0] if len(uniq) == 1 else None
+
+
+def client_stated_budget(message: str, history: Optional[list[dict]] = None) -> Optional[float]:
+    """The newest budget the client typed anywhere in this conversation.
+
+    Reads the client's own words only — each reply in the brief-so-far, newest first,
+    then their saved turns — so a figure Jane mentioned (a past campaign's spend) is
+    never mistaken for one the client gave.
+    """
+    pieces = [p for p in re.split(r"\.(?:\s+|$)", message or "") if p.strip()]
+    texts = list(reversed(pieces)) + [
+        t.get("content", "") for t in reversed(history or []) if t.get("role") == "user"
+    ]
+    for text in texts:
+        found = stated_budget_ngn(text)
+        if found:
+            return found
+    return stated_budget_ngn(message)
+
+
+_SENTENCE = re.compile(r"[^.?!]*(?:[.?!]+|$)")
+
+
+def _without_budget_questions(clarify: str) -> str:
+    """`clarify` with every sentence that asks about the budget removed, or "" when no
+    question is left. The budget is already settled when this is called."""
+    kept = [s.strip() for s in _SENTENCE.findall(clarify or "")
+            if s.strip() and not (_is_about_budget(s) or "spent" in s.lower()
+                                  or "allocat" in s.lower())]
+    return " ".join(kept) if any("?" in s for s in kept) else ""
+
+
+def _without_geography_questions(clarify: str) -> str:
+    """`clarify` minus every sentence about WHERE, or "" when no question is left.
+    Called once the client has already named their area."""
+    kept = [s.strip() for s in _SENTENCE.findall(clarify or "")
+            if s.strip() and not _is_about_geography(s)]
+    return " ".join(kept) if any("?" in s for s in kept) else ""
+
+
+def _whole_area_sentence(stated_plan: str, whole: str) -> str:
+    """Jane's own line, minus any sentence naming neighbourhoods, led by the whole area.
+
+    The plan covered all of Lagos while her message said "focusing on areas like
+    Lekki, Ikeja and Surulere" — the client reads the sentence, not the targeting.
+    """
+    kept = [s.strip() for s in _SENTENCE.findall(stated_plan or "")
+            if s.strip() and not place_named_in(s) and "areas like" not in s.lower()
+            and "?" not in s]
+    lead = f"I'll cover all of {whole}."
+    if any("all of" in s.lower() for s in kept):
+        return " ".join(kept)
+    return " ".join([lead, *kept])
+
+
+CLIENT_NAMED = "the area you named"
+
+# The model fills intermediary_note even when there is none ("No intermediary needed;
+# direct SME owners are the targets", "URI directly targets business owners, not
+# intermediaries") and it reaches the client's plan as noise.
+_NO_INTERMEDIARY = re.compile(
+    r"\bintermediar\w*\b[^.]*\b(?:no|not|without|instead|rather|needed)\b"
+    r"|\b(?:no|not|without|instead of|rather than)\b[^.]*\bintermediar"
+    r"|^\s*target\w*\b[^.]*\bdirectly\b",
+    re.IGNORECASE)
+
+
+def _without_no_intermediary(text: str) -> str:
+    return " ".join(s.strip() for s in _SENTENCE.findall(text) if s.strip() and not _NO_INTERMEDIARY.search(s))
+
+
+def client_named_areas(brief: "ConsultantBrief") -> list[str]:
+    return [a["name"] for a in brief.geo_areas or [] if a.get("reason") == CLIENT_NAMED]
+
+
+def _named_areas_only(brief: "ConsultantBrief", client_words: str) -> "ConsultantBrief":
+    """The neighbourhoods the client named, and only those.
+
+    Asked for Lekki and Ikeja, Jane planned Lekki Phase 1, Ikeja GRA and Victoria
+    Island; asked for Lekki, she added Admiralty Way and Victoria Island. A place the
+    client named is the brief, not a starting point to widen from.
+    """
+    named = places_named_in(client_words)
+    if not named:
+        return brief
+    areas = [{"name": n, "reason": CLIENT_NAMED} for n in named]
+    plan = f"I'll target {_listed(named)}, as you asked."
+    kept = [s.strip() for s in _SENTENCE.findall(brief.stated_plan or "")
+            if s.strip() and "?" not in s and not place_named_in(s)
+            and not s.strip().lower().startswith("let me know")]
+    return brief.model_copy(update={"geo_areas": areas, "stated_plan": " ".join([plan, *kept])})
+
+
+def _listed(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
@@ -663,7 +846,7 @@ def _is_about_budget(text: str) -> bool:
 
 
 def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
-                               known_budget: Optional[float]) -> ConsultantBrief:
+                               known_budget: Optional[float], broad: str = "") -> ConsultantBrief:
     """A real media buyer never guesses or skips the budget and the area — enforced HERE,
     not just prompted, because prompting alone already let two failure modes through
     once: treating a remembered past-campaign spend as this campaign's confirmed budget,
@@ -712,22 +895,35 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     # own clarify, and everything past that guard only runs when there is no clarify
     # to begin with — so a check placed after it can never see the loop it exists to
     # break.
-    whole = _whole_area_answered(message)
+    whole = _whole_area_answered(message) or broad
     if whole and _is_about_geography(brief.clarify):
         print(f"[Consultant] client asked for all of {whole} — dropping the area "
               f"question and settling the geography", flush=True)
         brief = brief.model_copy(update={
-            "city": brief.city or whole,
+            "city": whole,
             "geo_areas": [],
             "geo_mode": _geographic_mode(brief.geo_mode),
             "whole_area": True,
+            "stated_plan": _whole_area_sentence(brief.stated_plan, whole),
             "clarify": "",
             "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
         })
     elif whole:
-        brief = brief.model_copy(update={"city": brief.city or whole, "geo_areas": [],
+        brief = brief.model_copy(update={"city": whole, "geo_areas": [],
                                          "geo_mode": _geographic_mode(brief.geo_mode),
-                                         "whole_area": True})
+                                         "whole_area": True,
+                                         "stated_plan": _whole_area_sentence(brief.stated_plan, whole)})
+    elif brief.clarify and _is_about_geography(brief.clarify) and place_named_in(message):
+        # The client already named their neighbourhood ("lekki"). Asking which
+        # pockets within it they mean is the same question again. Live-reported.
+        place = place_named_in(message)
+        brief = brief.model_copy(update={
+            "clarify": _without_geography_questions(brief.clarify),
+            "city": brief.city or "Lagos",
+            "geo_mode": _geographic_mode(brief.geo_mode),
+            "geo_areas": brief.geo_areas or [{"name": place, "reason": "the area you named"}],
+            "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
+        })
 
     # The same loop, for the budget. A figure the client has already given does not
     # become unknown because the model asked again — and the existing loop-breaker
@@ -825,7 +1021,7 @@ def _coerce(data: dict, business_name: str, category: str) -> ConsultantBrief:
         geo_mode=geo_mode if geo_mode in _GEO_MODES else None,
         geo_areas=geo_areas,
         geo_explanation=str(data.get("geo_explanation") or "").strip(),
-        intermediary_note=str(data.get("intermediary_note") or "").strip(),
+        intermediary_note=_without_no_intermediary(str(data.get("intermediary_note") or "").strip()),
         creative_fit_warning=str(data.get("creative_fit_warning") or "").strip(),
-        stated_plan=str(data.get("stated_plan") or "").strip(),
+        stated_plan=_without_no_intermediary(str(data.get("stated_plan") or "").strip()),
     )

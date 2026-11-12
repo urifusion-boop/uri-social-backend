@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# Fetch latest changes from remote
+echo "🔍 Checking if remote has new changes..."
+git fetch origin
+
+# Get current branch
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# Check if remote branch exists
+if git rev-parse --verify origin/$BRANCH >/dev/null 2>&1; then
+    # Compare local and remote
+    LOCAL=$(git rev-parse @)
+    REMOTE=$(git rev-parse origin/$BRANCH)
+    BASE=$(git merge-base @ origin/$BRANCH)
+
+    if [ "$LOCAL" = "$REMOTE" ]; then
+        echo "✅ Branch is up to date with remote"
+    elif [ "$LOCAL" = "$BASE" ]; then
+        echo "❌ ERROR: Remote has new commits that you don't have locally!"
+        echo "❌ Please run: git pull origin $BRANCH --rebase"
+        echo "❌ Then try pushing again"
+        exit 1
+    elif [ "$REMOTE" = "$BASE" ]; then
+        echo "✅ You have local commits to push"
+    else
+        echo "⚠️  WARNING: Branches have diverged!"
+        echo "⚠️  Please run: git pull origin $BRANCH --rebase"
+        echo "⚠️  Then try pushing again"
+        exit 1
+    fi
+else
+    echo "ℹ️  New branch - no remote tracking branch found"
+fi
+
+echo "✅ Pre-push check passed"
+exit 0

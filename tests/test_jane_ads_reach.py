@@ -175,3 +175,9 @@ def test_restating_keeps_the_audience_words_and_whole_words():
 
     out = restate_geography("Reaching the businesses in Yaba via vivid video.", ["Ikeja"], "Lagos")
     assert out == "Reaching the businesses in all of Lagos via vivid video."
+
+
+def test_widened_named_areas_do_not_claim_the_client_asked_for_the_whole_city():
+    from app.agents.jane_ads.reach import restate_geography
+    out = restate_geography("I'll target Lekki and Ikeja, as you asked.", ["Lekki", "Ikeja"], "Lagos")
+    assert out == "I'll target all of Lagos."

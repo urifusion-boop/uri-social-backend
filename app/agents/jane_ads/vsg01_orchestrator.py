@@ -876,6 +876,19 @@ async def _build_problem_solution(business_name: str, category: str, description
 
 # ── Shared: extract a REAL quote, never compose one ───────────────────────
 
+def _normalise_for_match(text: str) -> str:
+    import re
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    return re.sub(r"\s+", " ", re.sub(r"[\"'.,!?;:()\-–—]", " ", text.lower())).strip()
+
+
+def _appears_in(fragment: str, source: str) -> bool:
+    """Whether `fragment` is in `source` word for word, ignoring case, quote marks
+    and punctuation. An empty fragment never counts."""
+    f = _normalise_for_match(fragment)
+    return bool(f) and f in _normalise_for_match(source)
+
+
 async def _extract_real_quote(description: str) -> Optional[dict]:
     """Used by Review Card and Testimonial+Offer — both require a genuine
     customer quote (§2.1/§2.2). Only ever extracts what the caller's own
@@ -896,6 +909,13 @@ async def _extract_real_quote(description: str) -> Optional[dict]:
     )
     d = await _call_content_model(prompt)
     if not d or not d.get("quote"):
+        return None
+    # The model is asked for a verbatim quote but nothing made it one: a paraphrase
+    # or an invented line presented as a customer's words is a fabricated
+    # testimonial (Ads PRD CR-07). Both the words and who said them must appear in
+    # the business's own text, or the format is not used.
+    if not _appears_in(str(d["quote"]), description) or \
+            not _appears_in(str(d.get("attribution") or ""), description):
         return None
     star = d.get("star_rating")
     star = int(star) if isinstance(star, (int, float)) and 1 <= int(star) <= 5 else None
@@ -1006,7 +1026,7 @@ async def _build_review_card(business_name: str, category: str, description: str
         return None
     try:
         document = review_card.build_document(
-            photo_url, real["quote"], real["attribution"] or "A happy customer",
+            photo_url, real["quote"], real["attribution"],
             star_rating=real["star_rating"], canvas_size=_CANVAS_SIZE, tokens=tokens,
             brand_logo_url=brand_logo_url,
         )
@@ -1019,7 +1039,7 @@ async def _build_review_card(business_name: str, category: str, description: str
     return document
 
 
-# ── SEED-082: Text on a Face (needs a real, attested customer photo) ─────
+# ── SEED-082: Text on a Face (needs an attested photo of the owner or their team) ─────
 
 async def _content_text_on_a_face(business_name: str, category: str, description: str,
                                   correction: str = "",
@@ -1070,7 +1090,7 @@ async def _build_text_on_a_face(business_name: str, category: str, description: 
         # happens) IS the permission confirmation this format requires.
         return text_on_a_face.build_document(
             photo_url, stmt, permission_on_file=True, canvas_size=_CANVAS_SIZE, tokens=tokens,
-            brand_logo_url=brand_logo_url,
+            brand_logo_url=brand_logo_url, speaker="owner",
         )
 
     try:
@@ -1132,7 +1152,7 @@ async def _build_testimonial_offer(business_name: str, category: str, descriptio
         return None
     try:
         document = testimonial_offer.build_document(
-            photo_url, real["quote"], real["attribution"] or "A happy customer",
+            photo_url, real["quote"], real["attribution"],
             offer["offer_text"], permission_on_file=True,
             price_or_terms=offer["price_or_terms"], canvas_size=_CANVAS_SIZE, tokens=tokens,
             brand_logo_url=brand_logo_url,
@@ -1337,6 +1357,11 @@ async def _build_text_only(business_name: str, category: str, description: str, 
 # ── SEED-098: Work In Progress (generated scene — see module
 # docstring on why this doesn't yet accept a real work photo) ─────────────
 
+def _is_true(value) -> bool:
+    """A model's boolean, which may come back as true or as the string "true"."""
+    return value is True or str(value).strip().lower() in ("true", "yes", "1")
+
+
 async def _content_work_in_progress(business_name: str, category: str, description: str,
                                     brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
@@ -1349,10 +1374,23 @@ async def _content_work_in_progress(business_name: str, category: str, descripti
         "- statement: the short line, 6 words or fewer\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
-        "Return ONLY the JSON with exactly these 3 keys."
+        "- applies: true ONLY if THIS business itself does visible, hands-on physical work a camera "
+        "could photograph on site (trades, repairs, installation, construction, food preparation, "
+        "tailoring, cleaning, farming...). false for software, apps, online services, consulting, "
+        "finance, education, agencies and anything done at a screen or desk.\n"
+        "The examples above only show the STYLE. Never reuse them: the activity must be this "
+        "business's own real work. If applies is false, leave the other fields empty.\n"
+        "Return ONLY the JSON with exactly these 4 keys."
     )
     d = await _call_content_model(prompt)
     if not d:
+        return None
+    # This format shows a tradesperson mid-job. For a business with no such work
+    # the model used to copy an example from the prompt — a software company got
+    # an ad of plumbers fixing a burst pipe (seen on dev). Returning None makes
+    # select_and_render_vsg01_creative move on to the next format.
+    if not _is_true(d.get("applies")):
+        print(f"[VSG01] Work In Progress doesn't fit {business_name or 'this business'} (no hands-on work) — skipping", flush=True)
         return None
     trade_activity = str(d.get("trade_activity", "")).strip()
     statement = str(d.get("statement", "")).strip()
@@ -1953,6 +1991,18 @@ async def render_vsg01_creative(
     return {"png_bytes": png_bytes, "format_id": strategy.strategy_id, "attributes": attributes}
 
 
+PHOTO_ATTESTATIONS = ("product_photo", "real_customer_photo", "owner_photo")
+
+# Whose words a person-photo format may put beside them. Text on a Face lays a line
+# composed in the OWNER's voice across the face, so over a customer's photo it would
+# put invented words in a real customer's mouth; Testimonial + Offer presents the
+# person as a customer, which the owner or their staff are not.
+_FORMATS_NOT_FOR_PERSON = {
+    "real_customer_photo": frozenset({"SEED-082"}),
+    "owner_photo": frozenset({"SEED-074"}),
+}
+
+
 def _vsg01_candidate_params(
     *, photo_url: Optional[str], photo_attestation: Optional[str], recomposite: bool,
 ) -> tuple[Optional[frozenset], bool, bool, Optional[str]]:
@@ -1961,10 +2011,13 @@ def _vsg01_candidate_params(
     pre-generation suggest-format endpoint (router.py's POST /jane-ads/creative/
     suggest-format) computes the SAME eligible pool a real generation call
     would, rather than a second hand-maintained copy that could drift."""
-    if photo_url and photo_attestation:
+    if photo_url and photo_attestation in PHOTO_ATTESTATIONS:
         candidate_ids = RECOMPOSITE_PHOTO_FORMAT_IDS if recomposite else UPLOAD_PHOTO_FORMAT_IDS
         has_product_photo = photo_attestation == "product_photo"
-        has_real_customer_photo = photo_attestation == "real_customer_photo"
+        # Both are a real, consenting person — what differs is whose words a format
+        # may put beside them (see _FORMATS_BY_PERSON).
+        has_real_customer_photo = photo_attestation in ("real_customer_photo", "owner_photo")
+        candidate_ids = candidate_ids - _FORMATS_NOT_FOR_PERSON.get(photo_attestation, frozenset())
         return candidate_ids, has_product_photo, has_real_customer_photo, photo_url
     return NO_PHOTO_FORMAT_IDS, False, False, None
 
@@ -1998,6 +2051,7 @@ async def select_and_render_vsg01_creative(
     recomposite: bool = False,
     forced_format_id: Optional[str] = None,
     day30_photo_url: Optional[str] = None,
+    exclude_format_ids: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """The one call creative.py's GENERATE/UPLOAD/RECOMPOSITE paths need:
     select eligible formats from the real corpus (scoped to what this module
@@ -2047,6 +2101,8 @@ async def select_and_render_vsg01_creative(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
         isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT, candidate_ids=candidate_ids, description=description,
     )
+    # Ads tested together must differ in structure, not just wording.
+    ranked = [s for s in ranked if s.strategy_id not in (exclude_format_ids or [])]
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
     if effective_forced is None:

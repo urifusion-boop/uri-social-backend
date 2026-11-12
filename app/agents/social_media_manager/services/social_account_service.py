@@ -215,9 +215,14 @@ class SocialAccountService:
             # platform in the picker could never leave more than one connected
             # locally, no matter how many were actually selected. Outstand's own
             # side was never affected by this — only our local mirror was.
+            # Only Outstand's own records are replaced: a direct Meta connection carries the
+            # Page token the inbox needs, which Outstand never provides, so wiping it here
+            # silently stopped DMs and auto-replies for that brand.
             networks_in_batch = {acc.get("network") for acc in accounts if acc.get("network")}
             for network in networks_in_batch:
-                await db["social_connections"].delete_many({**brand_scope, "platform": network})
+                await db["social_connections"].delete_many(
+                    {**brand_scope, "platform": network, "connected_via": "outstand"}
+                )
 
             for acc in accounts:
                 outstand_account_id = acc.get("id")

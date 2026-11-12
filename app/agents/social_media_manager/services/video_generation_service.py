@@ -1,26 +1,381 @@
 import asyncio
+import os
+import tempfile
+import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from app.core.config import settings
 from app.database import get_db
-from app.utils.s3_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes, upload_file_path
+from app.agents.social_media_manager.services import yarngpt_tts_service
+from app.agents.social_media_manager.services.people_consistency import with_face_stability
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-    _gemini_client = genai.Client(api_key=settings.GOOGLE_GEMINI_API_KEY)
-except Exception as _e:
-    _gemini_client = None
-    print(f"[VideoGenerationService] google-genai init failed: {_e}")
+# Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
+# (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
+# minus Seedance 2.5 which the brief explicitly says not to make a launch
+# default ("Do not expose as standard launch infrastructure without evidence
+# that the quality uplift improves conversion or reduces retries enough to
+# justify the cost" — §3.8). Every model here is fal.ai's own IMAGE-to-video
+# endpoint for that model (confirmed per-model from fal.ai's own API docs,
+# 2026-10-01) since this pipeline always has a real, brand-grounded storyboard
+# frame to animate — never a bare text prompt.
+#
+# Two of the brief's picks (MiniMax H3 Max Turbo, MiniMax H3 Max) are listed
+# under fal.ai's bare `minimax/` namespace rather than `fal-ai/` — confirmed
+# correct, not a typo; that's how fal.ai itself hosts this specific partner's
+# models.
+#
+# cost_per_second below was originally the brief's own figure (§1's table),
+# converted from its stated NGN back to USD at the brief's own FX assumption
+# (₦1,327.84/$1, 1 October 2026) — the brief itself warned this was a
+# snapshot, not a live-fetched rate, and should be re-checked before
+# production rollout. That check happened 2026-10-06 against the account's
+# own fal.ai billing dashboard: Veo 3.1 Fast and the Talking Avatar model
+# matched closely, but H3 Max Turbo and PixVerse V6 were off by 3.2x and 12x
+# respectively — both corrected below to the real billed rate. Kling 2.5
+# Standard, H3 Max, Wan 3.0, and Seedance 2.0 Fast have not yet had a single
+# real billed call to verify against (fal.ai's dashboard only had 4 endpoints
+# with usage as of this check) — still the brief-converted figure, same
+# "re-check before relying on it" caveat applies to those four.
+MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "minimax/h3-max-turbo/image-to-video": {
+        "label": "H3 Max Turbo",
+        "cost_per_second": 0.0125,  # confirmed 2026-10-06 via fal.ai billing dashboard; was 0.0399
+    },
+    "fal-ai/kling-video/v2.5-turbo/standard/image-to-video": {
+        "label": "Kling 2.5 Standard",
+        "cost_per_second": 0.0422,
+    },
+    "fal-ai/pixverse/v6/image-to-video": {
+        "label": "PixVerse V6",
+        "cost_per_second": 0.005,  # confirmed 2026-10-06 via fal.ai billing dashboard; was 0.0603
+    },
+    "minimax/h3-max/image-to-video": {
+        "label": "H3 Max",
+        "cost_per_second": 0.0798,
+    },
+    "alibaba/wan-3.0/image-to-video": {
+        "label": "Wan 3.0",
+        "cost_per_second": 0.1002,
+    },
+    "fal-ai/veo3.1/fast/image-to-video": {
+        "label": "Veo 3.1 Fast",
+        "cost_per_second": 0.1499,
+    },
+    # Google's current multimodal video model (the successor line to Veo; fal's Veo 3 is retired and Veo 3.1 is
+    # being removed on 2026-11-17). The "High Quality" outcome's model. Price is fal's published 720p rate
+    # (2026-11-09: $0.0819/s, native audio included); not yet checked against a real billed call.
+    "google/gemini-omni-flash/v1.2/image-to-video": {
+        "label": "Gemini Omni Flash",
+        "cost_per_second": 0.0819,
+    },
+    "bytedance/seedance-2.0/image-to-video": {
+        "label": "Seedance 2.0 Fast",
+        "cost_per_second": 0.2419,
+    },
+    # Not in the brief (which predates this need) — added for real talking-
+    # head support. Veo 3.1 Fast's "generate_audio" only produces ambient/
+    # prompt-described audio, not a script the caller actually controls, and
+    # isn't true lip-sync. fal-ai/ai-avatar/single-text takes an exact script
+    # (text_input), converts it to speech (voice enum), and lip-syncs a still
+    # image to it — confirmed via fal.ai's own API docs, 2026-10-01. Priced
+    # at $0.2/sec at 480p ("$0.2 per second... 720p price will be doubled" —
+    # fal.ai's own pricing copy); this registry entry fixes 480p so cost stays
+    # predictable (see _generate_scene_fal).
+    "fal-ai/ai-avatar/single-text": {
+        "label": "Talking Avatar",
+        "cost_per_second": 0.2,
+    },
+    # fal-ai/ai-avatar/single-text's voice enum (AVATAR_VOICES) is ElevenLabs'
+    # stock "Default" library — no African accents in it at all. fal-ai/ai-avatar
+    # (base, audio_url variant) was fal.ai's own documented way to feed a custom
+    # audio source instead, but that endpoint is deprecated (confirmed via fal.ai's
+    # own API docs, 2026-10-21). This is the replacement used for the cloned
+    # Nigerian voices (NIGERIAN_VOICE_REFS, see _generate_scene_fal) — also
+    # cheaper than the model it replaces ($0.05/sec at 480p vs $0.2/sec).
+    "minimax/h3-max/lip-sync/image-to-video": {
+        "label": "Talking Avatar (Nigerian)",
+        "cost_per_second": 0.05,
+    },
+}
 
-DEFAULT_MODEL = "veo-3.1-generate-preview"
+_H3_TURBO = "minimax/h3-max-turbo/image-to-video"
+_KLING_STANDARD = "fal-ai/kling-video/v2.5-turbo/standard/image-to-video"
+_PIXVERSE = "fal-ai/pixverse/v6/image-to-video"
+_H3_MAX = "minimax/h3-max/image-to-video"
+_WAN_3 = "alibaba/wan-3.0/image-to-video"
+_VEO_FAST = "fal-ai/veo3.1/fast/image-to-video"
+_SEEDANCE_FAST = "bytedance/seedance-2.0/image-to-video"
+_OMNI_FLASH = "google/gemini-omni-flash/v1.2/image-to-video"
+_AVATAR_TALKING = "fal-ai/ai-avatar/single-text"
+_NG_LIPSYNC = "minimax/h3-max/lip-sync/image-to-video"
 
-# fal.ai model IDs
-KLING_MODEL = "fal-ai/kling-video/v3/pro/image-to-video"
-SEEDANCE_MODEL = "bytedance/seedance-2.0/image-to-video"
+# fal.ai's own documented voice enum for fal-ai/ai-avatar/single-text — keep
+# in sync with AVATAR_VOICES in VideoStoryboardGenerator.tsx if this changes.
+AVATAR_VOICES = [
+    "Aria", "Roger", "Sarah", "Laura", "Charlie", "George", "Callum", "River",
+    "Liam", "Charlotte", "Alice", "Matilda", "Will", "Jessica", "Eric",
+    "Chris", "Brian", "Daniel", "Lily", "Bill",
+]
+DEFAULT_AVATAR_VOICE = "Sarah"
+
+# Real Nigerian-accented reference clips — generated via YarnGPT (yarngpt.co,
+# a Nigerian-built TTS model; voices "idera"/female and "jude"/male), uploaded
+# to fal's storage 2026-10-21, cloned per-generation via fal-ai/f5-tts (see
+# _generate_scene_fal). Not in AVATAR_VOICES/MODEL_REGISTRY's ElevenLabs
+# enum — these route to _NG_LIPSYNC instead of _AVATAR_TALKING's text_input+
+# voice call. Keep in sync with NIGERIAN_VOICES in VideoStoryboardGenerator.tsx.
+NIGERIAN_VOICE_REFS: dict[str, str] = {
+    "Idera (Nigerian)": "https://v3b.fal.media/files/b/0aaf4340/2-A31OjeKxJX1mCVu8jEs_xrxy8rhkfgbh5ftdh91u.wav",
+    "Jude (Nigerian)": "https://v3b.fal.media/files/b/0aaf4340/dptLL3gm-UU3Syor1fUyF_fthsxkvq959bw7zvwi6d.wav",
+}
+
+# §2 ("Product Principle: URI Chooses the Model") + §4 ("Recommended URI
+# Routing Logic") of the brief, combined: the customer picks an OUTCOME, never
+# a raw model name — "Model names should remain an implementation detail so
+# engineering can change routing as pricing, quality and availability change."
+# Each outcome's fallback is §4's own table entry for that same request
+# signal, used automatically (not offered as a choice) when the primary route
+# fails — see run_job below. label/description are what the UI shows; the
+# model ids are never surfaced to a customer-facing caller.
+OUTCOME_ROUTES: Dict[str, Dict[str, Any]] = {
+    "quick_video": {
+        "label": "Quick Video",
+        "description": "Fast, low-cost general creative — the everyday default.",
+        "primary": _H3_TURBO,
+        "fallback": _PIXVERSE,
+    },
+    "animate_product": {
+        "label": "Animate My Product",
+        "description": "Turn a product/brand photo into camera movement.",
+        "primary": _KLING_STANDARD,
+        "fallback": _H3_TURBO,
+    },
+    "social_video": {
+        "label": "Social Video",
+        "description": "Cheap variants for iteration — native audio, high volume.",
+        "primary": _PIXVERSE,
+        "fallback": _H3_TURBO,
+    },
+    "high_quality": {
+        "label": "High Quality",
+        "description": "Premium brand shots and hero creative.",
+        "primary": _OMNI_FLASH,
+        # No fallback, on purpose and for now: a High Quality scene that fails is reported as failed (and refunded)
+        # rather than quietly re-rendered on a lesser model the customer did not pick.
+        "fallback": None,
+    },
+    "complex_cinematic": {
+        "label": "Complex / Cinematic",
+        "description": "Hard motion, multiple subjects, demanding scene coherence.",
+        "primary": _WAN_3,
+        "fallback": _H3_MAX,
+    },
+    "talking_dialogue": {
+        "label": "Talking / Dialogue",
+        "description": "Synchronized speech, lip-sync, a visible talking human.",
+        # Primary is the dedicated talking-avatar model (exact scripted
+        # dialogue + real lip-sync), not Veo — Veo's audio is prompt-described,
+        # not a script the caller controls. Veo stays as fallback: it still
+        # produces a plausible talking-human clip (its own prompt can describe
+        # speech) if the avatar model fails, which beats a hard failure.
+        "primary": _AVATAR_TALKING,
+        "fallback": _VEO_FAST,
+    },
+    "advanced_references": {
+        "label": "Advanced References",
+        "description": "Sophisticated reference-driven, brand-consistency-critical creative.",
+        "primary": _SEEDANCE_FAST,
+        "fallback": _H3_MAX,
+    },
+}
+
+DEFAULT_OUTCOME = "quick_video"
+
+# Per-attempt ceiling on _submit_and_poll's manual queue polling (see
+# _generate_scene_fal) — generous enough for the slower models without
+# letting a genuine hang block a scene (and the background task behind it)
+# forever. A timeout here is treated exactly like any other primary-model
+# failure: run_job retries once on the outcome's paired fallback.
+_FAL_SUBSCRIBE_TIMEOUT_SECONDS = 300
+
+# Per-model override. The talking-avatar model routinely takes 3-12+ minutes
+# to complete even on SUCCESS — confirmed 2026-10-06 from fal.ai's own
+# request-history dashboard (one real request: Completed at 750.62s). Since
+# run_job no longer falls back on a timeout for this model specifically (see
+# the comment there — a timeout used to mean double-billing for a strictly
+# worse result), this ceiling is now a pure safety net against a genuinely
+# dead request, not a "give up and substitute" trigger — set generously
+# above every real completion time seen so far, not tuned to the typical case.
+_MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
+    "fal-ai/ai-avatar/single-text": 1800,
+    "minimax/h3-max/lip-sync/image-to-video": 1800,  # same family/speed as the avatar model above
+    # Seedance 2.0 Fast sat "InProgress" past the 300s default on both scenes of a 10s staging test (2026-11-09)
+    # and each scene was then re-rendered, silently, on the fallback. Give it room; the "completed, Ns elapsed"
+    # log line shows its real time, so tune this from that rather than guessing.
+    "bytedance/seedance-2.0/image-to-video": 900,
+}
+
+
+# Models that are given a scene's spoken line inside the prompt and asked to say it themselves (they generate their
+# own lip-synced audio). EXPERIMENT: this lets "Complex / Cinematic", "Advanced References" and "High Quality" be tried
+# on a script with dialogue. Unlike the talking avatar the exact words, the voice and the accent are not guaranteed. The
+# customer is not told (the clip just says Done); each such scene is logged as "SPEECH-IN-PROMPT".
+_SPEECH_IN_PROMPT_MODELS = (_WAN_3, _SEEDANCE_FAST, _OMNI_FLASH)
+
+
+def with_spoken_line(prompt: str, line: str) -> str:
+    """The clip prompt with the scene's spoken line added, so a model that makes its own audio has the words to say."""
+    line = " ".join(str(line or "").replace('"', "'").split())
+    if not line:
+        return prompt
+    return (
+        f'{(prompt or "").rstrip()} The person on camera speaks directly to the viewer, lips moving in sync with '
+        f'the words, saying exactly: "{line}" Only this person speaks, in a natural, clear voice, with no music over the speech.'
+    ).strip()
+
+
+def _pad_wav_bytes(raw: bytes, min_seconds: float = 5.2) -> Optional[bytes]:
+    """Trailing silence added to a PCM WAV shorter than `min_seconds`.
+
+    Returns None when nothing needs doing: the clip is already long enough, or it can't
+    be parsed as PCM WAV (some float/non-PCM encoding would fail `wave.open`)."""
+    import io
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as w:
+            n_channels = w.getnchannels()
+            sampwidth = w.getsampwidth()
+            framerate = w.getframerate()
+            n_frames = w.getnframes()
+            frames = w.readframes(n_frames)
+    except wave.Error:
+        return None
+
+    duration = n_frames / framerate
+    if duration >= min_seconds:
+        return None
+
+    silence_frames = int((min_seconds - duration) * framerate)
+    silence = b"\x00" * (silence_frames * n_channels * sampwidth)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(n_channels)
+        out.setsampwidth(sampwidth)
+        out.setframerate(framerate)
+        out.writeframes(frames + silence)
+    return buf.getvalue()
+
+
+async def _pad_wav_silence(audio_url: str, min_seconds: float = 5.2) -> str:
+    """minimax/h3-max/lip-sync/image-to-video hard-rejects audio under 5s
+    ("Audio duration must be between 5 and 900 seconds") — live-confirmed
+    2026-10-21: this pipeline chops a script into short (~5-10s) scenes, and
+    a single scene's dialogue routinely comes in under that floor,
+    which previously made the whole talking_dialogue attempt fail over to
+    generic Veo, losing both the Nigerian voice AND real lip-sync. Pads with
+    trailing silence instead (mouth goes idle for the silent tail, which
+    reads fine) so a short scene still gets the real Nigerian voice.
+    0.2s margin above the bare 5.0s floor, not cutting it exactly that fine.
+
+    Returns the original URL unchanged if it's already long enough, or if it
+    can't be parsed as PCM WAV (see _pad_wav_bytes) — the caller's own fallback
+    (see _generate_scene_fal) is the last safety net if a clip still gets rejected.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(audio_url)
+        resp.raise_for_status()
+        raw = resp.content
+
+    padded = _pad_wav_bytes(raw, min_seconds)
+    if padded is None:
+        return audio_url
+    return await upload_bytes(padded, folder="uri-social/generated-audio", resource_type="audio")
+
+
+class NoResubmit(RuntimeError):
+    """A request that may already have finished (and been billed) on fal's side, e.g. we lost contact while it ran.
+    It must NOT be sent again or re-rendered on another model, or the customer's clip is paid for twice.
+    `request_id` is fal's id for it, so the finished clip can still be found on fal's side."""
+
+    def __init__(self, message: str, request_id: Optional[str] = None):
+        super().__init__(message)
+        self.request_id = request_id
+
+
+# A failure that retrying cannot fix: the content was refused or the request itself is wrong.
+_NOT_RETRYABLE_HINTS = (
+    "content_policy", "sensitive", "safety", "nsfw", "moderation", "violat", "not allowed",
+    "invalid", "validation", "unprocessable", "unsupported", "too large", "unauthorized", "forbidden", "not found",
+)
+_RETRY_PAUSE_SECONDS = 3.0
+
+
+def _is_image_flag(text: str) -> bool:
+    """True when the model refused the START IMAGE as possibly showing a real person (ByteDance's likeness check,
+    which rejects our photoreal AI faces some of the time and accepts the same image the next time). fal: 422
+    "image_url: The images or videos provided may contain likenesses of real people or other private information
+    that cannot be processed", billed $0.00. Nothing to do with the audio."""
+    return "likenesses of real people" in text.lower()
+
+
+def _is_content_flag(text: str) -> bool:
+    """True when a model's safety check refused the request (the input image or the generated audio)."""
+    return "content_policy_violation" in text or "sensitive content" in text.lower() or _is_image_flag(text)
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """True for a failure worth one more try on the same model: a network blip, a 5xx, an overloaded queue, a model
+    that errored once. False for a timeout (the request may still complete), a request that may already be paid
+    for, our own validation errors, and anything the model or its safety filter refused."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, NoResubmit, ValueError)):
+        return False
+    msg = str(exc).lower()
+    if _is_image_flag(msg):
+        return True          # an inconsistent filter: the same image often passes on the next try
+    return not any(hint in msg for hint in _NOT_RETRYABLE_HINTS)
+
+
+async def _retry_transient(call, what: str, attempts: int = 4, base_delay: float = 2.0):
+    """Run `call()` (a no-argument coroutine factory), retrying transient failures with a growing pause."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call()
+        except Exception as e:
+            if attempt == attempts or not is_retryable(e):
+                raise
+            delay = min(base_delay * 2 ** (attempt - 1), 20.0)
+            print(f"[VideoGen] {what} failed ({type(e).__name__}: {str(e)[:160]}); retry {attempt}/{attempts - 1} in {delay:.0f}s",
+                  flush=True)
+            await asyncio.sleep(delay)
+
+
+# Consecutive failed progress checks tolerated before we stop trying to reach fal. Each check backs off up to 30s, so
+# this is several minutes: the request keeps running on fal's side the whole time.
+_MAX_CONSECUTIVE_POLL_FAILURES = 20
+
+class ClipStillRendering(TimeoutError):
+    """A clip passed its model's normal ceiling but fal is STILL RENDERING it (and billing for it), so it will arrive.
+    It is neither failed nor re-rendered: the job moves on to the next scene and a watcher delivers this clip when fal
+    finishes it, then tells the customer. Carries what the watcher needs."""
+
+    def __init__(self, message: str, request_id: Optional[str] = None, handle: Any = None, model: Optional[str] = None):
+        super().__init__(message)
+        self.request_id, self.handle, self.model = request_id, handle, model
+        self.actual_seconds: Optional[float] = None
+
+
+# A late clip is watched for this long before it is given up on (and its credits returned by the settle sweep).
+_LATE_CLIP_MAX_SECONDS = 3600
+_LATE_CLIP_POLL_SECONDS = 15
+# Late-clip watchers live in this process; keep a reference so they are not garbage-collected mid-wait.
+_late_clip_tasks: set = set()
 
 
 def _jobs_collection():
@@ -35,209 +390,856 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 class VideoGenerationService:
 
     @staticmethod
-    async def create_job(storyboard: dict, model: str) -> str:
-        job_id = uuid.uuid4().hex
+    async def create_job(storyboard: dict, outcome: str, avatar_voice: str = DEFAULT_AVATAR_VOICE,
+                         job_id: Optional[str] = None, user_id: str = "", billing: Optional[dict] = None) -> str:
+        job_id = job_id or uuid.uuid4().hex
+        route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         await _jobs_collection().insert_one({
             "job_id": job_id,
             "status": "queued",
-            "model": model,
+            "outcome": outcome,
+            "model": route["primary"],  # kept for display/back-compat; the real model per clip is `routed_model`
+            "avatar_voice": avatar_voice,  # only consulted when a clip routes to _AVATAR_TALKING
             "total_scenes": len(storyboard.get("scenes", [])),
             "current_scene": 0,
             "clips": [],
             "error": None,
+            "user_id": user_id,
+            "billing": billing,
         })
         return job_id
+
+    @staticmethod
+    async def run_job_and_settle(
+        job_id: str,
+        storyboard: dict,
+        brand_images: List[str],
+        outcome: str,
+        avatar_voice: str = DEFAULT_AVATAR_VOICE,
+    ) -> None:
+        """run_job, then close the books on the credits charged for it. The settlement runs however the job
+        ends (it finished, some scenes failed, or it crashed), so credits for work that was not delivered
+        are always returned. A no-op for jobs that were not charged."""
+        from app.agents.social_media_manager.services import video_generation_billing as billing
+
+        try:
+            await VideoGenerationService.run_job(job_id, storyboard, brand_images, outcome, avatar_voice)
+        except Exception as e:
+            print(f"[VideoGenJob {job_id}] crashed: {type(e).__name__}: {e}", flush=True)
+            await _jobs_collection().update_one(
+                {"job_id": job_id}, {"$set": {"status": "failed", "error": f"{type(e).__name__}: {str(e)[:200]}"}}
+            )
+        finally:
+            try:
+                await billing.settle(job_id)
+            except Exception as e:
+                print(f"[VideoGenJob {job_id}] billing settlement failed: {type(e).__name__}: {e}", flush=True)
 
     @staticmethod
     async def run_job(
         job_id: str,
         storyboard: dict,
         brand_images: List[str],
-        model: str,
+        outcome: str,
+        avatar_voice: str = DEFAULT_AVATAR_VOICE,
     ) -> None:
         col = _jobs_collection()
-
-        if model == DEFAULT_MODEL and not _gemini_client:
-            await col.update_one(
-                {"job_id": job_id},
-                {"$set": {"status": "failed", "error": "Google Gemini client not initialised"}},
-            )
-            return
-
         scenes = storyboard.get("scenes", [])
+        route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
+        primary_model, fallback_model = route["primary"], route["fallback"]
+        if (avatar_voice not in AVATAR_VOICES and avatar_voice not in NIGERIAN_VOICE_REFS
+                and yarngpt_tts_service.speaker_for(avatar_voice) is None):
+            avatar_voice = DEFAULT_AVATAR_VOICE
         await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
         for scene in scenes:
             scene_num = scene.get("scene_number", 0)
             await col.update_one({"job_id": job_id}, {"$set": {"current_scene": scene_num}})
 
+            base_fields = {
+                "scene_number": scene_num,
+                "shot_type": scene.get("shot_type", ""),
+                "duration_seconds": scene.get("duration_seconds", 5),
+                "motion": scene.get("motion", ""),
+                "text_overlay": scene.get("text_overlay"),
+                "video_prompt": scene.get("video_prompt", ""),
+            }
+
+            # §6 ("Reliability & fallback"): "Fallback to the nearest lower-cost/
+            # quality-compatible route where possible" + "Record whether fallback
+            # altered expected quality, audio or reference support." One retry on
+            # the outcome's own paired fallback model (§4's table), never a blind
+            # retry of the same failing endpoint — if the fallback also fails,
+            # that's a real, surfaced failure, not a silent third attempt.
+            started = time.monotonic()
+            fallback_used = False
+            fallback_warning = None
+            scene_notes: dict = {}
             try:
-                video_url = await VideoGenerationService._generate_scene(scene, brand_images, model)
-                clip = {
-                    "scene_number": scene_num,
-                    "shot_type": scene.get("shot_type", ""),
-                    "duration_seconds": scene.get("duration_seconds", 5),
-                    "motion": scene.get("motion", ""),
-                    "text_overlay": scene.get("text_overlay"),
-                    "video_prompt": scene.get("video_prompt", ""),
-                    "video_url": video_url,
-                }
-            except Exception as e:
-                print(f"[VideoGenJob {job_id}] Scene {scene_num} failed: {e}")
-                clip = {
-                    "scene_number": scene_num,
-                    "shot_type": scene.get("shot_type", ""),
-                    "duration_seconds": scene.get("duration_seconds", 5),
-                    "motion": scene.get("motion", ""),
-                    "text_overlay": scene.get("text_overlay"),
-                    "video_prompt": scene.get("video_prompt", ""),
-                    "video_url": None,
-                    "error": str(e),
-                }
+                video_url, cost_usd = await VideoGenerationService._generate_scene_with_retry(
+                    scene, primary_model, avatar_voice, job_id, notes=scene_notes
+                )
+                routed_model = primary_model
+            except Exception as primary_error:
+                if isinstance(primary_error, ClipStillRendering):
+                    # Still rendering on fal (and billed): deliver it when it lands; don't fail it or re-render it.
+                    await VideoGenerationService._hand_off_late_clip(job_id, col, scene, base_fields, outcome,
+                                                                     primary_error, started)
+                    continue
+                # The talking-avatar model routinely takes 3-12+ minutes to
+                # complete even on success (fal.ai's own request history,
+                # live-confirmed 2026-10-06) — a client-side timeout there
+                # does NOT mean the generation failed, fal.ai keeps running it
+                # and bills for it either way. Falling back on a timeout for
+                # THIS model specifically meant double-billing (the full
+                # avatar generation + the Veo fallback that then also ran)
+                # for a strictly worse result (no real lip-synced speech) —
+                # confirmed live: a request that timed out at our old 600s
+                # ceiling shows as Completed at 750.62s on fal.ai's own
+                # dashboard. No fallback on slowness for this one model; a
+                # genuine error (content policy, missing dialogue, a real
+                # API failure) still falls back exactly as before.
+                if primary_model == _AVATAR_TALKING and isinstance(primary_error, TimeoutError):
+                    latency = round(time.monotonic() - started, 2)
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} timed out "
+                          f"client-side ({primary_error}) — not falling back, fal.ai may still complete it")
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": False,
+                        "latency_seconds": latency,
+                        "fal_request_id": getattr(primary_error, "request_id", None),
+                        "error": (
+                            "This scene is taking longer than expected — talking videos "
+                            "routinely take several minutes. We did not retry it with a different "
+                            "model, so it is not made twice. Regenerate this scene in a few minutes."
+                        ),
+                    }}})
+                    continue
+                if isinstance(primary_error, NoResubmit):
+                    # We lost contact with a request that may have finished: sending it again, to this model or a
+                    # fallback, would bill the customer's clip twice.
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_error} — not retrying or falling back",
+                          flush=True)
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": False,
+                        "latency_seconds": round(time.monotonic() - started, 2),
+                        "fal_request_id": getattr(primary_error, "request_id", None),
+                        "error": (
+                            "We lost contact with the video service while this scene was rendering. It was not "
+                            "sent again, so it is not made twice. Regenerate this scene in a few minutes."
+                        ),
+                    }}})
+                    continue
+                if fallback_model is None:
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
+                          f"({primary_error}); this outcome has no fallback")
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": False,
+                        "latency_seconds": round(time.monotonic() - started, 2),
+                        "fal_request_id": getattr(primary_error, "request_id", None),
+                        "error": f"{primary_model}: {primary_error}",
+                    }}})
+                    continue
+                print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
+                      f"({primary_error}), falling back to {fallback_model}")
+                # Record WHY it fell back even when the fallback itself succeeds —
+                # a clip that "works" on the fallback can still be materially
+                # different from what was asked for (e.g. talking_dialogue's
+                # fallback has no scripted-speech guarantee at all), and without
+                # this the UI shows an identical "Done" badge either way, hiding
+                # that mismatch from the caller entirely.
+                fallback_warning = f"Fell back to {MODEL_REGISTRY.get(fallback_model, {}).get('label', fallback_model)}: {primary_model} failed ({primary_error})"
+                try:
+                    video_url, cost_usd = await VideoGenerationService._generate_scene_with_retry(
+                        scene, fallback_model, avatar_voice, job_id, notes=scene_notes
+                    )
+                    routed_model = fallback_model
+                    fallback_used = True
+                except ClipStillRendering as late:
+                    await VideoGenerationService._hand_off_late_clip(job_id, col, scene, base_fields, outcome,
+                                                                     late, started)
+                    continue
+                except Exception as fallback_error:
+                    latency = round(time.monotonic() - started, 2)
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: fallback {fallback_model} "
+                          f"also failed ({fallback_error})")
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": True,
+                        "latency_seconds": latency,
+                        "error": f"{primary_model}: {primary_error} | fallback {fallback_model}: {fallback_error}",
+                    }}})
+                    continue
 
-            await col.update_one({"job_id": job_id}, {"$push": {"clips": clip}})
+            latency = round(time.monotonic() - started, 2)
+            await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                **base_fields,
+                "video_url": video_url,
+                "cost_usd": cost_usd,
+                "outcome": outcome,
+                "routed_model": routed_model,
+                "fallback_used": fallback_used,
+                "warning": " ".join(w for w in (fallback_warning, scene_notes.get("voice_fallback")) if w) or None,
+                "latency_seconds": latency,
+            }}})
 
-        await col.update_one(
-            {"job_id": job_id},
-            {"$set": {"status": "complete", "current_scene": len(scenes)}},
-        )
+        # Every scene has been dispatched. Complete the job now, unless a clip is still rendering on fal: then it stays
+        # "generating" (so the page keeps polling and nothing can be merged early) until the last late clip lands.
+        await col.update_one({"job_id": job_id}, {"$set": {"dispatch_done": True, "current_scene": len(scenes)}})
+        await VideoGenerationService._complete_if_done(job_id)
+
+    # ── fal.ai — every model in MODEL_REGISTRY goes through this one entry
+    #    point. Each model's request shape genuinely differs (confirmed from
+    #    fal.ai's own per-model API docs, 2026-10-01) — Wan 3.0 uniquely uses
+    #    `start_image_url` where every other model here uses `image_url`;
+    #    Kling 2.5 Standard only accepts duration 5 or 10; the two MiniMax H3
+    #    models have no resolution/audio toggle beyond a 480P/768P/1080P enum
+    #    (audio is automatic, not optional) — so this dispatches per model id
+    #    rather than pretending they share one shape. ───────────────────────
 
     @staticmethod
-    async def _generate_scene(scene: dict, brand_images: List[str], model: str) -> str:
-        if "kling" in model or "seedance" in model:
-            return await VideoGenerationService._generate_scene_fal(scene, model)
-        return await VideoGenerationService._generate_scene_veo(scene, brand_images, model)
+    async def _store_clip(result: Dict[str, Any], model: str, actual_seconds: float) -> tuple[str, Optional[float]]:
+        """Download a finished clip from fal and save it to our own storage. Returns (our url, what it cost)."""
+        info = MODEL_REGISTRY[model]
+        video_url = result["video"]["url"]
 
-    # ── Veo 3.1 ──────────────────────────────────────────────────────────────
+        # Stream the download straight to a temp file and upload FROM that
+        # file (upload_file_path streams it in chunks too) — never holds the
+        # whole clip in memory at once, unlike the old `.content` + bytes
+        # upload. Confirmed live: that pattern was large and frequent enough,
+        # combined with glibc not returning freed memory to the OS inside
+        # the container, to ratchet process memory up until the kernel
+        # OOM-killed a uvicorn worker. See upload_file_path's docstring.
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp4")
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream("GET", video_url) as video_resp:
+                    video_resp.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in video_resp.aiter_bytes():
+                            f.write(chunk)
 
-    @staticmethod
-    async def _generate_scene_veo(scene: dict, brand_images: List[str], model: str) -> str:
-        prompt = scene.get("video_prompt", "")
-        duration_req = scene.get("duration_seconds", 5)
-        # Veo only accepts 4, 6, or 8 seconds
-        duration = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
-
-        first_frame: Optional[genai_types.Image] = None
-        frame_image_url = scene.get("frame_image_url")
-        if frame_image_url:
-            try:
-                async with httpx.AsyncClient(timeout=30) as http:
-                    resp = await http.get(frame_image_url)
-                    frame_bytes = resp.content
-                mime = "image/webp" if ".webp" in frame_image_url else "image/jpeg"
-                first_frame = genai_types.Image(image_bytes=frame_bytes, mime_type=mime)
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: animating from storyboard frame (Veo)")
-            except Exception as e:
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: could not load frame: {e}")
-
-        config = genai_types.GenerateVideosConfig(
-            aspect_ratio="9:16",
-            duration_seconds=duration,
-            number_of_videos=1,
-        )
-
-        loop = asyncio.get_running_loop()
-        operation = await loop.run_in_executor(
-            None,
-            lambda: _gemini_client.models.generate_videos(
-                model=model,
-                prompt=prompt,
-                image=first_frame,
-                config=config,
-            ),
-        )
-
-        for _ in range(60):
-            if operation.done:
-                break
-            await asyncio.sleep(10)
-            operation = await loop.run_in_executor(
-                None,
-                lambda op=operation: _gemini_client.operations.get(op),
+            stored_url = await upload_file_path(
+                tmp_path,
+                folder="uri-social/generated-videos",
+                resource_type="video",
             )
-
-        if not operation.done:
-            raise TimeoutError("Veo generation timed out after 10 minutes")
-        if not operation.response:
-            raise ValueError("Veo returned no response — prompt may have been rejected by content policy")
-
-        generated = operation.response.generated_videos
-        if not generated:
-            raise ValueError("Veo returned no generated videos")
-
-        video_file = generated[0].video
-        video_bytes = await loop.run_in_executor(
-            None,
-            lambda: _gemini_client.files.download(file=video_file),
-        )
-
-        return await upload_bytes(
-            bytes(video_bytes),
-            folder="uri-social/generated-videos",
-            resource_type="video",
-        )
-
-    # ── fal.ai (Kling 3.0 Pro + Seedance 2.0) ────────────────────────────────
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        cost_usd = round(actual_seconds * info["cost_per_second"], 3)
+        return stored_url, cost_usd
 
     @staticmethod
-    async def _generate_scene_fal(scene: dict, model: str) -> str:
-        import os
+    async def _hand_off_late_clip(job_id: str, col, scene: dict, base_fields: dict, outcome: str,
+                                  late: "ClipStillRendering", started: float) -> None:
+        """A clip is still rendering on fal. Record it as pending, start a watcher that delivers it when it lands, and
+        let the job carry on with the other scenes."""
+        scene_num = scene.get("scene_number")
+        await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+            **base_fields,
+            "video_url": None,
+            "cost_usd": None,
+            "outcome": outcome,
+            "routed_model": late.model,
+            "fallback_used": False,
+            "pending": True,
+            "pending_since": datetime.utcnow(),
+            "fal_request_id": late.request_id,
+            "latency_seconds": round(time.monotonic() - started, 2),
+        }}})
+        print(f"[VideoGenJob {job_id}] Scene {scene_num}: {late.model} is still rendering (request {late.request_id}); "
+              f"moving on, it will be delivered and the user told when it finishes", flush=True)
+        task = asyncio.create_task(VideoGenerationService._watch_late_clip(job_id, scene_num, late))
+        _late_clip_tasks.add(task)
+        task.add_done_callback(_late_clip_tasks.discard)
+
+    @staticmethod
+    async def _watch_late_clip(job_id: str, scene_num: Any, late: "ClipStillRendering") -> None:
+        """Wait for a clip fal is still rendering, save it, tell the customer. Never raises."""
+        model, handle = late.model, late.handle
+        started = time.monotonic()
+        result, error, failures = None, None, 0
+        try:
+            while True:
+                if time.monotonic() - started > _LATE_CLIP_MAX_SECONDS:
+                    error = f"still not finished after {_LATE_CLIP_MAX_SECONDS // 60} minutes"
+                    break
+                try:
+                    status = await handle.status(with_logs=False)
+                    failures = 0
+                except Exception as e:
+                    failures += 1
+                    if failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                        error = f"lost contact with {model} ({e})"
+                        break
+                    await asyncio.sleep(min(_LATE_CLIP_POLL_SECONDS * failures, 60))
+                    continue
+                if type(status).__name__ == "Completed":
+                    if getattr(status, "error", None):
+                        error = f"{model} failed: {status.error}"
+                        break
+                    try:
+                        result = await _retry_transient(lambda: handle.get(), f"{model} fetch late result", attempts=5)
+                    except Exception as e:
+                        error = f"{model} finished but its result could not be fetched ({e})"
+                    break
+                await asyncio.sleep(_LATE_CLIP_POLL_SECONDS)
+
+            stored_url = cost = None
+            if result is not None:
+                try:
+                    stored_url, cost = await VideoGenerationService._store_clip(
+                        result, model, late.actual_seconds or 5)
+                except Exception as e:
+                    error = f"{model} finished but the clip could not be saved ({e})"
+            col = _jobs_collection()
+            if stored_url:
+                await col.update_one({"job_id": job_id, "clips.scene_number": scene_num}, {"$set": {
+                    "clips.$.video_url": stored_url, "clips.$.cost_usd": cost, "clips.$.pending": False,
+                    "clips.$.late": True, "clips.$.error": None,
+                }})
+                print(f"[VideoGenJob {job_id}] Scene {scene_num}: late clip delivered after "
+                      f"{time.monotonic() - started:.0f}s more", flush=True)
+            else:
+                await col.update_one({"job_id": job_id, "clips.scene_number": scene_num}, {"$set": {
+                    "clips.$.pending": False, "clips.$.error": f"{error or 'the clip did not arrive'}. "
+                    "Your credits for this scene are returned; you can regenerate it.",
+                }})
+                print(f"[VideoGenJob {job_id}] Scene {scene_num}: late clip lost: {error}", flush=True)
+            await VideoGenerationService._complete_if_done(job_id)
+            await VideoGenerationService._notify_late_clip(job_id, scene_num, delivered=bool(stored_url))
+        except Exception as e:  # a watcher must never take the server down
+            print(f"[VideoGenJob {job_id}] late-clip watcher for scene {scene_num} crashed: {type(e).__name__}: {e}", flush=True)
+
+    @staticmethod
+    async def _complete_if_done(job_id: str) -> None:
+        """Mark the job complete once every scene has been dispatched and none is still pending. Atomic, so whichever
+        of the job loop and the late-clip watchers finishes last is the one that completes it."""
+        await _jobs_collection().update_one(
+            {"job_id": job_id, "dispatch_done": True, "status": "generating",
+             "clips": {"$not": {"$elemMatch": {"pending": True}}}},
+            {"$set": {"status": "complete"}},
+        )
+        await VideoGenerationService._settle_when_finished(job_id)
+
+    @staticmethod
+    async def _settle_when_finished(job_id: str) -> None:
+        """Close the credits once the job is truly over (billing itself holds back while a clip is pending)."""
+        try:
+            from app.agents.social_media_manager.services import video_generation_billing as billing
+            job = await _jobs_collection().find_one({"job_id": job_id}, {"status": 1, "dispatch_done": 1})
+            if job and job.get("dispatch_done") and job.get("status") in ("complete", "failed"):
+                await billing.settle(job_id)
+        except Exception as e:
+            print(f"[VideoGenJob {job_id}] settlement after a late clip failed: {type(e).__name__}: {e}", flush=True)
+
+    @staticmethod
+    async def _notify_late_clip(job_id: str, scene_num: Any, delivered: bool) -> None:
+        """Tell the customer in-app (the bell) that a slow clip is ready. Best effort."""
+        try:
+            job = await _jobs_collection().find_one({"job_id": job_id}, {"user_id": 1, "status": 1}) or {}
+            user_id = job.get("user_id")
+            if not user_id:
+                return
+            from app.services.NotificationService import notification_service
+            if delivered:
+                message = (f"Scene {scene_num} of your video has finished rendering. "
+                           + ("All your clips are ready, so you can merge them now." if job.get("status") == "complete"
+                              else "Open the video page to see it."))
+                subject = "Your video clip is ready"
+            else:
+                message = (f"Scene {scene_num} of your video could not be finished. Your credits for it were returned, "
+                           "and you can regenerate that scene.")
+                subject = "A video clip could not be finished"
+            await notification_service._log_notification(
+                user_id=user_id, notification_type="video_clip_ready", channel="email", subject=subject,
+                status="sent", metadata={"job_id": job_id, "scene_number": scene_num, "message": message,
+                                         "delivered": delivered},
+            )
+        except Exception as e:
+            print(f"[VideoGenJob {job_id}] could not send the clip-ready notification: {type(e).__name__}: {e}", flush=True)
+
+    @staticmethod
+    async def _generate_scene_with_retry(
+        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE, job_id: Optional[str] = None,
+        notes: Optional[dict] = None, attempts: int = 2,
+    ) -> tuple[str, Optional[float]]:
+        """One scene on one model, with one more try on the SAME model when it failed in a way that can be fixed by
+        trying again (see is_retryable) — before anyone falls back to a lesser model or loses the scene. A failed
+        request is not billed by fal, so the second try costs nothing extra."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return await VideoGenerationService._generate_scene_fal(scene, model, avatar_voice, job_id, notes=notes)
+            except Exception as e:
+                if attempt == attempts or not is_retryable(e):
+                    raise
+                print(f"[VideoGenJob {job_id}] Scene {scene.get('scene_number')}: {model} failed ({e}); "
+                      f"trying it once more", flush=True)
+                await asyncio.sleep(_RETRY_PAUSE_SECONDS)
+
+    @staticmethod
+    async def _submit_and_poll(
+        model: str, arguments: Dict[str, Any], timeout_seconds: int, scene_num: Any, job_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Submit + manually poll fal.ai's queue instead of subscribe_async's
+        black-box wait. Live-confirmed 2026-10-05: the talking-avatar model
+        timed out at 300s, then again at 600s, on three separate real jobs —
+        subscribe_async gave zero visibility into whether that time was spent
+        actually queued (fal.ai capacity problem) or genuinely processing, so
+        every timeout looked identical and undiagnosable. This logs on every
+        STATE change (not every poll, to avoid log spam) so the next timeout
+        tells us which one it was.
+
+        Field/method names below (status.position, status.error, handle.get())
+        were pulled from the actually-installed fal_client package source
+        (inspect.getsource on fal_client.client.AsyncRequestHandle/Status in
+        this repo's venv), not from fal.ai's docs — a first version of this
+        trusted the docs' `position_`/`error_`/`.result()` and broke every
+        single fal.ai call in this file with `'AsyncRequestHandle' object has
+        no attribute 'result'`, confirmed live 2026-10-05.
+
+        When job_id is given, the live fal.ai status (queued/position,
+        processing, elapsed seconds) is written to that job's own document on
+        every poll — not just logged server-side — so the frontend's existing
+        10s job-status poll can show real progress instead of a static
+        "Generating…" spinner for however long this model actually takes.
+        """
+        import fal_client
+
+        # A failed SUBMIT sent nothing, so retrying it cannot double-bill.
+        handle = await _retry_transient(lambda: fal_client.submit_async(model, arguments=arguments), f"{model} submit")
+        started = time.monotonic()
+        poll_failures = 0
+        request_id = getattr(handle, "request_id", None)
+        last_state = None
+        col = _jobs_collection() if job_id else None
+        model_label = MODEL_REGISTRY.get(model, {}).get("label", model)
+        if col is not None and request_id:
+            # So a clip that finishes after we stopped waiting can still be traced and fetched from fal.
+            await col.update_one({"job_id": job_id}, {"$push": {"fal_requests": {
+                "scene_number": scene_num, "model": model, "request_id": request_id,
+            }}})
+
+        while True:
+            elapsed = time.monotonic() - started
+
+            try:
+                status = await handle.status(with_logs=False)
+                poll_failures = 0
+            except Exception as poll_err:
+                # A failed progress check says nothing about the request, which is still running (and billed) on
+                # fal. Giving up here and re-rendering elsewhere is what double-billed Seedance, so keep checking.
+                poll_failures += 1
+                if poll_failures >= _MAX_CONSECUTIVE_POLL_FAILURES:
+                    raise NoResubmit(
+                        f"lost contact with {model} after {poll_failures} failed checks ({poll_err}); "
+                        "the request may have finished, so it was not re-sent",
+                        request_id,
+                    )
+                print(f"[VideoGen] Scene {scene_num}: {model} progress check failed ({type(poll_err).__name__}: "
+                      f"{str(poll_err)[:120]}); still waiting ({poll_failures}/{_MAX_CONSECUTIVE_POLL_FAILURES})", flush=True)
+                await asyncio.sleep(min(5 * poll_failures, 30))
+                continue
+            state = type(status).__name__  # "Queued" | "InProgress" | "Completed"
+            position = getattr(status, "position", None) if state == "Queued" else None
+            if state != last_state:
+                if state == "Queued":
+                    print(f"[VideoGen] Scene {scene_num}: {model} queued (position {position}), {elapsed:.0f}s elapsed")
+                elif state == "InProgress":
+                    print(f"[VideoGen] Scene {scene_num}: {model} now processing, {elapsed:.0f}s elapsed")
+                elif state == "Completed":
+                    print(f"[VideoGen] Scene {scene_num}: {model} completed, {elapsed:.0f}s elapsed")
+                last_state = state
+
+            if state == "Completed":
+                if col is not None:
+                    await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
+                error = getattr(status, "error", None)
+                if error:
+                    raise RuntimeError(f"{model} failed: {error}")
+                try:
+                    return await _retry_transient(lambda: handle.get(), f"{model} fetch result", attempts=5)
+                except Exception as fetch_err:
+                    # It finished, so it was billed: do not send it again.
+                    raise NoResubmit(f"{model} finished but its result could not be fetched ({fetch_err})", request_id)
+
+            if elapsed > timeout_seconds:
+                # Not finished at the model's normal ceiling. A request still QUEUED has not started, so it is
+                # cancelled free of charge and the scene can safely move to a fallback. One already RENDERING is
+                # being billed and will finish: hand it off to be delivered when it does, instead of abandoning it
+                # (and paying again for a re-render) or holding up the other scenes.
+                if col is not None:
+                    await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
+                if state != "Queued":
+                    raise ClipStillRendering(
+                        f"{model} is still rendering after {timeout_seconds}s", request_id, handle, model)
+                try:
+                    await handle.cancel()
+                except Exception as cancel_err:
+                    print(f"[VideoGen] Scene {scene_num}: could not cancel {model} ({cancel_err})", flush=True)
+                err = TimeoutError(
+                    f"{model} did not start within {timeout_seconds}s (last known state: {last_state})"
+                )
+                err.request_id = request_id
+                raise err
+
+            if col is not None:
+                await col.update_one({"job_id": job_id}, {"$set": {
+                    "current_scene_status": {
+                        "scene_number": scene_num,
+                        "model_label": model_label,
+                        "state": state,  # "Queued" | "InProgress"
+                        "position": position,
+                        "elapsed_seconds": round(elapsed),
+                    },
+                }})
+
+            await asyncio.sleep(5)
+
+    @staticmethod
+    async def _generate_scene_fal(
+        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE, job_id: Optional[str] = None,
+        notes: Optional[dict] = None,
+    ) -> tuple[str, Optional[float]]:
         import fal_client
 
         frame_image_url = scene.get("frame_image_url")
         if not frame_image_url:
             raise ValueError(f"{model} requires a storyboard frame image — generate the storyboard frames first")
 
+        info = MODEL_REGISTRY.get(model)
+        if info is None:
+            raise ValueError(f"Unknown video model: {model}")
+
         prompt = scene.get("video_prompt", "")
+        if model not in (_AVATAR_TALKING, _NG_LIPSYNC):
+            # Faces melt and morph in image-to-video unless told to hold still; the talking models are driven by
+            # the voice, not this prompt.
+            prompt = with_face_stability(prompt)
+        spoken = (scene.get("dialogue") or "").strip()
+        if spoken and model in _SPEECH_IN_PROMPT_MODELS:
+            prompt = with_spoken_line(prompt, spoken)
+            # Logged, not shown: the customer just sees a finished clip. Search the ECS log for "SPEECH-IN-PROMPT".
+            print(f"[VideoGen] Scene {scene.get('scene_number')}: SPEECH-IN-PROMPT experiment on "
+                  f"{MODEL_REGISTRY.get(model, {}).get('label', model)} — line: {spoken!r}", flush=True)
         duration_req = scene.get("duration_seconds", 5)
+        scene_num = scene.get("scene_number")
+        actual_seconds: float
 
-        if "kling" in model:
-            duration = str(max(3, min(15, duration_req)))
-            arguments: Dict[str, Any] = {
-                "start_image_url": frame_image_url,
-                "prompt": prompt,
-                "duration": duration,
-                "generate_audio": True,
-            }
-            print(f"[VideoGen] Scene {scene.get('scene_number')}: Kling 3.0 Pro, {duration}s")
-        else:  # seedance
-            duration = str(max(4, min(15, duration_req)))
-            arguments = {
-                "image_url": frame_image_url,
-                "prompt": prompt,
-                "duration": duration,
-                "aspect_ratio": "9:16",
-                "resolution": "720p",
-                "generate_audio": True,
-            }
-            print(f"[VideoGen] Scene {scene.get('scene_number')}: Seedance 2.0, {duration}s")
-
-        # fal_client reads FAL_KEY; map our FAL_API_KEY if needed
+        # Moved ahead of the if/elif chain (was previously set just before the
+        # final _submit_and_poll call below) — the Nigerian-voice branch needs
+        # FAL_KEY in os.environ earlier, to make its own nested _submit_and_poll
+        # call (the f5-tts clone step) before the shared call further down.
         fal_key = settings.FAL_API_KEY
         if fal_key:
             os.environ["FAL_KEY"] = fal_key
 
+        if model in (_H3_TURBO, _H3_MAX):
+            # No documented min/max on `duration` beyond "integer, default 5" —
+            # clamped to the 5-10s range every other MiniMax model in this file
+            # uses, rather than sending an unvalidated raw value.
+            seconds = max(5, min(10, duration_req))
+            actual_seconds = seconds
+            arguments: Dict[str, Any] = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+                "resolution": "768P",
+                "prompt_expansion_mode": "balanced",
+            }
+            print(f"[VideoGen] Scene {scene_num}: {info['label']}, {seconds}s")
+
+        elif model == _KLING_STANDARD:
+            seconds = 10 if duration_req >= 8 else 5  # only valid values per this model's own schema
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+            }
+            print(f"[VideoGen] Scene {scene_num}: Kling 2.5 Standard, {seconds}s")
+
+        elif model == _PIXVERSE:
+            seconds = max(1, min(15, duration_req))
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+                "resolution": "720p",
+                "generate_audio_switch": True,  # brief's own ₦80/sec figure is priced "720p + audio"
+            }
+            print(f"[VideoGen] Scene {scene_num}: PixVerse V6, {seconds}s")
+
+        elif model == _WAN_3:
+            seconds = max(3, min(10, duration_req))
+            actual_seconds = seconds
+            arguments = {
+                "start_image_url": frame_image_url,  # NOT image_url — this model's own field name
+                "prompt": prompt,
+                "duration": seconds,
+                "resolution": "720p",
+                "aspect_ratio": "9:16",
+            }
+            print(f"[VideoGen] Scene {scene_num}: Wan 3.0, {seconds}s")
+
+        elif model == _VEO_FAST:
+            seconds = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": f"{seconds}s",
+                "aspect_ratio": "9:16",
+                "resolution": "720p",
+                "generate_audio": True,  # brief's own ₦199/sec figure is priced "Fast + audio"
+            }
+            print(f"[VideoGen] Scene {scene_num}: Veo 3.1 Fast, {seconds}s")
+
+        elif model == _OMNI_FLASH:
+            seconds = max(3, min(15, int(duration_req)))  # 3-15s, an integer (not "5s" like Veo)
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+                "aspect_ratio": "9:16",
+                "resolution": "720p",  # audio is built in; this schema has no audio, negative-prompt or seed switch
+            }
+            print(f"[VideoGen] Scene {scene_num}: Gemini Omni Flash, {seconds}s")
+
+        elif model == _SEEDANCE_FAST:
+            seconds = max(4, min(15, duration_req))
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": str(seconds),
+                "aspect_ratio": "9:16",
+                "resolution": "720p",
+                "generate_audio": True,
+            }
+            print(f"[VideoGen] Scene {scene_num}: Seedance 2.0 Fast, {seconds}s")
+
+        elif model == _AVATAR_TALKING:
+            dialogue = (scene.get("dialogue") or scene.get("text_overlay") or prompt or "").strip()
+            if not dialogue:
+                raise ValueError("Talking Avatar requires a scripted line — this scene has no dialogue")
+
+            def _western_avatar_args(line: str) -> tuple[Dict[str, Any], float]:
+                # No duration field on this model — it's driven by num_frames at
+                # a fixed internal frame rate. fal.ai doesn't publish the fps for
+                # this endpoint; 25fps is the standard rate for the MultiTalk-
+                # family avatar models this one is built on, used here as the
+                # best-available estimate — if a live generation's actual runtime
+                # diverges noticeably from this, re-derive from a real response.
+                fps = 25
+
+                # The model converts text_input to speech internally and hard-
+                # rejects num_frames that outruns that synthesized audio — live-
+                # confirmed 2026-10-01: a 9-word line produced 3.58s of audio
+                # (≈2.5 words/sec, normal TTS cadence) and a scene-duration-based
+                # num_frames exceeded it, so it was never really duration_req that
+                # bounded this model, it's how long the dialogue takes to say.
+                # 3.0 words/sec is a deliberately faster-than-typical estimate —
+                # it under-predicts speech length, keeping num_frames comfortably
+                # under the real synthesized audio rather than risking the same
+                # error from an optimistic guess. Still capped by duration_req so
+                # a long line in a short scene doesn't run past the scene's pacing.
+                wc = max(1, len(line.split()))
+                secs = min(wc / 3.0, duration_req)
+                nf = max(41, min(721, round(secs * fps)))
+                return (
+                    {
+                        "image_url": frame_image_url,
+                        "text_input": line,
+                        "voice": avatar_voice if avatar_voice in AVATAR_VOICES else DEFAULT_AVATAR_VOICE,
+                        "prompt": prompt or line,
+                        "num_frames": nf,
+                        "resolution": "480p",  # fixed — 720p doubles the $/sec rate baked into MODEL_REGISTRY above
+                    },
+                    round(nf / fps, 2),
+                )
+
+            if avatar_voice in NIGERIAN_VOICE_REFS or yarngpt_tts_service.speaker_for(avatar_voice):
+                # Preferred: YarnGPT speaks the line itself (its own Nigerian voice, no
+                # cloning). Only attempted when the TTS service is configured; any failure
+                # drops to the clone path below for the two voices that have a reference
+                # clip, so a down service never breaks them.
+                cloned_audio_url = None
+                voice_source = "cloned"
+                speaker = yarngpt_tts_service.speaker_for(avatar_voice)
+                if speaker and yarngpt_tts_service.is_configured():
+                    try:
+                        raw_audio = await yarngpt_tts_service.synthesize(dialogue, speaker)
+                        raw_audio = _pad_wav_bytes(raw_audio) or raw_audio
+                        cloned_audio_url = await upload_bytes(
+                            raw_audio, folder="uri-social/generated-audio", resource_type="audio"
+                        )
+                        voice_source = "YarnGPT"
+                    except Exception as yarn_err:
+                        print(f"[VideoGen] Scene {scene_num}: YarnGPT direct synthesis failed "
+                              f"({yarn_err}); falling back to the cloned voice")
+                        cloned_audio_url = None
+                        if notes is not None and avatar_voice in NIGERIAN_VOICE_REFS:
+                            # Idera and Jude still have a clone to fall back on, so the scene keeps
+                            # a Nigerian voice, but it is not the YarnGPT one the customer picked
+                            # (and the reason, e.g. out of credits, is worth seeing).
+                            notes["voice_fallback"] = (
+                                f"YarnGPT could not speak this scene ({str(yarn_err)[:140]}), so the older "
+                                f"cloned {avatar_voice} voice was used."
+                            )
+
+                default_voice_instead = False
+                if cloned_audio_url is None and avatar_voice not in NIGERIAN_VOICE_REFS:
+                    # YarnGPT could not speak this line and there is no reference clip to clone
+                    # from. Keep the scripted line and the lip-sync with a default voice, and
+                    # say so on the clip, rather than losing the speech by falling to Veo.
+                    default_voice_instead = True
+                    if notes is not None:
+                        notes["voice_fallback"] = (
+                            f"The {avatar_voice} voice could not be generated for this scene, "
+                            f"so a default voice was used."
+                        )
+                elif cloned_audio_url is None:
+                    # Clone the reference sample reading this scene's actual line
+                    # (fal-ai/f5-tts), then lip-sync that audio to the frame image
+                    # (minimax/h3-max/lip-sync/image-to-video) — see NIGERIAN_VOICE_REFS
+                    # and the MODEL_REGISTRY entry above for why this two-step path
+                    # exists instead of _AVATAR_TALKING's single text_input+voice call.
+                    tts_result = await VideoGenerationService._submit_and_poll(
+                        "fal-ai/f5-tts",
+                        {
+                            "gen_text": dialogue,
+                            "ref_audio_url": NIGERIAN_VOICE_REFS[avatar_voice],
+                            "model_type": "F5-TTS",
+                        },
+                        _FAL_SUBSCRIBE_TIMEOUT_SECONDS,
+                        scene_num,
+                        job_id,
+                    )
+                    cloned_audio_url = tts_result["audio_url"]["url"]
+                    try:
+                        cloned_audio_url = await _pad_wav_silence(cloned_audio_url)
+                    except Exception as pad_err:
+                        print(f"[VideoGen] Scene {scene_num}: silence-padding failed ({pad_err}), using clip as-is")
+
+                if default_voice_instead:
+                    arguments, actual_seconds = _western_avatar_args(dialogue)
+                    print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice} unavailable, default voice), ~{actual_seconds}s")
+                else:
+                    model = _NG_LIPSYNC
+                    info = MODEL_REGISTRY[model]
+                    # No duration field on this model — the output simply runs as
+                    # long as the supplied audio does. Same word-count estimate
+                    # _AVATAR_TALKING's own branch used, as a placeholder; overridden
+                    # below with the real reported duration once the call completes.
+                    word_count = max(1, len(dialogue.split()))
+                    actual_seconds = min(word_count / 3.0, duration_req)
+                    arguments = {
+                        "image_url": frame_image_url,
+                        "audio_url": cloned_audio_url,
+                        "resolution": "480P",
+                    }
+                    print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}, {voice_source}), ~{actual_seconds}s")
+            else:
+                arguments, actual_seconds = _western_avatar_args(dialogue)
+                print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}), ~{actual_seconds}s")
+
+        else:
+            raise ValueError(f"Unknown video model: {model}")
+
+        model_timeout = _MODEL_TIMEOUT_OVERRIDES.get(model, _FAL_SUBSCRIBE_TIMEOUT_SECONDS)
+
         try:
-            result = await fal_client.subscribe_async(model, arguments)
+            result = await VideoGenerationService._submit_and_poll(
+                model, arguments, model_timeout, scene_num, job_id
+            )
         except Exception as e:
+            if isinstance(e, ClipStillRendering):
+                e.actual_seconds = actual_seconds
+                raise
             err_str = str(e)
-            if "content_policy_violation" in err_str or "sensitive content" in err_str.lower():
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: audio flagged, retrying without audio")
-                arguments = {**arguments, "generate_audio": False}
-                result = await fal_client.subscribe_async(model, arguments)
+            has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
+            if has_audio_toggle and _is_content_flag(err_str):
+                toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
+                image_refused = _is_image_flag(err_str)
+                print(f"[VideoGen] Scene {scene_num}: {model} refused the request "
+                      f"({'start image taken for a real person' if image_refused else 'audio flagged'}): "
+                      f"{err_str[:300]}", flush=True)
+                # Dropping the sound is the LAST resort, not the first. A refused start image has nothing to do with
+                # the audio (staging 2026-11-09: scene 1 was refused for "likenesses of real people", the retry with
+                # the sound off passed, and the clip came out silent). And the checks are not consistent: the same
+                # request often passes on the next try. So retry it unchanged first: twice for a refused image, once
+                # for a flagged audio track on a spoken scene (silence defeats a talking scene).
+                same_args_retries = 2 if image_refused else (1 if spoken and model in _SPEECH_IN_PROMPT_MODELS else 0)
+                result = None
+                for attempt in range(1, same_args_retries + 1):
+                    print(f"[VideoGen] Scene {scene_num}: trying the same request again, audio on "
+                          f"({attempt}/{same_args_retries})", flush=True)
+                    try:
+                        result = await VideoGenerationService._submit_and_poll(
+                            model, arguments, model_timeout, scene_num, job_id
+                        )
+                        break
+                    except Exception as again:
+                        if isinstance(again, ClipStillRendering):
+                            again.actual_seconds = actual_seconds
+                            raise
+                        if not _is_content_flag(str(again)):
+                            raise
+                        print(f"[VideoGen] Scene {scene_num}: refused again: {str(again)[:300]}", flush=True)
+                if result is None:
+                    print(f"[VideoGen] Scene {scene_num}: retrying without audio", flush=True)
+                    arguments = {**arguments, toggle_key: False}
+                    result = await VideoGenerationService._submit_and_poll(
+                        model, arguments, model_timeout, scene_num, job_id
+                    )
+            elif model == _NG_LIPSYNC:
+                # Cloned+padded audio still got rejected (some other validation
+                # issue _pad_wav_silence didn't cover) — degrade to the normal
+                # Western voice for this one scene rather than letting this
+                # propagate up to run_job's own primary/fallback, which would
+                # lose lip-sync entirely by falling through to generic Veo.
+                print(f"[VideoGen] Scene {scene_num}: Nigerian voice path failed ({e}), using default voice instead")
+                if notes is not None:
+                    # Without this the customer hears a different, non-Nigerian voice on this scene
+                    # and nothing says why; run_job puts it on the clip as a warning.
+                    notes["voice_fallback"] = (
+                        f"The {avatar_voice} voice could not be generated for this scene, "
+                        f"so a default voice was used."
+                    )
+                model = _AVATAR_TALKING
+                info = MODEL_REGISTRY[model]
+                model_timeout = _MODEL_TIMEOUT_OVERRIDES.get(model, _FAL_SUBSCRIBE_TIMEOUT_SECONDS)
+                arguments, actual_seconds = _western_avatar_args(dialogue)
+                result = await VideoGenerationService._submit_and_poll(
+                    model, arguments, model_timeout, scene_num, job_id
+                )
             else:
                 raise
 
-        video_url = result["video"]["url"]
+        if model == _NG_LIPSYNC and isinstance(result.get("duration"), (int, float)):
+            actual_seconds = result["duration"]  # real figure, replacing the word-count estimate above
 
-        # Download and store in Cloudinary
-        async with httpx.AsyncClient(timeout=120) as client:
-            video_resp = await client.get(video_url)
-            video_resp.raise_for_status()
-            video_bytes = video_resp.content
-
-        return await upload_bytes(
-            video_bytes,
-            folder="uri-social/generated-videos",
-            resource_type="video",
-        )
+        return await VideoGenerationService._store_clip(result, model, actual_seconds)

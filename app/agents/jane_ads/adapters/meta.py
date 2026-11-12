@@ -78,6 +78,8 @@ _VIDEO_POLL_INTERVAL_SECONDS = 5
 
 # Meta's `effective_status` values, translated to plain language for the campaign-
 # list view — callers never see raw Ads-Manager jargon.
+RETRY_DELAY_SECONDS = 4
+
 _DELIVERY_LABELS = {
     "ACTIVE": "Active",
     "PAUSED": "Paused",
@@ -368,7 +370,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # Meta also enforces its own daily-budget floor per currency; a too-small
         # budget will come back as a descriptive error from the API, not a silent
         # failure, so this is intentionally not pre-validated here.
-        daily_budget_minor = max(int((total_budget_ngn / days) * 100), 100)
+        # One ad set each splits the daily budget equally. Ads sharing an ad set share it.
+        split_adsets = plan.ad_layout == "abo" and bool(plan.concepts)
+        n_adsets = 1 + len(plan.concepts) if split_adsets else 1
+        daily_budget_minor = max(int((total_budget_ngn / days / n_adsets) * 100), 100)
         # A real end date, not just a `days` number in copy — without this the ad
         # set has no natural stop and would run (and spend) indefinitely once
         # activated. Measured from creation, not activation: if a campaign sits
@@ -559,7 +564,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             "page_id": plan.page_id,
                             "whatsapp_phone_number": plan.whatsapp_number,
                         }
-                    else:
+                    elif plan.objective != CampaignObjective.AWARENESS:
+                        # Awareness stays on REACH: Meta refuses LINK_CLICKS under
+                        # OUTCOME_AWARENESS (subcode 2490408).
                         adset_payload["optimization_goal"] = "LINK_CLICKS"
 
                 # The manual campaign's routing: ONE ad set whose destination covers
@@ -649,134 +656,170 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 _raise_for_error(adset_data, "ad set creation")
                 adset_id = adset_data["id"]
 
-                if is_followers_goal:
-                    message = plan.creative.primary_text or plan.creative.headline or "Follow us for more!"
-                    # LIKE_PAGE drives the tap straight to following the Page — confirmed
-                    # live shape (Meta Marketing API docs), no link/WhatsApp routing at all.
-                    cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
-                else:
-                    message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
-                    # The tap opens the brand's chosen destination through a plain link
-                    # (see the ad set above for why this is a link ad and not Meta's
-                    # native Click-to-WhatsApp). For photo ads the destination is
-                    # link_data.link itself; video_data has no link field of its own
-                    # (confirmed against Meta's AdCreativeVideoData reference), so there
-                    # the destination has to ride on the CTA's value.link — which
-                    # WHATSAPP_MESSAGE refuses to carry. destination.meta_cta owns that
-                    # whole choice.
-                    if use_native_whatsapp:
-                        # The native button carries no link: the ad set's
-                        # destination_type/promoted_object own the routing, and
-                        # WHATSAPP_MESSAGE refuses a value.link (which is exactly why
-                        # the link-ad path can't use it). Works for photo and video
-                        # alike, since neither needs a link on the CTA here.
-                        cta = {"type": "WHATSAPP_MESSAGE"}
+                async def _creative_and_ad(ad_creative, for_adset: str, vid, thumb, suffix: str = ""):
+                    """One creative and its ad inside an ad set."""
+                    headline, description = creative_text(ad_creative)
+                    if is_followers_goal:
+                        message = ad_creative.primary_text or ad_creative.headline or "Follow us for more!"
+                        # LIKE_PAGE drives the tap straight to following the Page — confirmed
+                        # live shape (Meta Marketing API docs), no link/WhatsApp routing at all.
+                        cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
                     else:
-                        cta = destination.meta_call_to_action(plan.creative.is_video)
-                if plan.creative.is_video:
-                    object_story_spec = {
-                        "page_id": plan.page_id,
-                        "video_data": {
-                            "video_id": video_id,
-                            "image_url": video_thumbnail_url,
-                            "message": message,
-                            # Left out, Ads Manager shows "no headline / no description"
-                            # on the ad.
-                            **({"title": headline} if headline else {}),
-                            **({"link_description": description} if description else {}),
-                            "call_to_action": cta,
-                        },
-                    }
-                else:
-                    object_story_spec = {
-                        "page_id": plan.page_id,
-                        "link_data": {
-                            "message": message,
-                            **({"name": headline} if headline else {}),
-                            **({"description": description} if description else {}),
-                            # LIKE_PAGE ignores this link (the button does the follow action
-                            # itself), so the Page's own URL is the sensible placeholder
-                            # there. For every other goal this is the REAL destination:
-                            # wa.me/<the brand's number>. It used to be a bare
-                            # "https://wa.me/" with no number, which went nowhere.
-                            # A native Click-to-WhatsApp ad routes through the ad set,
-                            # not through a link — Meta rejects a wa.me URL sitting in a
-                            # link-destination field (#2446860), which is what Ads
-                            # Manager complains about on the link-ad form.
-                            "link": (
-                                f"https://www.facebook.com/{plan.page_id}"
-                                if (is_followers_goal or use_native_whatsapp)
-                                else dest_link
-                            ),
-                            "picture": plan.creative.image_url,
-                            "call_to_action": cta,
-                        },
-                    }
-                creative_body = {
-                    "name": f"JaneAds-{plan.business_id}-creative",
-                    "object_story_spec": object_story_spec,
-                }
-                if use_multi_destination:
-                    # The manual ad's creative: the Messenger button on the story, one
-                    # call-to-action per inbox in the asset feed, the welcome message
-                    # with its ice-breaker, a headline, and Meta's standard creative
-                    # enhancements opted in. An API-created creative defaults every
-                    # enhancement to OPT_OUT, which is most of what made Jane's ad a
-                    # lesser version of the same ad.
-                    cta_type = CTA_CHOICES.get(destination.cta, ("", "CONTACT_US"))[1]
-                    ig = await self._instagram_ids(plan.page_id)
-                    story = {"page_id": plan.page_id}
-                    if ig.get("id"):
-                        story["instagram_user_id"] = ig["id"]
-                    common = {
-                        "message": message,
-                        "call_to_action": messaging_ad.primary_call_to_action(cta_type),
-                        "page_welcome_message": messaging_ad.welcome_message(),
-                    }
-                    if plan.creative.is_video:
-                        story["video_data"] = {
-                            "video_id": video_id, "image_url": video_thumbnail_url,
-                            "title": plan.creative.headline or "", **common,
+                        message = ad_creative.primary_text or ad_creative.headline or "Chat with us on WhatsApp!"
+                        # The tap opens the brand's chosen destination through a plain link
+                        # (see the ad set above for why this is a link ad and not Meta's
+                        # native Click-to-WhatsApp). For photo ads the destination is
+                        # link_data.link itself; video_data has no link field of its own
+                        # (confirmed against Meta's AdCreativeVideoData reference), so there
+                        # the destination has to ride on the CTA's value.link — which
+                        # WHATSAPP_MESSAGE refuses to carry. destination.meta_cta owns that
+                        # whole choice.
+                        if use_native_whatsapp:
+                            # The native button carries no link: the ad set's
+                            # destination_type/promoted_object own the routing, and
+                            # WHATSAPP_MESSAGE refuses a value.link (which is exactly why
+                            # the link-ad path can't use it). Works for photo and video
+                            # alike, since neither needs a link on the CTA here.
+                            cta = {"type": "WHATSAPP_MESSAGE"}
+                        else:
+                            cta = destination.meta_call_to_action(ad_creative.is_video)
+                    if ad_creative.is_video:
+                        object_story_spec = {
+                            "page_id": plan.page_id,
+                            "video_data": {
+                                "video_id": vid,
+                                "image_url": thumb,
+                                "message": message,
+                                # Left out, Ads Manager shows "no headline / no description"
+                                # on the ad.
+                                **({"title": headline} if headline else {}),
+                                **({"link_description": description} if description else {}),
+                                "call_to_action": cta,
+                            },
                         }
                     else:
-                        story["link_data"] = {
-                            "link": "https://fb.com/messenger_doc/",
-                            "name": plan.creative.headline or "",
-                            "picture": plan.creative.image_url, **common,
+                        object_story_spec = {
+                            "page_id": plan.page_id,
+                            "link_data": {
+                                "message": message,
+                                **({"name": headline} if headline else {}),
+                                **({"description": description} if description else {}),
+                                # LIKE_PAGE ignores this link (the button does the follow action
+                                # itself), so the Page's own URL is the sensible placeholder
+                                # there. For every other goal this is the REAL destination:
+                                # wa.me/<the brand's number>. It used to be a bare
+                                # "https://wa.me/" with no number, which went nowhere.
+                                # A native Click-to-WhatsApp ad routes through the ad set,
+                                # not through a link — Meta rejects a wa.me URL sitting in a
+                                # link-destination field (#2446860), which is what Ads
+                                # Manager complains about on the link-ad form.
+                                "link": (
+                                    f"https://www.facebook.com/{plan.page_id}"
+                                    if (is_followers_goal or use_native_whatsapp)
+                                    else dest_link
+                                ),
+                                "picture": ad_creative.image_url,
+                                "call_to_action": cta,
+                            },
                         }
                     creative_body = {
-                        "name": f"JaneAds-{plan.business_id}-creative",
-                        "object_story_spec": story,
-                        "asset_feed_spec": messaging_ad.asset_feed_spec(
-                            cta_type, ig.get("ig_id", "")),
-                        **messaging_ad.creative_extras(),
+                        "name": f"JaneAds-{plan.business_id}-creative{suffix}",
+                        "object_story_spec": object_story_spec,
                     }
-                creative_resp = await client.post(
-                    f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
-                    params={"access_token": self._access_token},
-                    json=creative_body,
-                )
-                creative_data = creative_resp.json()
-                if want_native_whatsapp and _whatsapp_refusal(creative_data):
-                    _raise_not_linked(creative_data, plan)
-                _raise_for_error(creative_data, "ad creative creation")
-                creative_id = creative_data["id"]
+                    if use_multi_destination:
+                        # The manual ad's creative: the Messenger button on the story, one
+                        # call-to-action per inbox in the asset feed, the welcome message
+                        # with its ice-breaker, a headline, and Meta's standard creative
+                        # enhancements opted in. An API-created creative defaults every
+                        # enhancement to OPT_OUT, which is most of what made Jane's ad a
+                        # lesser version of the same ad.
+                        cta_type = CTA_CHOICES.get(destination.cta, ("", "CONTACT_US"))[1]
+                        ig = await self._instagram_ids(plan.page_id)
+                        story = {"page_id": plan.page_id}
+                        if ig.get("id"):
+                            story["instagram_user_id"] = ig["id"]
+                        common = {
+                            "message": message,
+                            "call_to_action": messaging_ad.primary_call_to_action(cta_type),
+                            "page_welcome_message": messaging_ad.welcome_message(),
+                        }
+                        if ad_creative.is_video:
+                            story["video_data"] = {
+                                "video_id": vid, "image_url": thumb,
+                                "title": ad_creative.headline or "", **common,
+                            }
+                        else:
+                            story["link_data"] = {
+                                "link": "https://fb.com/messenger_doc/",
+                                "name": ad_creative.headline or "",
+                                "picture": ad_creative.image_url, **common,
+                            }
+                        creative_body = {
+                            "name": f"JaneAds-{plan.business_id}-creative{suffix}",
+                            "object_story_spec": story,
+                            "asset_feed_spec": messaging_ad.asset_feed_spec(
+                                cta_type, ig.get("ig_id", "")),
+                            **messaging_ad.creative_extras(),
+                        }
+                    # Meta's code 2 means "temporarily unavailable, try again": asks are
+                    # retried here rather than failing a launch of several ads at the last one.
+                    for attempt in range(3):
+                        creative_resp = await client.post(
+                            f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
+                            params={"access_token": self._access_token},
+                            json=creative_body,
+                        )
+                        creative_data = creative_resp.json()
+                        if (creative_data.get("error") or {}).get("code") != 2 or attempt == 2:
+                            break
+                        print(f"[MetaAds] creative creation temporarily unavailable, retrying "
+                              f"({ad_creative.concept or ad_creative.image_url[-30:]})", flush=True)
+                        await asyncio.sleep(RETRY_DELAY_SECONDS)
+                    if want_native_whatsapp and _whatsapp_refusal(creative_data):
+                        _raise_not_linked(creative_data, plan)
+                    _raise_for_error(creative_data, "ad creative creation")
+                    new_creative = creative_data["id"]
 
-                ad_resp = await client.post(
-                    f"{self._graph_base}/act_{self._ad_account_id}/ads",
-                    params={"access_token": self._access_token},
-                    json={
-                        "name": f"JaneAds-{plan.business_id}-ad",
-                        "adset_id": adset_id,
-                        "creative": {"creative_id": creative_id},
-                        "status": "PAUSED",
-                    },
-                )
-                ad_data = ad_resp.json()
-                if want_native_whatsapp and _whatsapp_refusal(ad_data):
-                    _raise_not_linked(ad_data, plan)
-                _raise_for_error(ad_data, "ad creation")
-                ad_id = ad_data["id"]
+                    ad_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/ads",
+                        params={"access_token": self._access_token},
+                        json={
+                            "name": f"JaneAds-{plan.business_id}-ad{suffix}",
+                            "adset_id": for_adset,
+                            "creative": {"creative_id": new_creative},
+                            "status": "PAUSED",
+                        },
+                    )
+                    ad_data = ad_resp.json()
+                    if want_native_whatsapp and _whatsapp_refusal(ad_data):
+                        _raise_not_linked(ad_data, plan)
+                    _raise_for_error(ad_data, "ad creation")
+                    return new_creative, ad_data["id"]
+
+                creative_id, ad_id = await _creative_and_ad(
+                    plan.creative, adset_id, video_id, video_thumbnail_url)
+                ad_ids = [ad_id]
+                adset_ids = [adset_id]
+                # Every other ad being tested: in the same ad set, or in its own with the
+                # same targeting and an equal share of the budget (ABO).
+                for i, extra in enumerate(plan.concepts, start=2):
+                    suffix = f"-{extra.concept or i}"
+                    target_adset = adset_id
+                    if split_adsets:
+                        extra_resp = await client.post(
+                            f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                            params={"access_token": self._access_token},
+                            json={**adset_payload, "name": f"JaneAds-{plan.business_id}-adset{suffix}"},
+                        )
+                        extra_data = extra_resp.json()
+                        _raise_for_error(extra_data, "ad set creation")
+                        target_adset = extra_data["id"]
+                        adset_ids.append(target_adset)
+                    extra_vid, extra_thumb = (None, None)
+                    if extra.is_video:
+                        extra_vid, extra_thumb = await self._upload_video_to_meta(extra.image_url)
+                    _, extra_ad = await _creative_and_ad(extra, target_adset, extra_vid, extra_thumb, suffix)
+                    ad_ids.append(extra_ad)
         except Exception:
             await self._rollback_partial_launch(campaign_id, creative_id)
             raise
@@ -787,8 +830,13 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 "campaign_id": campaign_id,
                 "adset_id": adset_id,
                 "ad_id": ad_id,
+                "adset_ids": adset_ids,
+                "ad_ids": ad_ids,
+                "concepts": [c.concept for c in [plan.creative, *plan.concepts]],
                 "business_id": plan.business_id,
                 "platform": "meta",
+                # Set only for a multi-platform campaign — see CampaignPlan.campaign_group_id.
+                "campaign_group_id": plan.campaign_group_id,
                 "last_conversation_count": 0,
                 # The billing basis this campaign was SOLD under, frozen here so the
                 # meter can never re-base a live campaign onto a later fee change
@@ -895,6 +943,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "access_token": self._access_token,
                     "level": "ad",
                     "fields": "ad_id,spend",
+                    "date_preset": "maximum",
                 },
             )
             data = resp.json()
@@ -968,7 +1017,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         "effective_status,"
                         "adsets{end_time},"
                         "ads{effective_status},"
-                        "insights{impressions,reach,spend,actions,cost_per_action_type}"
+                        "insights.date_preset(maximum){impressions,reach,spend,actions,cost_per_action_type}"
                     ),
                 },
             )
@@ -1026,6 +1075,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 params={
                     "access_token": self._access_token,
                     "fields": "spend,actions",
+                    "date_preset": "maximum",
                 },
             )
             data = resp.json()
