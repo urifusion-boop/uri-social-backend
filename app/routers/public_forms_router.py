@@ -59,6 +59,13 @@ def _throttle(request: Request, bucket: str) -> None:
     hits.append(now)
 
 
+async def _notify_team(**mail) -> None:
+    """Send the notification and log the outcome, so a missing email can be traced
+    (send_raw_email only logs failures, and only says "not configured" if SMTP is unset)."""
+    ok = await email_service.send_raw_email(to_email=INBOX, **mail)
+    print(f"{'📧 Public form notification sent' if ok else '⚠️ Public form notification NOT sent'}: {mail['subject']!r} -> {INBOX}")
+
+
 def _email_html(title: str, rows: Dict[str, str], body: Optional[str] = None) -> str:
     """Plain internal notification; every user-supplied value is escaped."""
     table = "".join(
@@ -123,8 +130,7 @@ async def submit_contact(
     )
 
     background.add_task(
-        email_service.send_raw_email,
-        to_email=INBOX,
+        _notify_team,
         subject=f"[Contact] {body.subject} — {name}"[:150].replace("\r", " ").replace("\n", " "),
         html_body=_email_html(
             "New message from the Contact page",
@@ -166,14 +172,18 @@ async def join_api_waitlist(
         upsert=True,
     )
 
-    if result.upserted_id is not None:
-        background.add_task(
-            email_service.send_raw_email,
-            to_email=INBOX,
-            subject="[API waitlist] New signup",
-            html_body=_email_html("New API waitlist signup", {"Email": email}),
-            reply_to=email,
-        )
+    # Notify on every submission, not just the first: a repeat is still someone
+    # asking for access, and skipping it made a failed first email unrecoverable.
+    is_new = result.upserted_id is not None
+    background.add_task(
+        _notify_team,
+        subject=f"[API waitlist] {'New signup' if is_new else 'Repeat signup'}",
+        html_body=_email_html(
+            "New API waitlist signup" if is_new else "API waitlist signup (already on the list)",
+            {"Email": email},
+        ),
+        reply_to=email,
+    )
 
     return {
         "status": True,
