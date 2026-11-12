@@ -4271,6 +4271,28 @@ async def get_performance(
 
         published = [d for d in all_published if _is_recent(d)]
 
+        # Only what is connected right now: the Connected Accounts page's own list is the source of
+        # truth, so a platform / account that was disconnected (or never connected here) leaves no
+        # trace in the totals, the breakdowns or the top posts. If that list cannot be read, show
+        # everything rather than hide real data on a transient error.
+        def _norm_platform(pl):
+            pl = (pl or "").lower()
+            return "x" if pl == "twitter" else pl
+
+        connected_by_platform = None
+        try:
+            _conn_res = await SocialAccountService.get_user_connections(db, user_id, brand_id)
+            if _conn_res.get("status"):
+                connected_by_platform = {
+                    _norm_platform(pl): accs
+                    for pl, accs in ((_conn_res.get("responseData") or {}).get("connections") or {}).items()
+                    if accs
+                }
+        except Exception as _cn_err:
+            print(f"⚠️ performance: could not read connected accounts, not filtering: {_cn_err}", flush=True)
+        if connected_by_platform is not None:
+            published = [d for d in published if _norm_platform(d.get("platform")) in connected_by_platform]
+
         if not published:
             return UriResponse.get_single_data_response("performance", {
                 "has_data": False,
@@ -4944,20 +4966,27 @@ async def get_performance(
         # one that could not be (analytics read from a stored copy) goes to the platform's only
         # account when there is exactly one, and otherwise stays "unattributed" rather than guessed.
         _social_platforms = ("instagram", "facebook", "tiktok", "x", "twitter", "youtube", "threads", "bluesky", "pinterest")
-        known_conns = await db["social_connections"].find(
-            {**_conn_scope, "platform": {"$in": list(_social_platforms)}, "connection_status": "active"},
-            {"_id": 0, "id": 1, "platform": 1, "ig_user_id": 1, "page_id": 1, "outstand_account_id": 1,
-             "username": 1, "account_name": 1, "page_name": 1},
-        ).to_list(length=50)
+        def _account_key(platform, value):
+            """Facebook direct ids are "fb_<page id>" while posts carry the bare page id."""
+            value = str(value)
+            return value[3:] if platform == "facebook" and value.startswith("fb_") else value
 
-        def _conn_key(c):
-            return c.get("ig_user_id") or c.get("page_id") or c.get("outstand_account_id") or c.get("id")
-
-        accounts_by_platform: dict = {}
-        for c in known_conns:
-            accounts_by_platform.setdefault(c["platform"], {})[str(_conn_key(c))] = (
-                c.get("username") or c.get("account_name") or c.get("page_name") or c["platform"]
-            )
+        # One canonical id per connected account, and every other id it is known by (an account
+        # can carry an Instagram / Page id, an Outstand id and a local id) pointing back to it.
+        accounts_by_platform: dict = {}   # platform -> {canonical id: name}
+        alias_to_account: dict = {}       # platform -> {any id: canonical id}
+        for pl, accs in (connected_by_platform or {}).items():
+            if pl not in _social_platforms:
+                continue
+            for a in accs:
+                keys = [_account_key(pl, k) for k in (a.get("ig_user_id"), a.get("outstand_account_id"), a.get("id")) if k]
+                if not keys:
+                    continue
+                accounts_by_platform.setdefault(pl, {})[keys[0]] = (
+                    a.get("username") or a.get("account_name") or a.get("page_name") or pl
+                )
+                for k in keys:
+                    alias_to_account.setdefault(pl, {})[k] = keys[0]
 
         by_account: dict = {}
 
@@ -4975,14 +5004,21 @@ async def get_performance(
             for aid, name in accts.items():
                 _bucket(pl, aid, name)
         for p in posts:
-            pl = p.get("platform")
-            aid = str(p["account_id"]) if p.get("account_id") else None
-            name = p.get("account_name")
-            if not aid and len(accounts_by_platform.get(pl, {})) == 1:
-                aid, name = next(iter(accounts_by_platform[pl].items()))
-            if aid and not name:
-                name = accounts_by_platform.get(pl, {}).get(aid) or pl
-            b = _bucket(pl, aid, name or f"{pl} (account not recorded)")
+            pl = _norm_platform(p.get("platform"))
+            known = accounts_by_platform.get(pl, {})
+            aid = alias_to_account.get(pl, {}).get(_account_key(pl, p["account_id"])) if p.get("account_id") else None
+            if not aid and p.get("account_name"):
+                # an id from a system we don't list it under — match the account by name
+                aid = next((k for k, n in known.items() if n.lower() == str(p["account_name"]).lower()), None)
+            if not aid and len(known) == 1:
+                aid = next(iter(known))
+            if aid:
+                name = known[aid]
+            elif len(known) > 1:
+                name = f"{pl} (account not recorded)"
+            else:
+                continue   # nothing connected on this platform — not shown
+            b = _bucket(pl, aid, name)
             b["posts"] += 1
             for k in ("impressions", "reach", "views", "likes", "comments", "shares", "saves"):
                 b[k] += p.get(k, 0) or 0
@@ -5050,6 +5086,16 @@ async def get_account_metrics(
             print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
             outstand_accounts = []
 
+        # Accounts the user explicitly disconnected stay out even if Outstand still lists them
+        # (the same record the Connected Accounts page filters on).
+        _is_personal = (not brand_id) or brand_id == _BA.personal_brand_id(user_id)
+        _tombstone_scope = {"user_id": user_id} if _is_personal else {"brand_id": brand_id}
+        _disconnected_ids = {
+            d["outstand_account_id"]
+            async for d in db["disconnected_accounts"].find(_tombstone_scope, {"outstand_account_id": 1})
+        }
+        outstand_accounts = [a for a in outstand_accounts if a.get("id") not in _disconnected_ids]
+
         async def _fetch_outstand_metrics(acc):
             account_id = acc.get("id")
             if not account_id:
@@ -5086,7 +5132,7 @@ async def get_account_metrics(
 
         # ── Direct (non-Outstand) connections scoped to active brand ──────────
         direct_conns = await db["social_connections"].find(
-            {**_conn_scope, "connected_via": {"$ne": "outstand"}},
+            {**_conn_scope, "connected_via": {"$ne": "outstand"}, "connection_status": "active"},
             {"_id": 0, "id": 1, "platform": 1, "connected_via": 1, "connection_status": 1,
              "page_access_token": 1, "ig_user_id": 1, "page_name": 1, "page_id": 1, "account_name": 1,
              "profile_picture_url": 1},
