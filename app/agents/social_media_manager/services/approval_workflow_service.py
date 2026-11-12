@@ -2495,6 +2495,9 @@ class ApprovalWorkflowService:
                         "outstand_account_id": connection.get("outstand_account_id")}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
+                from app.agents.social_media_manager.services.outstand_service import OutstandDisabledError
+                if isinstance(e, OutstandDisabledError):
+                    return {"success": False, "error": e.message}
                 return {"success": False, "error": f"Outstand publish failed: {str(e)}"}
 
         # ── Legacy direct Facebook connection ─────────────────────────────────
