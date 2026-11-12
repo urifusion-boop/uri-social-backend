@@ -3,7 +3,7 @@ Public (no-login) forms on the marketing site: the Contact page's "Send message"
 and the API Docs page's "Join the API waitlist".
 
 Both store what they receive (so nothing is lost if SMTP is down or unset) and
-email hello@urisocial.com so a human sees it.
+email the team inbox so a human sees it.
 """
 import time
 from collections import defaultdict, deque
@@ -20,7 +20,8 @@ from app.services.EmailService import email_service
 
 router = APIRouter(prefix="/public", tags=["Public forms"])
 
-INBOX = "hello@urisocial.com"
+# hello@urisocial.com bounces ("550 5.1.1 User does not exist"); this is the inbox the team reads.
+INBOX = "urisocialinsight@gmail.com"
 
 # Must match the <select> on the Contact page.
 CONTACT_SUBJECTS = {
@@ -170,7 +171,7 @@ async def join_api_waitlist(
             email_service.send_raw_email,
             to_email=INBOX,
             subject="[API waitlist] New signup",
-            html_body=_email_html("New API waitlist signup", {"Email": email, "Name": name or "—"}),
+            html_body=_email_html("New API waitlist signup", {"Email": email}),
             reply_to=email,
         )
 
