@@ -49,3 +49,21 @@ def test_naive_timestamp_from_mongo_is_handled():
 def test_other_states_untouched():
     doc = {"plan_id": "p1", "status": "launched"}
     assert asyncio.run(_release_if_stale_launch(_db(doc), dict(doc)))["status"] == "launched"
+
+
+def test_status_endpoint_reports_launched_plan():
+    from app.agents.jane_ads.router import meta_plan_status
+    doc = {"plan_id": "p1", "status": "launched", "brand_id": "b1", "campaign_id": "188",
+           "plan": {"platforms": [{"platform": "tiktok"}]}}
+    out = asyncio.run(meta_plan_status("p1", db=_db(doc), brand_ctx={"brand_id": "b1"}))
+    assert out == {"status": "launched", "campaign_id": "188", "platform": "tiktok", "last_launch_error": ""}
+
+
+def test_status_endpoint_hides_other_brands_plan():
+    import pytest
+    from fastapi import HTTPException
+    from app.agents.jane_ads.router import meta_plan_status
+    doc = {"plan_id": "p1", "status": "pending", "brand_id": "b1"}
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(meta_plan_status("p1", db=_db(doc), brand_ctx={"brand_id": "other"}))
+    assert e.value.status_code == 404

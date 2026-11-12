@@ -4668,6 +4668,29 @@ async def _release_if_stale_launch(db, doc: dict) -> dict:
     return await db["jane_ads_pending_plans"].find_one({"plan_id": doc["plan_id"]}) or doc
 
 
+@router.get("/meta/plan/{plan_id}/status")
+async def meta_plan_status(
+    plan_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Where a plan's launch stands, for the page to follow along. A video launch can
+    outlast the browser's connection (the TikTok video is re-encoded first), so the page
+    can't rely on the launch request's own answer — it asks here instead of telling the
+    person it failed, or "already launched", when it actually went through."""
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    doc = await _release_if_stale_launch(db, doc)
+    platforms = ((doc.get("plan") or {}).get("platforms") or [{}])
+    return {
+        "status": doc.get("status"),
+        "campaign_id": doc.get("campaign_id") or "",
+        "platform": (platforms[0] or {}).get("platform") or "",
+        "last_launch_error": doc.get("last_launch_error") or "",
+    }
+
+
 @router.post("/meta/plan/{plan_id}/launch")
 async def meta_launch_plan(
     plan_id: str,
