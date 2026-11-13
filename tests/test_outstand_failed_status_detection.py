@@ -227,8 +227,8 @@ def test_friendly_error_explains_the_identity_checkpoint_in_plain_language():
     raw = "Error publishing post to Facebook: Failed to upload Facebook photo: 400 - Confirm your identity before you can publish as this Page. Open the Facebook app on your phone and follow the instructions."
     friendly = _friendlier_facebook_error(raw)
     assert "confirm your identity" in friendly.lower()
-    assert "Meta Business Suite" in friendly
-    assert "Notifications or Support Inbox" in friendly
+    assert "Facebook app on your phone" in friendly
+    assert "reconnecting won't fix it" in friendly
     # Raw detail kept for support/debugging, not discarded.
     assert raw in friendly
 

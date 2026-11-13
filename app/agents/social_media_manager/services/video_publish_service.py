@@ -298,7 +298,8 @@ class VideoPublishService:
             if info.resume_at:
                 fields["resume_at"] = info.resume_at.isoformat()
             return fields
-        return {"status": "failed", "error": str(exc)}
+        from app.agents.social_media_manager.services.publish_confirmation import specific_message
+        return {"status": "failed", "error": specific_message(network, str(exc)) or str(exc)}
 
     @staticmethod
     async def publish_scheduled_tiktok_photo(draft: Dict[str, Any], conn: Dict[str, Any], db) -> Dict[str, Any]:
