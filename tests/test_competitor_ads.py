@@ -170,3 +170,20 @@ def test_an_ad_still_being_read_cannot_be_recreated_yet():
     with patch("app.services.CreditService.credit_service", new=_Credits()):
         with pytest.raises(ValueError):
             _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_9"))
+
+
+def test_using_a_version_makes_one_content_draft_the_builder_can_start_from():
+    db = _db()
+    _run(db[A.RECREATIONS].insert_one({"recreation_id": "rec_1", "brand_id": "b1", "user_id": "u1", "ad_id": "cad_1",
+                                       "count": 1, "status": "done",
+                                       "results": [{"image_url": "https://cdn.uri/v1.png", "headline": "Ride easy",
+                                                    "primary_text": "Fixed-price airport runs.", "angle": "offer"}]}))
+    first = _run(A.use_version(db, brand_id="b1", user_id="u1", recreation_id="rec_1", index=0))
+    again = _run(A.use_version(db, brand_id="b1", user_id="u1", recreation_id="rec_1", index=0))
+    assert first["draft_id"] == again["draft_id"] and first["image_url"] == "https://cdn.uri/v1.png"
+    drafts = _run(db["content_drafts"].find({}).to_list(length=10))
+    assert len(drafts) == 1 and drafts[0]["has_image"] and drafts[0]["user_id"] == "u1"
+    from app.agents.jane_ads.creative import get_draft_image
+    assert _run(get_draft_image(first["draft_id"], "u1", db))["image_url"] == "https://cdn.uri/v1.png"
+    with pytest.raises(LookupError):
+        _run(A.use_version(db, brand_id="b2", user_id="u2", recreation_id="rec_1", index=0))
