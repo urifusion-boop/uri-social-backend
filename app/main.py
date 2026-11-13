@@ -191,6 +191,10 @@ async def startup_event():
         from app.agents.competitors import service as _competitors
         await _competitors.ensure_indexes(get_db())
         _job_worker.register(_competitors.JOB_TYPE, _competitors.discovery_job)
+        from app.agents.competitors import ads as _competitor_ads
+        await _competitor_ads.ensure_indexes(get_db())
+        _job_worker.register(_competitor_ads.ANALYSIS_JOB, _competitor_ads.analysis_job)
+        _job_worker.register(_competitor_ads.RECREATE_JOB, _competitor_ads.recreate_job)
         _job_worker.start(get_db)
         print("✅ Background job worker started")
     except Exception as e:

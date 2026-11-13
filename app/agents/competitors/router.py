@@ -7,8 +7,17 @@
   POST   /competitors/{id}/keep            a suggestion is a real competitor
   POST   /competitors/{id}/remove          not a competitor (with a reason Jane learns from)
   PATCH  /competitors/{id}                 direct ↔ similar
+
+  GET    /competitors/ads                  saved competitor ads (filter, paged)
+  POST   /competitors/ads                  save one (Jane reads it in the background)
+  DELETE /competitors/ads/{id}
+  POST   /competitors/ads/{id}/recreate    make this business's own version → the request
+  GET    /competitors/recreations/{id}     its versions, as they arrive
 """
 from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -17,7 +26,7 @@ from pydantic import BaseModel
 from app.dependencies import get_active_brand_context, get_db_dependency
 from app.jobs import queue
 
-from . import service
+from . import ads, service
 
 router = APIRouter(prefix="/competitors", tags=["Competitors"])
 
@@ -38,6 +47,19 @@ class RemoveBody(BaseModel):
 
 class KindBody(BaseModel):
     kind: str
+
+
+class SaveAdBody(BaseModel):
+    image_url: str
+    competitor_id: str = ""
+    platform: str = ""
+    link: str = ""
+    note: str = ""
+
+
+class RecreateBody(BaseModel):
+    product: str = ""
+    count: int = 3
 
 
 def _not_found(e: LookupError) -> HTTPException:
@@ -67,6 +89,57 @@ async def discovery_status(job_id: str, db: AsyncIOMotorDatabase = Depends(get_d
     if not job or job.get("type") != service.JOB_TYPE:
         raise HTTPException(status_code=404, detail="That search wasn't found.")
     return {**queue.public_view(job), "poll_after_ms": 2500}
+
+
+@router.get("/ads")
+async def list_competitor_ads(competitor_id: str = "", angle: str = "", platform: str = "",
+                              before: Optional[datetime] = None, limit: int = 24,
+                              db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                              ctx: dict = Depends(get_active_brand_context)) -> dict:
+    return await ads.list_ads(db, ctx["brand_id"], competitor_id=competitor_id, angle=angle, platform=platform,
+                              before=before, limit=limit)
+
+
+@router.post("/ads")
+async def save_competitor_ad(body: SaveAdBody, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                             ctx: dict = Depends(get_active_brand_context)) -> dict:
+    try:
+        return await ads.save_ad(db, brand_id=ctx["brand_id"], user_id=ctx["user_id"], image_url=body.image_url,
+                                 competitor_id=body.competitor_id, platform=body.platform, link=body.link,
+                                 note=body.note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/ads/{ad_id}")
+async def delete_competitor_ad(ad_id: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                               ctx: dict = Depends(get_active_brand_context)) -> dict:
+    if not await ads.delete_ad(db, ctx["brand_id"], ad_id):
+        raise HTTPException(status_code=404, detail="That ad wasn't found.")
+    return {"deleted": True}
+
+
+@router.post("/ads/{ad_id}/recreate")
+async def recreate_ad(ad_id: str, body: RecreateBody, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                      ctx: dict = Depends(get_active_brand_context)) -> dict:
+    try:
+        return await ads.start_recreate(db, brand_id=ctx["brand_id"], user_id=ctx["user_id"], ad_id=ad_id,
+                                        product=body.product, count=body.count)
+    except LookupError as e:
+        raise _not_found(e)
+    except PermissionError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.get("/recreations/{recreation_id}")
+async def get_recreation(recreation_id: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                         ctx: dict = Depends(get_active_brand_context)) -> dict:
+    rec = await ads.get_recreation(db, ctx["brand_id"], recreation_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="That request wasn't found.")
+    return {**rec, "poll_after_ms": 3000}
 
 
 @router.post("")
