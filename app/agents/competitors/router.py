@@ -142,6 +142,20 @@ async def get_recreation(recreation_id: str, db: AsyncIOMotorDatabase = Depends(
     return {**rec, "poll_after_ms": 3000}
 
 
+class UseBody(BaseModel):
+    index: int
+
+
+@router.post("/recreations/{recreation_id}/use")
+async def use_recreation(recreation_id: str, body: UseBody, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                         ctx: dict = Depends(get_active_brand_context)) -> dict:
+    try:
+        return await ads.use_version(db, brand_id=ctx["brand_id"], user_id=ctx["user_id"],
+                                     recreation_id=recreation_id, index=body.index)
+    except LookupError as e:
+        raise _not_found(e)
+
+
 @router.post("")
 async def add_competitor(body: AddBody, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                          ctx: dict = Depends(get_active_brand_context)) -> dict:

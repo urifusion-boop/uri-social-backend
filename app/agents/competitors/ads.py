@@ -278,3 +278,30 @@ async def _profile(db, user_id: str, brand_id: str) -> dict:
     from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
     res = await BrandProfileService.get(user_id, db, brand_id=brand_id)
     return (res.get("responseData") or {}) if isinstance(res, dict) and res.get("status") else {}
+
+
+async def use_version(db, *, brand_id: str, user_id: str, recreation_id: str, index: int) -> dict:
+    """Keep one version as a content draft (it then shows in Creatives) and hand back the draft the
+    campaign builder already knows how to start from. Asking twice for the same version returns
+    the same draft."""
+    rec = await db[RECREATIONS].find_one({"brand_id": brand_id, "recreation_id": recreation_id}, {"_id": 0})
+    if not rec:
+        raise LookupError("That request wasn't found.")
+    results = rec.get("results") or []
+    if not 0 <= index < len(results):
+        raise LookupError("That version wasn't found.")
+    chosen = results[index]
+    if chosen.get("draft_id"):
+        draft_id = chosen["draft_id"]
+    else:
+        draft_id = str(uuid.uuid4())
+        await db["content_drafts"].insert_one({
+            "id": draft_id, "user_id": user_id, "brand_id": brand_id, "platform": "instagram",
+            "content": chosen.get("primary_text", ""), "headline": chosen.get("headline", ""),
+            "image_url": chosen["image_url"], "has_image": True, "status": "draft",
+            "content_source": "ad_recreate", "recreation_id": recreation_id, "created_at": _now(),
+        })
+        await db[RECREATIONS].update_one({"recreation_id": recreation_id},
+                                         {"$set": {f"results.{index}.draft_id": draft_id}})
+    return {"draft_id": draft_id, "platform": "instagram", "content": (chosen.get("primary_text") or "")[:200],
+            "image_url": chosen["image_url"], "created_at": _now().isoformat()}
