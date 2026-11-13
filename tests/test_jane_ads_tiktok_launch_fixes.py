@@ -241,6 +241,7 @@ def test_engagement_video_still_launches_under_video_views():
     ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_TIME_DONE", "Ended"),
     ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_BALANCE_EXCEED", "Needs billing info"),
     ("AD_STATUS_DELIVERY_OK", "ADGROUP_STATUS_BUDGET_EXCEED", "Budget used"),
+    ("AD_STATUS_CAMPAIGN_EXCEED", "ADGROUP_STATUS_CAMPAIGN_EXCEED", "Spending limit reached"),
     ("AD_STATUS_DISABLE", "ADGROUP_STATUS_DELIVERY_OK", "Ad paused"),
     ("AD_STATUS_SOMETHING_NEW", "ADGROUP_STATUS_DELIVERY_OK", "Needs attention"),
 ])
