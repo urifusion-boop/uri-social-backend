@@ -69,9 +69,21 @@ def test_each_scene_is_matched_only_against_its_own_categories():
     assert [a["action_scene"] for a in got.actions] == ["VIDEO_RELATED"]   # no "Education" creator category exists
 
 
-def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience():
+def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience_when_no_broad_one_exists():
     got = _resolve(["Quantum plumbing"], **{"/tool/action_category/": ACTION_CATEGORIES})
     assert got.actions == []
+
+
+def test_topics_no_category_fits_use_the_broad_business_categories_in_each_scene():
+    pool = {"action_categories": [
+        {"action_category_id": "5", "action_scene": "VIDEO_RELATED", "name": "Business & Finance"},
+        {"action_category_id": "6", "action_scene": "VIDEO_RELATED", "name": "Technology"},
+        {"action_category_id": "7", "action_scene": "VIDEO_RELATED", "name": "Comedy"},
+        {"action_category_id": "8", "action_scene": "CREATOR_RELATED", "name": "Business"},
+    ]}
+    got = _resolve(["Digital marketing (marketing)", "Email marketing (marketing)"], **{"/tool/action_category/": pool})
+    scenes = {a["action_scene"]: a["action_category_ids"] for a in got.actions}
+    assert scenes == {"VIDEO_RELATED": ["5", "6"], "CREATOR_RELATED": ["8"]}
 
 
 def test_no_topics_means_nothing_is_looked_up():
