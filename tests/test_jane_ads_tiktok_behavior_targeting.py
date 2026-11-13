@@ -21,6 +21,13 @@ ACTION_CATEGORIES = {"action_categories": [
 HASHTAGS = {"hashtags": [{"hashtag_id": "h1", "hashtag_name": "learnontiktok"}, {"hashtag_id": "h2", "hashtag_name": "study"}]}
 
 
+@pytest.fixture(autouse=True)
+def _no_model_calls():
+    """No test reaches a real model: with no key, the category choice answers nothing."""
+    with patch.object(bt.settings, "jane_ads_openai_key", "", create=True):
+        yield
+
+
 def _lookups(**by_path):
     async def fake(path, params, token):
         value = by_path.get(path)
@@ -74,6 +81,46 @@ def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience_whe
     assert got.actions == []
 
 
+def test_when_no_category_matches_by_name_the_choice_is_made_from_the_scenes_own_list():
+    pool = {"action_categories": [
+        {"action_category_id": "5", "action_scene": "VIDEO_RELATED", "name": "Culture & Education & Technology"},
+        {"action_category_id": "7", "action_scene": "VIDEO_RELATED", "name": "Comedy"},
+        {"action_category_id": "8", "action_scene": "CREATOR_RELATED", "name": "Motivation & Advice"},
+    ]}
+    chosen = {}
+
+    async def fake_choose(names, scoped, limit):
+        chosen[scoped[0]["name"]] = [e["id"] for e in scoped]
+        return [scoped[0]["id"], "not-in-the-list"][:1]
+
+    with patch.object(bt, "_choose_categories", side_effect=fake_choose):
+        got = _resolve(["Digital marketing (marketing)"], **{"/tool/action_category/": pool})
+    scenes = {a["action_scene"]: a["action_category_ids"] for a in got.actions}
+    assert scenes == {"VIDEO_RELATED": ["5"], "CREATOR_RELATED": ["8"]}
+    assert chosen["Culture & Education & Technology"] == ["5", "7"]            # each scene is offered only its own
+
+
+def test_a_model_answer_is_trusted_only_for_ids_that_are_in_the_list():
+    scoped = [{"id": "5", "name": "A"}, {"id": "6", "name": "B"}]
+
+    class _Completions:
+        async def create(self, **kw):
+            from types import SimpleNamespace as NS
+            return NS(choices=[NS(message=NS(content='{"ids": ["6", "999", "5", "6"]}'))])
+
+    class _Client:
+        def __init__(self, **kw):
+            self.chat = type("C", (), {"completions": _Completions()})()
+
+    import sys, types
+    fake_openai = types.ModuleType("openai"); fake_openai.AsyncOpenAI = _Client
+    with patch.dict(sys.modules, {"openai": fake_openai}), patch.object(bt.settings, "jane_ads_openai_key", "k", create=True):
+        assert _run(bt._choose_categories(["x"], scoped, 2)) == ["6", "5"]
+        assert _run(bt._choose_categories(["x"], [], 2)) == []
+    with patch.object(bt.settings, "jane_ads_openai_key", "", create=True):
+        assert _run(bt._choose_categories(["x"], scoped, 2)) == []              # no key: caller falls back
+
+
 def test_topics_no_category_fits_use_the_broad_business_categories_in_each_scene():
     pool = {"action_categories": [
         {"action_category_id": "5", "action_scene": "VIDEO_RELATED", "name": "Business & Finance"},
@@ -81,7 +128,8 @@ def test_topics_no_category_fits_use_the_broad_business_categories_in_each_scene
         {"action_category_id": "7", "action_scene": "VIDEO_RELATED", "name": "Comedy"},
         {"action_category_id": "8", "action_scene": "CREATOR_RELATED", "name": "Business"},
     ]}
-    got = _resolve(["Digital marketing (marketing)", "Email marketing (marketing)"], **{"/tool/action_category/": pool})
+    with patch.object(bt, "_choose_categories", new=AsyncMock(return_value=[])):        # model unavailable
+        got = _resolve(["Digital marketing (marketing)", "Email marketing (marketing)"], **{"/tool/action_category/": pool})
     scenes = {a["action_scene"]: a["action_category_ids"] for a in got.actions}
     assert scenes == {"VIDEO_RELATED": ["5", "6"], "CREATOR_RELATED": ["8"]}
 
