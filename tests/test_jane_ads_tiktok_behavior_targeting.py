@@ -96,6 +96,22 @@ def test_purchase_intention_is_looked_up_only_when_asked_for():
     assert _resolve(["Education"], False, **{"/tool/interest_keyword/recommend/": PURCHASE}).purchase_intention_keyword_ids == []
 
 
+def test_purchase_intention_searches_plain_words_and_falls_back_to_semantic_search():
+    asked = []
+
+    async def fake(path, params, token):
+        if path != "/tool/interest_keyword/recommend/":
+            return None
+        asked.append((params["keyword"], params["mode"]))
+        return PURCHASE if params["mode"] == "SEMANTIC_RECOMMEND" else {"recommended_keywords": []}
+
+    with patch.object(bt, "_lookup", side_effect=fake):
+        got = _run(bt.resolve_behavior_targeting(["Parenting (children and parenting)"], "adv1", "tok",
+                                                 _best_tiktok_interest, True))
+    assert asked == [("Parenting", "FUZZ_MATCH"), ("Parenting", "SEMANTIC_RECOMMEND")]   # no Meta qualifier
+    assert got.purchase_intention_keyword_ids == ["p1", "p2"]
+
+
 def test_purchase_intention_goes_with_the_interactions_on_every_objective():
     t = bt.BehaviorTargeting(actions=[{"action_scene": "VIDEO_RELATED"}], purchase_intention_keyword_ids=["p1"])
     assert t.fields() == {"actions": [{"action_scene": "VIDEO_RELATED"}], "purchase_intention_keyword_ids": ["p1"]}
