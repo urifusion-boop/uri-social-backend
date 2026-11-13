@@ -643,6 +643,13 @@ _TIKTOK_DELIVERY_RULES: list[tuple[str, str, str]] = [
      "TikTok is reviewing this ad. It starts delivering once it's approved."),
     ("BALANCE", "Needs billing info",
      "TikTok can't deliver because the advertiser account's balance or payment method needs attention."),
+    # CAMPAIGN_EXCEED: TikTok holds the ad because a spending limit above the ad
+    # group was hit — the campaign's own budget or the ad account's spending cap —
+    # which can happen before this ad has spent anything.
+    ("CAMPAIGN_EXCEED", "Spending limit reached",
+     "TikTok has paused delivery because a spending limit was reached on the TikTok side "
+     "(the campaign's budget or the ad account's spending limit). Raise or remove that "
+     "limit in TikTok Ads Manager and it will start delivering."),
     ("BUDGET_EXCEED", "Budget used",
      "This campaign's whole budget has been spent."),
     ("TIME_DONE", "Ended",
