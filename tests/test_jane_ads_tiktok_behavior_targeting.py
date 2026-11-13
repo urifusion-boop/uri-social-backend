@@ -96,6 +96,23 @@ def test_purchase_intention_is_looked_up_only_when_asked_for():
     assert _resolve(["Education"], False, **{"/tool/interest_keyword/recommend/": PURCHASE}).purchase_intention_keyword_ids == []
 
 
+def test_a_multi_word_topic_finds_hashtags_through_its_key_word_or_the_run_together_form():
+    asked = []
+
+    async def fake(path, params, token):
+        if path != "/tool/hashtag/recommend/":
+            return None
+        asked.append(params["keywords"])
+        return HASHTAGS if params["keywords"] == '["marketing"]' else {"recommend_keywords": []}
+
+    with patch.object(bt, "_lookup", side_effect=fake):
+        got = _run(bt.resolve_behavior_targeting(["Social media marketing (marketing)"], "adv1", "tok",
+                                                 _best_tiktok_interest))
+    hashtag = [a for a in got.actions if a["action_scene"] == "HASHTAG_RELATED"]
+    assert hashtag and hashtag[0]["action_category_ids"] == ["h1", "h2"]
+    assert '["marketing"]' in asked and '["socialmediamarketing"]' in asked      # the key word, and the run-together form
+
+
 def test_purchase_intention_searches_plain_words_and_falls_back_to_semantic_search():
     asked = []
 

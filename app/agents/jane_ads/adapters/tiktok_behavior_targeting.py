@@ -187,10 +187,16 @@ async def resolve_behavior_targeting(
         hashtag_keys = (("hashtag_id", "keyword_id", "id"), ("hashtag_name", "keyword", "name"))
         hashtags = _entries(data, *hashtag_keys)
         if not hashtags:
-            # Several keywords at once can come back empty where a single one does not.
-            for keyword in keywords[:3]:
+            # Several keywords at once can come back empty where a single one does not, and a hashtag is one token:
+            # "Social media marketing" finds nothing, "marketing" and "socialmediamarketing" do. So try each topic's
+            # key word on its own first, then the topic run together.
+            singles = list(dict.fromkeys(k.split()[-1].lower() for k in keywords if k.split()))
+            joined = [k.replace(" ", "").lower() for k in keywords if " " in k]
+            for candidate in list(dict.fromkeys(singles + joined))[:7]:
+                if len(hashtags) >= MAX_HASHTAGS:
+                    break
                 one = await _lookup("/tool/hashtag/recommend/",
-                                    {"advertiser_id": advertiser_id, "keywords": json.dumps([keyword])}, access_token)
+                                    {"advertiser_id": advertiser_id, "keywords": json.dumps([candidate])}, access_token)
                 for entry in _entries(one or {}, *hashtag_keys)[:2]:
                     if entry["id"] not in {h["id"] for h in hashtags}:
                         hashtags.append(entry)

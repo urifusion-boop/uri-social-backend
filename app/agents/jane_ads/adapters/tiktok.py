@@ -533,6 +533,7 @@ async def _resolve_tiktok_interests(
         if len(resolved) >= MAX_TIKTOK_INTERESTS:
             break
         hit = _best_tiktok_interest(raw, categories)
+        print(f"[TikTokAdsAdapter] interest {raw!r} -> {hit['interest_category_name'] if hit else None!r}", flush=True)
         if not hit:
             rejected.append(raw)
         elif hit["interest_category_id"] not in {r["interest_category_id"] for r in resolved}:
