@@ -22,12 +22,12 @@ from pymongo import ReturnDocument
 _FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
     (
         re.compile(r"confirm your identity", re.IGNORECASE),
-        "Facebook needs you to confirm your identity before this Page can publish. "
-        "This is a security check from Facebook itself, not something wrong with your "
-        "account here — open the Facebook app (or Meta Business Suite) and check "
-        "Notifications or Support Inbox for a verification prompt, then follow "
-        "Facebook's steps. Once confirmed, this and future posts to this Page will go "
-        "out normally again — no need to reconnect anything here."
+        "Facebook is asking you to confirm your identity before you can post from this Page. "
+        "This is a security check on Facebook's side, not a problem with your connection "
+        "here, so reconnecting won't fix it. Open the Facebook app on your phone (signed in "
+        "as the person who connected this Page) and follow the \u201cConfirm your identity\u201d "
+        "prompt; it may also be in your notifications. Once Facebook has confirmed you, "
+        "publish this post again."
     ),
     (
         # Live-reported: "MEEQAT TRAVELS AND TOURS LTD"'s Facebook post failed
@@ -463,6 +463,11 @@ class ApprovalWorkflowService:
                             # by then framed as a surprise, unexplained failure. Surfacing it
                             # now, still without changing the retry behavior itself.
                             if _d["publish_result"] and not _d["publish_result"].get("success"):
+                                from app.agents.social_media_manager.services import publish_confirmation as _pcw
+                                _known = _pcw.specific_message(_d["platform"], _d["publish_result"].get("error") or "")
+                                if _known:
+                                    warnings.append({"draft_id": _d["draft_id"], "warning": _known})
+                                    continue
                                 warnings.append({
                                     "draft_id": _d["draft_id"],
                                     "warning": (
@@ -1473,7 +1478,8 @@ class ApprovalWorkflowService:
                         {"$set": {
                             "status": "scheduled",
                             "scheduled_date": scheduled_datetime,
-                            "last_dispatch_warning": publish_result.get("error"),
+                            "last_dispatch_warning": _pc.specific_message(platform, publish_result.get("error") or "")
+                            or publish_result.get("error"),
                             "updated_at": datetime.utcnow(),
                         }},
                     )
