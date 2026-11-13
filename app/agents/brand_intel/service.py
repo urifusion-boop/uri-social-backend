@@ -21,7 +21,7 @@ import httpx
 from app.jobs import queue
 from app.jobs.worker import JobError
 
-from . import extractor
+from . import extractor, social
 from .html_read import add_colors, pick_pages, read_page, top_colors
 from .safe_fetch import TIMEOUT, USER_AGENT, FetchError, fetch, normalize_url, robots_permits, site_key
 
@@ -54,14 +54,23 @@ async def ensure_indexes(db) -> None:
 
 # ── starting a read ────────────────────────────────────────────────────────────
 
-async def start_read(db, *, brand_id: str, user_id: str, url: str, force: bool = False) -> dict:
-    """Queue a read of `url` for this brand. Asking again while one is running returns that one."""
-    normalized = normalize_url(url)  # FetchError → the router turns it into a 400 with this message
+async def start_read(db, *, brand_id: str, user_id: str, url: str = "", force: bool = False,
+                     source: str = "website") -> dict:
+    """Queue a read for this brand: its website (`url`), or its own connected Instagram or Facebook
+    Page (`source`). Asking again while one is running returns that one."""
     since = datetime.now(timezone.utc) - timedelta(days=1)
     recent = await db[queue.COLLECTION].count_documents(
         {"brand_id": brand_id, "type": JOB_TYPE, "created_at": {"$gte": since}})
     if recent >= READS_PER_BRAND_PER_DAY:
         raise FetchError("You've read your website a lot today. Try again tomorrow.", "rate_limited")
+    if source in social.SOURCES:
+        if not await social.find_connection(db, user_id, brand_id, source):
+            name = "Instagram" if source == "instagram" else "Facebook Page"
+            raise FetchError(f"Connect your {name} in Connected Accounts first, then Jane can read it.",
+                             "not_connected")
+        return await queue.enqueue(db, JOB_TYPE, {"source": source, "url": "", "force": True},
+                                   brand_id=brand_id, user_id=user_id, key=f"{brand_id}:{source}", max_attempts=3)
+    normalized = normalize_url(url)  # FetchError → the router turns it into a 400 with this message
     return await queue.enqueue(
         db, JOB_TYPE, {"url": normalized, "force": force},
         brand_id=brand_id, user_id=user_id, key=f"{brand_id}:{site_key(normalized)}", max_attempts=3)
@@ -70,6 +79,9 @@ async def start_read(db, *, brand_id: str, user_id: str, url: str, force: bool =
 # ── the job ────────────────────────────────────────────────────────────────────
 
 async def read_site_job(db, job: dict, ctx) -> dict:
+    source = job["payload"].get("source") or "website"
+    if source in social.SOURCES:
+        return await _read_social_job(db, job, ctx, source)
     try:
         url = normalize_url(job["payload"]["url"])
     except FetchError as e:
@@ -98,6 +110,9 @@ async def read_site_job(db, job: dict, ctx) -> dict:
         raise JobError("We read your website but couldn't make sense of it just now. Try again shortly.",
                        code="ai_unavailable", retry=True)
     fields.update(_deterministic_fields(site, fields))
+    logo = await find_logo(site.get("logo_candidates") or [], site["url"])
+    if logo:
+        fields["logo_url"] = logo
     await ctx.step("understand", "Understanding your business", "done", f"Found {len(fields)} things")
     await ctx.found(_found_preview(fields))
 
@@ -106,6 +121,70 @@ async def read_site_job(db, job: dict, ctx) -> dict:
     await db[SITES].update_one({"site": key}, {"$set": doc}, upsert=True)
     await _tell_owner(db, job, key, len(fields))
     return _result(doc)
+
+
+async def _read_social_job(db, job: dict, ctx, source: str) -> dict:
+    """The business's own connected Instagram or Facebook Page, read through Meta's API. Not shared
+    across brands (it's the brand's own account), so not cached by site."""
+    name = "Instagram" if source == "instagram" else "Facebook Page"
+    await ctx.step("check", f"Opening your {name}")
+    conn = await social.find_connection(db, job["user_id"], job["brand_id"], source)
+    if not conn:
+        raise JobError(f"Connect your {name} in Connected Accounts first, then Jane can read it.", code="not_connected")
+    try:
+        site = await social.read_profile(conn, source)
+    except FetchError as e:
+        raise JobError(e.message, code=e.code, retry=e.code == "graph_error")
+    await ctx.step("check", f"Opening your {name}", "done", site["page_list"][0]["title"])
+    await ctx.step("understand", "Understanding your business")
+    try:
+        fields = await extractor.extract(site)
+    except extractor.ExtractionUnavailable as e:
+        print(f"[brand_intel] extraction failed for {source}: {e}", flush=True)
+        raise JobError(f"We read your {name} but couldn't make sense of it just now. Try again shortly.",
+                       code="ai_unavailable", retry=True)
+    fields.update(_deterministic_fields(site, fields))
+    fields.pop("website", None)
+    if site.get("website_found"):
+        fields["website"] = {"value": site["website_found"], "basis": "stated", "page": site["url"]}
+    logo = await find_logo(site.get("logo_candidates") or [], site["url"])
+    if logo:
+        fields["logo_url"] = logo
+    await ctx.step("understand", "Understanding your business", "done", f"Found {len(fields)} things")
+    await ctx.found(_found_preview(fields))
+    doc = {"site": site["url"].replace("https://", ""), "url": site["url"], "fetched_at": datetime.now(timezone.utc),
+           "fields": fields, "pages": site["page_list"]}
+    await _tell_owner(db, job, doc["site"], len(fields))
+    return _result(doc)
+
+
+LOGO_MIN_PX = 96
+
+
+async def find_logo(candidates: list[str], page: str) -> Optional[dict]:
+    """The first candidate that is a real, reasonably sized image, stored on Uri's own storage (a
+    hotlinked logo on someone's site can change or vanish). A guess the owner confirms, never applied
+    without them."""
+    import io
+
+    from PIL import Image
+
+    from app.utils.s3_upload import upload_bytes
+
+    for url in [c for c in dict.fromkeys(candidates) if c and not c.lower().split("?")[0].endswith((".svg", ".ico"))][:4]:
+        try:
+            img_page = await fetch(url, accept=("image/",), max_bytes=2_000_000)
+            img = Image.open(io.BytesIO(img_page.body))
+            w, h = img.size
+            if min(w, h) < LOGO_MIN_PX or max(w, h) / max(1, min(w, h)) > 4:
+                continue
+            buf = io.BytesIO()
+            img.convert("RGBA").save(buf, format="PNG")
+            stored = await upload_bytes(buf.getvalue(), folder="uri-social/brand-logos", resource_type="image")
+            return {"value": stored, "basis": "inferred", "page": page}
+        except Exception:
+            continue
+    return None
 
 
 async def _tell_owner(db, job: dict, site: str, count: int) -> None:

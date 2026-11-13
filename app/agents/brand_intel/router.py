@@ -26,8 +26,9 @@ router = APIRouter(prefix="/brand-intel", tags=["Brand Intelligence"])
 
 
 class StartReadBody(BaseModel):
-    url: str
+    url: str = ""
     force: bool = False   # read again even if the site was read in the last day
+    source: str = "website"   # or "instagram" / "facebook": the brand's own connected account
 
 
 class ApplyBody(BaseModel):
@@ -64,7 +65,7 @@ async def start_website_read(body: StartReadBody, db: AsyncIOMotorDatabase = Dep
                              ctx: dict = Depends(get_active_brand_context)) -> dict:
     try:
         job = await service.start_read(db, brand_id=ctx["brand_id"], user_id=ctx["user_id"],
-                                       url=body.url, force=body.force)
+                                       url=body.url, force=body.force, source=body.source)
     except FetchError as e:
         raise HTTPException(status_code=429 if e.code == "rate_limited" else 400, detail=e.message)
     return await _view(db, ctx, job)
