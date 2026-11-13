@@ -94,6 +94,11 @@ def _apply_intelligent_fallbacks(profile_data: Dict[str, Any], missing_fields: L
     return profile
 
 
+def video_draft_platform(target: str) -> str:
+    """The network behind a video target: "instagram_reels" -> "instagram", "facebook_reels" -> "facebook"."""
+    return target[: -len("_reels")] if target.endswith("_reels") else target
+
+
 def _get_user_id(token: dict) -> str | None:
     """
     Extract user_id from JWT payload.
@@ -8475,7 +8480,10 @@ async def save_video_draft(
             "id": draft_id,
             "draft_id": draft_id,
             "request_id": request_id,
-            "platform": platform,
+            # The video screens name a target "instagram_reels" / "facebook_reels", but a draft's `platform`
+            # is the network, which is what the connections, the Library's "is it connected" check and the
+            # approval/scheduling path all look up. `platforms` keeps the name the screen sent.
+            "platform": video_draft_platform(platform),
             "platforms": [platform],
             "user_id": user_id,
             "media_type": "video",
