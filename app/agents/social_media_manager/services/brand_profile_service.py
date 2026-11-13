@@ -113,6 +113,12 @@ class BrandProfileService:
             "brand_name": "",
             "industry": "",
             "website": "",
+            # Website → Playbook (brand_intel): the site's social profiles, where each field's
+            # value came from (so the Playbook can say "From your website" until the owner
+            # changes it), and when the website was last read.
+            "social_links": {},
+            "field_sources": {},
+            "website_read": None,
             "tagline": "",
             "product_description": "",
             "key_products_services": [],
