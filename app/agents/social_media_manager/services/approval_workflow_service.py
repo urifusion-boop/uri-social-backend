@@ -1727,6 +1727,7 @@ class ApprovalWorkflowService:
                     video_url=video_url,
                     caption=content,
                     page_id=page_id,
+                    audio=draft.get("instagram_audio"),
                 )
             elif post_type == "story":
                 image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")

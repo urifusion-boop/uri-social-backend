@@ -33,6 +33,8 @@ class Settings(BaseSettings):
 
     # Social platforms
     FACEBOOK_API_VERSION: str = "v21.0"
+    # Instagram Audio API (music on Reels): Meta documents it on a newer Graph version than the rest of our calls.
+    INSTAGRAM_AUDIO_API_VERSION: str = "v22.0"
     META_API_KEY: str = ""
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""

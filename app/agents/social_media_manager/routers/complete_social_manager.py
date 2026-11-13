@@ -3708,6 +3708,70 @@ async def set_tiktok_auto_add_music(
     return {"status": True, "responseMessage": "Updated", "responseData": {"tiktok_auto_add_music": request.enabled}}
 
 
+class InstagramAudioChoice(BaseModel):
+    audio_id: str = Field(..., pattern=r"^\d{1,40}$")
+    title: str = Field("", max_length=200)
+    artist: str = Field("", max_length=200)
+    audio_volume: int = Field(100, ge=1, le=100)   # the music
+    video_volume: int = Field(100, ge=1, le=100)   # the Reel's own sound
+
+
+class InstagramAudioRequest(BaseModel):
+    audio: Optional[InstagramAudioChoice] = None   # None removes the music
+
+
+@router.get("/instagram/audio/search")
+async def search_instagram_audio(
+    q: Optional[str] = Query(None, max_length=100),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Licensed music for an Instagram Reel (Instagram Audio API); trending when `q` is empty. Music
+    can only be attached to Reels — Instagram's API has no audio option for images, carousels or Stories."""
+    from app.agents.social_media_manager.services import instagram_audio
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": "instagram"},
+        {"_id": 0, "page_access_token": 1, "ig_user_id": 1},
+    )
+    if not conn or not conn.get("page_access_token") or not conn.get("ig_user_id"):
+        raise HTTPException(status_code=400, detail="No connected Instagram account found. Connect your account first.")
+    try:
+        tracks = await instagram_audio.search_music(conn["ig_user_id"], conn["page_access_token"], q)
+    except instagram_audio.AudioSearchError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return UriResponse.get_single_data_response("instagram_audio", {"tracks": tracks})
+
+
+@router.patch("/drafts/{draft_id}/instagram-audio")
+async def set_instagram_audio(
+    draft_id: str,
+    request: InstagramAudioRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Choose (or, with audio=null, remove) the music track for a Reel draft. Stored on the draft so an
+    immediate publish and a scheduled one both attach it (approval_workflow_service / video_publish_service)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    draft = await db["content_drafts"].find_one({"id": draft_id, "user_id": user_id}, {"_id": 0, "video_url": 1})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if not draft.get("video_url"):
+        raise HTTPException(status_code=400, detail="Instagram only supports music on Reels (video posts).")
+
+    audio = request.audio.model_dump() if request.audio else None
+    await db["content_drafts"].update_one(
+        {"id": draft_id, "user_id": user_id},
+        {"$set": {"instagram_audio": audio, "updated_at": datetime.utcnow()}},
+    )
+    return UriResponse.get_single_data_response("instagram_audio", {"instagram_audio": audio})
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
@@ -8133,6 +8197,7 @@ async def publish_video_draft(
         conn,
         db,
         tiktok_settings,
+        instagram_audio=draft.get("instagram_audio") if request.platform == "instagram_reels" else None,
     )
 
     return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
