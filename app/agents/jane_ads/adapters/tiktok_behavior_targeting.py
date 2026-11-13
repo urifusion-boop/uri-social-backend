@@ -173,6 +173,10 @@ async def resolve_behavior_targeting(
             by_id = {e["id"]: e["name"] for e in scoped}
             print(f"[TikTokAdsAdapter] {scene} categories: {len(scoped)} of {len(pool)} read; matched "
                   f"{[(i, by_id.get(i)) for i in category_ids]} for {names}", flush=True)
+            if not category_ids:
+                # So a miss can be told from "TikTok has no such category": what the scene did offer.
+                print(f"[TikTokAdsAdapter] {scene} had no match; its categories: {[e['name'] for e in scoped][:100]}",
+                      flush=True)
             if category_ids:
                 result.actions.append({
                     "action_scene": scene, "action_period": period,
