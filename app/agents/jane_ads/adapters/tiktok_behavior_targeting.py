@@ -206,17 +206,20 @@ async def resolve_behavior_targeting(
 
     if want_purchase_intent:
         ids: list[str] = []
-        for name in names[:3]:
-            data = await _lookup(
-                "/tool/interest_keyword/recommend/",
-                {"advertiser_id": advertiser_id, "keyword": name, "audience_type": "PURCHASE_INTENTION", "limit": 3},
-                access_token)
-            found = _entries(data or {}, ("keyword_id", "id"), ("keyword", "name"))
-            if not found:
-                print(f"[TikTokAdsAdapter] no purchase intention keywords for {name!r}; TikTok answered "
-                      f"{str(data)[:300]}", flush=True)
-            for entry in found:
-                if entry["id"] not in ids:
-                    ids.append(entry["id"])
+        # Plain words (Meta's "Parenting (children and parenting)" matches nothing), fuzzy match first, then TikTok's
+        # semantic search for what the fuzzy match could not find.
+        for keyword in keywords[:3]:
+            for mode in ("FUZZ_MATCH", "SEMANTIC_RECOMMEND"):
+                data = await _lookup(
+                    "/tool/interest_keyword/recommend/",
+                    {"advertiser_id": advertiser_id, "keyword": keyword, "audience_type": "PURCHASE_INTENTION",
+                     "mode": mode, "limit": 3}, access_token)
+                found = _entries(data or {}, ("keyword_id", "id"), ("keyword", "name"))
+                if not found:
+                    print(f"[TikTokAdsAdapter] no purchase intention keywords for {keyword!r} ({mode}); TikTok answered "
+                          f"{str(data)[:300]}", flush=True)
+                    continue
+                ids.extend(e["id"] for e in found if e["id"] not in ids)
+                break
         result.purchase_intention_keyword_ids = ids[:MAX_PURCHASE_INTENT]
     return result
