@@ -1834,6 +1834,12 @@ class ApprovalWorkflowService:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
             post_type = draft.get("post_type", "feed")
+            # A user-uploaded video on a normal post is stored as video_url with no
+            # image_url (upload_user_content). Instagram only takes video as a Reel,
+            # and the feed branch below reads image_url only, so these drafts failed
+            # with "Instagram requires an image" every time.
+            if post_type not in ("carousel", "reel", "story") and not draft.get("image_url") and draft.get("video_url"):
+                post_type = "reel"
 
             if post_type == "carousel":
                 slides = draft.get("slides", [])
@@ -2589,6 +2595,11 @@ class ApprovalWorkflowService:
                 }
 
                 image_url = draft.get("image_url")
+                fb_video_url = draft.get("video_url") or ""
+                if not image_url and fb_video_url:
+                    return await ApprovalWorkflowService._publish_facebook_feed_video(
+                        page_id, page_token, fb_video_url, content, scheduled_datetime,
+                    )
                 if image_url:
                     if image_url.startswith("data:"):
                         media_fbid = await ApprovalWorkflowService._upload_base64_image_to_facebook(
@@ -2659,6 +2670,59 @@ class ApprovalWorkflowService:
                 return ApprovalWorkflowService._facebook_result(success, post_id, response)
 
         return {"success": False, "error": f"Platform '{platform}' publishing not implemented yet"}
+
+    @staticmethod
+    async def _publish_facebook_feed_video(
+        page_id: str,
+        page_token: str,
+        video_url: str,
+        content: str,
+        scheduled_datetime: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Post a user-uploaded video to the Page feed. Facebook fetches it from the
+        public URL itself (file_url), so nothing is streamed through our server."""
+        params: Dict[str, Any] = {
+            "file_url": video_url,
+            "description": content,
+            "published": "true",
+            "access_token": page_token,
+        }
+        if scheduled_datetime:
+            import calendar
+            params["published"] = "false"
+            params["scheduled_publish_time"] = int(calendar.timegm(scheduled_datetime.utctimetuple()))
+        import httpx
+        print(f"🎬 FB video publish | page_id={page_id} video_url={video_url[:80]} scheduled={bool(scheduled_datetime)}")
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/videos",
+                    data=params,
+                )
+            data = resp.json() if resp.content else {}
+        except Exception as e:
+            print(f"❌ FB video publish exception: {e}")
+            return {"success": False, "error": f"Facebook video publish failed. (Detail: {e})"}
+        video_id = (data or {}).get("id")
+        if video_id:
+            print(f"✅ FB video publish: video_id={video_id}")
+            return {"success": True, "post_id": video_id, "raw_response": data}
+        err = (data or {}).get("error") or {}
+        print(f"❌ FB video publish | status={resp.status_code} body={str(data)[:500]}")
+        response = {
+            "status": False,
+            "responseCode": resp.status_code,
+            "responseMessage": err.get("message") or "Facebook video publish failed",
+            "meta_error": {
+                "http_status": resp.status_code,
+                "code": err.get("code"),
+                "subcode": err.get("error_subcode"),
+                "message": err.get("message"),
+            },
+        }
+        result = ApprovalWorkflowService._facebook_result(False, None, response)
+        result.setdefault("error", "Facebook video publish failed.")
+        return result
 
     @staticmethod
     async def reconcile_published_posts(db: AsyncIOMotorDatabase):
