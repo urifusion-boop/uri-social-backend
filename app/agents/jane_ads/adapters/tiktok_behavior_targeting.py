@@ -38,8 +38,8 @@ VIDEO_ACTION_DAYS = 15            # the longer of TikTok's 7 / 15 day windows: a
 MAX_ACTION_CATEGORIES = 3         # per scene; Jane's interests are already few, and each one narrows the audience
 MAX_HASHTAGS = 5
 MAX_PURCHASE_INTENT = 5
-# When none of a plan's topics matches a video / creator category (a marketing agency's "Digital marketing", "Email
-# marketing", ...: TikTok has no category of that name), the audience would be left empty. These broad ones, in this
+# When none of a plan's topics matches a video / creator category by name (a marketing agency's "Digital marketing"),
+# a model chooses from the scene's own list (_choose_categories). If that finds nothing too, these broad ones, in this
 # order and only if the scene offers them, stand in so the box is not left empty.
 BROAD_FALLBACK_CATEGORIES = ["business & finance", "business", "finance", "professional & personal development",
                              "technology"]
@@ -153,6 +153,39 @@ def _match(names: list[str], pool: list[dict], best: Callable[[str, list[dict]],
     return ids
 
 
+async def _choose_categories(names: list[str], scoped: list[dict], limit: int) -> list[str]:
+    """Ids of the scene's own categories that best fit the plan's topics, picked by a model from the list TikTok
+    returned (its names do not look like Meta's, so name matching finds nothing for topics like "Digital marketing").
+    Only ids that are in the list are ever returned; any failure answers [] so the caller falls back."""
+    if not scoped or not settings.jane_ads_openai_key:
+        return []
+    by_id = {e["id"]: e["name"] for e in scoped}
+    listing = "\n".join(f"{i}: {n}" for i, n in by_id.items())
+    prompt = (
+        "You choose which TikTok content categories an ad's audience watches or follows.\n"
+        f"The ad is about these topics: {', '.join(names)}.\n"
+        f"Categories (id: name):\n{listing}\n\n"
+        f"Pick up to {limit} categories whose viewers or followers are the best audience for those topics. Prefer broad, "
+        "relevant ones, and pick only ids from the list. If none are even loosely relevant, pick none.\n"
+        'Return JSON: {"ids": ["..."]}'
+    )
+    try:
+        import openai
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini", response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}], timeout=15)
+        data = json.loads(resp.choices[0].message.content or "{}")
+        picked = [str(i) for i in (data.get("ids") or [])]
+    except Exception as e:
+        print(f"[TikTokAdsAdapter] category choice failed: {e}", flush=True)
+        if "insufficient_quota" in str(e):
+            from app.services.AIService import _alert_openai_out_of_credit
+            await _alert_openai_out_of_credit(str(e))
+        return []
+    return list(dict.fromkeys(i for i in picked if i in by_id))[:limit]
+
+
 async def resolve_behavior_targeting(
     interest_names: list[str],
     advertiser_id: str,
@@ -180,9 +213,13 @@ async def resolve_behavior_targeting(
             print(f"[TikTokAdsAdapter] {scene} categories: {len(scoped)} of {len(pool)} read; matched "
                   f"{[(i, by_id.get(i)) for i in category_ids]} for {names}", flush=True)
             if not category_ids:
+                category_ids = await _choose_categories(names, scoped, MAX_FALLBACK_CATEGORIES)
+                print(f"[TikTokAdsAdapter] {scene}: no category matched the topics by name, chosen from the list "
+                      f"{[(i, by_id.get(i)) for i in category_ids]}", flush=True)
+            if not category_ids:
                 by_name = {e["name"].strip().lower(): e["id"] for e in scoped}
                 category_ids = [by_name[n] for n in BROAD_FALLBACK_CATEGORIES if n in by_name][:MAX_FALLBACK_CATEGORIES]
-                print(f"[TikTokAdsAdapter] {scene}: no category matched the topics, using broad "
+                print(f"[TikTokAdsAdapter] {scene}: using broad "
                       f"{[(i, by_id.get(i)) for i in category_ids]}", flush=True)
             if not category_ids:
                 # So a miss can be told from "TikTok has no such category": what the scene did offer.
