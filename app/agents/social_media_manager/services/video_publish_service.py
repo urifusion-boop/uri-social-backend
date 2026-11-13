@@ -164,6 +164,7 @@ class VideoPublishService:
         conn: Dict[str, Any],
         db,
         tiktok_settings=None,
+        instagram_audio=None,
     ) -> None:
         col = _jobs_col()
         key, gap, net = VideoPublishService._gate_target(platform, conn)
@@ -171,7 +172,7 @@ class VideoPublishService:
             async def publish():
                 if platform == "instagram_reels":
                     return await VideoPublishService._publish_instagram_reel(
-                        conn["ig_user_id"], conn["page_access_token"], video_url, caption
+                        conn["ig_user_id"], conn["page_access_token"], video_url, caption, instagram_audio
                     )
                 if platform == "facebook_reels":
                     return await VideoPublishService._publish_facebook_video(
@@ -453,21 +454,30 @@ class VideoPublishService:
         page_access_token: str,
         video_url: str,
         caption: str,
+        audio: Optional[Dict[str, Any]] = None,
     ):
+        from app.agents.social_media_manager.services import instagram_audio
+
+        container_params = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": caption,
+            "access_token": page_access_token,
+        }
+        audio_cfg = instagram_audio.audio_configuration(audio)
+        container_base = GRAPH_BASE
+        if audio_cfg:
+            container_params["audio_configuration"] = audio_cfg
+            container_base = instagram_audio.AUDIO_BASE   # the music option is documented on a newer Graph version
+
         async with httpx.AsyncClient(timeout=30) as client:
             # Step 1: create media container
-            create_resp = await client.post(
-                f"{GRAPH_BASE}/{ig_user_id}/media",
-                params={
-                    "media_type": "REELS",
-                    "video_url": video_url,
-                    "caption": caption,
-                    "access_token": page_access_token,
-                },
-            )
+            create_resp = await client.post(f"{container_base}/{ig_user_id}/media", params=container_params)
             create_data = create_resp.json()
             if "error" in create_data:
-                raise _meta_error("IG container create error", create_resp, create_data, "instagram")
+                # Never quietly post the Reel without the track the customer chose.
+                prefix = "IG container create error (a music track was attached)" if audio_cfg else "IG container create error"
+                raise _meta_error(prefix, create_resp, create_data, "instagram")
             container_id = create_data["id"]
 
             # Step 2: poll until FINISHED
