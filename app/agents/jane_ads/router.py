@@ -5375,11 +5375,78 @@ async def meta_plan_ask(
         await _log("challenge", rebuilt.plan.explanation)
         return preview
 
+    if intent.kind == "edit_ad":
+        return await _ask_edit_ad(plan_id, doc, plan, req, intent, body.question, db, brand_ctx, _log)
+
     # "new_campaign" — never silently act on it as a correction to THIS plan.
     answer = ("That sounds like a new campaign rather than something about this one — "
              "describe it to Jane fresh and I'll plan it separately.")
     await _log("new_campaign", answer)
     return {"kind": "new_campaign", "answer": answer}
+
+
+async def _ask_edit_ad(plan_id: str, doc: dict, plan: CampaignPlan, req: CampaignRequest, intent,
+                       question: str, db, brand_ctx: dict, log) -> dict:
+    """"Make ad 2's headline shorter", typed into Ask. Live-caught: Ask only answered
+    questions, and a plain "change the second ad headline to …" was told it "sounds like
+    a new campaign". The change goes through the SAME endpoints the Edit words button
+    uses, so it answers to the same checks (headline length, ad policy) and is saved
+    exactly as a hand edit would be."""
+    from .plan_defence import NlUnavailableError, rewrite_ad_words
+
+    async def _say(answer: str, **extra) -> dict:
+        await log("edit_ad", answer)
+        return {"kind": "edit_ad", "answer": answer, **extra}
+
+    if doc.get("status") != "pending":
+        return await _say("This campaign has already gone out, so its ads can't be changed here.")
+    if plan.creative is None:
+        return await _say("This plan has no ad to change yet.")
+    total = 1 + len(plan.concepts)
+    n = intent.ad_number or (1 if total == 1 else None)
+    if n is None:
+        return await _say(f"Which ad should I change — {', '.join(str(i) for i in range(1, total))} or {total}? "
+                          "Say it like “make ad 2's headline shorter”.")
+    if n > total:
+        return await _say(f"This plan has {total} ad{'s' if total != 1 else ''} — which one did you mean?")
+
+    current = plan.creative if n == 1 else plan.concepts[n - 2]
+    cur_headline, cur_text = current.headline or "", current.primary_text or ""
+    if intent.new_text and intent.ad_field in ("headline", "caption"):
+        headline = intent.new_text if intent.ad_field == "headline" else cur_headline
+        text = intent.new_text if intent.ad_field == "caption" else cur_text
+    else:
+        try:
+            headline, text = await rewrite_ad_words(
+                cur_headline, cur_text, intent.instruction or question, intent.ad_field,
+                business=req.business_name)
+        except NlUnavailableError:
+            raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+
+    try:
+        if n == 1:
+            res = await meta_plan_edit_fields(
+                plan_id, PlanFieldsBody(edits={"headline": headline, "caption": text}), db, brand_ctx)
+            if res.get("rejected"):
+                reasons = res["rejected"]
+                reason = (next(iter(reasons.values())) if isinstance(reasons, dict)
+                          else (reasons[0].get("reason") if reasons and isinstance(reasons[0], dict) else str(reasons[0])))
+                return await _say(f"I couldn't make that change: {reason}")
+            updated = {"creative": res.get("creative"), "fields": res.get("fields")}
+        else:
+            res = await meta_plan_edit_ad(
+                plan_id, n - 2, PlanAdEditBody(headline=headline, primary_text=text), db, brand_ctx)
+            updated = {"concepts": res.get("concepts")}
+    except HTTPException as e:
+        return await _say(f"I couldn't make that change: {e.detail}")
+
+    changed = []
+    if headline != cur_headline:
+        changed.append(f"headline now reads “{headline}”")
+    if text != cur_text:
+        changed.append("caption is rewritten" if headline != cur_headline else f"caption now reads “{text}”")
+    what = " and its ".join(changed) if changed else "words are unchanged — that's already how it reads"
+    return await _say(f"Done — ad {n}'s {what}.", ad_number=n, **updated)
 
 
 @router.get("/meta/campaigns")

@@ -1441,6 +1441,28 @@ async def _build_work_in_progress(business_name: str, category: str, description
 # on the isolation-cap gate; upload_as_is of a real event photo is also
 # permitted by the format itself but has no attestation type to trigger it) ─
 
+_NEWS_FILLER = {
+    "the", "and", "for", "now", "our", "your", "you", "with", "new", "here", "today",
+    "just", "all", "are", "get", "its", "this", "that", "from", "into", "out", "now",
+}
+
+
+def _news_grounded(text: str, source: str) -> bool:
+    """True when the words that carry the news are the client's own. "Real
+    announcements only" was an instruction the model could break, and did: a brief
+    with no announcement in it produced "New branch in Lekki opens". A news ad is a
+    claim with the advertiser's name on it, so it has to be checkable against what
+    they actually wrote. A word counts when the brief has a word starting with the
+    same four letters ("open" ~ "opening")."""
+    words = [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+             if len(w) >= 3 and w not in _NEWS_FILLER]
+    if not words:
+        return False
+    stems = {w[:4] for w in re.findall(r"[a-z0-9]+", (source or "").lower()) if len(w) >= 3}
+    found = sum(1 for w in words if w[:4] in stems)
+    return found * 2 >= len(words) * 1 and found >= max(1, len(words) - 1)
+
+
 async def _content_news_headline(business_name: str, category: str, description: str,
                                  correction: str = "",
                                  brand_context: Optional[dict] = None) -> Optional[dict]:
@@ -1510,6 +1532,14 @@ async def _content_news_headline(business_name: str, category: str, description:
     headline = str(d.get("headline", "")).strip()
     secondary_line = str(d.get("secondary_line", "")).strip() or None
     date_stamp = str(d.get("date_stamp", "")).strip() or None
+    if not _news_grounded(headline, description):
+        print(f"[VSG01] news headline not in the client's words, format skipped: {headline!r}", flush=True)
+        return None
+    # The supporting line and the date are claims too: drop one that isn't the client's.
+    if secondary_line and not _news_grounded(secondary_line, description):
+        secondary_line = None
+    if date_stamp and not all(n in description for n in re.findall(r"\d+", date_stamp)):
+        date_stamp = None
     # Belt-and-suspenders, not just a prompt instruction: when the only real
     # date in the source text already sits inside the headline (a single-
     # date announcement, the common case), the model tends to restate it in
