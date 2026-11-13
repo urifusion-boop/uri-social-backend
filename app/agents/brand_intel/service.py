@@ -104,7 +104,24 @@ async def read_site_job(db, job: dict, ctx) -> dict:
     doc = {"site": key, "url": site["url"], "fetched_at": datetime.now(timezone.utc),
            "fields": fields, "pages": site["page_list"], "logo_candidates": site.get("logo_candidates", [])[:5]}
     await db[SITES].update_one({"site": key}, {"$set": doc}, upsert=True)
+    await _tell_owner(db, job, key, len(fields))
     return _result(doc)
+
+
+async def _tell_owner(db, job: dict, site: str, count: int) -> None:
+    """The bell: the owner may have left the page while the site was being read."""
+    if not job.get("user_id"):
+        return
+    try:
+        from app.services import brand_notifier
+        await brand_notifier.notify_in_app(
+            db, job["user_id"], job.get("brand_id"), "playbook_ready",
+            title="Your Playbook is ready to check",
+            message=f"Jane read {site} and found {count} things for your Brand Playbook. Check them before they're used.",
+            link="/workspace/?tab=playbook&website_read=1",
+            metadata={"read_id": job.get("job_id")})
+    except Exception as e:  # a notification must never fail the read
+        print(f"[brand_intel] notification failed: {e!r}", flush=True)
 
 
 async def _crawl(url: str, ctx) -> dict:
