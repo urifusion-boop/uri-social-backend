@@ -404,3 +404,19 @@ def test_a_brand_cannot_start_unlimited_reads():
     with pytest.raises(FetchError) as e:
         _run(service.start_read(db, brand_id="b1", user_id="u", url="magen.ng"))
     assert e.value.code == "rate_limited"
+
+
+def test_the_owner_gets_a_bell_notification_when_a_read_finishes():
+    db = _db()
+    pages = {"/": (HOME, "text/html")}
+    told = AsyncMock()
+    with patch("app.agents.brand_intel.service.httpx.AsyncClient", new=_patched_client(_site_transport(pages))), \
+         patch("app.agents.brand_intel.safe_fetch.resolve_public", new=AsyncMock(return_value="93.184.216.34")), \
+         patch.object(extractor, "extract", new=AsyncMock(return_value={})), \
+         patch("app.services.brand_notifier.notify_in_app", new=told):
+        _run(service.read_site_job(db, {"job_id": "j9", "user_id": "u1", "brand_id": "b1",
+                                        "payload": {"url": "https://magen.ng/"}}, _Ctx()))
+    args = told.await_args
+    assert args.args[1:4] == ("u1", "b1", "playbook_ready")
+    assert args.kwargs["title"] == "Your Playbook is ready to check"
+    assert "magen.ng" in args.kwargs["message"]
