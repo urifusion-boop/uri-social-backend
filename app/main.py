@@ -188,6 +188,9 @@ async def startup_event():
         await _job_queue.ensure_indexes(get_db())
         await _brand_intel.ensure_indexes(get_db())
         _job_worker.register(_brand_intel.JOB_TYPE, _brand_intel.read_site_job)
+        from app.agents.competitors import service as _competitors
+        await _competitors.ensure_indexes(get_db())
+        _job_worker.register(_competitors.JOB_TYPE, _competitors.discovery_job)
         _job_worker.start(get_db)
         print("✅ Background job worker started")
     except Exception as e:
@@ -374,6 +377,8 @@ app.include_router(sdk_router, tags=["SDK"])
 # Website → Brand Playbook (PRD Workstream 1)
 from app.agents.brand_intel.router import router as brand_intel_router
 app.include_router(brand_intel_router)
+from app.agents.competitors.router import router as competitors_router
+app.include_router(competitors_router)
 
 # Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
 from app.agents.jane_ads.router import router as jane_ads_router
