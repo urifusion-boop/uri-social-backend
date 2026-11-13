@@ -5449,6 +5449,14 @@ async def _ask_edit_ad(plan_id: str, doc: dict, plan: CampaignPlan, req: Campaig
     return await _say(f"Done — ad {n}'s {what}.", ad_number=n, **updated)
 
 
+@router.get("/budget-suggestions")
+async def budget_suggestions(platform: str = "meta", days: int = 7,
+                             brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """Suggested budgets for the campaign builder, each saying what it buys."""
+    from .budget_suggestions import suggest
+    return suggest(platform, days)
+
+
 @router.get("/meta/campaigns")
 async def meta_campaigns(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
