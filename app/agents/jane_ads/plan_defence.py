@@ -35,7 +35,13 @@ class NlUnavailableError(Exception):
 
 
 class FollowupIntent(BaseModel):
-    kind: Literal["question", "challenge", "new_campaign"] = "question"
+    kind: Literal["question", "challenge", "edit_ad", "new_campaign"] = "question"
+    # edit_ad only: which ad (1 = the first ad shown, None = not said), which words, and
+    # either the exact new wording the client gave or what they want changed about it.
+    ad_number: Optional[int] = None
+    ad_field: Literal["headline", "caption", "both"] = "both"
+    new_text: str = ""
+    instruction: str = ""
     corrected_field: str = ""   # only set for "challenge" — which foundation fact changed
     corrected_value: str = ""   # the new value, as the client stated it
     what_if_budget_ngn: Optional[float] = None  # set only when "question" is a budget
@@ -70,9 +76,19 @@ async def classify_followup(message: str, current_budget_ngn: Optional[float] = 
         "my main buyers', 'I'm actually in Yaba not Lekki', 'my budget is actually "
         "₦30,000' — something Jane got wrong about the business itself, not a "
         "question about her reasoning\n"
+        "- \"edit_ad\": asking to change the WORDS of one of the plan's ads — its "
+        "headline or its caption/text: 'change the second ad's headline to Ride easy', "
+        "'make ad 1 shorter', 'make the caption punchier', 'rewrite the headline'\n"
         "- \"new_campaign\": a fresh, unrelated campaign ask that has nothing to do "
         "with the existing plan\n"
-        "Return ONLY JSON: {\"kind\": one of the three strings above, "
+        "Return ONLY JSON: {\"kind\": one of the four strings above, "
+        "\"ad_number\": if kind is \"edit_ad\", which ad as a number (first/1st/one = 1, "
+        "second = 2, ...), or null if they didn't say, "
+        "\"ad_field\": if kind is \"edit_ad\", \"headline\", \"caption\" or \"both\", "
+        "\"new_text\": if kind is \"edit_ad\" and they gave the exact new wording, that "
+        "wording verbatim without quotes, else empty string, "
+        "\"instruction\": if kind is \"edit_ad\", what they want changed in a few words, "
+        "else empty string, "
         "\"corrected_field\": a short field name being corrected if kind is "
         "\"challenge\" else empty string, \"corrected_value\": the new value as "
         "stated if kind is \"challenge\" else empty string, \"what_if_budget_ngn\": "
@@ -97,15 +113,59 @@ async def classify_followup(message: str, current_budget_ngn: Optional[float] = 
             await _alert_openai_out_of_credit(str(e))
         return FollowupIntent(kind="new_campaign")
     kind = d.get("kind")
-    if kind not in ("question", "challenge", "new_campaign"):
+    if kind not in ("question", "challenge", "edit_ad", "new_campaign"):
         kind = "new_campaign"
     what_if_budget = d.get("what_if_budget_ngn")
+    ad_number = d.get("ad_number")
+    ad_field = d.get("ad_field") if d.get("ad_field") in ("headline", "caption", "both") else "both"
     return FollowupIntent(
         kind=kind,
         corrected_field=str(d.get("corrected_field", "")).strip(),
         corrected_value=str(d.get("corrected_value", "")).strip(),
         what_if_budget_ngn=float(what_if_budget) if isinstance(what_if_budget, (int, float)) else None,
+        ad_number=int(ad_number) if isinstance(ad_number, (int, float)) and ad_number >= 1 else None,
+        ad_field=ad_field,
+        new_text=str(d.get("new_text") or "").strip().strip('"\u201c\u201d'),
+        instruction=str(d.get("instruction") or "").strip(),
     )
+
+
+async def rewrite_ad_words(headline: str, primary_text: str, instruction: str, field: str,
+                           business: str = "") -> tuple[str, str]:
+    """The ad's words rewritten the way the client asked, on the client's own message:
+    it keeps every fact already in the ad and adds none (no prices, offers, dates or
+    claims that aren't there). Raises NlUnavailableError when the model can't be
+    reached, like the rest of this module."""
+    if not settings.jane_ads_openai_key:
+        raise NlUnavailableError("OPENAI_API_KEY is not configured")
+    which = {"headline": "only the headline (leave the caption exactly as it is)",
+             "caption": "only the caption (leave the headline exactly as it is)"}.get(
+        field, "the headline and the caption")
+    prompt = (
+        f"An ad{(' for ' + business) if business else ''} currently reads:\n"
+        f"HEADLINE: {headline}\nCAPTION: {primary_text}\n\n"
+        f"The client asked: \"{instruction}\". Rewrite {which}.\n"
+        "Rules: keep the same product and every fact already in it; never add a price, "
+        "offer, date, statistic or claim that isn't already there; headline at most 40 "
+        "characters, starting with a capital letter; caption 1-2 sentences; no emoji; "
+        "plain, natural English.\n"
+        "Return ONLY JSON: {\"headline\": \"...\", \"primary_text\": \"...\"}."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+            timeout=20,
+        )
+        d = json.loads(resp.choices[0].message.content or "{}")
+    except Exception as e:
+        print(f"[PlanDefence] rewrite error: {e}", flush=True)
+        raise NlUnavailableError(str(e))
+    new_headline = str(d.get("headline") or "").strip() if field != "caption" else headline
+    new_text = str(d.get("primary_text") or "").strip() if field != "headline" else primary_text
+    return (new_headline or headline), (new_text or primary_text)
 
 
 async def explain_plan(

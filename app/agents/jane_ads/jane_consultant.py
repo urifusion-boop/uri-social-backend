@@ -386,6 +386,21 @@ async def consult(message: str, business_name: str = "", category: str = "",
         # has only a name and an industry label, and plans come out generic — a
         # category is not an offer, and the offer is what an audience responds to.
         known_bits.append(f"what they sell: {offering}")
+    if business_name or category or offering:
+        # The facts above come from the account's saved profile. Live-caught: a brand
+        # saved as a transport company described "Uri Social — an app that creates and
+        # posts social media content" for this campaign, and the plans, audiences and
+        # captions were all written for commuters while the picture (built from the
+        # client's own words) sold content creation — one ad, two businesses. What the
+        # client says they are promoting NOW is the decision; the profile only fills in
+        # what they didn't say.
+        known_bits.append(
+            "those business facts come from the account's saved profile. If the client's "
+            "own words in this conversation describe a DIFFERENT business, product or "
+            "service they are promoting this time, their words win: set business_name and "
+            "category to what they are promoting now, and plan every audience for that — "
+            "never for the profile's business"
+        )
     if known_budget:
         known_bits.append(f"last campaign they spent ₦{known_budget:,.0f} (a PAST campaign — "
                           "do not treat this as THIS campaign's budget; you may offer it as a "

@@ -383,9 +383,15 @@ def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None, u
         adverb = _BANNED_ADVERB_FALLBACK.get(key) if universal else None
 
         def _sub(m: "re.Match") -> str:
-            if adverb and m.group(0).lower().endswith("ly") and not key.endswith("ly"):
-                return adverb
-            return default
+            found = m.group(0)
+            rep = adverb if (adverb and found.lower().endswith("ly") and not key.endswith("ly")) else default
+            # Keep the capitals of the word being replaced. Live-caught: an ad headline
+            # "Effortless ..." shipped as "simple ..." — a headline starting in lower case.
+            if rep and len(found) > 1 and found.isupper():
+                return rep.upper()
+            if rep and found[:1].isupper():
+                return rep[:1].upper() + rep[1:]
+            return rep
 
         out = _word_strip_pattern(word).sub(_sub, out)
     if out == text:
@@ -399,7 +405,11 @@ def strip_banned_words(text: str, extra_words: Optional[Iterable[str]] = None, u
     out = re.sub(r",?\s*\band\s*\.", ".", out, flags=re.IGNORECASE)
     out = re.sub(r"(?m)^[ \t]*,[ \t]*", "", out)
     out = re.sub(r"[ \t]{2,}", " ", out)
-    return out.strip()
+    out = out.strip()
+    # A removed first word leaves the next one opening the text in lower case.
+    if text.lstrip()[:1].isupper() and out[:1].islower():
+        out = out[:1].upper() + out[1:]
+    return out
 
 
 # ── 1b. After writing: check, then enforce ───────────────────────────────────

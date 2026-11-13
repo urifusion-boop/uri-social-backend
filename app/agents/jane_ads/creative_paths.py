@@ -215,15 +215,27 @@ TALKING_POINTS = [
 ]
 
 
+# The campaign builder appends "Budget: ₦30000 over 7 days." to the brief. Live-caught:
+# only the figure was removed, "Budget: over 7 days." stayed, and a News Headline ad
+# painted "7 days" onto the picture as if it were a deadline. How long the campaign runs
+# is how the ad is bought, never something the ad says.
+_BUILDER_BUDGET_LINE = re.compile(
+    r"\bBudget\s*:\s*(?:₦|NGN\s*|N(?=\s*\d))?\s*[\d,.]*\s*k?\s*(?:naira\s*)?"
+    r"(?:(?:over|for)\s+\d+\s+(?:days?|weeks?|months?))?\s*\.?",
+    re.I,
+)
+
+
 def without_budget(text: str, budget_ngn: Optional[float]) -> str:
     """Takes the ad budget out of campaign text, so a script writer can't read it as a price."""
+    text = _BUILDER_BUDGET_LINE.sub("", text or "").strip()
     if not budget_ngn or budget_ngn <= 0:
         return text
     n = int(budget_ngn)
     forms = [f"{n:,}", str(n)] + ([f"{n // 1000}k"] if n % 1000 == 0 else [])
     figure = "|".join(re.escape(f) for f in forms)
     pattern = (rf"(?:,\s*)?(?:(?:₦|NGN\s*|\bN)\s*)?(?<![\d,.])(?:{figure})(?![\d,]|\.\d)(?:\s*naira)?"
-               r"(?:\s+(?:budget|for\s+\d+\s+(?:days?|weeks?)))?")
+               r"(?:\s+(?:budget|(?:for|over)\s+\d+\s+(?:days?|weeks?)))?")
     return re.sub(pattern, "", text, flags=re.I).strip(" ,")
 
 
