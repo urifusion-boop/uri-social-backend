@@ -38,6 +38,12 @@ VIDEO_ACTION_DAYS = 15            # the longer of TikTok's 7 / 15 day windows: a
 MAX_ACTION_CATEGORIES = 3         # per scene; Jane's interests are already few, and each one narrows the audience
 MAX_HASHTAGS = 5
 MAX_PURCHASE_INTENT = 5
+# When none of a plan's topics matches a video / creator category (a marketing agency's "Digital marketing", "Email
+# marketing", ...: TikTok has no category of that name), the audience would be left empty. These broad ones, in this
+# order and only if the scene offers them, stand in so the box is not left empty.
+BROAD_FALLBACK_CATEGORIES = ["business & finance", "business", "finance", "professional & personal development",
+                             "technology"]
+MAX_FALLBACK_CATEGORIES = 2
 
 
 
@@ -173,6 +179,11 @@ async def resolve_behavior_targeting(
             by_id = {e["id"]: e["name"] for e in scoped}
             print(f"[TikTokAdsAdapter] {scene} categories: {len(scoped)} of {len(pool)} read; matched "
                   f"{[(i, by_id.get(i)) for i in category_ids]} for {names}", flush=True)
+            if not category_ids:
+                by_name = {e["name"].strip().lower(): e["id"] for e in scoped}
+                category_ids = [by_name[n] for n in BROAD_FALLBACK_CATEGORIES if n in by_name][:MAX_FALLBACK_CATEGORIES]
+                print(f"[TikTokAdsAdapter] {scene}: no category matched the topics, using broad "
+                      f"{[(i, by_id.get(i)) for i in category_ids]}", flush=True)
             if not category_ids:
                 # So a miss can be told from "TikTok has no such category": what the scene did offer.
                 print(f"[TikTokAdsAdapter] {scene} had no match; its categories: {[e['name'] for e in scoped][:100]}",
