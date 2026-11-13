@@ -45,6 +45,7 @@ class Page:
     status: int
     content_type: str
     text: str
+    body: bytes = b""  # the raw bytes, for images
 
 
 def normalize_url(raw: str) -> str:
@@ -157,7 +158,8 @@ async def fetch(url: str, *, accept: tuple[str, ...] = ("text/html", "applicatio
                     text = bytes(body[:max_bytes]).decode(encoding, errors="replace")
                 except LookupError:
                     text = bytes(body[:max_bytes]).decode("utf-8", errors="replace")
-                return Page(url=current, status=resp.status_code, content_type=ctype, text=text)
+                return Page(url=current, status=resp.status_code, content_type=ctype, text=text,
+                            body=bytes(body[:max_bytes]))
             finally:
                 await resp.aclose()
         raise FetchError("Your website redirects too many times.", "redirects")

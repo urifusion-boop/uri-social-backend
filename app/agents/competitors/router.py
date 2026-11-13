@@ -146,6 +146,47 @@ class UseBody(BaseModel):
     index: int
 
 
+class EditVersionBody(BaseModel):
+    headline: str
+    primary_text: str
+
+
+@router.patch("/recreations/{recreation_id}/versions/{index}")
+async def edit_version(recreation_id: str, index: int, body: EditVersionBody,
+                       db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                       ctx: dict = Depends(get_active_brand_context)) -> dict:
+    try:
+        return await ads.edit_version(db, brand_id=ctx["brand_id"], recreation_id=recreation_id, index=index,
+                                      headline=body.headline, primary_text=body.primary_text)
+    except LookupError as e:
+        raise _not_found(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/recreations/{recreation_id}/versions/{index}")
+async def remove_version(recreation_id: str, index: int, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                         ctx: dict = Depends(get_active_brand_context)) -> dict:
+    try:
+        return await ads.remove_version(db, brand_id=ctx["brand_id"], recreation_id=recreation_id, index=index)
+    except LookupError as e:
+        raise _not_found(e)
+
+
+@router.post("/recreations/{recreation_id}/versions/{index}/redo")
+async def redo_version(recreation_id: str, index: int, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+                       ctx: dict = Depends(get_active_brand_context)) -> dict:
+    try:
+        return await ads.redo_version(db, brand_id=ctx["brand_id"], user_id=ctx["user_id"],
+                                      recreation_id=recreation_id, index=index)
+    except LookupError as e:
+        raise _not_found(e)
+    except PermissionError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
 @router.post("/recreations/{recreation_id}/use")
 async def use_recreation(recreation_id: str, body: UseBody, db: AsyncIOMotorDatabase = Depends(get_db_dependency),
                          ctx: dict = Depends(get_active_brand_context)) -> dict:

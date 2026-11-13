@@ -383,6 +383,10 @@ from app.agents.brand_intel.router import router as brand_intel_router
 app.include_router(brand_intel_router)
 from app.agents.competitors.router import router as competitors_router
 app.include_router(competitors_router)
+from app.features.router import router as features_router
+app.include_router(features_router)
+from app.jobs.router import router as jobs_router
+app.include_router(jobs_router)
 
 # Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
 from app.agents.jane_ads.router import router as jane_ads_router

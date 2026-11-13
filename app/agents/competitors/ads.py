@@ -60,7 +60,8 @@ def _now() -> datetime:
 
 def public_ad(doc: dict) -> dict:
     a = doc.get("analysis") or {}
-    return {"id": doc["ad_id"], "image_url": doc["image_url"], "competitor_id": doc.get("competitor_id", ""),
+    return {"id": doc["ad_id"], "image_url": doc["image_url"], "thumb_url": doc.get("thumb_url") or doc["image_url"],
+            "competitor_id": doc.get("competitor_id", ""),
             "competitor_name": doc.get("competitor_name", ""), "platform": doc.get("platform", ""),
             "link": doc.get("link", ""), "note": doc.get("note", ""), "status": doc["status"],
             "analysis": a, "angle_label": ANGLE_LABELS.get(a.get("angle", ""), ""),
@@ -165,11 +166,39 @@ def clean_analysis(raw: dict) -> dict:
             "layout": s("layout", 200), "why_it_works": s("why_it_works", 420)}
 
 
+THUMB_PX = 480
+
+
+async def make_thumbnail(image_url: str) -> str:
+    """A small copy for the grid, so a page of ads doesn't load full-size screenshots. Best effort:
+    the grid falls back to the original."""
+    import io
+
+    from PIL import Image
+
+    from app.agents.brand_intel.safe_fetch import FetchError, fetch
+    from app.utils.s3_upload import upload_bytes
+    try:
+        page = await fetch(image_url, accept=("image/",), max_bytes=10_000_000)
+        img = Image.open(io.BytesIO(page.body)).convert("RGB")
+        img.thumbnail((THUMB_PX, THUMB_PX))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82)
+        return await upload_bytes(buf.getvalue(), folder="uri-social/competitor-ads/thumbs", resource_type="image")
+    except (FetchError, Exception) as e:
+        print(f"[competitor ads] thumbnail skipped: {e!r}", flush=True)
+        return ""
+
+
 async def analysis_job(db, job: dict, ctx) -> dict:
     ad_id = job["payload"]["ad_id"]
     ad = await db[ADS].find_one({"ad_id": ad_id})
     if not ad:
         raise JobError("That ad was deleted.", code="gone")
+    if not ad.get("thumb_url"):
+        thumb = await make_thumbnail(ad["image_url"])
+        if thumb:
+            await db[ADS].update_one({"ad_id": ad_id}, {"$set": {"thumb_url": thumb}})
     await ctx.step("read", "Reading the ad")
     try:
         analysis = clean_analysis(await _vision(ad["image_url"]))
@@ -248,6 +277,9 @@ async def recreate_job(db, job: dict, ctx) -> dict:
     angle = _LAYOUT_ANGLE.get(analysis.get("angle", ""), "outcome")
     angles = [angle] + [a for a, _, _ in concepts_mod.ANGLES if a != angle]
     brief = recreation_brief(analysis, rec.get("product", ""), profile.get("product_description", ""))
+    redo = job["payload"].get("redo_index")
+    if redo is not None:
+        return await _redo_one(db, rec, int(redo), ctx)
     done = len(rec.get("results") or [])  # a retry carries on where the last attempt stopped
     await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "running", "error": ""}})
     for i in range(done, rec["count"]):
@@ -263,6 +295,7 @@ async def recreate_job(db, job: dict, ctx) -> dict:
             raise JobError("Jane couldn't make that ad just now. Try again shortly.", code="ai_unavailable", retry=True)
         await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
         result = {"image_url": ad.image_url, "headline": ad.headline, "primary_text": ad.primary_text, "angle": a}
+        result["draft_id"] = await _save_draft(db, rec, result)
         await db[RECREATIONS].update_one({"recreation_id": rid}, {"$push": {"results": result}})
         await ctx.step(f"ad{i}", f"Making version {i + 1} of {rec['count']}", "done", ad.headline)
     await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done"}})
@@ -305,3 +338,116 @@ async def use_version(db, *, brand_id: str, user_id: str, recreation_id: str, in
                                          {"$set": {f"results.{index}.draft_id": draft_id}})
     return {"draft_id": draft_id, "platform": "instagram", "content": (chosen.get("primary_text") or "")[:200],
             "image_url": chosen["image_url"], "created_at": _now().isoformat()}
+
+
+
+# ── per-version actions ────────────────────────────────────────────────────────
+
+async def _save_draft(db, rec: dict, result: dict) -> str:
+    """Every version is kept in Creatives as soon as it's made, so closing the composer loses nothing."""
+    draft_id = str(uuid.uuid4())
+    await db["content_drafts"].insert_one({
+        "id": draft_id, "user_id": rec["user_id"], "brand_id": rec["brand_id"], "platform": "instagram",
+        "content": result.get("primary_text", ""), "headline": result.get("headline", ""),
+        "image_url": result["image_url"], "has_image": True, "status": "draft",
+        "content_source": "ad_recreate", "recreation_id": rec["recreation_id"], "created_at": _now(),
+    })
+    return draft_id
+
+
+async def _version(db, brand_id: str, recreation_id: str, index: int) -> tuple[dict, dict]:
+    rec = await db[RECREATIONS].find_one({"brand_id": brand_id, "recreation_id": recreation_id}, {"_id": 0})
+    if not rec:
+        raise LookupError("That request wasn't found.")
+    results = rec.get("results") or []
+    if not 0 <= index < len(results):
+        raise LookupError("That version wasn't found.")
+    return rec, results[index]
+
+
+async def edit_version(db, *, brand_id: str, recreation_id: str, index: int, headline: str, primary_text: str) -> dict:
+    """The owner's own words for one version. Same checks as any ad's words: a headline of up to 40
+    characters, and nothing the ad-policy check would block."""
+    from app.agents.jane_ads.models import Platform
+    from app.agents.jane_ads.policy import Severity, review_ad_creative
+    headline, primary_text = " ".join(headline.split()), primary_text.strip()
+    if not headline or not primary_text:
+        raise ValueError("Add a headline and a caption.")
+    if len(headline) > 40:
+        raise ValueError("Keep the headline to 40 characters.")
+    blocking = [v for v in review_ad_creative(headline, primary_text, platform=Platform.META.value).violations
+                if v.severity == Severity.BLOCK]
+    if blocking:
+        raise ValueError(f"Those words can't run as an ad: {blocking[0].guidance}")
+    rec, version = await _version(db, brand_id, recreation_id, index)
+    await db[RECREATIONS].update_one({"recreation_id": recreation_id},
+                                     {"$set": {f"results.{index}.headline": headline,
+                                               f"results.{index}.primary_text": primary_text}})
+    if version.get("draft_id"):
+        await db["content_drafts"].update_one({"id": version["draft_id"]},
+                                              {"$set": {"headline": headline, "content": primary_text}})
+    return {**version, "headline": headline, "primary_text": primary_text}
+
+
+async def remove_version(db, *, brand_id: str, recreation_id: str, index: int) -> dict:
+    """Not wanted: off the list, and out of Creatives."""
+    rec, version = await _version(db, brand_id, recreation_id, index)
+    results = [r for i, r in enumerate(rec["results"]) if i != index]
+    await db[RECREATIONS].update_one({"recreation_id": recreation_id}, {"$set": {"results": results}})
+    if version.get("draft_id"):
+        await db["content_drafts"].delete_one({"id": version["draft_id"], "content_source": "ad_recreate"})
+    return public_recreation({**rec, "results": results})
+
+
+async def redo_version(db, *, brand_id: str, user_id: str, recreation_id: str, index: int) -> dict:
+    """Make one version again, in its place. One credit, checked first."""
+    from app.services.CreditService import credit_service
+    rec, _ = await _version(db, brand_id, recreation_id, index)
+    if rec["status"] == "running":
+        raise ValueError("Jane is still working on these. Try again when she's done.")
+    if not await credit_service.check_sufficient_credits(user_id, required=1):
+        raise PermissionError("Making it again takes 1 content credit. Top up first.")
+    await db[RECREATIONS].update_one({"recreation_id": recreation_id},
+                                     {"$set": {"status": "running", "error": "", f"results.{index}.redoing": True}})
+    await queue.enqueue(db, RECREATE_JOB, {"recreation_id": recreation_id, "redo_index": index}, brand_id=brand_id,
+                        user_id=user_id, key=f"{recreation_id}:redo:{index}", max_attempts=2)
+    rec = await db[RECREATIONS].find_one({"recreation_id": recreation_id}, {"_id": 0})
+    return public_recreation(rec)
+
+
+async def _redo_one(db, rec: dict, index: int, ctx) -> dict:
+    from app.agents.jane_ads import concepts as concepts_mod
+    from app.agents.jane_ads.creative import generate_ad_creative
+    from app.services.CreditService import credit_service
+
+    rid = rec["recreation_id"]
+    results = rec.get("results") or []
+    if not 0 <= index < len(results):
+        await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done"}})
+        return {"recreation_id": rid}
+    profile = await _profile(db, rec["user_id"], rec["brand_id"])
+    analysis = (rec.get("reference") or {}).get("analysis") or {}
+    old = results[index]
+    angle = old.get("angle") or _LAYOUT_ANGLE.get(analysis.get("angle", ""), "outcome")
+    brief = recreation_brief(analysis, rec.get("product", ""), profile.get("product_description", ""))
+    await ctx.step(f"redo{index}", f"Making version {index + 1} again")
+    ad = await generate_ad_creative(
+        profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
+        concepts_mod.brief_for(brief + " Make it clearly different from the last attempt.", angle),
+        user_id=rec["user_id"], db=db, brand_id=rec["brand_id"], city=profile.get("customer_location") or "",
+        image_layout=concepts_mod.layout_for(angle))
+    if not ad.image_url:
+        await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done", f"results.{index}.redoing": False,
+                                                                           "error": "Jane couldn't make that one again just now."}})
+        raise JobError("Jane couldn't make that one again just now.", code="ai_unavailable", retry=True)
+    await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
+    new = {"image_url": ad.image_url, "headline": ad.headline, "primary_text": ad.primary_text, "angle": angle,
+           "draft_id": old.get("draft_id", "")}
+    if new["draft_id"]:
+        await db["content_drafts"].update_one({"id": new["draft_id"]}, {"$set": {
+            "image_url": ad.image_url, "headline": ad.headline, "content": ad.primary_text}})
+    else:
+        new["draft_id"] = await _save_draft(db, rec, new)
+    await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {f"results.{index}": new, "status": "done"}})
+    await ctx.step(f"redo{index}", f"Making version {index + 1} again", "done", ad.headline)
+    return {"recreation_id": rid}

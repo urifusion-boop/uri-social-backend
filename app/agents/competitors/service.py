@@ -174,7 +174,8 @@ async def _sync_playbook(db, user_id: str, brand_id: str, add: Optional[str] = N
 async def keep(db, *, brand_id: str, user_id: str, competitor_id: str) -> dict:
     doc = await _get(db, brand_id, competitor_id)
     await db[COLLECTION].update_one({"brand_id": brand_id, "competitor_id": competitor_id},
-                                    {"$set": {"status": ACTIVE, "decided_at": _now(), "updated_at": _now()}})
+                                    {"$set": {"status": ACTIVE, "decided_at": _now(), "decided_by": user_id,
+                                              "updated_at": _now()}})
     await _sync_playbook(db, user_id, brand_id, add=D.handle_for_playbook(doc))
     return _public({**doc, "status": ACTIVE})
 
@@ -220,11 +221,42 @@ async def add(db, *, brand_id: str, user_id: str, name: str, website: str = "", 
     existing = await db[COLLECTION].find_one({"brand_id": brand_id, "key": key}, {"_id": 0})
     if existing:
         await db[COLLECTION].update_one({"brand_id": brand_id, "key": key},
-                                        {"$set": {"status": ACTIVE, "updated_at": now, "decided_at": now}})
+                                        {"$set": {"status": ACTIVE, "updated_at": now, "decided_at": now,
+                                                  "decided_by": user_id}})
         doc = {**existing, "status": ACTIVE}
     else:
         doc = {**c, "competitor_id": f"cmp_{uuid.uuid4().hex[:16]}", "brand_id": brand_id, "key": key,
-               "status": ACTIVE, "source": "added", "created_at": now, "updated_at": now, "decided_at": now}
+               "status": ACTIVE, "source": "added", "created_at": now, "updated_at": now, "decided_at": now,
+               "decided_by": user_id}
         await db[COLLECTION].insert_one(dict(doc))
     await _sync_playbook(db, user_id, brand_id, add=D.handle_for_playbook(doc))
     return _public(doc)
+
+
+REFRESH_AFTER = timedelta(days=7)
+
+
+async def refresh_due(db, now: Optional[datetime] = None, limit: int = 200) -> int:
+    """Weekly: look again for brands that keep a competitor list and haven't been searched for a
+    week. Queued as ordinary jobs (shared cache, limits and dedupe apply), a batch at a time, so a
+    large number of brands is spread across runs instead of hitting the search all at once."""
+    now = now or _now()
+    brands = await db[COLLECTION].distinct("brand_id", {"status": ACTIVE})
+    queued = 0
+    for brand_id in brands:
+        if queued >= limit:
+            break
+        last = await db[queue.COLLECTION].find_one({"brand_id": brand_id, "type": JOB_TYPE}, {"created_at": 1},
+                                                   sort=[("created_at", -1)])
+        at = (last or {}).get("created_at")
+        if at and (now - (at if at.tzinfo else at.replace(tzinfo=timezone.utc))) < REFRESH_AFTER:
+            continue
+        owner = await db[COLLECTION].find_one({"brand_id": brand_id, "status": ACTIVE, "decided_by": {"$exists": True}},
+                                              {"decided_by": 1})
+        user_id = (owner or {}).get("decided_by") or ""
+        if not user_id:
+            continue
+        await queue.enqueue(db, JOB_TYPE, {"force": False, "scheduled": True}, brand_id=brand_id, user_id=user_id,
+                            key=brand_id, max_attempts=2)
+        queued += 1
+    return queued
