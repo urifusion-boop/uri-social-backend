@@ -93,11 +93,17 @@ def test_a_tiktok_client_is_told_nothing_about_other_platforms_in_the_objective_
 
 # ── Which campaigns count as TikTok ─────────────────────────────────────────────
 
-def test_only_this_brands_tiktok_campaign_is_routed_to_tiktok():
+def test_another_brands_tiktok_campaign_is_never_acted_on():
+    """A campaign is only ever looked up for the brand that owns it: another brand gets the
+    same 404 as an unknown campaign, and TikTok is never asked about it."""
     db = _Db(tiktok=[TIKTOK_CAMPAIGN])
-    assert _run(jane_router._tiktok_live_campaign(db, "tt1", "brand-1")) == TIKTOK_CAMPAIGN
-    assert _run(jane_router._tiktok_live_campaign(db, "tt1", "someone-else")) is None
-    assert _run(jane_router._tiktok_live_campaign(db, "nope", "brand-1")) is None
+    other_brand = {"brand_id": "someone-else", "user_id": "user-2"}
+    fetch = AsyncMock(return_value=SCHEDULE)
+    with patch("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter.fetch_adgroup_schedule", fetch):
+        with pytest.raises(HTTPException) as e:
+            _run(jane_router.extend_quote("tt1", days=2, db=db, brand_ctx=other_brand))
+    assert e.value.status_code == 404
+    assert fetch.await_count == 0
 
 
 def test_a_challenge_rebuild_stays_on_tiktok_and_meta_stays_with_jane():

@@ -20,7 +20,8 @@ from app.agents.content_calendar_v2.services.content_calendar_v2_service import 
 
 USER_ID = "user-1"
 BRAND_ID = "brand-1"
-NOW = datetime(2026, 10, 22, 12, 0)
+# Relative to the real clock: the function filters on datetime.utcnow(), so fixed dates go stale.
+NOW = datetime.utcnow()
 
 
 def run(coro):

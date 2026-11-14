@@ -163,8 +163,8 @@ class TestImageModelSelection:
 
         assert captured.get("model") == "openai/gpt-image-2"
 
-    def test_with_reference_uses_gpt_image_1_edit_path(self):
-        """With reference_image, image_model is None so _call_dalle_api uses gpt-image-1 edit."""
+    def test_with_reference_uses_gpt_image_2_with_the_reference(self):
+        """GPT-Image-2 is the only image model (also with a reference image); the reference is passed through."""
         from app.agents.social_media_manager.services import image_content_service
 
         captured = {}
@@ -189,10 +189,7 @@ class TestImageModelSelection:
                 )
             )
 
-        assert captured.get("model") is None, (
-            "image_model must be None when reference_image is provided so the "
-            "gpt-image-1 edit path is taken in _call_dalle_api"
-        )
+        assert captured.get("model") == "openai/gpt-image-2"
         assert captured.get("reference_image") == "https://res.cloudinary.com/test/desk.jpg"
 
 

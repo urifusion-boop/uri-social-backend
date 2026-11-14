@@ -90,7 +90,7 @@ class TestBuildDocument:
         assert product_layers[0]["url"] == PRODUCT_URL
 
     def test_product_zone_stays_within_the_55_to_60_percent_band(self):
-        for quote in ("Fast delivery, great quality", "a" * 5, "This cream cleared up my dry patches and the packaging looks so premium for the price"):
+        for quote in ("Fast delivery, great quality", "a" * 5, "This cream cleared up my dry patches and looks so premium for the price"):
             doc = build_document(PRODUCT_URL, quote, "Chidi O.", star_rating=5, brand_logo_url=PRODUCT_URL)
             product = next(l for l in doc["layers"] if l["type"] == "composited_product")
             height = doc["canvas"]["height"]
@@ -102,7 +102,7 @@ class TestBuildDocument:
         quote's wrapped attribution line collide with the logo."""
         doc = build_document(
             PRODUCT_URL,
-            "This cream cleared up my dry patches and the packaging looks so premium for the price",
+            "This cream cleared up my dry patches and looks so premium for the price",
             "Ngozi A.",
             star_rating=5,
             brand_logo_url=PRODUCT_URL,
