@@ -28,6 +28,7 @@ from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
 from app.routers.notification_channels_router import router as notification_channels_router
 from app.routers.bug_report_router import router as bug_report_router
+from app.routers.public_forms_router import router as public_forms_router
 from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
@@ -85,6 +86,15 @@ async def startup_event():
         print("✅ Unique sdk_gateway_developer_id index ensured on users collection")
     except Exception as e:
         print(f"⚠️  Warning: Failed to create sdk_gateway_developer_id index: {e}")
+
+    # One waitlist row per email, even if two signups race.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["api_waitlist"].create_index("email", unique=True)
+        print("✅ Unique email index ensured on api_waitlist collection")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create api_waitlist email index: {e}")
 
     # Migrate social_connections index: old (user_id, platform, page_id) prevented the same
     # user from connecting the same platform to multiple agency brands. Replace with
@@ -323,6 +333,9 @@ app.include_router(
     prefix="/social-media",
     tags=["Bug Reports"],
 )
+
+# Public marketing-site forms (contact + API waitlist) — no login required
+app.include_router(public_forms_router)
 
 # Include additional social platform routers
 from app.agents.inbox.router import router as inbox_router

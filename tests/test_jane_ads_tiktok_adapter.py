@@ -1260,3 +1260,19 @@ def test_meta_style_interest_names_find_their_tiktok_category():
     assert pick("E-commerce (retail)") == "3"
     assert pick("Entrepreneurship (business and finance)") == "4"
     assert pick("Leadership (social concept)") is None
+
+
+def test_a_category_that_qualifies_the_shared_word_differently_is_not_a_match():
+    # Live 2026-11-12: "Children's clothing" put "Men's Clothing" on a tutoring ad for sharing the word "clothing".
+    from app.agents.jane_ads.adapters.tiktok import _best_tiktok_interest
+    cats = [
+        {"interest_category_id": "1", "interest_category_name": "Men's Clothing", "level": 2},
+        {"interest_category_id": "2", "interest_category_name": "Women's Clothing", "level": 2},
+        {"interest_category_id": "3", "interest_category_name": "Clothing", "level": 1},
+        {"interest_category_id": "4", "interest_category_name": "Science & Technology", "level": 1},
+    ]
+    pick = lambda n: (_best_tiktok_interest(n, cats) or {}).get("interest_category_id")
+    assert pick("Children's clothing (clothing)") == "3"            # the plain category still fits
+    assert pick("Technology (computers and electronics)") == "4"    # a "X & Y" list category is still fine
+    assert _best_tiktok_interest("Children's clothing", cats[:2]) is None   # only men's / women's: no match at all
+    assert pick("Men's clothing") == "1"

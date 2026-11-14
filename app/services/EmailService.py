@@ -144,6 +144,7 @@ class EmailService:
         to_email: str,
         subject: str,
         html_body: str,
+        reply_to: Optional[str] = None,
     ) -> bool:
         """Send an email with pre-rendered HTML body."""
         if not self.is_configured:
@@ -154,6 +155,8 @@ class EmailService:
         msg["From"] = f"{settings.SMTP_FROM_NAME} <{settings.SMTP_FROM_EMAIL}>"
         msg["To"] = to_email
         msg["Subject"] = subject
+        if reply_to:
+            msg["Reply-To"] = reply_to
         msg.attach(MIMEText(html_body, "html"))
 
         last_error = None
