@@ -17,6 +17,7 @@ Adds the following fields with defaults:
 Run this script once to migrate all existing users.
 """
 
+import os
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
@@ -24,7 +25,7 @@ from datetime import datetime
 
 async def migrate_users():
     # Connect to production database
-    client = AsyncIOMotorClient("mongodb://urifusion:***REMOVED***%21@REMOVED_HOST:27018/?authSource=admin")
+    client = AsyncIOMotorClient(os.environ["MONGODB_URI"])  # never hard-code a connection string
     db = client["Uri_Insight"]
 
     print("=" * 80)
