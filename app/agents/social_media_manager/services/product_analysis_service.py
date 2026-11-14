@@ -13,6 +13,29 @@ import asyncio
 from typing import Dict, Any, Optional
 
 
+def _g(d: Dict[str, Any], key: str, default: Any) -> Any:
+    """dict.get(key, default), except an explicit JSON null for `key` also falls
+    back to `default` — dict.get()'s own default only covers a MISSING key, not
+    a key present with value None. The vision model routinely returns explicit
+    null for fields that don't apply (e.g. logo_description when a label has no
+    logo) rather than omitting the key, and every such null used to flow straight
+    into build_preservation_block's f-strings as the literal text "None" —
+    tripping image_content_service.py's "Prompt contains null values" safety
+    check and aborting generation outright. Confirmed live: this is exactly what
+    started happening the moment the forensic analysis call itself was fixed
+    (see AIService.build_ai_model's max_tokens bug) and product_spec started
+    carrying real, model-produced data for the first time instead of always
+    hitting the except-block default."""
+    value = d.get(key, default)
+    if value is None:
+        return default
+    # Vision models routinely write the literal string "null"/"none" instead of
+    # a real JSON null for an inapplicable field — same failure mode, same fix.
+    if isinstance(value, str) and value.strip().lower() in ("null", "none"):
+        return default
+    return value
+
+
 class ProductAnalysisService:
     """
     Forensic product analysis using GPT-4o-mini vision.

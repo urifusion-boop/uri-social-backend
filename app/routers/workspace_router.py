@@ -9,8 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.models.workspace import (
     Workspace,
     CreateWorkspaceRequest,
@@ -30,7 +29,7 @@ router = APIRouter(prefix="/social-media/workspaces", tags=["Workspaces"])
 async def create_workspace(
     client_id: str = Query(..., description="Client ID to create workspace under"),
     request: CreateWorkspaceRequest = ...,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -56,7 +55,7 @@ async def create_workspace(
     # Check if user has permission to create workspace
     # For now, only client owner can create workspaces
     # TODO: Allow workspace admins to create workspaces if client allows
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the client owner can create workspaces"
@@ -74,7 +73,7 @@ async def create_workspace(
     workspace = await WorkspaceService.create_workspace(
         request=request,
         client_id=client_id,
-        creator_user_id=token["userId"],
+        creator_user_id=auth["user_id"],
         db=db
     )
 
@@ -106,7 +105,7 @@ async def create_workspace(
 @router.get("/{workspace_id}")
 async def get_workspace(
     workspace_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -127,7 +126,7 @@ async def get_workspace(
     # Check if user is a member
     member = await WorkspaceService.get_member(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         db=db
     )
 
@@ -152,7 +151,7 @@ async def get_workspace(
 @router.get("/")
 async def list_workspaces(
     client_id: Optional[str] = Query(None, description="Filter by client ID"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -176,7 +175,7 @@ async def list_workspaces(
             )
 
         # Check if user is client owner
-        if client.owner_user_id != token["userId"]:
+        if client.owner_user_id != auth["user_id"]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have access to this client's workspaces"
@@ -198,7 +197,7 @@ async def list_workspaces(
     else:
         # List all workspaces user is a member of
         workspaces_with_role = await WorkspaceService.get_workspaces_for_user(
-            user_id=token["userId"],
+            user_id=auth["user_id"],
             db=db
         )
 
@@ -220,7 +219,7 @@ async def list_workspaces(
 async def update_workspace(
     workspace_id: str,
     request: UpdateWorkspaceRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -241,7 +240,7 @@ async def update_workspace(
     # Check permissions
     has_permission = await WorkspaceService.check_permission(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         permission="can_edit_workspace_settings",
         db=db
     )
@@ -274,7 +273,7 @@ async def update_workspace(
 @router.post("/{workspace_id}/archive")
 async def archive_workspace(
     workspace_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -294,11 +293,11 @@ async def archive_workspace(
         )
 
     # Check if user is owner
-    member = await WorkspaceService.get_member(workspace_id, token["userId"], db)
+    member = await WorkspaceService.get_member(workspace_id, auth["user_id"], db)
     if not member or member.role != WorkspaceRole.OWNER:
         # Also check if user is client owner
         client = await ClientService.get_client_by_id(workspace.client_id, db)
-        if not client or client.owner_user_id != token["userId"]:
+        if not client or client.owner_user_id != auth["user_id"]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only workspace owner or client owner can archive workspace"
@@ -318,7 +317,7 @@ async def archive_workspace(
 @router.post("/{workspace_id}/unarchive")
 async def unarchive_workspace(
     workspace_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -336,10 +335,10 @@ async def unarchive_workspace(
         )
 
     # Check permissions (same as archive)
-    member = await WorkspaceService.get_member(workspace_id, token["userId"], db)
+    member = await WorkspaceService.get_member(workspace_id, auth["user_id"], db)
     if not member or member.role != WorkspaceRole.OWNER:
         client = await ClientService.get_client_by_id(workspace.client_id, db)
-        if not client or client.owner_user_id != token["userId"]:
+        if not client or client.owner_user_id != auth["user_id"]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only workspace owner or client owner can unarchive workspace"
@@ -360,7 +359,7 @@ async def unarchive_workspace(
 async def delete_workspace(
     workspace_id: str,
     hard_delete: bool = Query(False, description="Permanently delete (cannot be undone)"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -386,10 +385,10 @@ async def delete_workspace(
         )
 
     # Check permissions
-    member = await WorkspaceService.get_member(workspace_id, token["userId"], db)
+    member = await WorkspaceService.get_member(workspace_id, auth["user_id"], db)
     if not member or member.role != WorkspaceRole.OWNER:
         client = await ClientService.get_client_by_id(workspace.client_id, db)
-        if not client or client.owner_user_id != token["userId"]:
+        if not client or client.owner_user_id != auth["user_id"]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only workspace owner or client owner can delete workspace"
@@ -411,7 +410,7 @@ async def delete_workspace(
 async def list_workspace_members(
     workspace_id: str,
     include_inactive: bool = Query(False, description="Include suspended/removed members"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -425,7 +424,7 @@ async def list_workspace_members(
     For detailed member info, use the workspace-members endpoints.
     """
     # Check if user is a member
-    member = await WorkspaceService.get_member(workspace_id, token["userId"], db)
+    member = await WorkspaceService.get_member(workspace_id, auth["user_id"], db)
     if not member or member.status != "active":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -461,7 +460,7 @@ async def list_workspace_members(
 @router.get("/{workspace_id}/usage")
 async def get_workspace_usage(
     workspace_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -478,7 +477,7 @@ async def get_workspace_usage(
     - Member activity
     """
     # Check if user is a member
-    member = await WorkspaceService.get_member(workspace_id, token["userId"], db)
+    member = await WorkspaceService.get_member(workspace_id, auth["user_id"], db)
     if not member or member.status != "active":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

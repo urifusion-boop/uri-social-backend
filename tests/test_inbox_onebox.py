@@ -276,3 +276,27 @@ def test_a_onebox_payment_activates_the_workspaces_plan_once(monkeypatch):
     s = sub(db)
     assert s["plan_id"] == "growth" and s["allowance"] == 1000 and s["status"] == "active"
     assert run(db["payment_transactions"].find_one({"transaction_ref": "URI_OBX_1"}))["status"] == "completed"
+
+
+def test_usage_still_loads_when_the_new_trial_row_cannot_be_read_back():
+    db = make_db()
+
+    class Lagging:
+        """Reads of subscriptions come back empty, as when a read lands before the write."""
+        def __init__(self, real):
+            self.real = real
+
+        def __getitem__(self, name):
+            coll = self.real[name]
+            if name != onebox.SUBSCRIPTIONS:
+                return coll
+
+            class Coll:
+                insert_one = staticmethod(coll.insert_one)
+
+                async def find_one(self, *a, **k):
+                    return None
+            return Coll()
+
+    out = run(onebox.usage(Lagging(db), "fresh-ws"))
+    assert out["plan_id"] == "trial" and out["allowance"] > 0 and out["used"] == 0

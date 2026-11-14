@@ -606,19 +606,22 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
 
 async def write_shoot_script(business_name: str, category: str, goal: str,
                              video_recommendation_reason: str, description: str = "",
-                             brand_context: Optional[dict] = None, filmed_by: str = "") -> ShootScript:
+                             brand_context: Optional[dict] = None, filmed_by: str = "",
+                             platform: str = "meta") -> ShootScript:
     """Path C (PRD §4.1): when a video was recommended over the (photo-only)
     AI generator, write a short, phone-filmable shoot script instead — no crew or
     equipment assumed. The business owner films it themselves; the footage is
     uploaded via the existing upload path and swapped into the pending plan via
     POST /meta/plan/{plan_id}/creative. Never raises — an empty script just means
-    the user films freely instead."""
+    the user films freely instead. `platform` ("meta" | "tiktok", default "meta") only
+    changes which platform the script says the ad is for."""
     if not settings.jane_ads_openai_key:
         return ShootScript()
     bc = brand_context or {}
     brand_bits = _brand_copy_bits(bc)
     prompt = (
-        f"Write a short phone-filmable shoot script for a Meta/Instagram ad for "
+        f"Write a short phone-filmable shoot script for a "
+        f"{'TikTok' if platform == 'tiktok' else 'Meta/Instagram'} ad for "
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
         f"{category or 'local business'}) whose goal is {goal}. Why video: "
         f"{video_recommendation_reason}.{(' ' + brand_bits) if brand_bits else ''}\n"

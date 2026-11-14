@@ -4640,6 +4640,57 @@ class PlanLaunchBody(BaseModel):
     allow_out_of_area: bool = False
 
 
+# A launch normally finishes in seconds-to-minutes. A claim this old means the request
+# that held it never finished (the server restarted mid-launch) — nothing will ever
+# release it, and the plan would refuse every launch forever ("already being launched").
+_STALE_LAUNCH_AFTER = 20 * 60
+
+
+async def _release_if_stale_launch(db, doc: dict) -> dict:
+    """Give an abandoned "launching" plan back to "pending" so it can be launched again.
+    Platforms create the campaign switched off and only switch it on as the last step,
+    and the wallet is charged only after success — so an interrupted launch has spent
+    nothing and left nothing running."""
+    from datetime import datetime, timezone
+    from . import launch_governance as gov
+    if doc.get("status") != "launching":
+        return doc
+    started = doc.get("launching_at")
+    if started is None:
+        return doc
+    if getattr(started, "tzinfo", None) is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - started).total_seconds() < _STALE_LAUNCH_AFTER:
+        return doc
+    print(f"[Launch] plan {doc.get('plan_id')} stuck launching since {started.isoformat()} — released", flush=True)
+    await gov.release(db, doc["plan_id"], "system",
+                      "The previous launch was interrupted before it finished — nothing was charged.")
+    return await db["jane_ads_pending_plans"].find_one({"plan_id": doc["plan_id"]}) or doc
+
+
+@router.get("/meta/plan/{plan_id}/status")
+async def meta_plan_status(
+    plan_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Where a plan's launch stands, for the page to follow along. A video launch can
+    outlast the browser's connection (the TikTok video is re-encoded first), so the page
+    can't rely on the launch request's own answer — it asks here instead of telling the
+    person it failed, or "already launched", when it actually went through."""
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    doc = await _release_if_stale_launch(db, doc)
+    platforms = ((doc.get("plan") or {}).get("platforms") or [{}])
+    return {
+        "status": doc.get("status"),
+        "campaign_id": doc.get("campaign_id") or "",
+        "platform": (platforms[0] or {}).get("platform") or "",
+        "last_launch_error": doc.get("last_launch_error") or "",
+    }
+
+
 @router.post("/meta/plan/{plan_id}/launch")
 async def meta_launch_plan(
     plan_id: str,
@@ -4661,6 +4712,7 @@ async def meta_launch_plan(
     doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
     if not doc or doc.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Plan not found")
+    doc = await _release_if_stale_launch(db, doc)
     if doc["status"] == "launching":
         raise HTTPException(status_code=409, detail="This plan is already being launched — give it a moment, then refresh.")
     if doc["status"] != "pending":
@@ -5051,6 +5103,7 @@ async def _load_pending_plan(db, plan_id: str, brand_id: str) -> dict:
     doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
     if not doc or doc.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Plan not found")
+    doc = await _release_if_stale_launch(db, doc)
     if doc.get("status") != "pending":
         raise HTTPException(
             status_code=409,
@@ -5322,11 +5375,78 @@ async def meta_plan_ask(
         await _log("challenge", rebuilt.plan.explanation)
         return preview
 
+    if intent.kind == "edit_ad":
+        return await _ask_edit_ad(plan_id, doc, plan, req, intent, body.question, db, brand_ctx, _log)
+
     # "new_campaign" — never silently act on it as a correction to THIS plan.
     answer = ("That sounds like a new campaign rather than something about this one — "
              "describe it to Jane fresh and I'll plan it separately.")
     await _log("new_campaign", answer)
     return {"kind": "new_campaign", "answer": answer}
+
+
+async def _ask_edit_ad(plan_id: str, doc: dict, plan: CampaignPlan, req: CampaignRequest, intent,
+                       question: str, db, brand_ctx: dict, log) -> dict:
+    """"Make ad 2's headline shorter", typed into Ask. Live-caught: Ask only answered
+    questions, and a plain "change the second ad headline to …" was told it "sounds like
+    a new campaign". The change goes through the SAME endpoints the Edit words button
+    uses, so it answers to the same checks (headline length, ad policy) and is saved
+    exactly as a hand edit would be."""
+    from .plan_defence import NlUnavailableError, rewrite_ad_words
+
+    async def _say(answer: str, **extra) -> dict:
+        await log("edit_ad", answer)
+        return {"kind": "edit_ad", "answer": answer, **extra}
+
+    if doc.get("status") != "pending":
+        return await _say("This campaign has already gone out, so its ads can't be changed here.")
+    if plan.creative is None:
+        return await _say("This plan has no ad to change yet.")
+    total = 1 + len(plan.concepts)
+    n = intent.ad_number or (1 if total == 1 else None)
+    if n is None:
+        return await _say(f"Which ad should I change — {', '.join(str(i) for i in range(1, total))} or {total}? "
+                          "Say it like “make ad 2's headline shorter”.")
+    if n > total:
+        return await _say(f"This plan has {total} ad{'s' if total != 1 else ''} — which one did you mean?")
+
+    current = plan.creative if n == 1 else plan.concepts[n - 2]
+    cur_headline, cur_text = current.headline or "", current.primary_text or ""
+    if intent.new_text and intent.ad_field in ("headline", "caption"):
+        headline = intent.new_text if intent.ad_field == "headline" else cur_headline
+        text = intent.new_text if intent.ad_field == "caption" else cur_text
+    else:
+        try:
+            headline, text = await rewrite_ad_words(
+                cur_headline, cur_text, intent.instruction or question, intent.ad_field,
+                business=req.business_name)
+        except NlUnavailableError:
+            raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+
+    try:
+        if n == 1:
+            res = await meta_plan_edit_fields(
+                plan_id, PlanFieldsBody(edits={"headline": headline, "caption": text}), db, brand_ctx)
+            if res.get("rejected"):
+                reasons = res["rejected"]
+                reason = (next(iter(reasons.values())) if isinstance(reasons, dict)
+                          else (reasons[0].get("reason") if reasons and isinstance(reasons[0], dict) else str(reasons[0])))
+                return await _say(f"I couldn't make that change: {reason}")
+            updated = {"creative": res.get("creative"), "fields": res.get("fields")}
+        else:
+            res = await meta_plan_edit_ad(
+                plan_id, n - 2, PlanAdEditBody(headline=headline, primary_text=text), db, brand_ctx)
+            updated = {"concepts": res.get("concepts")}
+    except HTTPException as e:
+        return await _say(f"I couldn't make that change: {e.detail}")
+
+    changed = []
+    if headline != cur_headline:
+        changed.append(f"headline now reads “{headline}”")
+    if text != cur_text:
+        changed.append("caption is rewritten" if headline != cur_headline else f"caption now reads “{text}”")
+    what = " and its ".join(changed) if changed else "words are unchanged — that's already how it reads"
+    return await _say(f"Done — ad {n}'s {what}.", ad_number=n, **updated)
 
 
 @router.get("/meta/campaigns")
@@ -5373,10 +5493,9 @@ async def meta_campaigns(
     google_adapter = (google_flow.GoogleCampaigns(db)
                       if with_metrics and google_records and google_flow.configured() else None)
 
-    out = []
     google_own = (await google_flow.get_mode(db, brand_id)) == "own"
-    for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
-                             + [("google", r) for r in google_records]):
+
+    async def _row(platform_name, r):
         is_tiktok = platform_name == "tiktok"
         is_google = platform_name == "google"
         collection = (google_flow.GOOGLE_CAMPAIGNS if is_google
@@ -5448,7 +5567,7 @@ async def meta_campaigns(
                 # on; everything else (paused/active/in review/etc.) still renders.
                 if summary["delivery"] == "Deleted":
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
-                    continue
+                    return None
                 row["status"] = summary["delivery"].lower()
                 if is_google:
                     row["serving_note"] = google_flow.serving_note(summary)
@@ -5500,7 +5619,26 @@ async def meta_campaigns(
                     # Don't fall back to "paused": that hid a campaign that was running.
                     row["status"] = "status unavailable"
                     row["serving_note"] = "Couldn't reach Google to check this campaign. Press Refresh in a minute."
-        out.append(row)
+        return row
+
+    # Every campaign's live numbers used to be fetched one after another, so the page
+    # took as long as the brand's whole campaign history. Fetch them concurrently
+    # (bounded, to stay well inside Meta/TikTok/Google rate limits); order and per-row
+    # behaviour are unchanged.
+    import asyncio
+
+    _sem = asyncio.Semaphore(8)
+
+    async def _bounded(platform_name, r):
+        async with _sem:
+            return await _row(platform_name, r)
+
+    rows = await asyncio.gather(*[
+        _bounded(platform_name, r)
+        for platform_name, r in ([("meta", r) for r in meta_records] + [("tiktok", r) for r in tiktok_records]
+                                 + [("google", r) for r in google_records])
+    ])
+    out = [row for row in rows if row is not None]
 
     out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
     return {"campaigns": out}
@@ -7264,159 +7402,6 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
-@router.get("/debug/vsg01-news-headline-prompt", include_in_schema=False)
-async def _debug_vsg01_news_headline_prompt(
-    request: Request,
-    business_name: str = "Test Business",
-    category: str = "",
-    description: str = "",
-    brand_colors: str = "",
-) -> dict:
-    """TEMPORARY — returns the EXACT, real final prompt News Headline would
-    send to gpt-image-2 for a given brief, using a REAL content-model call
-    for announcement_subject (not a hand-picked example) — so it can be
-    handed to the user for a genuine side-by-side GPT comparison, same
-    rigor as the prompt already given earlier this session. Does NOT call
-    the image model itself (cheap/fast — just the content step + prompt
-    assembly). brand_colors: comma-separated hex, optional. Same secret-
-    gated pattern as this session's other diagnostics; remove after use."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-    from .vsg01_orchestrator import _content_news_headline, _CANVAS_SIZE
-    from .ad_formats.news_headline import _scene_prompt
-    from .layer2_generation import COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE, GLOBAL_NEGATIVE_PROMPT, _resolve_ratio_clause, brand_palette_clause
-
-    content = await _content_news_headline(business_name, category, description)
-    if not content:
-        return {"success": False, "error": "content model returned nothing usable for this description"}
-
-    brand_context = {"brand_colors": [c.strip() for c in brand_colors.split(",") if c.strip()]} if brand_colors else None
-    scene = _scene_prompt(content["announcement_subject"], content["nigerian_setting"])
-    width, height = _CANVAS_SIZE
-    ratio_clause = _resolve_ratio_clause(f"{width}x{height}")
-    palette_clause = brand_palette_clause(brand_context)
-    fixed_suffix = (
-        f" {ratio_clause}"
-        f"{' ' + palette_clause if palette_clause else ''}"
-        f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
-    )
-    return {
-        "success": True,
-        "content": content,
-        "full_prompt": f"{scene.strip()}{fixed_suffix}",
-    }
-
-
-@router.get("/debug/vsg01-select-trace", include_in_schema=False)
-async def _debug_vsg01_select_trace(
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    business_name: str = "Test Business",
-    category: str = "",
-    description: str = "",
-    forced_format_id: str = "",
-    render: bool = False,
-    brand_colors: str = "",
-) -> dict:
-    """TEMPORARY — trace exactly what select_ranked_ad_formats/
-    select_and_render_vsg01_creative do for a given description + optional
-    forced_format_id, WITHOUT going through the frontend's multi-step chat
-    state. render=true additionally does a REAL render via
-    select_and_render_vsg01_creative (the exact function the real chat flow
-    calls) and returns the image URL, to inspect the raw generated asset
-    directly — e.g. a live report that the photo itself has a large empty
-    gap the fixed scene-prompt wording was supposed to prevent. Same
-    secret-gated pattern as this session's other diagnostics; remove after
-    use."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-    from .vsg01_orchestrator import (
-        VSG01_ISOLATED_AD_ACCOUNT, NO_PHOTO_FORMAT_IDS, select_and_render_vsg01_creative,
-        select_ranked_ad_formats,
-    )
-    ranked = await select_ranked_ad_formats(
-        db, isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT,
-        candidate_ids=NO_PHOTO_FORMAT_IDS, description=description,
-    )
-    result = {
-        "ranked_ids_in_order": [s.strategy_id for s in ranked],
-        "forced_format_id_would_be_honored": forced_format_id in {s.strategy_id for s in ranked} if forced_format_id else None,
-    }
-    if render:
-        import time
-        import traceback
-        from .creative import _upload_bytes_to_cloudinary
-        try:
-            brand_context = (
-                {"brand_colors": [c.strip() for c in brand_colors.split(",") if c.strip()]}
-                if brand_colors else None
-            )
-            vsg01_result = await select_and_render_vsg01_creative(
-                db, business_name, category, description,
-                brand_context=brand_context, forced_format_id=forced_format_id or None,
-            )
-            if vsg01_result is None:
-                result["render"] = {"success": False, "error": "select_and_render_vsg01_creative returned None"}
-            else:
-                image_url = await _upload_bytes_to_cloudinary(
-                    vsg01_result["png_bytes"], f"vsg01-trace-{int(time.time())}",
-                )
-                result["render"] = {"success": True, "format_id": vsg01_result["format_id"], "image_url": image_url}
-        except Exception as e:
-            result["render"] = {"success": False, "error": str(e), "traceback": traceback.format_exc()}
-    return result
-
-
-@router.get("/debug/organic-prompt-sample", include_in_schema=False)
-async def _debug_organic_prompt_sample(request: Request, style: str = "afro_glam") -> dict:
-    """TEMPORARY — call the EXISTING organic-content image-brief generator
-    (image_content_service.py's _generate_image_brief, the system already
-    used for regular social posts) with a realistic Nigerian brand context,
-    to produce one REAL example prompt for direct side-by-side comparison
-    against a VSG-01 ad prompt — same request that produced the VSG-01
-    sample, now asking to see the organic system's equivalent output
-    rather than a description of how it works. Same secret-gated pattern
-    as this session's other diagnostics; remove after use."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-    from app.agents.social_media_manager.services.image_content_service import ImageContentService
-    from app.agents.social_media_manager.services.style_library import STYLES
-
-    style_entry = STYLES.get(style)
-    if style_entry is None:
-        return {"success": False, "error": f"unknown style {style!r}", "available": list(STYLES.keys())}
-
-    brand_context = {
-        "brand_name": "Naija Glow Cosmetics",
-        "industry": "beauty_wellness",
-        "tagline": "Glow that speaks your language",
-        "business_description": "We make natural, locally-sourced skincare and haircare for Nigerian skin and climate.",
-        "key_products_services": ["shea butter body cream", "black soap", "herbal hair pomade"],
-        "brand_colors": ["#CD1B78", "#F5A623", "#1A1A1A"],
-        "brand_voice": "warm, confident, proudly Nigerian",
-        "target_audience": "young Nigerian women aged 20-35 who care about natural beauty",
-        "ideal_customer_profile": "a Lagos professional who wants effective skincare rooted in local ingredients",
-        "audience_age_range": "20-35",
-        "primary_goal": "build a loyal, proud local beauty brand",
-        "region": "Lagos, Nigeria",
-    }
-    try:
-        result = await ImageContentService._generate_image_brief(
-            content="We're opening a new branch in Yaba on 1 October, tell people about it",
-            seed_content="new branch opening announcement",
-            platform="instagram",
-            brand_context=brand_context,
-            specs={"format": "square"},
-            style_fragment=style_entry["prompt_fragment"],
-        )
-        if result is None:
-            return {"success": False, "error": "_generate_image_brief returned None — check server logs"}
-        return {"success": True, "style_used": style_entry["name"], **result}
-    except Exception as e:
-        import traceback
-        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
-
-
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
@@ -7552,3 +7537,64 @@ $("go").onclick = async () => {
   }
 };
 </script></main></body></html>"""
+
+
+@router.post("/admin/seed-vsg01-corpus", include_in_schema=False)
+async def _admin_seed_vsg01_corpus(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """ONE-OFF PRODUCTION BOOTSTRAP — mirrors migrations/seed_and_approve_vsg01_corpus.py
+    exactly, but runs inside the deployed app (using the same get_db_dependency every
+    real request uses) instead of needing direct network access to the DocumentDB
+    cluster, which is VPC-private and unreachable from outside. Idempotent — safe to
+    call more than once: records already ingested are left alone, and only records
+    not yet approved get approved.
+
+    Gated by _require_ads_admin — a real authenticated caller whose own JWT email is
+    on JANE_ADS_ADMIN_EMAILS, the same allowlist the billing report above already
+    uses — not a shared static secret. approved_by is the caller's own verified
+    email (corpus.py's own rule: ingestion can never self-approve; this way it can
+    never be spoofed to a placeholder). Remove this endpoint once the corpus is
+    confirmed seeded and approved in prod."""
+    _require_ads_admin(token)
+    approved_by = ((token.get("claims", {}) or {}).get("email") or "").lower()
+
+    from .entities import StrategyStatus
+    from .store import MongoStrategyStore
+    from .vsg01_corpus_seed import build_vsg01_strategies
+
+    store = MongoStrategyStore(db)
+    await store.ensure_indexes()
+
+    strategies = build_vsg01_strategies()
+    to_ingest, to_approve, already_approved = [], [], []
+    for s in strategies:
+        existing = await store.get(s.strategy_id, s.version)
+        if existing is None:
+            to_ingest.append(s)
+            to_approve.append(s)
+        elif existing.status is StrategyStatus.APPROVED:
+            already_approved.append(s.strategy_id)
+        else:
+            to_approve.append(s)
+
+    for s in to_ingest:
+        await store.ingest(s)
+    for s in to_approve:
+        await store.approve(s.strategy_id, s.version, approved_by=approved_by)
+
+    approved = await store.fetch_approved()
+    vsg01_ids = {s.strategy_id for s in strategies}
+    live = sorted(r.strategy_id for r in approved if r.strategy_id in vsg01_ids)
+
+    return {
+        "success": True,
+        "approved_by": approved_by,
+        "newly_ingested": [s.strategy_id for s in to_ingest],
+        "newly_approved": [s.strategy_id for s in to_approve],
+        "already_approved_before_this_call": already_approved,
+        "total_live_now": len(live),
+        "total_expected": len(strategies),
+        "live_strategy_ids": live,
+    }

@@ -96,7 +96,7 @@ class APIKey(BaseModel):
     user_id: str = Field(..., description="User ID who owns this API key")
 
     # API Key details
-    key_prefix: str = Field(..., description="First 8 chars of key for display (e.g., 'uri_sk_abcd1234')")
+    key_prefix: str = Field(..., description="First 8 chars of key for display (e.g., 'urisocial_abcd1234')")
     key_hash: str = Field(..., description="SHA256 hash of the full API key")
 
     name: str = Field(..., max_length=100, description="Human-readable name for the key")
@@ -115,7 +115,7 @@ class APIKey(BaseModel):
     status: str = Field(default="active", pattern="^(active|revoked|expired)$")
 
     # Metadata
-    environment: str = Field(default="production", pattern="^(production|development|staging)$")
+    environment: str = Field(default="production", pattern="^(production|development|staging|testing)$")
     allowed_ips: Optional[List[str]] = Field(None, description="Whitelist of allowed IP addresses")
     allowed_origins: Optional[List[str]] = Field(None, description="Whitelist of allowed CORS origins")
 
@@ -138,10 +138,10 @@ class APIKey(BaseModel):
     def generate_api_key() -> str:
         """
         Generate a secure API key
-        Format: uri_sk_<32 random chars>
+        Format: urisocial_<32 random chars>
         """
         random_part = secrets.token_urlsafe(24)  # 32 chars after base64 encoding
-        return f"uri_sk_{random_part}"
+        return f"urisocial_{random_part}"
 
     @staticmethod
     def hash_api_key(api_key: str) -> str:
@@ -155,15 +155,15 @@ class APIKey(BaseModel):
 
     def has_scope(self, required_scope: str) -> bool:
         """Check if API key has the required scope"""
-        # Admin has all permissions
-        if APIKeyScope.ADMIN_ALL in self.scopes:
+        # Admin has all permissions (support both admin:all and admin:* from SDK Gateway)
+        if APIKeyScope.ADMIN_ALL in self.scopes or "admin:*" in self.scopes:
             return True
 
         return required_scope in self.scopes
 
     def has_any_scope(self, required_scopes: List[str]) -> bool:
         """Check if API key has any of the required scopes"""
-        if APIKeyScope.ADMIN_ALL in self.scopes:
+        if APIKeyScope.ADMIN_ALL in self.scopes or "admin:*" in self.scopes:
             return True
 
         return any(scope in self.scopes for scope in required_scopes)
@@ -233,7 +233,7 @@ class CreateAPIKeyRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
     scopes: Optional[List[str]] = None
-    environment: str = Field(default="production", pattern="^(production|development|staging)$")
+    environment: str = Field(default="production", pattern="^(production|development|staging|testing)$")
     expires_in_days: Optional[int] = Field(None, ge=1, le=3650, description="Expiration in days (max 10 years)")
     rate_limit_requests_per_hour: Optional[int] = Field(None, ge=1, le=10000)
 

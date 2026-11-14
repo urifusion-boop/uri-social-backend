@@ -13,8 +13,10 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency, get_active_brand_context
+from app.dependencies import get_db_dependency, get_active_brand_context, flexible_auth, get_flexible_brand_context
 from app.core.auth_bearer import JWTBearer
+from app.middleware.api_key_auth import verify_api_key
+from app.models.api_key import APIKey
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
 
@@ -29,6 +31,16 @@ from ..services.meta_oauth import build_authorize_url as build_meta_authorize_ur
 from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
+
+
+async def flexible_token(auth: dict = Depends(flexible_auth)) -> dict:
+    """Accept a dashboard JWT OR an SDK API key (as prod does on every route here),
+    returning the shape this router's code reads from a JWTBearer token: user_id at
+    the top level plus the JWT's "claims". An API key has no JWT, so its claims
+    carry just the userId."""
+    claims = dict(((auth.get("jwt_payload") or {}).get("claims") or {}))
+    claims.setdefault("userId", auth.get("user_id"))
+    return {**auth, "claims": claims}
 
 # Strong references to fire-and-forget background image-generation tasks, so they
 # aren't garbage-collected mid-flight (asyncio only weakly tracks pending tasks).
@@ -450,6 +462,22 @@ class BrandProfileRequest(BaseModel):
     canvas_editor_enabled: Optional[bool] = None
     use_v3_prompts: Optional[bool] = None
 
+
+def _report_sdk_credit_cost(response: Response, ctx: dict, credits: int = 1) -> None:
+    """
+    For gateway API-key-authenticated requests only: report the credit-equivalent
+    cost of this action via a response header, since real wallet deduction is
+    deliberately skipped for API-key auth on this branch (the SDK Gateway meters
+    and bills these developers instead — see the "skip for API key users" credit
+    blocks throughout this file). The SDK Gateway's proxy reads this header to
+    meter usage by actual cost instead of a flat per-request count.
+
+    No-ops entirely for JWT/dashboard requests (ctx["auth_type"] != "api_key") —
+    never touches their response.
+    """
+    if ctx.get("auth_type") == "api_key":
+        response.headers["X-URI-Credits-Consumed"] = str(credits)
+
 # ==============================================================================
 # CONTENT GENERATION ENDPOINTS
 # ==============================================================================
@@ -528,8 +556,9 @@ async def expand_video_prompt(
 async def generate_content(
     request: ContentGenerationRequest,
     background_tasks: BackgroundTasks,
+    response: Response,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Generate AI-powered social media content with optional images.
@@ -544,6 +573,9 @@ async def generate_content(
     """
     user_id = ctx["user_id"]
     active_brand_id = ctx["brand_id"]
+    # SDK (API key) requests are metered and billed by the SDK Gateway, not the
+    # per-user wallet — see _report_sdk_credit_cost. Same behaviour as prod.
+    auth_type = ctx.get("auth_type", "jwt")
 
     print(
         f"🖼️📥 [REF-IMG TRACE] incoming request: post_type={request.post_type!r} "
@@ -559,11 +591,44 @@ async def generate_content(
         from app.services.CreditService import credit_service
         from app.services.TrialService import trial_service
 
-        is_trial_user = await trial_service.has_active_trial(user_id)
+        # Carousels bill 1 credit per slide — computed up front so the checks below
+        # and the deduction after generation agree (prod's pre-check, kept).
+        _pre_post_type = request.post_type or "feed"
+        _pre_num_slides = max(2, min(10, request.num_slides or 3)) if _pre_post_type == "carousel" else 1
+        required_credits = _pre_num_slides if _pre_post_type == "carousel" else 1
 
-        if not is_trial_user:
-            # Paid user path — check subscription/bonus credits
-            has_credits = await credit_service.check_sufficient_credits(user_id)
+        is_trial_user = False
+        if auth_type != "api_key":
+            is_trial_user = await trial_service.has_active_trial(user_id)
+
+        if auth_type != "api_key" and is_trial_user and required_credits > 1:
+            # has_active_trial only confirms >0 trial credits. Without this, a carousel's
+            # generation (and its real OpenAI cost) would proceed and the later
+            # deduct_trial_credit(amount=...) would fail its sufficiency guard silently,
+            # leaving the content generated for free. Prod fix, kept.
+            trial_status = await trial_service.get_trial_status(user_id)
+            if trial_status.credits_remaining < required_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": (
+                            f"This {_pre_num_slides}-slide carousel needs {required_credits} credits, "
+                            f"but only {trial_status.credits_remaining} trial credits remain. "
+                            "Choose fewer slides or upgrade to continue."
+                        ),
+                        "responseData": {
+                            "credits_remaining": trial_status.credits_remaining,
+                            "credits_required": required_credits,
+                            "upgrade_url": "/pricing"
+                        }
+                    }
+                )
+
+        if auth_type != "api_key" and not is_trial_user:
+            # Paid user path — check subscription/bonus credits for the full cost
+            has_credits = await credit_service.check_sufficient_credits(user_id, required=required_credits)
             if not has_credits:
                 # PRD 8: "You've run out of credits. Upgrade to continue."
                 return JSONResponse(
@@ -584,6 +649,22 @@ async def generate_content(
         # agency brands use their own voice/colors, not the personal brand's.
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+
+        if not profile_data and auth_type == "api_key":
+            # API key (SDK) users: auto-create a minimal profile instead of blocking
+            minimal_profile_data = {
+                "brand_name": f"API User {user_id[:8]}",
+                "industry": "general_other",
+                "brand_colors": ["#C2185B", "#FFFEF2"],
+                "style_selections": ["lifestyle_natural"],
+                "region": "Global",
+                "onboarding_completed": True,
+                "created_via": "api_key_auto",
+            }
+            await BrandProfileService.save(user_id, minimal_profile_data, db, brand_id=active_brand_id)
+            print(f"✅ Auto-created minimal profile for API key user {user_id}")
+            profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+            profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
 
         if not profile_data:
             return UriResponse.error_response(
@@ -615,7 +696,8 @@ async def generate_content(
         # PROGRESSIVE ENFORCEMENT: Warn but allow generation with intelligent fallbacks
         if missing_fields:
             # Check if user acknowledged incomplete profile
-            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False)
+            # API key users auto-acknowledged (they use the SDK, not the frontend modal)
+            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False) or auth_type == "api_key"
 
             if not acknowledged:
                 # Return warning response for frontend modal
@@ -783,7 +865,10 @@ async def generate_content(
                 # Text-only posts (feed, story): 1 credit total
                 credits_to_deduct = 1
 
-            if request_id:
+            if auth_type == "api_key":
+                # No wallet deduction for SDK requests: report the cost to the gateway instead.
+                _report_sdk_credit_cost(response, ctx, credits=credits_to_deduct)
+            elif request_id:
                 if is_trial_user:
                     await trial_service.deduct_trial_credit(
                         user_id=user_id,
@@ -939,7 +1024,7 @@ async def regenerate_content(
     draft_id: str,
     feedback: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Regenerate content with optional feedback"""
     user_id = _get_user_id(token)
@@ -989,7 +1074,7 @@ async def upload_user_content(
     request: Dict[str, Any],
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Upload user-provided media (images/videos) and generate captions using brand playbook.
@@ -1620,7 +1705,7 @@ async def get_download_url(
 @router.post("/connect/initiate")
 async def initiate_social_connections(
     request: SocialConnectionRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Step 1 of the social connection flow (onboarding step 2).
@@ -1663,6 +1748,9 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings"), re
         "pages_messaging",
         "pages_manage_engagement",
         "pages_manage_metadata",
+        # Pages that live in a Business portfolio are left out of /me/accounts unless
+        # the token carries this — live-reported: 4 Pages on the account, only 3 offered.
+        "business_management",
     ]
     # Facebook never asks again for a permission the person once switched off, so a plain
     # reconnect comes back without it every time. rerequest asks for exactly those again.
@@ -1689,6 +1777,67 @@ async def declined_scopes(client, graph_base: str, token: str) -> list[str]:
         return [p["permission"] for p in r.json().get("data", []) if p.get("status") == "declined"]
     except Exception:
         return []
+
+
+_PAGE_FIELDS = "id,name,access_token,picture"
+
+
+async def _graph_list(client, url: str, params: dict, cap: int = 500) -> list[dict]:
+    """Every row of a Graph list edge, following paging.next. Errors end the walk
+    quietly — a missing permission just means fewer rows, never a failed connect."""
+    rows: list[dict] = []
+    next_url, next_params = url, {**params, "limit": 100}
+    while next_url and len(rows) < cap:
+        try:
+            body = (await client.get(next_url, params=next_params)).json()
+        except Exception:
+            break
+        if not isinstance(body, dict) or "error" in body:
+            if isinstance(body, dict):
+                print(f"[FBPages] {url.rsplit('/', 2)[-2:]} → {body['error'].get('message')}", flush=True)
+            break
+        rows.extend(body.get("data") or [])
+        next_url, next_params = (body.get("paging") or {}).get("next"), None
+    return rows
+
+
+async def fetch_all_facebook_pages(client, graph_base: str, user_token: str) -> list[dict]:
+    """The Pages this person can post to. /me/accounts alone misses Pages that sit in a
+    Business portfolio (it also stops at 25 without paging), so those are gathered from
+    each business's owned_pages / client_pages too. A Page with no access_token can't be
+    posted to as the Page, so it's dropped."""
+    found: dict[str, dict] = {}
+
+    for p in await _graph_list(client, f"{graph_base}/me/accounts",
+                               {"access_token": user_token, "fields": _PAGE_FIELDS}):
+        if p.get("id"):
+            found[p["id"]] = p
+    from_me = len(found)
+
+    businesses = await _graph_list(client, f"{graph_base}/me/businesses",
+                                   {"access_token": user_token, "fields": "id,name"}, cap=50)
+    for biz in businesses:
+        for edge in ("owned_pages", "client_pages"):
+            for p in await _graph_list(client, f"{graph_base}/{biz['id']}/{edge}",
+                                       {"access_token": user_token, "fields": _PAGE_FIELDS}):
+                pid = p.get("id")
+                if not pid or (pid in found and found[pid].get("access_token")):
+                    continue
+                if not p.get("access_token"):
+                    # The edge sometimes leaves the token out; ask the Page itself.
+                    try:
+                        one = (await client.get(f"{graph_base}/{pid}",
+                                                params={"access_token": user_token, "fields": _PAGE_FIELDS})).json()
+                        if isinstance(one, dict) and one.get("access_token"):
+                            p = one
+                    except Exception:
+                        pass
+                found[pid] = p
+
+    pages = [p for p in found.values() if p.get("access_token")]
+    print(f"[FBPages] /me/accounts={from_me} businesses={len(businesses)} "
+          f"total_with_token={len(pages)} (seen={len(found)})", flush=True)
+    return pages
 
 
 @router.get("/connect/facebook-direct/callback")
@@ -1768,19 +1917,44 @@ async def facebook_direct_callback(
             if declined:
                 print(f"[FBDirectOAuth] inbox permission(s) still declined after re-asking: {declined}", flush=True)
 
-            # Step 3: get the user's Facebook Pages
-            pages_resp = await client.get(
-                f"{graph_base}/me/accounts",
-                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
-            )
-            pages_data = pages_resp.json()
-            pages = pages_data.get("data", [])
+            # Step 3: get the user's Facebook Pages (their own and their Business portfolios')
+            pages = await fetch_all_facebook_pages(client, graph_base, long_token)
 
             if not pages:
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
-            # Use the first page (most users have one main page)
+            # Always let the owner choose which Page(s) to connect — even when there's only
+            # one — so nothing is connected until they pick it (live-reported twice: first
+            # "no option to select which of my Facebook Pages", then "it just connects, I
+            # want to see the available Pages first even if it's just one"). Same
+            # stash-and-pick shape as Instagram's direct connect.
+            if pages:
+                import secrets
+                token = secrets.token_urlsafe(24)
+                await db["pending_facebook_connections"].insert_one({
+                    "token": token,
+                    "pages": [
+                        {
+                            "page_id": p["id"],
+                            "page_name": p.get("name") or "Facebook Page",
+                            "page_access_token": p.get("access_token"),
+                            "profile_picture_url": (
+                                p.get("picture", {}).get("data", {}).get("url", "")
+                                if isinstance(p.get("picture"), dict) else ""
+                            ),
+                        }
+                        for p in pages if p.get("id") and p.get("access_token")
+                    ],
+                    "created_at": datetime.utcnow(),
+                })
+                print(f"[FBDirectOAuth] {len(pages)} Pages — awaiting the owner's pick (token={token})")
+                pick_redirect = f"{web_app_url}/workspace/?tab=connections"
+                return RedirectResponse(
+                    f"{pick_redirect}&connected=facebook_pending&token={urllib.parse.quote(token)}"
+                )
+
+            # Exactly one Page: connect it straight away.
             page = pages[0]
             page_id = page["id"]
             page_name = page["name"]
@@ -1826,7 +2000,7 @@ async def facebook_direct_callback(
 async def facebook_direct_finalize(
     fb_page_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Called by the frontend after the Facebook direct OAuth callback to
@@ -1849,6 +2023,85 @@ async def facebook_direct_finalize(
         raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
+
+
+@router.get("/connect/facebook-direct/pending/{token}")
+async def facebook_direct_pending(token: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """The Facebook Pages awaiting the owner's pick, stashed by the callback when the
+    Meta login manages more than one Page. Never returns Page tokens."""
+    pending = await db["pending_facebook_connections"].find_one({"token": token})
+    if not pending:
+        return UriResponse.error_response(
+            "This connection session has expired — please connect Facebook again.", code=404
+        )
+    return UriResponse.get_single_data_response("pending_facebook_connection", {
+        "token": token,
+        "pages": [
+            {"page_id": p["page_id"], "page_name": p.get("page_name"),
+             "profile_picture_url": p.get("profile_picture_url")}
+            for p in pending.get("pages", [])
+        ],
+    })
+
+
+@router.post("/connect/facebook-direct/finalize-pending")
+async def facebook_direct_finalize_pending(
+    body: Dict[str, Any],
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """Connect the Facebook Page(s) the owner picked. Stored active straight away (this
+    call is already authenticated), exactly like the single-Page path ends up after
+    /finalize. Only the picked Pages are consumed from the session."""
+    from app.models.brand_account import BrandAccount
+    from datetime import timezone
+
+    token = body.get("token")
+    page_ids = body.get("page_ids") or ([body["page_id"]] if body.get("page_id") else [])
+    if not token or not page_ids:
+        raise HTTPException(status_code=400, detail="token and page_ids are required")
+
+    pending = await db["pending_facebook_connections"].find_one({"token": token})
+    if not pending:
+        raise HTTPException(status_code=404, detail="This connection session has expired — please connect Facebook again.")
+
+    by_id = {p["page_id"]: p for p in pending.get("pages", [])}
+    chosen = [by_id[i] for i in page_ids if i in by_id]
+    if not chosen:
+        raise HTTPException(status_code=400, detail="Those Pages weren't part of this connection session.")
+
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    now = datetime.now(timezone.utc).isoformat()
+
+    connected = []
+    for p in chosen:
+        conn_doc = {
+            "id": f"fb_{p['page_id']}",
+            "user_id": user_id,
+            "platform": "facebook",
+            "connected_via": "facebook_direct_oauth",
+            "page_id": p["page_id"],
+            "page_access_token": p["page_access_token"],
+            "account_name": p.get("page_name") or "Facebook Page",
+            "profile_picture_url": p.get("profile_picture_url") or "",
+            "connection_status": "active",
+            "connected_at": now,
+            "updated_at": now,
+        }
+        if not is_personal:
+            conn_doc["brand_id"] = brand_id
+        await db["social_connections"].update_one({"id": conn_doc["id"]}, {"$set": conn_doc}, upsert=True)
+        connected.append({"page_id": p["page_id"], "page_name": conn_doc["account_name"]})
+
+    remaining = [p for p in pending.get("pages", []) if p["page_id"] not in {c["page_id"] for c in connected}]
+    if remaining:
+        await db["pending_facebook_connections"].update_one({"token": token}, {"$set": {"pages": remaining}})
+    else:
+        await db["pending_facebook_connections"].delete_one({"token": token})
+
+    return UriResponse.get_single_data_response("facebook_connected", {"connected": connected, "total": len(connected)})
 
 
 # ── TikTok direct — Content Posting API via FILE_UPLOAD, bypassing Outstand.
@@ -2540,7 +2793,7 @@ async def instagram_direct_callback(
 async def instagram_direct_finalize(
     ig_user_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Called by the frontend after the Instagram direct OAuth callback to
@@ -2601,7 +2854,7 @@ async def instagram_direct_pending(token: str, db: AsyncIOMotorDatabase = Depend
 async def instagram_direct_finalize_pending(
     body: Dict[str, Any],
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Called once the user picks which Instagram account(s) to connect from the
@@ -2747,7 +3000,7 @@ async def outstand_oauth_callback(
 async def get_pending_connection(
     session_token: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Step 2 of the social connection flow.
@@ -2767,7 +3020,7 @@ async def get_pending_connection(
 async def finalize_social_connection(
     request: FinalizeConnectionRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Step 3 of the social connection flow (completes onboarding step 2).
@@ -2792,7 +3045,7 @@ async def finalize_outstand_direct(
     username: Optional[str] = None,
     network_unique_id: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Finalizes an Outstand connection that used the "direct" callback shape —
@@ -2849,7 +3102,7 @@ async def finalize_outstand_direct(
 
 @router.get("/connections")
 async def get_user_connections(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get social accounts connected for the active brand (isolated per brand)."""
@@ -2862,7 +3115,7 @@ async def get_user_connections(
 async def disconnect_social_account(
     outstand_account_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Permanently disconnect a social account for the active brand.
@@ -2881,7 +3134,7 @@ async def disconnect_social_account(
 async def disconnect_all_for_platform(
     platform: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Disconnect every currently-connected account for one platform, for the
@@ -2900,7 +3153,7 @@ async def disconnect_all_for_platform(
 async def disconnect_instagram_direct(
     ig_user_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Disconnect an Instagram account connected via direct OAuth for the active brand.
@@ -2934,7 +3187,7 @@ async def disconnect_instagram_direct(
 @router.delete("/connections/facebook-direct")
 async def disconnect_facebook_direct(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Disconnect a Facebook Page connected via direct OAuth for the active brand.
@@ -3008,7 +3261,7 @@ async def disconnect_tiktok_direct(
 @router.get("/onboarding/status")
 async def get_onboarding_status(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Returns the user's onboarding completion state.
@@ -3032,7 +3285,7 @@ async def approve_content(
     request: ApprovalRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Approve content drafts with scheduling options
@@ -3068,7 +3321,7 @@ async def regenerate_draft_image(
     request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Regenerate the image for an existing draft using user feedback.
@@ -3213,7 +3466,7 @@ async def edit_draft_image(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Edit image in-place using user feedback
@@ -3268,7 +3521,7 @@ async def reposition_draft_logo(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Move/resize the logo on an already-generated draft's image — a plain
@@ -3313,7 +3566,7 @@ async def undo_draft_image_edit(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Undo last image edit and restore previous version
@@ -3363,7 +3616,7 @@ async def update_carousel_slide(
     slide_index: int,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Update text (headline/body) of a single carousel slide.
@@ -3438,7 +3691,7 @@ async def regenerate_carousel_slide_image(
     request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Regenerate the image for a single carousel slide.
@@ -3546,7 +3799,7 @@ async def delete_carousel_slide(
     draft_id: str,
     slide_index: int,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Delete a single slide from a carousel.
@@ -3605,7 +3858,7 @@ async def reorder_carousel_slides(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Reorder carousel slides based on new index array.
@@ -3781,14 +4034,18 @@ async def set_instagram_audio(
 async def delete_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
-    """Permanently delete a content draft"""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Permanently delete a content draft — scoped to the active brand.
 
-    result = await db["content_drafts"].delete_one({"id": draft_id, "user_id": user_id})
+    Previously scoped by the bare developer user_id from flexible_auth, so
+    under multi-tenant mode any end-user could delete any other end-user's
+    draft by id. Now brand-scoped like GET/PATCH /drafts/{id} above.
+    """
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
+    result = await db["content_drafts"].delete_one({**scope, "id": draft_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Draft not found")
 
@@ -3805,7 +4062,7 @@ class SyncImageRequest(BaseModel):
 async def sync_image_across_drafts(
     request: SyncImageRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Copy images from a source draft to one or more target drafts (same user only).
@@ -3880,7 +4137,7 @@ async def sync_image_across_drafts(
 async def deny_content(
     request: DenialRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Deny content drafts with optional regeneration request"""
     user_id = _get_user_id(token)
@@ -3904,7 +4161,7 @@ async def deny_content(
 async def unschedule_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Move a scheduled draft back to draft status."""
     user_id = ctx["user_id"]
@@ -3970,7 +4227,7 @@ async def restore_draft(
 async def refine_content(
     request: RefinementRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """
     Refine/edit content before approval
@@ -4005,7 +4262,7 @@ async def refine_content(
 async def schedule_content(
     request: SchedulingRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Schedule approved content for future publishing"""
     user_id = _get_user_id(token)
@@ -4028,7 +4285,7 @@ async def schedule_content(
 @router.get("/scheduled")
 async def get_scheduled_content(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Get all scheduled content for the active brand"""
     user_id = ctx["user_id"]
@@ -4074,7 +4331,7 @@ async def get_scheduled_content(
 @router.get("/content-calendar/performance")
 async def get_calendar_performance(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Return aggregated post performance data for the active brand."""
     user_id = ctx["user_id"]
@@ -4086,7 +4343,7 @@ async def get_calendar_performance(
 @router.get("/content-calendar/trends")
 async def get_calendar_trends(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Return trending keywords for the active brand's industry."""
     user_id = ctx["user_id"]
@@ -4123,7 +4380,7 @@ async def get_content_calendar(
     limit: int = 50,
     skip: int = 0,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Get the active brand's complete content calendar
@@ -4243,7 +4500,7 @@ async def get_content_analytics(
     platform: Optional[str] = None,
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Get content performance analytics"""
     user_id = _get_user_id(token)
@@ -4303,7 +4560,7 @@ async def get_content_analytics(
 async def get_performance(
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Fetch real-time post analytics from Outstand for the active brand's published drafts.
@@ -5124,7 +5381,7 @@ async def get_performance(
 async def get_account_metrics(
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Fetch account-level metrics (followers, engagement totals) for the active brand's
@@ -5674,7 +5931,7 @@ async def get_account_metrics(
 async def debug_outstand_account_metrics(
     account_id: str,
     days: int = 30,
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Return raw Outstand account metrics response for debugging field mapping."""
     import time as _time
@@ -5692,7 +5949,7 @@ async def debug_outstand_account_metrics(
 @router.get("/debug/outstand-post/{post_id}")
 async def debug_outstand_post(
     post_id: str,
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Fetch the live status of an Outstand post by its ID."""
     try:
@@ -5706,7 +5963,7 @@ async def debug_outstand_post(
 @router.get("/debug/outstand-analytics/{post_id}")
 async def debug_outstand_analytics(
     post_id: str,
-    token: dict = Depends(JWTBearer())
+    token: dict = Depends(flexible_token)
 ):
     """Return the raw Outstand analytics response for a post — shows exactly what fields are available."""
     try:
@@ -5720,7 +5977,7 @@ async def debug_outstand_analytics(
 @router.get("/debug/performance-raw")
 async def debug_performance_raw(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Show raw published drafts + their platform_post_id and outstand markers for this user."""
     user_id = _get_user_id(token)
@@ -5745,7 +6002,7 @@ async def debug_performance_raw(
 @router.get("/debug/connections-raw")
 async def debug_connections_raw(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Show the raw social_connections documents for the current user.
@@ -5823,7 +6080,7 @@ async def get_draft_image(
 async def get_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Get a single draft by ID — scoped to the active brand."""
     user_id = ctx["user_id"]
@@ -5842,11 +6099,123 @@ async def get_draft(
     return UriResponse.get_single_data_response("draft", draft)
 
 
+class UpdateDraftRequest(BaseModel):
+    text_content: Optional[List[Dict[str, Any]]] = None
+    image_url: Optional[str] = None
+
+
+@router.patch("/drafts/{draft_id}")
+async def update_draft(
+    draft_id: str,
+    body: UpdateDraftRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """Update a draft's text/image content — scoped to the active brand.
+
+    The SDK Gateway's legacy PATCH /api/v1/drafts/{id} only ever scoped by
+    the developer's shared account, so under multi-tenant mode every
+    end-user could read and overwrite every other end-user's drafts. This
+    is the brand-scoped replacement, mirroring GET/DELETE /drafts/{id}
+    above.
+    """
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
+    updates = {k: v for k, v in body.dict(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    updates["updated_at"] = datetime.utcnow()
+
+    result = await db["content_drafts"].update_one({**scope, "id": draft_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    draft = await db["content_drafts"].find_one({**scope, "id": draft_id}, {"_id": 0})
+    return UriResponse.get_single_data_response("draft", draft)
+
+
+@router.get("/sdk/end-users")
+async def list_sdk_end_users(
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0),
+    api_key: APIKey = Depends(verify_api_key),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """List every end-user provisioned under the calling API key, each with
+    a summary of their brand setup (name, industry, region, voice, colors,
+    onboarding status). This is the SDK client's own admin view — an
+    end-user never sees this, only the platform built on top of the SDK
+    would (e.g. Feest's own internal team, not an individual restaurant)."""
+    from app.services.MultiTenantService import MultiTenantService
+
+    sdk_client = await MultiTenantService.get_or_create_sdk_client(
+        api_key_hash=api_key.key_hash,
+        api_key_prefix=api_key.key_prefix,
+        developer_id=api_key.user_id,
+        company_name=api_key.name or "SDK Client",
+        db=db,
+    )
+    if not sdk_client:
+        raise HTTPException(status_code=500, detail="Failed to resolve SDK client")
+
+    end_users = await MultiTenantService.get_end_users_for_client(
+        sdk_client.sdk_client_id, limit, skip, db
+    )
+
+    results = []
+    for eu in end_users:
+        # brand_profiles docs are looked up (and written) by brand_id, not by
+        # a stored end_user_id field — that field exists in the schema but
+        # nothing in the real onboarding/save path ever populates it, so
+        # querying by it here always returned nothing. brand_profile_id,
+        # cached on the end-user doc itself, is the real join key.
+        brand = None
+        if eu.brand_profile_id:
+            brand = await db["brand_profiles"].find_one(
+                {"brand_id": eu.brand_profile_id},
+                {
+                    "_id": 0,
+                    "brand_name": 1,
+                    "industry": 1,
+                    "region": 1,
+                    "derived_voice": 1,
+                    "brand_colors": 1,
+                    "logo_url": 1,
+                    "onboarding_completed": 1,
+                },
+            )
+        results.append({
+            "end_user_id": eu.end_user_id,
+            "external_user_id": eu.external_user_id,
+            "external_name": eu.external_name,
+            "external_email": eu.external_email,
+            "status": eu.status,
+            # The brand profile's own onboarding_completed is the accurate
+            # signal — the copy on the end-user doc is never updated after
+            # creation (mark_end_user_onboarding_complete has no caller).
+            "onboarding_completed": bool(brand and brand.get("onboarding_completed")),
+            "total_generations": eu.total_generations,
+            "total_images": eu.total_images,
+            "total_api_calls": eu.total_api_calls,
+            "last_active_at": eu.last_active_at,
+            "created_at": eu.created_at,
+            "setup": brand,
+        })
+
+    return UriResponse.get_single_data_response("end_users", {
+        "sdk_client_id": sdk_client.sdk_client_id,
+        "company_name": sdk_client.company_name,
+        "total_end_users": sdk_client.stats.total_end_users if sdk_client.stats else len(results),
+        "users": results,
+    })
+
+
 @router.get("/drafts/{draft_id}/image-stream")
 async def stream_draft_image(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     SSE stream — sends a `image_ready` event with the draft payload the moment
@@ -5921,7 +6290,7 @@ async def test_endpoint():
 
 @router.get("/auto-generate/settings")
 async def get_auto_generate_settings(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get (or create) the auto-content generation settings for the active brand.
@@ -5939,7 +6308,7 @@ async def get_auto_generate_settings(
 @router.put("/auto-generate/settings")
 async def update_auto_generate_settings(
     request: AutoGenerateSettingsRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Update auto-content generation settings (upsert), scoped to the active brand."""
@@ -5956,7 +6325,7 @@ async def update_auto_generate_settings(
 @router.post("/auto-generate/connect-insights")
 async def connect_insights(
     request: ConnectInsightsRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -5986,7 +6355,7 @@ async def connect_insights(
 @router.post("/auto-generate/trigger")
 async def trigger_auto_generate(
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Manually trigger auto-content generation for the active brand."""
@@ -6003,7 +6372,7 @@ async def trigger_auto_generate(
 
 @router.get("/brand-profile")
 async def get_brand_profile(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get the brand profile (onboarding data) for the active brand."""
@@ -6017,7 +6386,7 @@ async def get_brand_profile(
 async def upload_brand_logo(
     file: UploadFile = File(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Upload a brand logo image. Saves to local static storage and stores the URL
@@ -6025,9 +6394,8 @@ async def upload_brand_logo(
     """
     import os, uuid
 
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    brand_id = ctx.get("brand_id")
 
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml"}
     if file.content_type not in allowed_types:
@@ -6041,11 +6409,31 @@ async def upload_brand_logo(
         from app.utils.s3_upload import upload_bytes
         logo_url = await upload_bytes(contents, folder="uri-social/logos")
 
-        await db["brand_profiles"].update_one(
-            {"user_id": user_id},
-            {"$set": {"logo_url": logo_url, "updated_at": datetime.utcnow()}},
-            upsert=True,
-        )
+        # Scope the write to the ACTIVE brand. This previously updated
+        # {"user_id": user_id} with no brand_id, so for a multi-brand account
+        # update_one wrote the logo onto whichever profile matched first — a
+        # DIFFERENT brand than the one being edited (observed live: two brands
+        # under one account ended up sharing a single logo).
+        from app.models.brand_account import BrandAccount
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if brand_id and brand_id != personal_bid:
+            scope = {"brand_id": brand_id}
+            set_fields = {"logo_url": logo_url, "brand_id": brand_id,
+                          "user_id": user_id, "updated_at": datetime.utcnow()}
+        else:
+            # personal/solo brand — prefer the brand_id-keyed doc, else the
+            # legacy user_id-only doc (from before brand_id existed).
+            legacy = await db["brand_profiles"].find_one(
+                {"user_id": user_id, "brand_id": {"$exists": False}}, {"_id": 1})
+            if legacy:
+                scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                set_fields = {"logo_url": logo_url, "updated_at": datetime.utcnow()}
+            else:
+                scope = {"brand_id": personal_bid}
+                set_fields = {"logo_url": logo_url, "brand_id": personal_bid,
+                              "user_id": user_id, "updated_at": datetime.utcnow()}
+
+        await db["brand_profiles"].update_one(scope, {"$set": set_fields}, upsert=True)
 
         return UriResponse.get_single_data_response("logo_upload", {"logo_url": logo_url})
 
@@ -6059,7 +6447,7 @@ async def upload_brand_logo(
 async def upload_sample_template(
     file: UploadFile = File(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Upload a sample design or content template. Saves to local static storage and
@@ -6068,9 +6456,8 @@ async def upload_sample_template(
     """
     import os, uuid
 
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    brand_id = ctx.get("brand_id")
 
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "application/pdf"}
     if file.content_type not in allowed_types:
@@ -6088,11 +6475,30 @@ async def upload_sample_template(
         resource_type = "raw" if file.content_type == "application/pdf" else "image"
         file_url = await upload_bytes(contents, folder="uri-social/templates", resource_type=resource_type)
 
+        # Scope the write to the ACTIVE brand — same cross-brand bug as the logo
+        # endpoint had: a bare {"user_id": user_id} $push would append the template
+        # to whichever brand profile matched first, not the one being edited.
+        from app.models.brand_account import BrandAccount
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if brand_id and brand_id != personal_bid:
+            scope = {"brand_id": brand_id}
+            on_insert = {"brand_id": brand_id, "user_id": user_id}
+        else:
+            legacy = await db["brand_profiles"].find_one(
+                {"user_id": user_id, "brand_id": {"$exists": False}}, {"_id": 1})
+            if legacy:
+                scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                on_insert = {"user_id": user_id}
+            else:
+                scope = {"brand_id": personal_bid}
+                on_insert = {"brand_id": personal_bid, "user_id": user_id}
+
         await db["brand_profiles"].update_one(
-            {"user_id": user_id},
+            scope,
             {
                 "$push": {"sample_template_urls": file_url},
                 "$set": {"updated_at": datetime.utcnow()},
+                "$setOnInsert": on_insert,
             },
             upsert=True,
         )
@@ -6109,14 +6515,18 @@ async def upload_sample_template(
 @router.post("/brand-profile")
 async def save_brand_profile(
     request: BrandProfileRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Save or update the brand profile for the active brand."""
     user_id = ctx["user_id"]
     try:
         print(f"🔍 PYDANTIC PARSED REQUEST: logo_position={repr(request.logo_position)}, logo_size={repr(request.logo_size)}, ideal_customer_profile={repr(request.ideal_customer_profile)}, primary_font={repr(request.primary_font)}, secondary_font={repr(request.secondary_font)}")
-        payload = request.dict(exclude_none=True)
+        # exclude_unset (not exclude_none): BrandProfileService.save() decides whether to
+        # touch a field by checking `if field in data`. exclude_none dropped fields sent
+        # explicitly as null (e.g. logo_url after "Remove logo"), so the removed logo
+        # came back after every save — confirmed live on prod. Prod fix, kept.
+        payload = request.dict(exclude_unset=True)
         if isinstance(payload.get("platform_tones"), dict):
             from ..services.brand_profile_service import normalize_platform_tones
             payload["platform_tones"] = normalize_platform_tones(payload["platform_tones"])
@@ -6433,7 +6843,7 @@ async def get_next_posting_time(
 
 @router.get("/brand-profile/business-pulse")
 async def get_business_pulse(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -6456,7 +6866,7 @@ async def get_business_pulse(
 @router.post("/brand-profile/business-pulse")
 async def save_business_pulse(
     request: BusinessPulseRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -6475,7 +6885,7 @@ async def save_business_pulse(
 async def analyze_voice_samples(
     request: Dict[str, Any],
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Analyze sample captions to extract voice patterns.
@@ -7582,7 +7992,7 @@ async def generate_storyboard(
     request: StoryboardRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Generate a GPT-4o Vision video storyboard from brand images.
@@ -7638,7 +8048,7 @@ async def get_storyboard_job(
 async def generate_video_from_storyboard(
     request: VideoFromStoryboardRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
@@ -7728,7 +8138,7 @@ async def video_quote(
 @router.get("/video-job/{job_id}")
 async def get_video_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Poll for video generation progress.
@@ -7761,7 +8171,7 @@ async def get_video_job(
 async def generate_storyboard_frames(
     request: StoryboardFramesRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start background generation of a unique frame image for each storyboard scene.
@@ -7783,7 +8193,7 @@ async def generate_storyboard_frames(
 @router.get("/storyboard-frame-job/{job_id}")
 async def get_storyboard_frame_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll for storyboard frame image generation progress."""
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
@@ -7940,9 +8350,9 @@ class MergeVideoRequest(BaseModel):
 @router.post("/merge-video-job/{job_id}")
 async def merge_video_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     request: Optional[MergeVideoRequest] = None,
 ):
     """
@@ -8008,7 +8418,7 @@ class GenerateVideoCaptionRequest(BaseModel):
 async def generate_video_caption(
     request: GenerateVideoCaptionRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Generate a platform-optimised caption for a merged video, written from what the video is actually about
@@ -8049,7 +8459,7 @@ async def generate_video_caption(
 async def save_video_draft(
     request: SaveVideoDraftRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Save a merged video as a draft for later posting."""
     user_id = _get_user_id(token)
@@ -8094,7 +8504,7 @@ async def save_video_draft(
 @router.get("/video-drafts")
 async def list_video_drafts(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """List all saved video drafts for the current user."""
     user_id = _get_user_id(token)
@@ -8114,7 +8524,7 @@ async def publish_video_draft(
     request: PublishVideoDraftRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start async publishing of a saved video draft to Instagram Reels or Facebook.
@@ -8373,7 +8783,7 @@ async def get_tiktok_creator_info(
 @router.get("/video-publish-job/{job_id}")
 async def get_video_publish_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll the status of a video publish job."""
     from app.agents.social_media_manager.services.video_publish_service import get_publish_job, public_job_view
@@ -8389,7 +8799,7 @@ async def get_video_publish_job(
 @router.post("/extract-image-text")
 async def extract_image_text(
     image_url: str = Query(..., description="URL of the image to extract text from"),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Extract text overlaid on an image using OpenAI Vision API.
@@ -8437,7 +8847,7 @@ async def extract_image_text(
 @router.post("/upload-custom-font")
 async def upload_custom_font(
     file: UploadFile = File(...),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Upload a custom font file (.ttf or .otf) for the user's brand.
@@ -8485,7 +8895,7 @@ async def upload_custom_font(
 @router.post("/analyze-custom-font")
 async def analyze_custom_font(
     font_url: str = Query(..., description="Cloudinary URL of the uploaded font file"),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Analyze a custom font using GPT-4o-mini Vision API.
@@ -8527,7 +8937,7 @@ class BlogGenerationRequest(BaseModel):
 async def generate_blog_content(
     request: BlogGenerationRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -8669,7 +9079,7 @@ async def generate_blog_content(
 
 @router.get("/blog-drafts")
 async def get_blog_drafts(
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """Get all blog drafts for the authenticated user"""
@@ -8698,7 +9108,7 @@ async def get_blog_drafts(
 @router.get("/blog-drafts/{draft_id}")
 async def get_blog_draft(
     draft_id: str,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """Get a single blog draft by ID (for polling image status)"""
@@ -8893,7 +9303,7 @@ def _build_oai_messages(system_prompt: str, request: AgentChatRequest) -> list:
 @router.post("/agent/chat/upload")
 async def upload_chat_image(
     file: UploadFile = File(...),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
     from app.utils.s3_upload import upload_bytes
@@ -8926,7 +9336,7 @@ async def upload_chat_image(
 @router.post("/agent/chat/stream")
 async def agent_chat_stream(
     request: AgentChatRequest,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Streaming version of agent chat — returns SSE tokens as they arrive."""
@@ -9014,7 +9424,7 @@ async def agent_chat_stream(
 
 @router.get("/agent/chat/history")
 async def get_agent_chat_history(
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Return the last 100 persisted messages for this user."""
@@ -9032,7 +9442,7 @@ async def get_agent_chat_history(
 
 @router.delete("/agent/chat/history")
 async def clear_agent_chat_history(
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Archive (delete) the current conversation so the user starts fresh."""
@@ -9047,7 +9457,7 @@ async def clear_agent_chat_history(
 @router.post("/agent/chat")
 async def agent_chat(
     request: AgentChatRequest,
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """URI Agent in-app assistant — answers questions and navigates the user."""
@@ -9142,7 +9552,7 @@ async def edit_video(
     platform: str = Form("instagram_reels"),
     enhancements: str = Form("{}"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Accept a raw video upload, run the Level 1 FFmpeg editing pipeline
@@ -9223,7 +9633,7 @@ async def edit_video(
 async def get_edit_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll the status of a video editing job."""
     user_id = _get_user_id(token)
@@ -9247,7 +9657,7 @@ async def get_edit_video_job(
 @router.get("/video-polish-styles")
 async def list_video_polish_styles(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Return all available style presets for Video Polish."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -9257,7 +9667,7 @@ async def list_video_polish_styles(
 
 @router.get("/video-polish-caption-presets")
 async def list_caption_presets(
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Return all Reap caption style presets (system + user-created)."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -9273,7 +9683,7 @@ async def polish_video(
     language: str = Form("en-NG"),
     captions_preset: str = Form("system_beasty"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Accept a raw video upload, run the Video Polish clipping-API pipeline
@@ -9332,7 +9742,7 @@ async def polish_video(
 async def get_polish_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll the status of a Video Polish job."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -9355,7 +9765,7 @@ async def restyle_polish_video(
     new_style_preset: str = Form(...),
     language: str = Form("en-NG"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Re-polish an already-processed video with a different style preset.
@@ -9402,7 +9812,7 @@ async def polish_video_clip_action(
     source_language: str = Form("en"),
     target_language: str = Form("es"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Trigger a secondary action (reframe or dub) on a specific clip.
@@ -9448,7 +9858,7 @@ async def polish_video_clip_action(
 async def get_polish_video_clip_action(
     action_job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a clip action job (reframe / dub) by its action_job_id."""
     user_id = _get_user_id(token)
@@ -9470,14 +9880,17 @@ async def get_polish_video_clip_action(
 # there's no separate "platform admin" concept in this codebase yet, and
 # introducing one is out of scope of this PRD.
 
-def _is_billing_admin(token: dict) -> bool:
-    email = ((token.get("claims", {}) or {}).get("email") or "").lower()
-    allowed = {e.strip().lower() for e in (settings.JANE_ADS_ADMIN_EMAILS or "").split(",") if e.strip()}
+def _is_billing_admin(auth: dict) -> bool:
+    if auth.get("auth_type") != "jwt":
+        return False
+    claims = (auth.get("jwt_payload") or {}).get("claims", {}) or {}
+    email = (claims.get("email") or "").lower()
+    allowed = {e.strip().lower() for e in (settings.BILLING_ADMIN_EMAILS or "").split(",") if e.strip()}
     return bool(allowed) and email in allowed
 
 
 @router.get("/video-editing/pricing")
-async def get_video_editing_pricing(token: dict = Depends(JWTBearer())):
+async def get_video_editing_pricing(auth: dict = Depends(flexible_auth)):
     """Current video-editing credit rate — used by the frontend cost preview
     instead of hard-coding the rate client-side."""
     from app.services.VideoBillingService import get_video_edit_rate
@@ -9494,16 +9907,17 @@ class UpdateVideoPricingRequest(BaseModel):
 @router.patch("/video-editing/pricing")
 async def update_video_editing_pricing(
     body: UpdateVideoPricingRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Admin-only: change the live video-editing credit rate without a
     redeploy. See _is_billing_admin above for the allowlist."""
     from app.services.VideoBillingService import set_video_edit_rate
 
-    if not _is_billing_admin(token):
+    if not _is_billing_admin(auth):
         raise HTTPException(status_code=403, detail="Not authorized to change billing configuration.")
 
-    email = (token.get("claims", {}) or {}).get("email") or "unknown"
+    claims = (auth.get("jwt_payload") or {}).get("claims", {}) or {}
+    email = claims.get("email") or "unknown"
     rate = await set_video_edit_rate(body.credits_per_minute, updated_by=email)
     return UriResponse.get_single_data_response("video_editing_pricing", {"credits_per_minute": rate})
 
@@ -9524,7 +9938,7 @@ async def produce_video(
     custom_music: Optional[UploadFile] = File(None),
     transition_style: str = Form("auto"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start a full video production job.
@@ -9652,7 +10066,7 @@ async def produce_video(
 async def get_produce_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a video production job."""
     user_id = _get_user_id(token)
@@ -9673,7 +10087,7 @@ async def capture_video_frame(
     job_id: str,
     t: float = Query(default=0.0, ge=0.0),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Extract a JPEG frame at time t (seconds) from the produced video using ffmpeg."""
     user_id = _get_user_id(token)
@@ -9752,7 +10166,7 @@ async def start_produce_video_render(
     background_tasks: BackgroundTasks,
     payload: dict = Body(default={}),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Approve AI decisions and start the render phase.
@@ -9810,7 +10224,7 @@ async def adjust_produce_video(
     body: AdjustVideoBody,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Re-render a completed video with light adjustments (caption colour, caption text edits).
@@ -9927,7 +10341,7 @@ async def multi_clip_start(
     music_mood: str = Form("chill"),
     music_volume: float = Form(0.12),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Start a multi-clip composition job.
@@ -10005,7 +10419,7 @@ async def multi_clip_start(
 async def reset_multi_clip_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Reset a completed (ready/failed) job back to awaiting_order so the user can
@@ -10042,7 +10456,7 @@ async def reset_multi_clip_job(
 async def get_multi_clip_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a multi-clip composition job."""
     user_id = _get_user_id(token)
@@ -10063,7 +10477,7 @@ async def reorder_multi_clip_job(
     job_id: str,
     payload: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Set the user's chosen clip order.
@@ -10111,7 +10525,7 @@ async def update_clip_position(
     clip_id: str,
     req: UpdateClipPositionRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Override the auto-detected subject_position for one clip.
@@ -10144,7 +10558,7 @@ async def drop_multi_clip(
     job_id: str,
     payload: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Mark a clip as dropped (excluded from stitch).
@@ -10180,7 +10594,7 @@ async def stitch_multi_clip_job(
     job_id: str,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Trigger the render/stitch phase after the user has reviewed clip order and drops.
@@ -10218,7 +10632,7 @@ async def stitch_multi_clip_job(
 async def analyze_multi_clip_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     AI analyzes a stitched multi-clip video using existing clip transcripts/metadata
@@ -10329,7 +10743,7 @@ async def draft_product_script(
     job_id: str,
     req: DraftScriptRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Draft a short product video script from a user description using GPT-4o.
@@ -10378,7 +10792,7 @@ async def approve_product_script(
     req: ApproveScriptRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Save the approved script and kick off the vision-describe + ordering phase.
@@ -10423,12 +10837,20 @@ async def approve_product_script(
 
 @router.post("/fix-fractional-credits")
 async def fix_fractional_credits(
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     ADMIN ENDPOINT: Fix fractional credits in database.
     Rounds all fractional credit values to integers.
+
+    Bulk-rewrites every wallet and credit_transactions record — gated behind
+    the same billing-admin allowlist as PATCH /video-editing/pricing (see
+    _is_billing_admin above). The version this was ported from had no auth
+    check at all despite the "ADMIN ENDPOINT" label.
     """
+    if not _is_billing_admin(auth):
+        raise HTTPException(status_code=403, detail="Not authorized to run this operation.")
     try:
         # First, check for fractional values
         sample_wallet = await db.user_credits.find_one({})
@@ -11064,7 +11486,7 @@ async def submagic_produce(
     enable_music: bool = Form(False),
     custom_music: Optional[UploadFile] = File(None),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Upload a video to Submagic for AI-powered captioning and editing."""
     user_id = _get_user_id(token)
@@ -11214,7 +11636,7 @@ async def submagic_produce(
 async def get_submagic_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """Poll a Submagic production job for status and output URL."""
     from app.services.VideoBillingService import refund_video_job, VideoBillingResult
@@ -11322,7 +11744,7 @@ async def _zapcap_headers() -> dict:
 
 
 @router.get("/zapcap-templates")
-async def zapcap_templates(token: dict = Depends(JWTBearer())):
+async def zapcap_templates(token: dict = Depends(flexible_token)):
     import httpx
     headers = await _zapcap_headers()
     async with httpx.AsyncClient(timeout=20) as client:
@@ -11362,8 +11784,8 @@ async def zapcap_produce(
     contact_position: str = Form("bottom_center"),
     contact_timing: str = Form("end"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
-    ctx: dict = Depends(get_active_brand_context),
+    token: dict = Depends(flexible_token),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     import uuid as _uuid
     import httpx
@@ -11803,7 +12225,7 @@ async def video_voiceover_produce(
 async def zapcap_job_status(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     import httpx
     from app.services.VideoBillingService import refund_video_job, VideoBillingResult
@@ -12182,7 +12604,7 @@ async def zapcap_job_status(
 async def zapcap_job_transcript(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     import httpx
 
@@ -12239,7 +12661,7 @@ async def zapcap_job_rerender(
     job_id: str,
     body: dict,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     import uuid as _uuid2
     import httpx
@@ -12377,7 +12799,7 @@ async def zapcap_job_custom_broll(
     clips: List[UploadFile] = File(...),
     placements: str = Form(...),   # JSON: [{"clip_index": 0, "start_time": 3.5, "end_time": 7.5}]
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_token),
 ):
     """
     Re-render the ZapCap job with user-supplied b-roll clips at specified timestamps.

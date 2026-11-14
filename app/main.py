@@ -7,8 +7,9 @@ from fastapi.responses import JSONResponse
 from fastapi import HTTPException
 from fastapi.staticfiles import StaticFiles
 
-from app.database import connect_to_mongo
+from app.database import connect_to_mongo, connect_to_sdk_gateway_db
 from app.core.config import settings
+from app.middleware.sdk_cors import SdkCorsMiddleware
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
 from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
@@ -34,12 +35,15 @@ from app.routers.workspace_member_router import router as workspace_member_route
 from app.routers.admin_router import router as admin_router
 from app.agents.social_media_manager.routers.blog_router import router as blog_router
 from app.routers.agency_router import router as agency_router
+from app.agents.social_media_manager.routers.sdk_router import router as sdk_router
+from app.routers.jane_escalations_router import router as jane_escalations_router
 
 # Initialize Sentry
 initialize_sentry()
 
 # Connect to MongoDB
 connect_to_mongo(settings.MONGODB_DB)
+connect_to_sdk_gateway_db()
 
 app = FastAPI(
     title="URI Agent — Social Media Manager",
@@ -71,6 +75,17 @@ async def startup_event():
         print("✅ Unique email index ensured on users collection")
     except Exception as e:
         print(f"⚠️  Warning: Failed to create email index: {e}")
+
+    # Ensure unique sparse index for SDK Gateway developer → user linking
+    # (see app/services/SdkDeveloperLinkService.py) — sparse because most
+    # users never have this field at all.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["users"].create_index("sdk_gateway_developer_id", unique=True, sparse=True)
+        print("✅ Unique sdk_gateway_developer_id index ensured on users collection")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create sdk_gateway_developer_id index: {e}")
 
     # One waitlist row per email, even if two signups race.
     try:
@@ -227,6 +242,15 @@ app.add_middleware(
     max_age=3600,
 )
 
+# The SDK's public, API-key-authenticated surface (/social-media, /agency,
+# /api/v1) needs to be callable from arbitrary third-party developer
+# origins the allowlist above can't enumerate — see sdk_cors.py. Registered
+# after CORSMiddleware so it wraps outside it (Starlette's add_middleware
+# makes the most-recently-added middleware outermost), letting it either
+# short-circuit the preflight itself or add its own header only when the
+# strict middleware above didn't already authorize the origin.
+app.add_middleware(SdkCorsMiddleware)
+
 # Respect X-Forwarded-For / X-Forwarded-Proto when behind a proxy/load-balancer.
 # Import inside a try/except so static analyzers or environments without the
 # module won't fail; if available, register the middleware so request.url is
@@ -331,15 +355,20 @@ app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas E
 # Include Jane's First Message (personalized onboarding)
 app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Message"])
 
-# Include Agency Accounts (agency layer wrapping Jane) — agency_router already
-# declares its own prefix="/agency" internally, but the frontend's Agency route
-# constants live in the /social-media-prefixed route file (socialMediaAgentRoutes.ts,
-# via RouteHelper.createRoutes(URI_INSIGHTS_PATH, ...)), so the frontend has always
-# actually called /social-media/agency/... A prior fix (05ab69e) removed this prefix
-# believing the frontend called plain /agency — it never did, so that "fix" broke
-# what had been working and mismatched. Restoring the /social-media prefix here so
-# backend and frontend agree again.
+# Include Agency Accounts (agency layer wrapping Jane) under both paths, same
+# dual-mount pattern as auth_router above. Bare /agency/* is what SDK/API-key
+# callers and the docs expect (see agency_router.py's own docstring). But the
+# dashboard frontend's AgencyService.ts goes through UriHttpClient the same
+# way every other social-media-agent call does, which in production actually
+# lands on /social-media/agency/* — confirmed via live prod logs showing
+# POST /social-media/agency 404ing when only the bare mount existed. Mounting
+# bare-only "fixed" the SDK path but silently broke agency creation from the
+# dashboard.
+app.include_router(agency_router, tags=["Agency"])
 app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
+
+# Include SDK router (API key authentication for external developers)
+app.include_router(sdk_router, tags=["SDK"])
 
 # Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
 from app.agents.jane_ads.router import router as jane_ads_router
@@ -358,7 +387,10 @@ app.include_router(market_intelligence_router, tags=["Market Intelligence"])
 app.include_router(client_router)
 app.include_router(workspace_router)
 app.include_router(workspace_member_router)
-app.include_router(admin_router)
+
+# Include admin router (admin-only user management)
+app.include_router(admin_router, tags=["Admin"])
+app.include_router(jane_escalations_router)
 
 # Serve generated images directly from backend (avoids third-party CDN like imgBB)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

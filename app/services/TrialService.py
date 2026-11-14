@@ -8,6 +8,7 @@ Handles:
 - Trial credit deduction (PRD 5.2)
 - Trial expiry logic (PRD 2.3)
 - Abuse prevention (PRD 8)
+- Wallet creation on trial expiry
 """
 from typing import Optional
 from datetime import datetime, timedelta
@@ -153,7 +154,13 @@ class TrialService:
         end_date = trial_doc["trial_end_date"]
         credits_remaining = trial_doc["credits_remaining"]
 
-        # PRD 4.2: trial_active = current_time < trial_end_date AND credits_remaining > 0
+        # PRD 4.2: trial_active = current_time < trial_end_date AND credits_remaining > 0.
+        # Deliberately NOT subscription-aware — the trial keeps running on its
+        # own clock regardless of subscription status; it isn't cut short just
+        # because the user subscribed. Combining trial + subscription credits
+        # into one displayed balance, and suppressing "upgrade" messaging for
+        # subscribers, both belong in the credit-balance/display layer, not
+        # here — see CreditService.get_credit_balance.
         time_remaining = end_date - now
         is_active = now < end_date and credits_remaining > 0
 
@@ -274,16 +281,26 @@ class TrialService:
         """
         Check if trial user can generate content.
         PRD 5.4: If trial inactive → block content generation.
+        Creates wallet with 0 credits if trial expired.
         """
         trial_doc = await self.trials_collection.find_one({"user_id": user_id})
         if not trial_doc:
             return False
 
         now = datetime.utcnow()
-        return now < trial_doc["trial_end_date"] and trial_doc["credits_remaining"] > 0
+        is_active = now < trial_doc["trial_end_date"] and trial_doc["credits_remaining"] > 0
+
+        # If trial expired, ensure wallet exists with 0 credits
+        if not is_active:
+            await self._ensure_wallet_on_trial_expiry(user_id)
+
+        return is_active
 
     async def has_active_trial(self, user_id: str) -> bool:
-        """Check if user has an active trial (not expired, has credits)."""
+        """
+        Check if user has an active trial (not expired, has credits).
+        Creates wallet with 0 credits if trial expired.
+        """
         return await self.can_generate(user_id)
 
     async def has_used_trial(self, user_id: str) -> bool:

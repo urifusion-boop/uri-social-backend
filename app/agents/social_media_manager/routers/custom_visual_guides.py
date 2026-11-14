@@ -15,35 +15,12 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.domain.responses.uri_response import UriResponse
 
 from ..services.custom_visual_guide_service import CustomVisualGuideService
 
 router = APIRouter(tags=["Custom Visual Guides"])
-
-
-def _get_user_id(token: dict) -> str | None:
-    """Extract user_id from JWT payload"""
-    if not isinstance(token, dict):
-        return None
-
-    # flat keys
-    for k in ("user_id", "userId", "id", "sub"):
-        v = token.get(k)
-        if v:
-            return str(v)
-
-    # nested claims
-    claims = token.get("claims") or {}
-    if isinstance(claims, dict):
-        for k in ("userId", "user_id", "id", "sub"):
-            v = claims.get(k)
-            if v:
-                return str(v)
-
-    return None
 
 
 # ============================================================================
@@ -82,7 +59,7 @@ async def upload_reference_image(
     request: UploadReferenceImageRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     PRD Step 1-9: Upload and process reference image
@@ -98,7 +75,7 @@ async def upload_reference_image(
     Returns:
         Guide preview with match outcome for user confirmation
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -176,7 +153,7 @@ async def upload_reference_image(
 async def get_user_guides(
     status: Optional[str] = Query("active", description="Filter by status: active | archived"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Get all custom visual guides for the authenticated user
@@ -184,7 +161,7 @@ async def get_user_guides(
     Returns:
         List of guides with preview info
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -242,7 +219,7 @@ async def get_user_guides(
 async def get_guide_detail(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Get detailed information for a specific guide
@@ -250,7 +227,7 @@ async def get_guide_detail(
     Returns:
         Complete guide data including aesthetic profile, typography extraction, etc.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -296,7 +273,7 @@ async def update_guide_font(
     guide_id: str,
     request: UpdateGuideFontRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Update the matched font for a guide
@@ -305,7 +282,7 @@ async def update_guide_font(
     - Switch from matched font to alternative
     - Switch to brand default (matched_font_id = null)
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -342,13 +319,13 @@ async def update_guide_font(
 async def delete_guide(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Permanently delete a custom visual guide
     This allows users to re-upload the same image after deletion
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -376,7 +353,7 @@ async def delete_guide(
 async def rematch_guide_fonts(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Re-run font matching for a guide
@@ -386,7 +363,7 @@ async def rematch_guide_fonts(
 
     PRD Section 11.7: Manual rematch trigger
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -447,7 +424,7 @@ async def rematch_guide_fonts(
 async def auto_rematch_after_font_upload(
     new_font_id: str = Query(..., description="ID of newly uploaded custom font"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     PRD Section 11.7: Auto-rematch guides when user uploads new custom font
@@ -458,7 +435,7 @@ async def auto_rematch_after_font_upload(
     Returns:
         List of guide IDs that were updated to better matches
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -487,14 +464,14 @@ async def track_guide_usage(
     guide_id: str,
     applied_font: bool = Query(False, description="Whether matched font was used"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Track when a guide is used for content generation
 
     Updates usage analytics for the guide.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -533,7 +510,7 @@ async def track_guide_usage(
 @router.post("/social-media/custom-guides/cleanup-archived")
 async def cleanup_archived_guides(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Cleanup endpoint to permanently delete all archived custom visual guides
@@ -541,7 +518,7 @@ async def cleanup_archived_guides(
     This allows users to re-upload the same images after deletion.
     Needed because old code archived guides instead of deleting them.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 

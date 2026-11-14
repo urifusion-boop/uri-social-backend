@@ -886,7 +886,7 @@ class VideoPolishService:
                 with open(process_path, "rb") as f:
                     processed_bytes = f.read()
 
-            # ── Stage 1c: upload to Cloudinary ────────────────────────────
+            # ── Stage 1c: upload to S3 ──────────────────────────────────────
             await update(job_id, db, progress=20, status_message="Uploading to cloud storage…")
             source_url = await _upload_to_s3(processed_bytes, f"polish_{job_id}")
             await update(job_id, db, source_video_url=source_url, progress=30)

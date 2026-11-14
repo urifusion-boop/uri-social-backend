@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 
 from app.domain.responses.uri_response import UriResponse
 
@@ -33,33 +34,78 @@ class BrandProfileService:
         data: Dict[str, Any],
         db: AsyncIOMotorDatabase,
         brand_id: Optional[str] = None,
+        sdk_client_id: Optional[str] = None,
+        end_user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = datetime.utcnow()
 
-        # Debug: Log what data is received from frontend
-        print(f"📥 SAVE INPUT: logo_position={repr(data.get('logo_position'))}, logo_size={repr(data.get('logo_size'))}")
+        # Multi-tenant isolation: end_user_id is the primary isolation boundary
+        # Priority: end_user_id > brand_id > user_id (for backward compatibility)
+        # Resolved BEFORE building doc so the partial-save field-defaulting loop
+        # below can tell a brand-new profile from an update to an existing one.
+        if end_user_id:
+            # Multi-tenant mode: query by end_user_id (SDK end-user's profile)
+            scope = {"end_user_id": end_user_id}
+            existing = await db[BrandProfileService.COLLECTION].find_one({"end_user_id": end_user_id})
+        elif brand_id:
+            # Check if this is a personal brand or agency brand
+            from app.models.brand_account import BrandAccount
+            personal_bid = BrandAccount.personal_brand_id(user_id)
+            is_personal_brand = (brand_id == personal_bid)
 
-        # Fetched up front (rather than right before the update_one call, as
-        # before) so the field-defaulting loop below can tell a brand-new
-        # profile from an update to an existing one.
-        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
-        existing = await db[BrandProfileService.COLLECTION].find_one(scope)
+            if is_personal_brand:
+                # Personal brand: scope by brand_id like the agency branch below. A
+                # bare {"user_id": user_id} here would match ANY of this user's
+                # brand_profiles docs (a multi-brand user has one per brand) and
+                # silently overwrite a DIFFERENT brand's document with personal-brand
+                # data on the next save.
+                existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": personal_bid})
+                if not existing:
+                    # Legacy: personal profile saved before brand_id existed.
+                    existing = await db[BrandProfileService.COLLECTION].find_one(
+                        {"user_id": user_id, "brand_id": {"$exists": False}}
+                    )
+
+                if existing and not existing.get("brand_id"):
+                    scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                else:
+                    scope = {"brand_id": personal_bid}
+            else:
+                # Agency mode: query by brand_id (team brand)
+                # Try to find by brand_id first, then by user_id (for migration from old profiles)
+                existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
+                if not existing:
+                    # Fallback: old profile created before brand_id was added
+                    existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id, "brand_id": {"$exists": False}})
+
+                # Set scope: if existing profile has no brand_id, update by user_id; otherwise by brand_id
+                if existing and not existing.get("brand_id"):
+                    scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                else:
+                    scope = {"brand_id": brand_id}
+        else:
+            # Single-user mode: query by user_id (personal brand)
+            scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+            existing = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # Only ever $set a field if the caller's payload actually included it —
-        # unless this is a brand-new profile, in which case every field still
-        # gets backfilled with a sensible default so the initial document is
-        # fully populated. This used to build a full ~30-field document on
-        # EVERY save using data.get(field, default) regardless of whether it
-        # was an insert or an update — meaning any partial save (e.g. the
-        # custom-guide-selection or Canvas Editor auto-saves elsewhere in the
-        # frontend, which only send a couple of changed fields plus whatever
-        # was in their local cached copy of the profile) would silently reset
-        # every other field to its empty default. Confirmed live: 0 of 123
-        # production brand profiles ever had a non-empty ideal_customer_profile
-        # despite the save/read code path working correctly in isolation.
+        # unless this is a brand-new profile, in which case every field still gets
+        # backfilled with a sensible default so the initial document is fully
+        # populated. This used to build a full ~30-field document on EVERY save
+        # using data.get(field, default) regardless of whether it was an insert or
+        # an update — meaning any partial save (e.g. the custom-guide-selection or
+        # Canvas Editor auto-saves elsewhere in the frontend, which only send a
+        # couple of changed fields plus whatever was in their local cached copy of
+        # the profile) would silently reset every other field to its empty
+        # default. Confirmed live: 0 of 123 production brand profiles ever had a
+        # non-empty ideal_customer_profile despite the save/read code path working
+        # correctly in isolation.
         doc: Dict[str, Any] = {
             "user_id": user_id,
             "brand_id": brand_id,
+            # Multi-tenant fields (optional, for SDK end-users)
+            "sdk_client_id": sdk_client_id,
+            "end_user_id": end_user_id,
             "updated_at": now,
         }
 
@@ -137,7 +183,7 @@ class BrandProfileService:
             "team_members": [],
             "languages": [],
             "region": "",
-            # Fulfilment & operations (Uri Market Intelligence PRD §7)
+            # Fulfilment & operations (Uri Market Intelligence PRD §7) — from aws/dev
             "stock_availability": "",
             "delivery_capability": "",
             "lead_time": "",
@@ -152,9 +198,9 @@ class BrandProfileService:
             elif existing is None:
                 doc[field] = default
 
-        # Caption Voice System fields (PRD Section 3.1) — same "only touch what
-        # was sent" rule applied per sub-field, not just at the top level, so a
-        # save that only changes e.g. emoji_usage doesn't reset banned_words etc.
+        # Caption Voice System fields (PRD Section 3.1) — same "only touch what was
+        # sent" rule applied per sub-field, not just at the top level, so a save
+        # that only changes e.g. emoji_usage doesn't reset banned_words etc.
         vp_defaults = {
             "formality": "casual",
             "sentence_style": "mixed_rhythm",
@@ -185,9 +231,9 @@ class BrandProfileService:
         # Business Pulse — time-sensitive "what's happening right now" fields
         # (current promotions/campaigns/news/milestones/new products), saved as a
         # unit from their own dedicated panel/endpoint rather than the main wizard.
-        # Deliberately absent from PLAYBOOK_FIELDS below: one brand's active
-        # promotion is meaningless noise for a sibling agency brand, unlike the
-        # evergreen fields above which legitimately backfill.
+        # Deliberately absent from PLAYBOOK_FIELDS in get() below: one brand's
+        # active promotion is meaningless noise for a sibling agency brand, unlike
+        # the evergreen fields above which legitimately backfill.
         bp_defaults = {
             "current_period_goal": "",
             "current_promotions": [],
@@ -208,15 +254,14 @@ class BrandProfileService:
             doc["business_pulse"] = dict(bp_defaults)
             doc["business_pulse_updated_at"] = None
 
-        # Onboarding save-and-resume: the wizard fires a partial save on every
-        # step transition (see brand-setup/page.tsx), sending only that step's
-        # own fields plus these three. onboarding_current_step is the step's
-        # NAME (e.g. "targetCustomerDetail"), not a numeric index — indexes
-        # break silently if a step is later added/removed/reordered, whereas
-        # an unrecognized name just falls back to step 0 on the frontend.
-        # onboarding_started_at is set once, on the first partial save, and
-        # never overwritten after — every subsequent save only touches
-        # onboarding_current_step/onboarding_last_saved_at.
+        # Onboarding save-and-resume: the wizard fires a partial save on every step
+        # transition, sending only that step's own fields plus these three.
+        # onboarding_current_step is the step's NAME (e.g. "targetCustomerDetail"),
+        # not a numeric index — indexes break silently if a step is later
+        # added/removed/reordered, whereas an unrecognized name just falls back to
+        # step 0 on the frontend. onboarding_started_at is set once, on the first
+        # partial save, and never overwritten after — every subsequent save only
+        # touches onboarding_current_step/onboarding_last_saved_at.
         if "onboarding_current_step" in data:
             doc["onboarding_current_step"] = data["onboarding_current_step"]
             doc["onboarding_last_saved_at"] = now
@@ -225,15 +270,12 @@ class BrandProfileService:
 
         if "style_selections" in data:
             doc["style_selections"] = data["style_selections"]
-        if "style_prompt_fragments" in data:
-            doc["style_prompt_fragments"] = data["style_prompt_fragments"]
-        # VSG-01 ad format preference (Brand Playbook "Visual Styles — Ads" section) —
-        # same shape as style_selections/style_rotation_index above, but a separate
-        # field since it selects a corpus format_id, not an organic style_library slug.
         if "ad_format_selections" in data:
             doc["ad_format_selections"] = data["ad_format_selections"]
         if "ad_format_rotation_index" in data:
             doc["ad_format_rotation_index"] = data["ad_format_rotation_index"]
+        if "style_prompt_fragments" in data:
+            doc["style_prompt_fragments"] = data["style_prompt_fragments"]
         if "font_style" in data:
             doc["font_style"] = data["font_style"]
         if "font_style_prompt" in data:
@@ -287,12 +329,12 @@ class BrandProfileService:
         if "cta_rotation_index" in data:
             doc["cta_rotation_index"] = data["cta_rotation_index"]
 
-        # Per-platform visual style overrides — additive, optional. A platform
-        # with no entry here (or an empty list) falls back to the brand-wide
-        # fields above unchanged; only present so a user CAN give a platform
-        # its own style/guide pool and rotation, never required to. Keyed by
-        # the same platform strings _generate_image_bg already receives
-        # (instagram/facebook/linkedin/tiktok/x/...).
+        # Per-platform visual style overrides — additive, optional. A platform with
+        # no entry here (or an empty list) falls back to the brand-wide fields
+        # above unchanged; only present so a user CAN give a platform its own
+        # style/guide pool and rotation, never required to. Keyed by the same
+        # platform strings _generate_image_bg already receives (instagram/
+        # facebook/linkedin/tiktok/x/...).
         if "style_selections_by_platform" in data:
             doc["style_selections_by_platform"] = data["style_selections_by_platform"]
         if "selected_custom_guides_by_platform" in data:
@@ -321,36 +363,109 @@ class BrandProfileService:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
-            print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}, logo_size={repr(doc.get('logo_size'))}")
-            await db[BrandProfileService.COLLECTION].update_one(
-                scope, {"$set": doc}
-            )
+
+            identifier = end_user_id or brand_id or user_id
+            print(f"🖼️  SAVE DEBUG identifier={identifier}: saving logo_position={repr(doc.get('logo_position'))}")
+
+            # find_one_and_update (not update_one followed by a separate
+            # find_one) so the write and the read-back are a single atomic
+            # operation. A separate find_one right after update_one can race
+            # a lagging replica read and return the document from BEFORE
+            # this write landed — confirmed live: identical save requests
+            # sometimes got back the OLD field value, sometimes a different
+            # stale value from an earlier save entirely. Never reproduced
+            # via a direct, isolated API call — only through the real
+            # browser session, which is exactly what a read-your-own-write
+            # consistency gap looks like rather than a deterministic logic
+            # bug. This makes the response always reflect exactly what was
+            # just written, by construction.
+            try:
+                result = await db[BrandProfileService.COLLECTION].find_one_and_update(
+                    scope, {"$set": doc}, return_document=ReturnDocument.AFTER
+                )
+                print(f"✅ Updated brand profile for {scope}")
+            except Exception as e:
+                print(f"❌ Error updating brand profile for {scope}: {e}")
+                raise
         else:
             doc["created_at"] = now
-            await db[BrandProfileService.COLLECTION].insert_one(doc)
+            try:
+                await db[BrandProfileService.COLLECTION].insert_one(doc)
+                identifier = end_user_id or brand_id or user_id
+                print(f"✅ Created new brand profile for {identifier}")
+                # doc is already the complete, just-inserted document —
+                # insert_one mutates it in place with the generated _id, so
+                # there's no need to read it back at all.
+                result = doc
+            except Exception as e:
+                # Handle duplicate key error
+                if "duplicate key" in str(e).lower():
+                    identifier = end_user_id or brand_id or user_id
+                    print(f"⚠️  Duplicate profile detected for {identifier}, updating instead")
+                    # Profile was created by another request, update it instead
+                    result = await db[BrandProfileService.COLLECTION].find_one_and_update(
+                        scope, {"$set": doc}, return_document=ReturnDocument.AFTER
+                    )
+                    print(f"✅ Updated via fallback for {identifier}")
+                else:
+                    print(f"❌ Error creating brand profile for user {user_id}: {e}")
+                    raise
 
-        result = await db[BrandProfileService.COLLECTION].find_one(scope)
         if result:
             result.pop("_id", None)
         return UriResponse.get_single_data_response("brand_profile", result)
 
     @staticmethod
-    async def get(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get(
+        user_id: str,
+        db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
+        end_user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        # Multi-tenant mode: query by end_user_id (highest priority)
+        if end_user_id:
+            profile = await db[BrandProfileService.COLLECTION].find_one({"end_user_id": end_user_id})
+            if not profile:
+                return UriResponse.get_single_data_response("brand_profile", None)
+            profile.pop("_id", None)
+            return UriResponse.get_single_data_response("brand_profile", profile)
+
+        # Agency/personal brand mode (backward compatible)
         from app.models.brand_account import BrandAccount
         personal_bid = BrandAccount.personal_brand_id(user_id)
         is_agency_brand = brand_id and brand_id != personal_bid
 
-        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
-        profile = await db[BrandProfileService.COLLECTION].find_one(scope)
+        # For personal brands, try multiple query strategies to find legacy profiles
+        # that were saved with user_id only (before brand_id was introduced). No bare
+        # {"user_id": user_id} fallback here — a user with several brands has several
+        # brand_profiles docs sharing that user_id, and matching on user_id alone can
+        # return a DIFFERENT brand's document (confirmed live: switching to the
+        # personal brand or a brand without its own doc served up whatever other
+        # brand's profile Mongo happened to return first for that user_id).
+        if brand_id and not is_agency_brand:
+            scope_options = [
+                {"brand_id": brand_id},
+                {"user_id": user_id, "brand_id": {"$exists": False}},
+            ]
+            profile = None
+            for scope in scope_options:
+                profile = await db[BrandProfileService.COLLECTION].find_one(scope)
+                if profile:
+                    break
+        else:
+            scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+            profile = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # For agency brands: if the profile is missing or lacks key playbook fields
         # (colors, visual style, industry), merge in the personal brand's values so
         # content generation has a full context rather than using generic defaults.
         if is_agency_brand:
+            # No bare {"user_id": user_id} fallback here either — same cross-brand
+            # leak risk as above, just merging the wrong brand's data into this one
+            # instead of returning it outright.
             personal_scope_options = [
                 {"brand_id": personal_bid},
                 {"user_id": user_id, "brand_id": {"$exists": False}},
-                {"user_id": user_id},
             ]
             personal_profile = None
             for ps in personal_scope_options:
@@ -362,7 +477,15 @@ class BrandProfileService:
                 "brand_colors", "industry", "visual_style", "aesthetic_keywords",
                 "derived_voice", "personality_quiz", "audience_age_range",
                 "audience_interests", "content_tones", "cta_styles", "default_link",
-                "tagline", "region", "font_preference", "logo_url", "logo_position", "logo_size",
+                "tagline", "region", "font_preference",
+                # Deliberately NOT logo_url/logo_position/logo_size — a logo is
+                # the literal, unique visual mark of ONE specific brand, not
+                # reusable style scaffolding like voice/tone/colors above.
+                # Inheriting it meant a sibling agency brand could never
+                # actually have "no logo": clearing it just made this same
+                # merge silently restore the personal brand's logo on the
+                # very next read, and a brand-new agency profile launched
+                # wearing a different brand's mark by default.
                 "target_audience", "ideal_customer_profile",
                 # Business Details — evergreen brand facts, same reasoning as tagline/region above
                 "price_range", "unique_selling_proposition", "business_stage", "business_priorities",
@@ -370,6 +493,7 @@ class BrandProfileService:
                 "customer_gender", "customer_location", "customer_occupation", "customer_income_level",
                 "customer_interests", "customer_pain_points", "customer_needs", "customer_objections",
                 "why_customers_choose_us", "proof_points",
+                "onboarding_completed",
                 # URI Content Calendar Generation addendum §1-4 — same evergreen-persona
                 # reasoning as the customer_* fields directly above
                 "customer_desires", "customer_fears", "customer_frustrations", "customer_aspirations",
@@ -378,10 +502,21 @@ class BrandProfileService:
                 # noise for a sibling agency brand, unlike the evergreen facts above.
             ]
             if profile is None and personal_profile:
-                # No agency profile at all — use personal profile as base
-                profile = dict(personal_profile)
-                profile.pop("_id", None)
-                profile["brand_id"] = brand_id  # stamp agency brand_id for context
+                # No agency profile at all — inherit STYLE defaults only (colors,
+                # voice, industry, etc.) so content generation isn't starting from
+                # nothing. Never borrow brand_name: this brand's own real name
+                # (from brand_accounts) must always be what's shown/generated for
+                # it, or the Brand Playbook page displays a different brand's
+                # identity as if it were this one's. logo_url/logo_position/
+                # logo_size are no longer in PLAYBOOK_FIELDS (see above), so this
+                # comprehension naturally leaves them out — a brand-new agency
+                # brand starts with no logo, not a copy of the personal brand's.
+                profile = {f: personal_profile[f] for f in PLAYBOOK_FIELDS if personal_profile.get(f)}
+                profile["brand_id"] = brand_id
+                profile["user_id"] = user_id
+                own_brand = await db["brand_accounts"].find_one({"brand_id": brand_id})
+                profile["brand_name"] = (own_brand or {}).get("name", "")
+                profile["onboarding_completed"] = False
             elif profile and personal_profile:
                 # Agency profile exists but may be sparse — fill missing fields from personal
                 profile.pop("_id", None)

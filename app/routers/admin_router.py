@@ -1235,3 +1235,34 @@ async def send_access_code_email(
     for target in targets:
         _send_access_code_email(target, code, tier, access_code["duration_days"], access_code.get("label", ""))
     return {"sent": True, "to": targets}
+
+
+@router.post("/social-media/reconcile-published-posts")
+async def admin_reconcile_published_posts(
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Manual trigger for ApprovalWorkflowService.reconcile_published_posts, for
+    an admin to run from the Admin page instead of needing a cron secret.
+
+    Live-reported: a draft published immediately (not scheduled) is marked
+    status="published" the moment Outstand accepts the submission, but
+    nothing ever re-checks whether the platform actually went through with
+    it — a Facebook token invalidation (e.g. the "Vchain" Page, confirmed via
+    CloudWatch) silently failed post after post with status staying
+    "published" and no error anywhere. This re-checks every such draft from
+    the last 7 days against Outstand's real status: a genuine platform
+    failure gets corrected to publish_failed with the real error (and, if
+    the error is a dead token/session, the connection gets marked
+    disconnected and its owner notified); a confirmed-live post is marked so
+    it stops being re-checked; anything still pending is left alone.
+
+    Deliberately not yet on the automatic scheduler (see
+    notification_scheduler.py) — this is its first run against real
+    production data, triggered here so its effect can be reviewed in
+    CloudWatch before it runs unsupervised on a cron.
+    """
+    from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+    result = await ApprovalWorkflowService.reconcile_published_posts(db=db)
+    return {"status": True, **result}

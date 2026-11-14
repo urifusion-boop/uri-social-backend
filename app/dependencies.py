@@ -1,3 +1,4 @@
+from fastapi import Request, Header
 from typing import Generator, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from fastapi import Depends, HTTPException, Query, Header
@@ -76,3 +77,234 @@ async def get_current_user(token: dict = Depends(JWTBearer())) -> dict:
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     return claims
+
+
+async def flexible_auth(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    x_end_user_id: Optional[str] = Header(None, alias="X-End-User-ID"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+) -> dict:
+    """
+    Accept EITHER JWT token OR API key for authentication.
+    Supports optional multi-tenant mode via X-End-User-ID header.
+
+    Priority:
+    1. X-API-Key header (SDK authentication)
+       - If X-End-User-ID provided → Multi-tenant mode (SDK client with end-users)
+       - If X-End-User-ID missing → Single-tenant mode (developer's own account)
+    2. Authorization: Bearer header (Dashboard JWT authentication)
+
+    Returns:
+        dict with 'user_id' and 'auth_type' keys
+        - auth_type: "api_key" or "jwt"
+        - If multi-tenant: includes 'sdk_client_id', 'end_user_id', 'is_multi_tenant'
+
+    Raises:
+        HTTPException 401 if neither auth method is provided or both are invalid
+    """
+    from fastapi import Request, Header
+    from app.middleware.api_key_auth import api_key_auth_service
+    from app.services.MultiTenantService import MultiTenantService
+
+    # Try API key first (for SDK users)
+    if x_api_key:
+        try:
+            api_key_obj = await api_key_auth_service.verify_api_key(
+                api_key=x_api_key,
+                request=request
+            )
+
+            # Check for multi-tenant mode (X-End-User-ID header present)
+            if x_end_user_id:
+                # Multi-tenant mode: SDK client with end-users
+                # Get or create SDK client profile
+                sdk_client = await MultiTenantService.get_or_create_sdk_client(
+                    api_key_hash=api_key_obj.key_hash,
+                    api_key_prefix=api_key_obj.key_prefix,
+                    developer_id=api_key_obj.user_id,
+                    company_name=api_key_obj.name or "SDK Client",
+                    db=db
+                )
+
+                if not sdk_client:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to create SDK client profile"
+                    )
+
+                # Check if SDK client can create more end-users
+                if not await MultiTenantService.can_create_end_user(sdk_client.sdk_client_id, db):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"SDK client has reached maximum end-user limit ({sdk_client.limits.max_end_users})"
+                    )
+
+                # Get or create end-user
+                end_user = await MultiTenantService.get_or_create_end_user(
+                    sdk_client_id=sdk_client.sdk_client_id,
+                    external_user_id=x_end_user_id,
+                    external_email=None,  # Can be passed via request body if needed
+                    external_name=None,   # Can be passed via request body if needed
+                    db=db
+                )
+
+                if not end_user:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to create end-user profile"
+                    )
+
+                # Update activity timestamps
+                await MultiTenantService.update_sdk_client_activity(sdk_client.sdk_client_id, db)
+                await MultiTenantService.update_end_user_activity(end_user.end_user_id, db)
+
+                return {
+                    "user_id": api_key_obj.user_id,  # Developer ID (for credit checks)
+                    "auth_type": "api_key",
+                    "api_key_obj": api_key_obj,
+                    # Multi-tenant context
+                    "is_multi_tenant": True,
+                    "sdk_client_id": sdk_client.sdk_client_id,
+                    "end_user_id": end_user.end_user_id,
+                    "external_user_id": x_end_user_id,
+                    "sdk_client": sdk_client,
+                    "end_user": end_user
+                }
+            else:
+                # Single-tenant mode: Developer's own account (backward compatible)
+                return {
+                    "user_id": api_key_obj.user_id,
+                    "auth_type": "api_key",
+                    "api_key_obj": api_key_obj,
+                    "is_multi_tenant": False
+                }
+        except HTTPException:
+            # API key failed, re-raise the error
+            raise
+
+    # Fallback to JWT (for dashboard users)
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith("Bearer "):
+        jwt_bearer = JWTBearer(auto_error=True)
+        try:
+            jwt_payload = await jwt_bearer(request)
+            claims = jwt_payload.get("claims", {})
+            user_id = claims.get("userId") or claims.get("user_id")
+            if not user_id:
+                # Live-reported (connect-account flow): a 401 here silently
+                # force-logged the user out client-side with no visible error
+                # at all — "bounces back, no error". That client-side bug is
+                # now fixed too, but this 401 happening in the first place
+                # means a token decoded fine yet has no userId/user_id claim,
+                # which sign_jwt always sets — log enough to actually diagnose
+                # it (never the token itself) if it recurs.
+                print(
+                    f"⚠️ flexible_auth 401: JWT decoded but no userId/user_id in claims | "
+                    f"path={request.url.path} claim_keys={list(claims.keys())} "
+                    f"user_agent={request.headers.get('user-agent', '')[:200]}"
+                )
+                raise HTTPException(status_code=401, detail="User ID not found in JWT token")
+            return {
+                "user_id": user_id,
+                "auth_type": "jwt",
+                "jwt_payload": jwt_payload,
+                "is_multi_tenant": False
+            }
+        except HTTPException:
+            raise
+
+    # No valid authentication provided — no Bearer header and no X-API-Key.
+    # Same live-reported case as above: log enough to tell "token genuinely
+    # missing from this request" apart from the claims-shape case, without
+    # needing the user to reproduce it again.
+    print(
+        f"⚠️ flexible_auth 401: no Authorization/X-API-Key header on request | "
+        f"path={request.url.path} has_auth_header={bool(authorization)} "
+        f"auth_header_prefix={authorization[:10]!r} "
+        f"user_agent={request.headers.get('user-agent', '')[:200]}"
+    )
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required. Provide either X-API-Key header (SDK) or Authorization: Bearer header (Dashboard)."
+    )
+
+
+def extract_user_id_from_auth(auth: dict) -> str:
+    """
+    Helper function to extract user_id from flexible auth result.
+
+    Args:
+        auth: Result from flexible_auth dependency
+
+    Returns:
+        user_id as string
+    """
+    return auth.get("user_id")
+
+
+async def get_flexible_brand_context(
+    brand_id: Optional[str] = Query(None, description="Active brand id"),
+    x_brand_id: Optional[str] = Header(None, alias="X-Brand-Id"),
+    auth: dict = Depends(flexible_auth),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """
+    Flexible version of get_active_brand_context that accepts BOTH JWT and API key.
+
+    Priority:
+      1. Explicit brand_id (query param or X-Brand-Id header) — verified for access.
+      2. The user's personal solo brand (auto-created on first use).
+
+    Returns {"user_id", "brand_id", "agency_id", "auth_type"}
+    Raises 403 on denied access.
+
+    SDK multi-tenant mode (auth["is_multi_tenant"]): each end-user gets their
+    own brand, isolated from the developer's own personal brand and from
+    every other end-user under the same API key — the brand_id is derived
+    from the end_user_id, not the developer's user_id. Credits/billing still
+    attach to the developer (auth["user_id"]); only brand/content data is
+    end-user-scoped. Without this, every end-user silently shared the
+    developer's single personal brand.
+    """
+    from app.services.AgencyService import AgencyService
+    from app.services.BrandAccountService import BrandAccountService
+
+    user_id = auth["user_id"]
+    requested = brand_id or x_brand_id
+
+    if auth.get("is_multi_tenant") and auth.get("end_user_id"):
+        from app.services.MultiTenantService import MultiTenantService
+
+        end_user_id = auth["end_user_id"]
+        brand = await BrandAccountService.get_or_create_personal_brand(end_user_id, db)
+        try:
+            await MultiTenantService.link_end_user_to_brand_profile(end_user_id, brand.brand_id, db)
+        except Exception as link_err:
+            print(f"⚠️ brand context: failed to link end_user {end_user_id} to brand {brand.brand_id}: {link_err}")
+        return {
+            "user_id": user_id,
+            "brand_id": brand.brand_id,
+            "agency_id": None,
+            "auth_type": auth["auth_type"],
+        }
+
+    if requested and await AgencyService.user_has_access_to_brand(user_id, requested, db):
+        brand = await BrandAccountService.get_brand(requested, db)
+        return {
+            "user_id": user_id,
+            "brand_id": requested,
+            "agency_id": brand.agency_id if brand else None,
+            "auth_type": auth["auth_type"],
+        }
+
+    # No brand requested, OR user doesn't have access → fall back to personal brand
+    if requested:
+        print(f"⚠️ brand context: user {user_id} has no access to brand {requested}; falling back to personal brand")
+    personal = await BrandAccountService.get_or_create_personal_brand(user_id, db)
+    return {
+        "user_id": user_id,
+        "brand_id": personal.brand_id,
+        "agency_id": None,
+        "auth_type": auth["auth_type"],
+    }

@@ -734,15 +734,62 @@ RULES FOR THIS EDIT:
                 logo_position = current_logo_placement.get("position") or logo_position
                 logo_size = current_logo_placement.get("logo_size") or logo_size
 
-            edit_result = await ImageEditingService._call_edit_api(
-                image_bytes=image_bytes,
-                prompt=edit_prompt,
-                size=size,
-                exact_dimensions=(original_width, original_height),
-                logo_url=logo_url,
-                logo_position=logo_position,
-                logo_size=logo_size,
+            # Cleanest path, when this post kept its logo-free background and the exact box
+            # its logo sits in (everything generated since Move Logo shipped): edit THAT
+            # background, so the edit model never sees a logo it could redraw or duplicate,
+            # then paste the real logo back at the very same spot and size. Only when that
+            # isn't available (older posts) or fails do we fall back to clearing the logo's
+            # region on the composite image and re-placing it afterwards.
+            edit_result = None
+            saved_background = (
+                slides[slide_index].get("background_image_url") if slide_index is not None
+                else draft.get("background_image_url")
             )
+            saved_box = current_logo_placement or {}
+            if logo_url and saved_background and all(
+                isinstance(saved_box.get(k), (int, float)) for k in ("x", "y", "width", "height")
+            ):
+                try:
+                    bg_bytes = await ImageEditingService._download_image(saved_background)
+                    if bg_bytes:
+                        clean = await ImageEditingService._call_edit_api(
+                            image_bytes=bg_bytes,
+                            prompt=edit_prompt,
+                            size=size,
+                            exact_dimensions=(original_width, original_height),
+                            logo_url=None,
+                        )
+                        if clean and clean.get("image_url"):
+                            from .image_content_service import ImageContentService
+                            from app.utils.s3_upload import upload_base64
+                            relogo_b64 = await ImageContentService.composite_logo_at_position(
+                                clean["image_url"], logo_url,
+                                int(saved_box["x"]), int(saved_box["y"]),
+                                int(saved_box["width"]), int(saved_box["height"]),
+                            )
+                            final_url = await upload_base64(
+                                f"data:image/webp;base64,{relogo_b64}", folder="uri-social/content-drafts"
+                            )
+                            edit_result = {
+                                "image_url": final_url,
+                                "background_image_url": clean["image_url"],
+                                "logo_placement": {**saved_box},
+                            }
+                            print("[EDIT] Edited the logo-free background and re-placed the logo at its saved spot")
+                except Exception as _clean_e:
+                    print(f"[EDIT] Logo-free edit path failed, falling back: {_clean_e}")
+                    edit_result = None
+
+            if edit_result is None:
+                edit_result = await ImageEditingService._call_edit_api(
+                    image_bytes=image_bytes,
+                    prompt=edit_prompt,
+                    size=size,
+                    exact_dimensions=(original_width, original_height),
+                    logo_url=logo_url,
+                    logo_position=logo_position,
+                    logo_size=logo_size,
+                )
 
             if not edit_result:
                 return UriResponse.error_response("Image edit API call failed")

@@ -31,6 +31,7 @@ _PLATFORM_LABELS = {
     Platform.GOOGLE: "Google",
     Platform.TIKTOK: "TikTok",
 }
+_SHORT_PLATFORM_NAMES = {Platform.META: "Meta", Platform.GOOGLE: "Google", Platform.TIKTOK: "TikTok"}
 
 
 class ReasonedValue(BaseModel):
