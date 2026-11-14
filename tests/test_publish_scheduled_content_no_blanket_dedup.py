@@ -35,99 +35,35 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
-class FakeCursor:
-    def __init__(self, docs: list[dict]):
-        self._docs = docs
-
-    def sort(self, key, direction=1):
-        self._docs = sorted(self._docs, key=lambda d: d.get(key), reverse=(direction == -1))
-        return self
-
-    def limit(self, n):
-        self._docs = self._docs[:n]
-        return self
-
-    async def to_list(self, length=None):
-        return [dict(d) for d in (self._docs[:length] if length is not None else self._docs)]
-
-
-class FakeUpdateResult:
-    def __init__(self, modified_count=0, matched_count=0):
-        self.modified_count = modified_count
-        self.matched_count = matched_count
+# An in-memory MongoDB (mongomock) behind the small interface these tests use, so queries
+# behave exactly like the real database ($or next to other conditions, $nin, $not, upserts...).
+mongomock_motor = pytest.importorskip("mongomock_motor")
 
 
 class FakeCollection:
-    def __init__(self, docs=None):
-        self.docs: list[dict] = docs or []
+    """A real (in-memory) Mongo collection, plus `.docs`: the stored documents, for assertions."""
 
-    def _match(self, query):
-        if "$or" in query:
-            return [d for d in self.docs if any(
-                all(self._field_matches(d, k, v) for k, v in clause.items())
-                for clause in query["$or"]
-            )]
-        return [d for d in self.docs if all(self._field_matches(d, k, v) for k, v in query.items())]
+    def __init__(self, docs=None, _coll=None):
+        self._c = _coll if _coll is not None else mongomock_motor.AsyncMongoMockClient()["test"]["c"]
+        for d in docs or []:
+            _run(self._c.insert_one(dict(d)))
 
-    def _field_matches(self, d, k, v):
-        val = d.get(k)
-        if isinstance(v, dict):
-            if "$lte" in v:
-                return val is not None and val <= v["$lte"]
-            if "$ne" in v:
-                return val != v["$ne"]
-            if "$exists" in v:
-                return (k in d) == v["$exists"]
-            if "$in" in v:
-                return val in v["$in"]
-        return val == v
+    def __getattr__(self, name):
+        return getattr(self._c, name)
 
-    async def find_one(self, query, projection=None, sort=None):
-        matches = self._match(query)
-        if sort:
-            key, direction = sort[0]
-            matches.sort(key=lambda d: d.get(key), reverse=(direction == -1))
-        return dict(matches[0]) if matches else None
-
-    def find(self, query):
-        return FakeCursor(self._match(query))
-
-    async def find_one_and_update(self, query, update, return_document=None):
-        matches = self._match(query)
-        if not matches:
-            return None
-        d = matches[0]
-        before = dict(d)
-        d.update(update.get("$set", {}))
-        return before
-
-    async def update_one(self, query, update, upsert=False):
-        matches = self._match(query)
-        for d in matches:
-            d.update(update.get("$set", {}))
-            for k in update.get("$unset", {}):
-                d.pop(k, None)
-            return FakeUpdateResult(modified_count=1, matched_count=1)
-        if upsert:
-            new_doc = dict(query)
-            new_doc.update(update.get("$set", {}))
-            self.docs.append(new_doc)
-            return FakeUpdateResult(modified_count=0, matched_count=0)
-        return FakeUpdateResult(modified_count=0, matched_count=0)
-
-    async def update_many(self, query, update):
-        matches = self._match(query)
-        for d in matches:
-            d.update(update.get("$set", {}))
-        return FakeUpdateResult(modified_count=len(matches), matched_count=len(matches))
+    @property
+    def docs(self) -> list[dict]:
+        return _run(self._c.find({}, {"_id": 0}).to_list(None))
 
 
 class FakeDb:
     def __init__(self, collections: dict[str, list[dict]] | None = None):
-        self._colls = {name: FakeCollection(docs) for name, docs in (collections or {}).items()}
+        self._db = mongomock_motor.AsyncMongoMockClient()["test"]
+        for name, docs in (collections or {}).items():
+            FakeCollection(docs, _coll=self._db[name])
 
     def __getitem__(self, name):
-        return self._colls.setdefault(name, FakeCollection())
+        return FakeCollection(_coll=self._db[name])
 
 
 def _draft(draft_id, scheduled_date, created_at):
@@ -165,9 +101,13 @@ def test_two_legitimately_different_scheduled_posts_are_both_processed_not_cance
     ):
         result = _run(ApprovalWorkflowService.publish_scheduled_content(db))
 
-    statuses = {d["id"]: d["status"] for d in db["content_drafts"].docs}
-    assert statuses == {"draft-A": "published", "draft-B": "published"}
-    assert result["published_count"] == 2
+    drafts = {d["id"]: d for d in db["content_drafts"].docs}
+    # Neither is cancelled. Both go out: the first now, the second right after it, held
+    # back only by the per-account spacing between posts (it has a next_attempt_at).
+    assert "replaced" not in {d["status"] for d in drafts.values()}
+    assert drafts["draft-A"]["status"] == "published"
+    assert drafts["draft-B"]["status"] == "scheduled" and drafts["draft-B"].get("next_attempt_at")
+    assert result["published_count"] == 1
 
 
 def test_a_future_dated_outstand_scheduled_post_is_not_cancelled_by_a_newer_one():
