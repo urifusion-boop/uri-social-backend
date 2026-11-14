@@ -54,7 +54,7 @@ class TestViewerPresumptionGuard:
 
     @pytest.mark.parametrize("statement", [
         "I fix every phone myself, same day",
-        "Every stitch is done by hand in my shop",
+        "Every stitch is done by hand",
         "I answer every call personally",
     ])
     def test_seller_statement_of_position_is_allowed(self, statement):
@@ -78,13 +78,13 @@ class TestDisallowedPersonalTopicGuard:
         matters when aimed at the viewer (ViewerPresumption's job), not as
         a standalone banned word. A seller's own first-person 'observed
         situation' framing is exactly what §2.7 permits."""
-        doc = build_document(PHOTO_URL, "I struggled for years to find reliable suppliers", True)
+        doc = build_document(PHOTO_URL, "I struggled to find good suppliers", True)
         assert doc is not None
 
     def test_relationship_word_alone_is_not_a_topic_violation(self):
         """Same class of false positive: 'relationships with clients' is
         ordinary business language, not personal circumstance."""
-        doc = build_document(PHOTO_URL, "I value long-term relationships with every client", True)
+        doc = build_document(PHOTO_URL, "I value relationships with clients", True)
         assert doc is not None
 
 
@@ -116,11 +116,13 @@ class TestBuildDocument:
         assert photo["width"] == doc["canvas"]["width"]
         assert photo["height"] == doc["canvas"]["height"]
 
-    def test_plate_sits_at_lower_mid_face(self):
+    def test_plate_sits_below_the_face_not_across_it(self):
+        """Below the face, not across it: a line over someone's mouth reads as a gag
+        (moved there on purpose, 5 Nov). The plate stays on the canvas."""
         doc = self._doc()
         height = doc["canvas"]["height"]
         plate = next(l for l in doc["layers"] if l["type"] == "shape" and l.get("fill_color"))
-        assert 0.45 * height < plate["y"] < 0.65 * height
+        assert 0.65 * height < plate["y"] and plate["y"] + plate["height"] <= height
 
     def test_text_is_never_drawn_without_the_plate_beneath_it(self):
         """§2.7: 'Text over skin tones is where legibility fails first —

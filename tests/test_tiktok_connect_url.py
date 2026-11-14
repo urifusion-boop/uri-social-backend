@@ -27,5 +27,7 @@ def test_it_carries_everything_tiktok_requires():
     assert q["client_key"] == "ck"
     assert q["redirect_uri"] == REDIRECT
     assert q["response_type"] == "code"
-    assert q["scope"] == "user.info.basic,video.publish"
+    # Posting needs user.info.basic + video.publish; the Performance page also reads
+    # user.info.stats + video.list (see TIKTOK_SCOPES).
+    assert q["scope"] == "user.info.basic,user.info.stats,video.list,video.publish"
     assert q["state"] == "settings"

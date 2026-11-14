@@ -9,6 +9,7 @@ Usage:
     python scripts/seed_performance_data.py --user-id <uuid> --clear
 """
 
+import os
 import argparse
 import random
 import uuid
@@ -17,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pymongo import MongoClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MONGODB_URI = "mongodb://urifusion:UriTest2024%21@4.221.74.63:27018/Uri_Insight?authSource=admin"
+MONGODB_URI = os.environ["MONGODB_URI"]  # never hard-code a connection string
 MONGODB_DB  = "Uri_Insight"
 USER_ID     = "401f0801-a2f9-44da-8fd1-a0dd69eebcdd"  # shorekoya@gmail.com
 

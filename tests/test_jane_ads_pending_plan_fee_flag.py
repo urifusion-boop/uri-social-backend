@@ -7,6 +7,7 @@ and launch read it back as False.
 """
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -20,6 +21,13 @@ def _run(coro):
 
 
 class _Dump:
+    """A built plan, reduced to what storing it reads. Fields this test doesn't care about
+    (creative, objective, platforms, ...) are simply not set."""
+    platforms = []
+
+    def __getattr__(self, name):
+        return None
+
     def model_dump(self, mode="json"):
         return {}
 
@@ -63,7 +71,8 @@ def _stored_plan_for(monkeypatch, fee_bypassed):
 
     db = _Db()
     body = R.MetaLaunchFromMessageBody(message="run a TikTok ad", preferred_platform="tiktok" if fee_bypassed else "")
-    out = _run(R.meta_plan_from_message(body, db, BRAND))
+    request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))  # the client is still there
+    out = _run(R.meta_plan_from_message(body, request, db, BRAND))
     assert out["stage"] == "planned"
     assert len(db.pending.inserted) == 1
     return db.pending.inserted[0]

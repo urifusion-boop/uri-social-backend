@@ -5,11 +5,12 @@ Stuck = has_image:True but image_url is null/missing — these show infinite
 shimmer in the frontend because the background task died silently before the
 image_failed flag existed.
 """
+import os
 import asyncio
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorClient
 
-MONGODB_URI = "mongodb://urifusion:UriTest2024%21@4.221.74.63:27018/Uri_Insight?authSource=admin"
+MONGODB_URI = os.environ["MONGODB_URI"]  # never hard-code a connection string
 MONGODB_DB = "Uri_Insight"
 
 
