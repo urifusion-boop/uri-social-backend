@@ -189,6 +189,27 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create notification_daily_claims TTL index: {e}")
 
+    # Durable background jobs (app/jobs): indexes, then this process's worker. Jobs live in
+    # Mongo with a lease, so work started before a deploy is picked up by another server.
+    try:
+        from app.database import get_db
+        from app.jobs import queue as _job_queue, worker as _job_worker
+        from app.agents.brand_intel import service as _brand_intel
+        await _job_queue.ensure_indexes(get_db())
+        await _brand_intel.ensure_indexes(get_db())
+        _job_worker.register(_brand_intel.JOB_TYPE, _brand_intel.read_site_job)
+        from app.agents.competitors import service as _competitors
+        await _competitors.ensure_indexes(get_db())
+        _job_worker.register(_competitors.JOB_TYPE, _competitors.discovery_job)
+        from app.agents.competitors import ads as _competitor_ads
+        await _competitor_ads.ensure_indexes(get_db())
+        _job_worker.register(_competitor_ads.ANALYSIS_JOB, _competitor_ads.analysis_job)
+        _job_worker.register(_competitor_ads.RECREATE_JOB, _competitor_ads.recreate_job)
+        _job_worker.start(get_db)
+        print("✅ Background job worker started")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to start background job worker: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
@@ -370,6 +391,16 @@ app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 # Include SDK router (API key authentication for external developers)
 app.include_router(sdk_router, tags=["SDK"])
 
+# Website → Brand Playbook (PRD Workstream 1)
+from app.agents.brand_intel.router import router as brand_intel_router
+app.include_router(brand_intel_router)
+from app.agents.competitors.router import router as competitors_router
+app.include_router(competitors_router)
+from app.features.router import router as features_router
+app.include_router(features_router)
+from app.jobs.router import router as jobs_router
+app.include_router(jobs_router)
+
 # Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
 from app.agents.jane_ads.router import router as jane_ads_router
 app.include_router(jane_ads_router)
@@ -412,3 +443,14 @@ def health_check() -> dict:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
+
+
+@app.on_event("shutdown")
+async def stop_job_worker():
+    # Stop claiming new jobs; a job cut short here is taken over by another server when its
+    # lease runs out.
+    try:
+        from app.jobs import worker as _job_worker
+        _job_worker.stop()
+    except Exception:
+        pass
