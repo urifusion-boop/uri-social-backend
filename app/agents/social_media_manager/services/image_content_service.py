@@ -725,12 +725,11 @@ class ImageContentService:
         logo_position = bc.get('logo_position', 'bottom_right')
         logo_size = bc.get('logo_size', 'small')
 
-        # Logo size percentages: small=8%, medium=12%, large=16%.
-        # Reserve space = actual logo size + padding for badge + edge spacing.
+        # Logo size percentages: small=8%, medium=12%, large=16%, plus a little padding.
         logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
         logo_pct = logo_size_map.get(logo_size, 0.08)
-        reserve_width_pct = int((logo_pct + 0.05) * 100)
-        reserve_height_pct = int((logo_pct + 0.04) * 100)
+        reserve_width_pct = int((logo_pct + 0.02) * 100)
+        reserve_height_pct = int((logo_pct + 0.02) * 100)
         logo_reserve_size = f"{reserve_width_pct}% width × {reserve_height_pct}% height"
 
         position_map = {
@@ -742,20 +741,21 @@ class ImageContentService:
             "bottom_right": "bottom-right corner",
         }
         pos_text = position_map.get(logo_position, logo_position)
+        # Worded as "plain background that continues", never as a "zone" to "reserve": image
+        # models answer "reserve a logo zone" by DRAWING the zone (a dotted placeholder box the
+        # real logo then lands inside — reported on staging, Oct 2026). Same wording as the
+        # default generation path.
         return (
-            f"\n\n🚨 CRITICAL - LOGO OVERLAY ZONE ({pos_text}):\n"
-            f"A {logo_reserve_size} brand logo will be overlaid in the {pos_text}.\n"
-            f"MANDATORY REQUIREMENTS:\n"
-            f"  • This zone MUST be 100% clear of ALL text, headlines, diagrams, illustrations, and visual elements\n"
-            f"  • ONLY solid colors, gradients, or simple background patterns allowed in this zone\n"
-            f"  • NO text of any kind (not even small text or labels)\n"
-            f"  • NO shapes, icons, illustrations, or graphic elements\n"
-            f"  • ABSOLUTELY NO boxes, rectangles, squares, frames, borders, outlines, or containers of ANY kind\n"
-            f"  • ABSOLUTELY NO white boxes, dotted borders, dashed lines, or placeholder frames\n"
-            f"  • DO NOT draw rectangles, rounded corners, cards, panels, or any geometric shapes in this area\n"
-            f"  • The logo will be placed DIRECTLY on the background with transparency - keep the area COMPLETELY CLEAN\n"
-            f"  • Place ALL content (headlines, diagrams, text, visuals) OUTSIDE this reserved zone\n"
-            f"If you draw ANY box, border, frame, or shape in this zone, the design FAILS. This overrides all aesthetic preferences."
+            f"\n\n🚨 CRITICAL - KEEP THE {pos_text.upper()} PLAIN:\n"
+            f"The brand's real logo is added to the {pos_text} after the image is made "
+            f"(about {logo_reserve_size}). For that to look clean:\n"
+            f"  • Leave the {pos_text} as plain, continuous background — the same colour, gradient or "
+            f"surface as the area around it\n"
+            f"  • NO text of any kind there (not even small text or labels)\n"
+            f"  • NO shapes, icons, illustrations, people, products or graphic elements there\n"
+            f"  • {NO_MARK_LOGO}\n"
+            f"  • Place ALL content (headlines, diagrams, text, visuals) away from the {pos_text}\n"
+            f"This overrides all aesthetic preferences."
         )
 
     @staticmethod
@@ -1575,13 +1575,20 @@ OVERALL:
                         # re-paste the logo onto from scratch, instead of
                         # re-running AI generation just to move a badge.
                         background_image_data_url = data_url
-                        b64_final, chosen_position, geometry = await ImageContentService.overlay_logo_smart(
-                            _m.group(1), logo_url, logo_size, preferred_position=logo_position,
-                            return_placement=True,
+                        # The plain fixed-position overlay (fast). overlay_logo_smart adds up to 3
+                        # sequential AI vision calls per image, which made Jane's ad/organic
+                        # generation time out ("Network Error") — removed on prod 1 Oct
+                        # (ac608c3c), brought back by the 12 Nov merge, removed again here.
+                        loop = asyncio.get_running_loop()
+                        b64_final, geometry = await loop.run_in_executor(
+                            None,
+                            lambda: ImageContentService._overlay_logo(
+                                _m.group(1), logo_url, logo_position, logo_size, return_geometry=True
+                            ),
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
                         if geometry:
-                            logo_placement = {**geometry, "position": chosen_position, "logo_size": logo_size}
+                            logo_placement = {**geometry, "position": logo_position, "logo_size": logo_size}
                 else:
                     print(f"⚠️  LOGO SKIPPED: logo_url is None or empty")
 
@@ -1761,8 +1768,10 @@ rich tonal range, no pure black or pure white."""
             composited_b64 = _b64c.b64encode(composited_png).decode()
 
             if logo_url:
-                composited_b64 = await ImageContentService.overlay_logo_smart(
-                    composited_b64, logo_url, logo_size, preferred_position=logo_position
+                loop = asyncio.get_running_loop()
+                composited_b64 = await loop.run_in_executor(
+                    None,
+                    lambda: ImageContentService._overlay_logo(composited_b64, logo_url, logo_position, logo_size)
                 )
 
             return UriResponse.get_single_data_response("platform_image", {
