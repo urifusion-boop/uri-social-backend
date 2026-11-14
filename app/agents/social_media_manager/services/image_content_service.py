@@ -562,6 +562,19 @@ class ImageContentService:
             if not seed_content:
                 seed_content = content  # last resort
 
+            # REGENERATION FIX: If content is long (multi-paragraph post from calendar),
+            # extract just the first sentence/question to prevent text-heavy images.
+            # Direct generation already uses short content, so this only affects regeneration.
+            if len(content) > 150:
+                # Extract first sentence or first meaningful line
+                import re as _re_sent
+                sentences = _re_sent.split(r'[.!?]\s+', content)
+                if sentences:
+                    content = sentences[0].strip()
+                    if not content.endswith(('.', '!', '?')):
+                        content += '.'
+                    print(f"📝 Regeneration: Shortened content from {len(draft.get('content', ''))} to {len(content)} chars")
+
             # Load brand profile so logo (and its position) are applied during regeneration
             from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService as _BPS
             _profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
@@ -691,6 +704,98 @@ class ImageContentService:
             "fintech_saas_tech": "Thin geometric sans-serif. Subtle neon glow or holographic shimmer.",
         }
         return text_style_map.get(industry, "Clean sans-serif. Subtle shadow for readability. No heavy effects.")
+
+    @staticmethod
+    def build_logo_space_note(brand_context: Optional[Dict[str, Any]]) -> str:
+        """The brand's logo position is a user choice, not a negotiation — this
+        builds the CRITICAL instruction block that tells the image model to
+        leave 100% of that exact corner clear, so generated content is always
+        the one that adapts around the logo, never the other way around.
+        Empty string when no logo is configured. Shared by every
+        image-generation path (default, true-compositing, and the V2
+        custom-guide meta-prompt) so they can't silently drift out of sync —
+        without this, a path that forgets to ask for the reservation will
+        keep producing headline text that collides with the logo, since the
+        model has no way to know the logo even exists otherwise."""
+        bc = brand_context or {}
+        logo_url = bc.get('logo_url')
+        if not logo_url:
+            return ""
+
+        logo_position = bc.get('logo_position', 'bottom_right')
+        logo_size = bc.get('logo_size', 'small')
+
+        # Logo size percentages: small=8%, medium=12%, large=16%.
+        # Reserve space = actual logo size + padding for badge + edge spacing.
+        logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
+        logo_pct = logo_size_map.get(logo_size, 0.08)
+        reserve_width_pct = int((logo_pct + 0.05) * 100)
+        reserve_height_pct = int((logo_pct + 0.04) * 100)
+        logo_reserve_size = f"{reserve_width_pct}% width × {reserve_height_pct}% height"
+
+        position_map = {
+            "top_center": "top-center",
+            "top_left": "top-left corner",
+            "top_right": "top-right corner",
+            "bottom_left": "bottom-left corner",
+            "bottom_center": "bottom-center",
+            "bottom_right": "bottom-right corner",
+        }
+        pos_text = position_map.get(logo_position, logo_position)
+        return (
+            f"\n\n🚨 CRITICAL - LOGO OVERLAY ZONE ({pos_text}):\n"
+            f"A {logo_reserve_size} brand logo will be overlaid in the {pos_text}.\n"
+            f"MANDATORY REQUIREMENTS:\n"
+            f"  • This zone MUST be 100% clear of ALL text, headlines, diagrams, illustrations, and visual elements\n"
+            f"  • ONLY solid colors, gradients, or simple background patterns allowed in this zone\n"
+            f"  • NO text of any kind (not even small text or labels)\n"
+            f"  • NO shapes, icons, illustrations, or graphic elements\n"
+            f"  • ABSOLUTELY NO boxes, rectangles, squares, frames, borders, outlines, or containers of ANY kind\n"
+            f"  • ABSOLUTELY NO white boxes, dotted borders, dashed lines, or placeholder frames\n"
+            f"  • DO NOT draw rectangles, rounded corners, cards, panels, or any geometric shapes in this area\n"
+            f"  • The logo will be placed DIRECTLY on the background with transparency - keep the area COMPLETELY CLEAN\n"
+            f"  • Place ALL content (headlines, diagrams, text, visuals) OUTSIDE this reserved zone\n"
+            f"If you draw ANY box, border, frame, or shape in this zone, the design FAILS. This overrides all aesthetic preferences."
+        )
+
+    @staticmethod
+    def build_bottom_margin_rule(brand_context: Optional[Dict[str, Any]], bottom_pct: int = 20) -> str:
+        """The large 30% bottom reservation only earns its keep when the
+        logo is actually going to be composited into THAT strip afterward —
+        i.e. only when logo_position is a bottom corner. Without a
+        bottom-positioned logo, nothing ever fills that space, and a third
+        of the canvas left blank reads as broken, not intentional.
+        Confirmed live: a brand with logo_position="top_left" still had
+        this fire unconditionally off logo_url alone, producing a correctly
+        top-left-placed logo (via build_logo_space_note, which IS
+        position-aware) plus an entirely separate, pointless, un-filled 30%
+        blank band reserved at the bottom for a logo that was never going
+        there. This must stay in sync with logo_position, not just
+        logo_url — a top/center-positioned logo gets the same plain
+        {bottom_pct}%-margin treatment as no logo at all.
+
+        bottom_pct is the margin _safe_zone_margins_pct computed to survive
+        _crop_to_ratio's post-generation crop (which removes most of a
+        top+bottom crop from the bottom — see _TOP_CROP_BIAS) — it can
+        exceed the logo's own 30% on a badly-mismatched platform (e.g.
+        LinkedIn), in which case whichever is larger governs, since both are
+        real, independent constraints on the same edge."""
+        bc = brand_context or {}
+        logo_position = bc.get('logo_position', 'bottom_right')
+        bottom_positions = {"bottom_left", "bottom_center", "bottom_right"}
+        if bc.get('logo_url') and logo_position in bottom_positions:
+            required_pct = max(30, bottom_pct)
+            return (
+                f"⚠️ BOTTOM MARGIN — CRITICAL: CTA text, footers, and any bottom text must END at least\n"
+                f"{required_pct}% from the bottom edge (leave the bottom {required_pct}% of image height as EMPTY SPACE below any text) —\n"
+                "this reserved strip is where the brand's logo will be placed after generation."
+            )
+        return (
+            f"Maintain a minimum {bottom_pct}% safe-zone margin from the bottom edge too, same as the other three edges.\n"
+            "No bottom-positioned logo needs this space reserved, so there's no need for extra empty space "
+            "beyond that —\n"
+            "content may extend naturally into the lower part of the canvas."
+        )
 
     @staticmethod
     async def _generate_platform_image(
@@ -915,11 +1020,16 @@ class ImageContentService:
             _lr_pct = _safe_margins["left_right"]
             _crop_note = (
                 "\nThis image will be generated at a different aspect ratio than its final "
-                "size, then cropped to fit — the margins below already include a "
-                "buffer for that crop, so treat them as the true usable canvas, not a style "
-                "preference."
+                "size, then cropped to fit (biased toward keeping the top intact) — the "
+                "margins below already include a buffer for that crop, so treat them as "
+                "the true usable canvas, not a style preference."
                 if (_top_pct > 20 or _bottom_pct > 20 or _lr_pct > 20) else ""
             )
+            # The logo's own bottom-corner clearance (build_bottom_margin_rule)
+            # and the crop-survival margin (_bottom_pct) are independent
+            # constraints — whichever demands more space wins, so neither one
+            # silently loses to the other.
+            bottom_margin_rule = ImageContentService.build_bottom_margin_rule(bc, _bottom_pct)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
 You must follow every instruction below precisely.
@@ -933,19 +1043,23 @@ Every letter of every word must be 100% inside the image canvas with no clipping
 Maintain a minimum {_top_pct}% safe-zone margin from the top edge.
 Maintain a minimum {_bottom_pct}% safe-zone margin from the bottom edge.
 Maintain a minimum {_lr_pct}% safe-zone margin from the left and right edges.
+{bottom_margin_rule}
 This margin applies to EVERY visual element, not only text — decorative shapes, stars,
 arrows, icons, illustrations, badges and any other graphic flourish must also stay fully
 inside it. A star or icon placed right at the edge is just as broken as clipped text once
 the crop runs: it gets cut in half. Treat decoration with the same discipline as copy.
-Headlines must begin at least {_top_pct}% from the top edge. CTA text must end at least
-{_bottom_pct}% from the bottom edge. If text is too large to fit within these margins, reduce the
-font size — do NOT let any character touch or cross any edge. This rule overrides
-any visual style, typography, or layout instruction that follows.{logo_space_note}"""
+Headlines must begin at least {_top_pct}% from the top edge.
+If text is too large to fit within these margins, reduce the font size — do NOT let any
+character touch or cross any edge.
+⚠️ CRITICAL: Text cut off at bottom edges is a CRITICAL FAILURE. Leave generous space
+at the bottom. This rule overrides any visual style, typography, or layout instruction
+that follows.{logo_space_note}"""
 
             # SECTION 2: PROFESSIONAL OUTPUT RULES
             # These rules make AI graphics look professionally designed (not AI-generated)
             primary_color = brand_colors[0] if brand_colors else "#000000"
             secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
+            tertiary_color = brand_colors[2] if len(brand_colors) > 2 else None
 
             # Use CTA from brand playbook's cta_styles
             # Rotate through CTAs in round-robin fashion for even distribution
@@ -1047,9 +1161,10 @@ Follow these rules precisely for every image. No exceptions.
 1. BRAND NAME: {brand_name_directive}
 
 2. CALL-TO-ACTION: Display the following CTA text at the bottom of the image
-   in small clean sans-serif text: "{cta_text}". Style it subtle but legible,
-   approximately 30% the size of the headline. Position: bottom-centre or
-   bottom-right within safe zone. Do NOT style it as a button or banner.
+   in clean sans-serif text: "{cta_text}". Clearly legible at a glance —
+   approximately 45% the size of the headline, not a tiny caption. Position:
+   bottom-centre or bottom-right within safe zone. Do NOT style it as a
+   button or banner.
 
 3. FONTS: Maximum 2 font styles in the entire image. One bold/heavy weight
    for headlines. One regular weight for body and CTA. Same family or
@@ -1067,7 +1182,7 @@ Follow these rules precisely for every image. No exceptions.
 6. NO HASHTAGS: Do NOT render any hashtags on the image. Hashtags go in
    the caption text only.
 
-7. COLOUR LIMIT: Use only these colours: {primary_color}, {secondary_color},
+7. COLOUR LIMIT: Use only these colours: {primary_color}, {secondary_color}{', ' + tertiary_color if tertiary_color else ''},
    and one neutral (black #000000, white #FFFFFF, or grey #888888). No other
    colours unless specified in VISUAL STYLE.
 
@@ -1607,7 +1722,7 @@ Use the brand's colours where relevant: {color_str or 'a palette that suits the 
 Place the following text in {text_zone_desc}, in the negative space, never overlapping
 the reserved product zone:
 Headline based on: {seed_content.strip()[:80]}
-CTA text (small, clean sans-serif, subtle): "{cta_text}"
+CTA text (clean sans-serif, clearly legible — approximately 45% the size of the headline, not a tiny caption): "{cta_text}"
 {logo_space_note}
 
 Style: atmospheric, professional social-media graphic, one clear light source,
@@ -2016,7 +2131,7 @@ rich tonal range, no pure black or pure white."""
                 f"PLATFORM: {platform} ({aspect} format)\n"
                 f"PLATFORM GUIDANCE: {platform_note}\n\n"
                 f"{ref_instruction}"
-                f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
+                f"POST CAPTION (for context only - DO NOT render all this text on the image):\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
                 f"{brand_block}{style_directive_block}{feedback_block}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2026,6 +2141,9 @@ rich tonal range, no pure black or pure white."""
                 "on this specific platform.\n"
                 "2. If POSTER — be honest about TEXT_LEVEL. A bold visual with NONE often outperforms "
                 "a cluttered poster with text. Only use HEADLINE or FULL for a specific offer or launch.\n"
+                "   ⚠️ CRITICAL: For HEADLINE text level, EXTRACT a SHORT 4-6 word headline from the caption above.\n"
+                "   For FULL text level, extract ONE short headline + ONE short subtext line (max 15 words total).\n"
+                "   DO NOT render the entire post caption verbatim on the image. Distill it to its essence.\n"
                 "3. In PALETTE_NOTES and SCENE_NOTES, use every piece of brand context — never leave "
                 "anything generic. If the post topic is short, pull from business description, products, "
                 "audience, and region to enrich the scene.\n"
@@ -2624,6 +2742,19 @@ rich tonal range, no pure black or pure white."""
             resp = _req.get(logo_url, timeout=10)
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+            # Crop out any transparent padding baked into the logo file itself
+            # before sizing it — a logo exported with extra breathing room
+            # around the actual mark (common from Canva/Figma-style exports)
+            # otherwise makes "large" still look small, since the size
+            # percentage below is computed against the file's full canvas,
+            # not the visible content inside it. Reading only the alpha
+            # channel's bounding box (not all RGBA bands) avoids being thrown
+            # off by non-zero RGB values hiding under fully transparent
+            # pixels, which a plain getbbox() on the whole image would catch.
+            content_bbox = logo_img.split()[-1].getbbox()
+            if content_bbox and content_bbox != (0, 0, logo_img.width, logo_img.height):
+                logo_img = logo_img.crop(content_bbox)
 
             # Resize logo based on user preference or keep default at 8%
             # User can set logo_size: "small" (8%), "medium" (12%), "large" (16%)

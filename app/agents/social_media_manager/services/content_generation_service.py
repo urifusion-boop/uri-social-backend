@@ -231,7 +231,7 @@ Do NOT include hashtags in the main content - they will be added separately.
 Write one caption. No alternatives, no meta-commentary.
         """
     }
-    
+
     @staticmethod
     def _brand_banned_words(brand_context: Optional[Dict[str, Any]]) -> List[str]:
         """Every word the brand has said never to use (see brand_brief.banned_words)."""

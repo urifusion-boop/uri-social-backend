@@ -63,9 +63,26 @@ class AIService:
 
     @staticmethod
     def extract_ai_result(ai_response):
-        if isinstance(ai_response, dict):
-            return ai_response["choices"][0]["message"]["parsed"]
-        return ai_response.choices[0].message.parsed
+        try:
+            # Check if response is an error dict
+            if isinstance(ai_response, dict) and "error" in ai_response:
+                raise ValueError(ai_response["error"])
+
+            # Try object attribute access first
+            if hasattr(ai_response, 'choices'):
+                return ai_response.choices[0].message.parsed
+
+            # Try dict access
+            if isinstance(ai_response, dict):
+                return ai_response["choices"][0]["message"]["parsed"]
+
+            # Last resort: convert to dict and try
+            return dict(ai_response)["choices"][0]["message"]["parsed"]
+        except (AttributeError, KeyError, IndexError, TypeError) as e:
+            print(f"❌ Error extracting AI result: {e}")
+            print(f"📋 AI response type: {type(ai_response)}")
+            print(f"📋 AI response: {ai_response}")
+            raise
 
     @staticmethod
     def build_ai_model(
@@ -116,11 +133,11 @@ class AIService:
 
             if "authentication" in error_message.lower() or "401" in error_message:
                 print("⚠️ OpenAI authentication error - invalid API key")
-                return {"error": "AI service configuration error. Please contact support."}
+                return {"error": "Content generation is temporarily unavailable. Our team has been notified."}
 
             if "timeout" in error_message.lower() or "timed out" in error_message.lower():
                 print("⚠️ OpenAI request timed out")
-                return {"error": "AI service request timed out. Please try again."}
+                return {"error": "Request took too long. Please try again with a shorter prompt."}
 
             print(f"⚠️ Unexpected OpenAI error in chat_completion: {error_message}")
             raise e

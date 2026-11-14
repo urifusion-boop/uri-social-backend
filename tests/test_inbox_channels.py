@@ -197,7 +197,52 @@ def test_a_missing_messaging_scope_still_subscribes_comments():
 
     assert ok is True
     assert "pages_messaging" in note
-    assert attempts == ["messages,messaging_postbacks,message_reactions,feed", "feed"]
+    assert attempts == ["messages,messaging_postbacks,message_reactions,feed",
+                        "messages,messaging_postbacks,message_reactions", "feed"]
+
+
+def test_a_missing_manage_metadata_still_delivers_dms():
+    """pages_manage_metadata only gates `feed` (comments). A token without it must not
+    cost the inbox its DMs, which is what Meta's all-or-nothing call would otherwise do."""
+    import httpx
+
+    import app.agents.inbox.channels as ch
+
+    attempts = []
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+
+        def json(self):
+            return self._body
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, data=None):
+            attempts.append(data["subscribed_fields"])
+            if "feed" in data["subscribed_fields"]:
+                return FakeResponse(400, {"error": {"message":
+                    "(#200) To subscribe to the feed field, one of these "
+                    "permissions is needed: pages_manage_metadata"}})
+            return FakeResponse(200, {"success": True})
+
+    original = httpx.AsyncClient
+    httpx.AsyncClient = lambda **kw: FakeClient()
+    try:
+        ok, note = _run(ch.subscribe_page_to_app("PAGE7", "tok"))
+    finally:
+        httpx.AsyncClient = original
+
+    assert ok is True
+    assert note.startswith("DMs only") and "pages_manage_metadata" in note
+    assert attempts == ["messages,messaging_postbacks,message_reactions,feed",
+                        "messages,messaging_postbacks,message_reactions"]
 
 
 def test_an_account_claimed_by_two_workspaces_is_not_routed():

@@ -4,6 +4,23 @@ from app.core.config import settings
 
 OUTSTAND_BASE_URL = "https://api.outstand.so"
 
+
+class OutstandPublishError(Exception):
+    """
+    Raised when Outstand rejects a publish request. Carries Outstand's own
+    error message (e.g. "No social accounts found matching the provided
+    account identifiers" — the signature of a connection that's been
+    revoked/deleted on Outstand's side), not just the generic
+    "400 Bad Request" httpx.raise_for_status() would otherwise produce.
+    Callers need the real message to detect specific failure reasons and
+    act on them (e.g. mark the connection disconnected).
+    """
+
+    def __init__(self, message: str, status_code: int):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(message)
+
 # Maps our internal platform names → Outstand network identifiers
 PLATFORM_TO_NETWORK: Dict[str, str] = {
     "facebook":       "facebook",
@@ -302,3 +319,47 @@ class OutstandService:
                     response=resp,
                 )
             return resp.json()
+
+
+# ── Outstand switched off ─────────────────────────────────────────────────────
+# URI no longer uses Outstand. Rather than editing every call site, every public
+# OutstandService method refuses up front (no request is sent) unless
+# settings.OUTSTAND_ENABLED is explicitly true. Callers already treat Outstand errors
+# as failures, so a refused call fails cleanly with a message that tells the owner
+# exactly what to do; publish_confirmation recognises it and flags the connection
+# for reconnecting.
+# Shown to owners, so it never names the provider — just what to do. publish_confirmation
+# recognises this sentence and swaps in a platform-specific version of it.
+OUTSTAND_DISABLED_MESSAGE = (
+    "This account needs to be reconnected. Go to Connected Accounts, tap Reconnect, then try again."
+)
+
+
+class OutstandDisabledError(OutstandPublishError):
+    def __init__(self):
+        super().__init__(OUTSTAND_DISABLED_MESSAGE, status_code=410)
+
+
+def _outstand_guard(method):
+    import functools
+    import inspect
+
+    if inspect.iscoroutinefunction(method):
+        @functools.wraps(method)
+        async def wrapper(*args, **kwargs):
+            if not getattr(settings, "OUTSTAND_ENABLED", False):
+                raise OutstandDisabledError()
+            return await method(*args, **kwargs)
+    else:
+        @functools.wraps(method)
+        def wrapper(*args, **kwargs):
+            if not getattr(settings, "OUTSTAND_ENABLED", False):
+                raise OutstandDisabledError()
+            return method(*args, **kwargs)
+    return wrapper
+
+
+for _name, _attr in list(vars(OutstandService).items()):
+    if not _name.startswith("_") and callable(_attr):
+        setattr(OutstandService, _name, _outstand_guard(_attr))
+

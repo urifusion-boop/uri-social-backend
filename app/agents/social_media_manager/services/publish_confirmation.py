@@ -47,16 +47,47 @@ _RECONNECT_MARKERS = (
 # Signatures with their own precise, accurate explanation — checked before
 # the generic _RECONNECT_MARKERS catch-all, so a known-specific cause never
 # gets a message that tells the owner to do the wrong thing.
+_HIDE_RAW_MARKERS = ("this account needs to be reconnected", "does not have an active subscription",
+                     "confirm your identity")
+
+
+def _identity_check_message(name: str) -> str:
+    """Meta's identity checkpoint (Graph error 368 / subcode 4854002) sits on the personal
+    Facebook account that manages the Page, and it blocks Instagram posting through that Page
+    too — so the fix is always in the Facebook app, whichever network the post was for.
+    Reconnecting does not clear it; owners kept trying that."""
+    where = " to Instagram" if name == "Instagram" else ""
+    return (
+        f"Facebook is asking you to confirm your identity before you can post{where} from this Page. "
+        "This is a security check on Facebook's side, not a problem with your connection here, so "
+        "reconnecting won't fix it. Open the Facebook app on your phone (signed in as the person who "
+        "connected this Page) and follow the \u201cConfirm your identity\u201d prompt; it may also be "
+        "in your notifications. Once Facebook has confirmed you, publish this post again."
+    )
+
 _SPECIFIC_CAUSES = [
     (
-        "confirm your identity",
+        # The account can no longer publish through its old connection (the provider was
+        # switched off, or its own subscription lapsed): it needs a direct reconnect.
+        # Owners are never told which provider — just what to do.
+        "this account needs to be reconnected",
         lambda name: (
-            f"{name} needs you to confirm your identity before this Page can publish. This is a security check "
-            f"from {name} itself, not something wrong with your account here — open the {name} app (or Meta "
-            f"Business Suite) and check Notifications or Support Inbox for a verification prompt, then follow "
-            f"{name}'s steps. Once confirmed, this and future posts will go out normally again — no need to "
-            f"reconnect anything here."
+            f"Your {name} account needs to be reconnected. Go to Connected Accounts, tap Reconnect next to "
+            f"{name}, then publish this post again."
         ),
+        True,
+    ),
+    (
+        "does not have an active subscription",
+        lambda name: (
+            f"Your {name} account needs to be reconnected. Go to Connected Accounts, tap Reconnect next to "
+            f"{name}, then publish this post again."
+        ),
+        True,
+    ),
+    (
+        "confirm your identity",
+        _identity_check_message,
         False,  # resolves on its own, not a reconnect-worthy signature
     ),
     (
@@ -77,6 +108,17 @@ _SPECIFIC_CAUSES = [
         True,  # does need reconnecting (or a role fix), just not the generic wording
     ),
 ]
+
+
+def specific_message(platform: str, raw: str) -> Optional[str]:
+    """The friendly message for an error that has its own precise explanation (identity check,
+    lost Page role, ...), or None. For callers that otherwise show the network's own text and
+    shouldn't have the generic reconnect wording forced on them."""
+    info = explain(platform, raw)
+    low = " ".join(str(raw or "").split()).lower()
+    if any(marker in low for marker, _, _ in _SPECIFIC_CAUSES):
+        return info["message"]
+    return None
 
 
 def network_name(platform: str) -> str:
@@ -107,8 +149,12 @@ def explain(platform: str, raw: str, limit: Optional["_rate_limit.RateLimitInfo"
                 "message": f"{limit.user_message} ({name} said: {text[:220]})"}
     for marker, build_message, reconnect in _SPECIFIC_CAUSES:
         if marker in low:
+            # These two come from the old publishing provider, not from the network
+            # itself — show only the friendly sentence, never the raw provider text.
+            hide_raw = marker in _HIDE_RAW_MARKERS
             return {"reconnect": reconnect, "category": "known" if reconnect else "content",
-                     "message": f"{build_message(name)} ({name} said: {text[:220]})"}
+                     "message": build_message(name) if hide_raw
+                     else f"{build_message(name)} ({name} said: {text[:220]})"}
     if any(m in low for m in _RECONNECT_MARKERS):
         return {"reconnect": True, "category": "known", "message": (
             f"Your {name} connection has expired — {name} ended URI's access (this happens after a password "

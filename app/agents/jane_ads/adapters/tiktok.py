@@ -651,6 +651,13 @@ _TIKTOK_DELIVERY_RULES: list[tuple[str, str, str]] = [
      "TikTok is reviewing this ad. It starts delivering once it's approved."),
     ("BALANCE", "Needs billing info",
      "TikTok can't deliver because the advertiser account's balance or payment method needs attention."),
+    # CAMPAIGN_EXCEED: TikTok holds the ad because a spending limit above the ad
+    # group was hit — the campaign's own budget or the ad account's spending cap —
+    # which can happen before this ad has spent anything.
+    ("CAMPAIGN_EXCEED", "Spending limit reached",
+     "TikTok has paused delivery because a spending limit was reached on the TikTok side "
+     "(the campaign's budget or the ad account's spending limit). Raise or remove that "
+     "limit in TikTok Ads Manager and it will start delivering."),
     ("BUDGET_EXCEED", "Budget used",
      "This campaign's whole budget has been spent."),
     ("TIME_DONE", "Ended",
@@ -848,6 +855,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
 
         now = datetime.now(timezone.utc)
         end = now + timedelta(days=days)
+
+        # The video is made TikTok-ready (ratio/codec, ffmpeg) BEFORE anything exists on
+        # TikTok. A phone HEVC video can take minutes to re-encode; done mid-launch, a
+        # deploy/restart in that window left a campaign + ad group on the account with no
+        # ad and the plan stuck "launching" (live, 2026-11-12).
+        prepared_video_url = (
+            await ensure_tiktok_video(plan.creative.image_url) if not is_carousel else ""
+        )
 
         campaign_id = ""
         adgroup_id = ""
@@ -1055,7 +1070,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # replaced, the file is already sitting on S3 ready to fetch by
                     # the time we hand TikTok the URL, so there's no on-demand-transcode
                     # cold-cache race to warm up first (see tiktok_media.py's docstring).
-                    tiktok_video_url = await ensure_tiktok_video(plan.creative.image_url)
+                    tiktok_video_url = prepared_video_url  # prepared before step 1, above
                     video_resp = await client.post(
                         f"{self._api_base}/file/video/ad/upload/",
                         headers=self._headers(),

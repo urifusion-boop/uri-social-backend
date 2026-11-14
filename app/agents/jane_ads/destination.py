@@ -438,6 +438,12 @@ async def get_brand_destination(db, brand_id: Optional[str]) -> dict:
             {"_id": 0, "destination_type": 1, "whatsapp_number": 1, "website_url": 1,
              "instagram_username": 1, "custom_url": 1, "destination_cta": 1},
         ) or {}
+    return _destination_view(doc)
+
+
+def _destination_view(doc: dict) -> dict:
+    """The saved destination document as callers read it."""
+    doc = doc or {}
     dest = coerce_type(doc.get("destination_type", ""))
     return {
         "destination_type": dest.value,
@@ -489,10 +495,17 @@ async def set_brand_destination(
                 + ", ".join(sorted(CTA_CHOICES))
             )
         update["destination_cta"] = coerce_cta(destination_cta, destination_type)
-    await db[SETTINGS_COLLECTION].update_one(
-        {"brand_id": brand_id}, {"$set": update}, upsert=True
+    # The saved values come back from the write itself. Re-reading them straight after
+    # (as this did) goes to a DocumentDB replica by default, which can lag the write:
+    # a brand saving its first-ever destination read back nothing, and the planner
+    # answered "Your ads don't have a destination yet" to the website just typed in.
+    # Live-caught on prod — the same press worked the second time.
+    from pymongo import ReturnDocument
+    saved = await db[SETTINGS_COLLECTION].find_one_and_update(
+        {"brand_id": brand_id}, {"$set": update}, upsert=True,
+        return_document=ReturnDocument.AFTER,
     )
-    return await get_brand_destination(db, brand_id)
+    return _destination_view(saved or update)
 
 
 class ResolvedDestination(NamedTuple):

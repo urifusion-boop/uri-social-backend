@@ -115,6 +115,11 @@ class EmailService:
                 smtp = _make_smtp_client()
 
                 await smtp.connect()
+
+                # For port 587, upgrade to TLS after connecting
+                if settings.SMTP_PORT == 587:
+                    await smtp.starttls()
+
                 await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
                 await smtp.send_message(msg)
                 await smtp.quit()
@@ -162,6 +167,11 @@ class EmailService:
                 smtp = _make_smtp_client()
 
                 await smtp.connect()
+
+                # For port 587, upgrade to TLS after connecting
+                if settings.SMTP_PORT == 587:
+                    await smtp.starttls()
+
                 await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
                 await smtp.send_message(msg)
                 await smtp.quit()

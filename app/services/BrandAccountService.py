@@ -169,3 +169,27 @@ class BrandAccountService:
             {"$set": {"status": "archived", "archived_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
         )
         return result.modified_count > 0
+
+    @staticmethod
+    async def delete_brand_permanently(brand_id: str, db: AsyncIOMotorDatabase) -> Dict[str, int]:
+        """IRREVERSIBLE. Removes the brand_account and every collection keyed by
+        brand_id (the same set `duplicate_from_existing` clones, plus the
+        connection/access records that reference a brand but aren't cloned).
+        Returns a per-collection deleted count for an audit trail."""
+        from app.services.AgencyService import MEMBER_BRAND_ACCESS
+
+        deleted_counts: Dict[str, int] = {}
+        for coll in _PROFILE_COLLECTIONS:
+            result = await db[coll].delete_many({"brand_id": brand_id})
+            deleted_counts[coll] = result.deleted_count
+
+        social_result = await db["social_connections"].delete_many({"brand_id": brand_id})
+        deleted_counts["social_connections"] = social_result.deleted_count
+
+        access_result = await db[MEMBER_BRAND_ACCESS].delete_many({"brand_id": brand_id})
+        deleted_counts["member_brand_access"] = access_result.deleted_count
+
+        brand_result = await db[BRANDS].delete_one({"brand_id": brand_id})
+        deleted_counts["brand_accounts"] = brand_result.deleted_count
+
+        return deleted_counts

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Payment Successful! 🎉</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>Thank you for your purchase! Your payment has been processed successfully.</p>
+
+<div class="divider"></div>
+
+<div style="background:rgba(5,150,105,.04); border-radius:10px; padding:20px; margin:16px 0;">
+  <p style="font-size:14px; color:#059669; font-weight:700; margin:0 0 12px;">Payment Details</p>
+  <table style="width:100%; font-size:14px; color:#4B5563;">
+    <tr>
+      <td style="padding:4px 0;"><strong>Plan:</strong></td>
+      <td style="padding:4px 0; text-align:right;">{{ subscription_tier | title }}</td>
+    </tr>
+    <tr>
+      <td style="padding:4px 0;"><strong>Amount:</strong></td>
+      <td style="padding:4px 0; text-align:right;">{{ currency }} {{ "{:,.2f}".format(amount) }}</td>
+    </tr>
+    <tr>
+      <td style="padding:4px 0;"><strong>Credits Added:</strong></td>
+      <td style="padding:4px 0; text-align:right;">{{ credits_added }} credits</td>
+    </tr>
+    <tr>
+      <td style="padding:4px 0; color:#9CA3AF;"><strong>Transaction ID:</strong></td>
+      <td style="padding:4px 0; text-align:right; color:#9CA3AF; font-size:12px;">{{ transaction_ref }}</td>
+    </tr>
+  </table>
+</div>
+
+<div style="background:rgba(205,27,120,.04); border-radius:10px; padding:20px; margin:16px 0;">
+  <p style="font-size:14px; color:#CD1B78; font-weight:700; margin:0 0 8px;">What's Next?</p>
+  <p style="font-size:14px; color:#4B5563; margin:0; line-height:1.8;">
+    ✦ Your credits are now available in your workspace<br>
+    ✦ Start creating engaging content for your audience<br>
+    ✦ Generate posts for multiple platforms at once<br>
+    ✦ Track your credit usage in the billing dashboard
+  </p>
+</div>
+
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace" class="cta">Go to Workspace →</a>
+
+<p style="font-size:13px; color:#9CA3AF; margin-top:20px;">Need help? Contact us at <a href="mailto:support@urisocial.com" style="color:#CD1B78; text-decoration:none;">support@urisocial.com</a></p>
+{% endblock %}

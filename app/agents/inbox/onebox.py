@@ -150,9 +150,9 @@ async def get_subscription(db, ws: str, create_trial: bool = True) -> Optional[d
                      end=now + timedelta(days=cfg["trial_days"]))
         try:
             await db[SUBSCRIPTIONS].insert_one(dict(sub))
-        except Exception:      # a concurrent first call created it
-            pass
-        return await db[SUBSCRIPTIONS].find_one({"workspace_id": ws})
+        except Exception as e:      # a concurrent first call created it
+            print(f"[Onebox] trial insert for {ws!r} failed: {type(e).__name__}: {e}", flush=True)
+        return await db[SUBSCRIPTIONS].find_one({"workspace_id": ws}) or sub
     end = _aware(sub.get("period_end"))
     if end and now >= end and sub.get("status") != "expired":
         queued = sub.get("queued")

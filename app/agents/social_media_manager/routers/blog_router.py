@@ -18,8 +18,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
-from app.dependencies import get_db_dependency, get_active_brand_context
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, get_flexible_brand_context
 from app.domain.responses.uri_response import UriResponse
 
 from ..services.writing_dna_service import WritingDNAService
@@ -29,15 +28,6 @@ from app.services.AgencyCreditService import AgencyCreditService
 router = APIRouter(prefix="/blog", tags=["Blog Generator"])
 
 BLOG_CREDIT_COST = 1.0
-
-
-def _user_id(token: dict) -> str:
-    claims = token.get("claims", {})
-    uid = claims.get("userId")
-    if not uid:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-    return uid
 
 
 # ── Request / Response models ──────────────────────────────────────────────
@@ -99,7 +89,7 @@ class BlogPublishRequest(BaseModel):
 @router.post("/writing-dna/quiz")
 async def submit_writing_dna_quiz(
     body: WritingDNARequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -118,7 +108,7 @@ async def submit_writing_dna_quiz(
 
 @router.get("/writing-dna")
 async def get_writing_dna(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get the current Writing DNA profile for the active brand."""
@@ -128,7 +118,7 @@ async def get_writing_dna(
 @router.post("/generate")
 async def generate_blog(
     body: BlogGenerateRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -169,7 +159,7 @@ async def generate_blog(
 
 @router.get("/posts")
 async def list_blog_posts(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """List all generated blog posts for the active brand (content excluded)."""
@@ -179,7 +169,7 @@ async def list_blog_posts(
 @router.get("/posts/{blog_id}")
 async def get_blog_post(
     blog_id: str,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get a single blog post with full content (scoped to the active brand)."""
@@ -193,7 +183,7 @@ async def update_blog_post(
     blog_id: str,
     body: BlogUpdateRequest,
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -226,7 +216,7 @@ async def update_blog_post(
 async def record_blog_feedback(
     blog_id: str,
     body: BlogFeedbackRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Record 'Does this sound like you?' feedback (scoped to active brand)."""
@@ -241,7 +231,7 @@ async def publish_blog_post(
     blog_id: str,
     body: BlogPublishRequest,
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """

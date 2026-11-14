@@ -14,6 +14,183 @@ from app.services.FacebookService import FacebookService
 from app.core.config import settings
 from app.agents.social_media_manager.services.outstand_service import OutstandService
 from app.agents.social_media_manager.services.x_direct_service import XDirectService
+from pymongo import ReturnDocument
+
+
+# ── Prod-only publish-failure helpers (kept from aws/prod; used by reconcile_published_posts
+#    and the admin "Reconcile Facebook/Outstand Publishes" endpoint) ──
+_FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
+    (
+        re.compile(r"confirm your identity", re.IGNORECASE),
+        "Facebook is asking you to confirm your identity before you can post from this Page. "
+        "This is a security check on Facebook's side, not a problem with your connection "
+        "here, so reconnecting won't fix it. Open the Facebook app on your phone (signed in "
+        "as the person who connected this Page) and follow the \u201cConfirm your identity\u201d "
+        "prompt; it may also be in your notifications. Once Facebook has confirmed you, "
+        "publish this post again."
+    ),
+    (
+        # Live-reported: "MEEQAT TRAVELS AND TOURS LTD"'s Facebook post failed
+        # with Facebook's own "400 - The user must be an administrator, editor,
+        # or moderator of the page in order to impersonate it." The connected
+        # Facebook user lost their admin/editor/moderator role on the Page
+        # itself (removed, role changed, Page ownership changed) — the token
+        # can still be technically valid, so this is NOT the same thing as a
+        # dead session, and telling the owner to just "reconnect Facebook"
+        # alone is misleading: reconnecting with the same now-demoted account
+        # hits this identical error again. The real fix is restoring that
+        # person's role on the Page, or connecting a different account that
+        # already has one.
+        re.compile(r"administrator,?\s*editor,?\s*or moderator of the page", re.IGNORECASE),
+        "Facebook says the connected account is no longer an admin, editor or moderator of "
+        "this Page, so it can't post there. Ask whoever manages the Page to restore that "
+        "access, or go to Connected Accounts and reconnect Facebook using an account that "
+        "already has it."
+    ),
+]
+
+_TOKEN_INVALIDATION_PATTERNS = [
+    re.compile(r"error validating access token", re.IGNORECASE),
+    re.compile(r"session has been invalidated", re.IGNORECASE),
+    re.compile(r"session is invalid", re.IGNORECASE),
+    re.compile(r"administrator,?\s*editor,?\s*or moderator of the page", re.IGNORECASE),
+]
+
+UNKNOWN_FAILURE_ESCALATION_THRESHOLD = 3
+
+def _friendlier_facebook_error(raw: Optional[str]) -> str:
+    """Plain-language explanation for a Facebook/Outstand error, keeping the
+    raw detail alongside it (support/debugging). Checks the specific-cause
+    table first so a signature with its own precise explanation (e.g. lost
+    Page admin rights) never gets the generic "session expired" message
+    instead — that was wrong for that case and told the owner to do
+    something that wouldn't actually fix it. An error we haven't catalogued
+    at all still gets a plain-language lead-in, not raw passthrough — a
+    one-off failure on this post is told immediately, in words a non-
+    technical owner can read, even on the first occurrence; see
+    _should_flag_connection for the separate, more cautious decision about
+    whether the whole connection needs reconnecting."""
+    raw = raw or "unknown error"
+    for pattern, friendly in _FRIENDLY_FACEBOOK_ERROR_PATTERNS:
+        if pattern.search(raw):
+            return f"{friendly} (Facebook's detail: {raw})"
+    if _is_token_invalidation_error(raw):
+        return (
+            "Your Facebook connection has expired or was revoked — this Page needs to be "
+            "reconnected before it can publish again. Go to Connected Accounts and reconnect "
+            f"Facebook. (Facebook's detail: {raw})"
+        )
+    return f"This post couldn't be published to Facebook. Facebook's detail: {raw}"
+
+def _is_token_invalidation_error(raw: Optional[str]) -> bool:
+    """True when an error message signature means the connection can no longer
+    publish and needs the owner's attention (reconnecting, or fixing Page
+    access on Facebook's side), as opposed to a one-off content/policy
+    rejection. Used to decide whether to mark a connection disconnected and
+    notify the owner."""
+    raw = raw or ""
+    return any(pattern.search(raw) for pattern in _TOKEN_INVALIDATION_PATTERNS)
+
+async def _mark_connection_disconnected_and_notify(
+    db: AsyncIOMotorDatabase,
+    user_id: Optional[str],
+    platform: str,
+    connection: Optional[Dict[str, Any]],
+    reason: str,
+) -> None:
+    """Shared by every place that discovers a connection's token/session is
+    dead — the immediate-publish exception path, the scheduled-poll failure
+    branch, and the published-post reconciliation sweep. Without this, a dead
+    connection stays connection_status="active" forever and every future
+    publish attempt just fails silently again, exactly as it did for "Vchain"'s
+    Facebook Page (confirmed live via CloudWatch: repeated "Error validating
+    access token" failures, connection never marked disconnected, user never
+    notified)."""
+    if not user_id or db is None:
+        return
+    try:
+        # connection is only available at a few call sites (an already-looked-up
+        # doc, pinning the match to the exact outstand_account_id); the others
+        # only have the draft's user_id/platform, which is matched alone —
+        # still correct since a user has one active connection per platform.
+        match: Dict[str, Any] = {"user_id": user_id, "platform": (connection or {}).get("platform", platform)}
+        if connection and connection.get("outstand_account_id"):
+            match["outstand_account_id"] = connection["outstand_account_id"]
+        await db["social_connections"].update_one(
+            match,
+            {"$set": {"connection_status": "disconnected", "updated_at": datetime.utcnow()}},
+        )
+        print(f"⚠️ Marked {platform} connection disconnected for user_id={user_id} ({reason})")
+    except Exception as mark_err:
+        print(f"⚠️ Failed to mark connection disconnected: {mark_err}")
+
+    try:
+        from app.services.NotificationService import notification_service
+        await notification_service.notify_connection_disconnected(user_id=user_id, platform=platform)
+    except Exception as notify_err:
+        print(f"⚠️ connection_disconnected notification failed: {notify_err}")
+
+def _connection_match(user_id: Optional[str], platform: str, connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    match: Dict[str, Any] = {"user_id": user_id, "platform": (connection or {}).get("platform", platform)}
+    if connection and connection.get("outstand_account_id"):
+        match["outstand_account_id"] = connection["outstand_account_id"]
+    return match
+
+async def _should_flag_connection(
+    db: AsyncIOMotorDatabase,
+    user_id: Optional[str],
+    platform: str,
+    connection: Optional[Dict[str, Any]],
+    raw_error: Optional[str],
+) -> tuple[bool, str]:
+    """Whether a publish failure means this connection needs the owner's
+    attention right now, and why. A recognized signature (dead session, lost
+    Page role, ...) escalates immediately — see _is_token_invalidation_error.
+    An error we have never catalogued does NOT just get ignored forever: it
+    increments a per-connection counter, and after
+    UNKNOWN_FAILURE_ESCALATION_THRESHOLD consecutive failures of any kind
+    (known or not), it escalates too, with the raw error attached since
+    there's no friendly translation for it yet. A single one-off failure
+    (a bad image, a transient Outstand hiccup) does not escalate on its own
+    — only a real, repeated pattern does, the same bar a human reading the
+    logs would use before concluding "this connection is actually broken."
+    """
+    if _is_token_invalidation_error(raw_error):
+        return True, "token invalidated (recognized error signature)"
+    if db is None or not user_id:
+        return False, ""
+    try:
+        updated = await db["social_connections"].find_one_and_update(
+            _connection_match(user_id, platform, connection),
+            {"$inc": {"consecutive_publish_failures": 1}, "$set": {"last_publish_error": raw_error or "", "updated_at": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
+    except Exception as e:
+        print(f"⚠️ _should_flag_connection: counter update failed: {e}")
+        return False, ""
+    count = (updated or {}).get("consecutive_publish_failures", 0)
+    if count >= UNKNOWN_FAILURE_ESCALATION_THRESHOLD:
+        return True, f"{count} consecutive unrecognized publish failures (latest: {(raw_error or '')[:200]})"
+    return False, ""
+
+async def _record_publish_success(
+    db: AsyncIOMotorDatabase,
+    user_id: Optional[str],
+    platform: str,
+    connection: Optional[Dict[str, Any]],
+) -> None:
+    """Resets the unrecognized-failure counter on an actual successful
+    publish, so a connection that struggled once and then recovered doesn't
+    carry a stale count toward a future, unrelated run of failures."""
+    if db is None or not user_id:
+        return
+    try:
+        await db["social_connections"].update_one(
+            _connection_match(user_id, platform, connection),
+            {"$set": {"consecutive_publish_failures": 0}},
+        )
+    except Exception as e:
+        print(f"⚠️ _record_publish_success: counter reset failed: {e}")
 
 
 class ApprovalWorkflowService:
@@ -286,6 +463,11 @@ class ApprovalWorkflowService:
                             # by then framed as a surprise, unexplained failure. Surfacing it
                             # now, still without changing the retry behavior itself.
                             if _d["publish_result"] and not _d["publish_result"].get("success"):
+                                from app.agents.social_media_manager.services import publish_confirmation as _pcw
+                                _known = _pcw.specific_message(_d["platform"], _d["publish_result"].get("error") or "")
+                                if _known:
+                                    warnings.append({"draft_id": _d["draft_id"], "warning": _known})
+                                    continue
                                 warnings.append({
                                     "draft_id": _d["draft_id"],
                                     "warning": (
@@ -1296,7 +1478,8 @@ class ApprovalWorkflowService:
                         {"$set": {
                             "status": "scheduled",
                             "scheduled_date": scheduled_datetime,
-                            "last_dispatch_warning": publish_result.get("error"),
+                            "last_dispatch_warning": _pc.specific_message(platform, publish_result.get("error") or "")
+                            or publish_result.get("error"),
                             "updated_at": datetime.utcnow(),
                         }},
                     )
@@ -1657,6 +1840,12 @@ class ApprovalWorkflowService:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
             post_type = draft.get("post_type", "feed")
+            # A user-uploaded video on a normal post is stored as video_url with no
+            # image_url (upload_user_content). Instagram only takes video as a Reel,
+            # and the feed branch below reads image_url only, so these drafts failed
+            # with "Instagram requires an image" every time.
+            if post_type not in ("carousel", "reel", "story") and not draft.get("image_url") and draft.get("video_url"):
+                post_type = "reel"
 
             if post_type == "carousel":
                 slides = draft.get("slides", [])
@@ -2319,6 +2508,9 @@ class ApprovalWorkflowService:
                         "outstand_account_id": connection.get("outstand_account_id")}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
+                from app.agents.social_media_manager.services.outstand_service import OutstandDisabledError
+                if isinstance(e, OutstandDisabledError):
+                    return {"success": False, "error": e.message}
                 return {"success": False, "error": f"Outstand publish failed: {str(e)}"}
 
         # ── Legacy direct Facebook connection ─────────────────────────────────
@@ -2410,6 +2602,11 @@ class ApprovalWorkflowService:
                 }
 
                 image_url = draft.get("image_url")
+                fb_video_url = draft.get("video_url") or ""
+                if not image_url and fb_video_url:
+                    return await ApprovalWorkflowService._publish_facebook_feed_video(
+                        page_id, page_token, fb_video_url, content, scheduled_datetime,
+                    )
                 if image_url:
                     if image_url.startswith("data:"):
                         media_fbid = await ApprovalWorkflowService._upload_base64_image_to_facebook(
@@ -2480,6 +2677,164 @@ class ApprovalWorkflowService:
                 return ApprovalWorkflowService._facebook_result(success, post_id, response)
 
         return {"success": False, "error": f"Platform '{platform}' publishing not implemented yet"}
+
+    @staticmethod
+    async def _publish_facebook_feed_video(
+        page_id: str,
+        page_token: str,
+        video_url: str,
+        content: str,
+        scheduled_datetime: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Post a user-uploaded video to the Page feed. Facebook fetches it from the
+        public URL itself (file_url), so nothing is streamed through our server."""
+        params: Dict[str, Any] = {
+            "file_url": video_url,
+            "description": content,
+            "published": "true",
+            "access_token": page_token,
+        }
+        if scheduled_datetime:
+            import calendar
+            params["published"] = "false"
+            params["scheduled_publish_time"] = int(calendar.timegm(scheduled_datetime.utctimetuple()))
+        import httpx
+        print(f"🎬 FB video publish | page_id={page_id} video_url={video_url[:80]} scheduled={bool(scheduled_datetime)}")
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/videos",
+                    data=params,
+                )
+            data = resp.json() if resp.content else {}
+        except Exception as e:
+            print(f"❌ FB video publish exception: {e}")
+            return {"success": False, "error": f"Facebook video publish failed. (Detail: {e})"}
+        video_id = (data or {}).get("id")
+        if video_id:
+            print(f"✅ FB video publish: video_id={video_id}")
+            return {"success": True, "post_id": video_id, "raw_response": data}
+        err = (data or {}).get("error") or {}
+        print(f"❌ FB video publish | status={resp.status_code} body={str(data)[:500]}")
+        response = {
+            "status": False,
+            "responseCode": resp.status_code,
+            "responseMessage": err.get("message") or "Facebook video publish failed",
+            "meta_error": {
+                "http_status": resp.status_code,
+                "code": err.get("code"),
+                "subcode": err.get("error_subcode"),
+                "message": err.get("message"),
+            },
+        }
+        result = ApprovalWorkflowService._facebook_result(False, None, response)
+        result.setdefault("error", "Facebook video publish failed.")
+        return result
+
+    @staticmethod
+    async def reconcile_published_posts(db: AsyncIOMotorDatabase):
+        """
+        publish_scheduled_content's Sept-28 fix (see _friendlier_facebook_error /
+        _is_token_invalidation_error above) taught the SCHEDULED-post cron to
+        check each socialAccounts[] entry's real status instead of trusting
+        Outstand's initial "accepted" response — but that only covers drafts
+        with status="scheduled". A draft published via "Publish Now" is marked
+        status="published" the moment Outstand ACCEPTS the submission
+        (outstand_post_status="queued"/"processing" — see _publish_to_platform's
+        caller), which only means Outstand will attempt the dispatch, not that
+        each platform actually accepted it. Nothing ever revisited that draft
+        afterward.
+
+        Live-reported: a "Vchain" Facebook post (post_id=MADzP) was marked
+        published in our DB, confirmed via CloudWatch logs to have actually
+        failed on Facebook's side ("Error validating access token") — the only
+        reason it surfaced at all was someone manually opening that post's
+        analytics, which checks Outstand's live status but never corrects the
+        draft's own status field. This sweep does for "published" drafts what
+        the scheduled cron already does for "scheduled" ones.
+
+        Bounded to a 7-day window (Outstand/platform status for very old posts
+        isn't useful to keep re-polling) and to drafts not yet confirmed
+        (outstand_post_status still "queued"/"processing" — once confirmed
+        either way it's set to "published" or the draft moves to
+        "publish_failed", so it drops out of this query on its own).
+        """
+        try:
+            current_time = datetime.utcnow()
+            earliest = current_time - timedelta(days=7)
+            candidates = await db["content_drafts"].find({
+                "status": "published",
+                "outstand_post_status": {"$in": ["queued", "processing"]},
+                "platform_post_id": {"$exists": True, "$ne": None},
+                "published_date": {"$gte": earliest},
+            }).to_list(length=100)
+
+            print(f"🔁 reconcile_published_posts | candidates={len(candidates)} ids={[d.get('id') for d in candidates]}")
+
+            if not candidates:
+                return {"checked": 0, "corrected": 0}
+
+            from app.agents.social_media_manager.services.outstand_service import OutstandService
+            outstand = OutstandService()
+            corrected = 0
+
+            for draft in candidates:
+                post_id = draft.get("platform_post_id")
+                # Facebook direct post IDs ("1234567_9876543") never went through
+                # Outstand and have no outstand_post_status to begin with — this
+                # query can't actually match one, but guard anyway for safety.
+                if re.match(r'^\d+_\d+$', str(post_id)):
+                    continue
+                try:
+                    post_data = await outstand.get_post(post_id)
+                    post = post_data.get("post", {})
+                    failed_accounts = [acc for acc in post.get("socialAccounts", []) if acc.get("status") == "failed"]
+                    if failed_accounts:
+                        error_detail = "; ".join(
+                            _friendlier_facebook_error(acc.get("error"))
+                            if acc.get("error") else f"{acc.get('network', 'platform')} publish failed"
+                            for acc in failed_accounts
+                        )
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {
+                                "status": "publish_failed",
+                                "error_message": error_detail,
+                                "updated_at": current_time,
+                            }},
+                        )
+                        corrected += 1
+                        print(f"❌ Published draft actually failed at the platform | draft_id={draft['id']} post_id={post_id} error={error_detail}")
+                        _worst_raw = next((a.get("error") for a in failed_accounts if a.get("error")), None)
+                        _flag, _reason = await _should_flag_connection(
+                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                            connection=None, raw_error=_worst_raw,
+                        )
+                        if _flag:
+                            await _mark_connection_disconnected_and_notify(
+                                db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                                connection=None, reason=f"{_reason} (detected via published-post reconciliation)",
+                            )
+                    elif post.get("publishedAt"):
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {"outstand_post_status": "published", "updated_at": current_time}},
+                        )
+                        print(f"✅ Published draft confirmed live | draft_id={draft['id']} post_id={post_id}")
+                        await _record_publish_success(
+                            db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"), connection=None,
+                        )
+                    # Neither failed nor confirmed published yet — leave as-is,
+                    # it'll be re-checked next tick.
+                except Exception as e:
+                    print(f"⚠️ Could not poll Outstand for published draft_id={draft['id']}: {e}")
+
+            return {"checked": len(candidates), "corrected": corrected}
+        except Exception as e:
+            print(f"❌ reconcile_published_posts crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"checked": 0, "corrected": 0, "error": str(e)}
 
 
 # Usage Examples:

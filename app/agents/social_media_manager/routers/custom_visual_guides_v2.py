@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency
+from app.dependencies import get_db_dependency, flexible_auth
 from app.core.auth_bearer import JWTBearer
 from app.domain.responses.uri_response import UriResponse
 
@@ -70,7 +70,7 @@ class GenerateWithV2GuideRequest(BaseModel):
 async def upload_reference_image_v2(
     request: UploadReferenceImageV2Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Upload and process reference image for Custom Visual Guide V2.
@@ -147,7 +147,7 @@ async def upload_reference_image_v2(
 async def get_user_guides_v2(
     status: Optional[str] = Query("active", description="Filter by status: active | archived"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Get all Custom Visual Guides V2 for the authenticated user.
@@ -204,7 +204,7 @@ async def get_user_guides_v2(
 async def get_guide_detail_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Get detailed information for a specific Custom Visual Guide V2.
@@ -256,7 +256,7 @@ async def get_guide_detail_v2(
 async def archive_guide_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Archive (soft delete) a Custom Visual Guide V2.
@@ -319,7 +319,7 @@ async def archive_guide_v2(
 async def reanalyze_guide_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Re-run GPT-4o Vision style extraction on an existing guide's reference
@@ -366,7 +366,7 @@ async def reanalyze_guide_v2(
 async def generate_with_v2_guide(
     request: GenerateWithV2GuideRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    token: dict = Depends(flexible_auth),  # JWT or SDK API key, as on prod
 ):
     """
     Generate image using Custom Visual Guide V2 + art director meta-prompt.

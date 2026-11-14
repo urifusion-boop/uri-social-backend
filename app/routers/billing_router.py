@@ -15,8 +15,8 @@ Endpoints:
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from typing import Optional, List
-from app.core.auth_bearer import JWTBearer
 from datetime import datetime, timedelta
+from app.core.auth_bearer import JWTBearer
 from app.domain.models.billing_models import (
     InitializePaymentRequest,
     InitializePaymentResponse,
@@ -90,6 +90,31 @@ async def initialize_payment(
         raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
 
 
+@router.post("/credits/purchase-custom", response_model=InitializePaymentResponse)
+async def purchase_custom_credits(
+    body: PurchaseCustomCreditsRequest,
+    user_id: str = Depends(get_user_id),
+    user_email: str = Depends(get_user_email)
+):
+    """
+    Buy an arbitrary quantity of bonus credits (₦800/credit, NGN only).
+    Credits are added as bonus_credits (never expire) once payment verifies —
+    see PaymentService.initialize_custom_credit_payment / _complete_custom_credit_purchase.
+    Reuses the same SQUAD checkout + verify/webhook flow as subscription payments.
+    """
+    try:
+        result = await payment_service.initialize_custom_credit_payment(
+            user_id=user_id,
+            user_email=user_email,
+            quantity=body.quantity
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
+
+
 @router.post("/verify-payment")
 async def verify_payment(
     body: VerifyPaymentRequest,
@@ -125,31 +150,6 @@ async def verify_payment(
             }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
-
-
-@router.post("/credits/purchase-custom", response_model=InitializePaymentResponse)
-async def purchase_custom_credits(
-    body: PurchaseCustomCreditsRequest,
-    user_id: str = Depends(get_user_id),
-    user_email: str = Depends(get_user_email)
-):
-    """
-    Buy an arbitrary quantity of bonus credits (₦800/credit, NGN only).
-    Credits are added as bonus_credits (never expire) once payment verifies —
-    see PaymentService.initialize_custom_credit_payment / _complete_custom_credit_purchase.
-    Reuses the same SQUAD checkout + verify/webhook flow as subscription payments.
-    """
-    try:
-        result = await payment_service.initialize_custom_credit_payment(
-            user_id=user_id,
-            user_email=user_email,
-            quantity=body.quantity
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
 
 
 @router.post("/webhook")

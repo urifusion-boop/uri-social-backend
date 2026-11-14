@@ -1,12 +1,10 @@
 """
 Migrate existing Cloudinary-hosted assets to S3.
 
-PREREQUISITE: Cloudinary's shared account must be reachable again (even
-temporarily) before this can run at all — confirmed live 2026-09-30 that
-delivery is blocked account-wide (x-cld-error: "df8ckaeam cannot be
-accessed via this endpoint"), which blocks downloads too, not just new
-uploads. Run this once that's resolved; every URL below is a real GET
-against Cloudinary's own delivery domain.
+PREREQUISITE: Cloudinary's shared account must be reachable (even
+temporarily) before this can run at all — the block that started this
+migration affects downloads too, not just new uploads. Every URL below is a
+real GET against Cloudinary's own delivery domain.
 
 Scans every collection in the database, recursively, for any field — a
 plain string, or nested inside a dict/list, at any depth — whose value is

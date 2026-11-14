@@ -210,6 +210,16 @@ async def list_drafts(
 
     skip = (page - 1) * per_page
 
+    print(f"📋 SDK /api/v1/drafts request - API key user_id: {api_key.user_id}, page: {page}, per_page: {per_page}")
+
+    # Query all drafts for this user to debug
+    all_drafts_sample = await db.content_drafts.find(
+        {"user_id": api_key.user_id}
+    ).sort("created_at", -1).limit(5).to_list(length=5)
+
+    print(f"📋 Top 5 most recent draft IDs in DB: {[d.get('id', 'no-id') for d in all_drafts_sample]}")
+
+    # Now get the paginated results
     drafts_cursor = db.content_drafts.find(
         {"user_id": api_key.user_id}
     ).sort("created_at", -1).skip(skip).limit(per_page)
@@ -217,12 +227,33 @@ async def list_drafts(
     drafts = await drafts_cursor.to_list(length=per_page)
     total = await db.content_drafts.count_documents({"user_id": api_key.user_id})
 
-    # Convert ObjectId to string
+    print(f"📋 Returning {len(drafts)} drafts (total: {total})")
+
+    # Convert ObjectId and datetime to string for JSON serialization
+    import json
+    from bson import ObjectId
+    from datetime import datetime
+
+    def serialize_doc(doc):
+        """Convert MongoDB document to JSON-serializable dict"""
+        if isinstance(doc, dict):
+            return {k: serialize_doc(v) for k, v in doc.items()}
+        elif isinstance(doc, list):
+            return [serialize_doc(item) for item in doc]
+        elif isinstance(doc, ObjectId):
+            return str(doc)
+        elif isinstance(doc, datetime):
+            return doc.isoformat()
+        else:
+            return doc
+
+    serialized_drafts = []
     for draft in drafts:
         draft["id"] = str(draft.pop("_id"))
+        serialized_drafts.append(serialize_doc(draft))
 
     return JSONResponse(content={
-        "data": drafts,
+        "data": serialized_drafts,
         "total": total,
         "page": page,
         "per_page": per_page,

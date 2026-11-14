@@ -393,7 +393,11 @@ class CaptionValidatorService:
 Rewrite the caption fixing these specific issues:
 {chr(10).join(fix_instructions)}
 
-CRITICAL RULES FOR THE REWRITE:
+CRITICAL FORMATTING RULES:
+- MANDATORY: Add a blank line (press Enter twice) after every 1-2 sentences
+- MANDATORY: The caption MUST have at least 2-3 blank line separators (\\n\\n)
+- MANDATORY: No line should contain more than 2 sentences
+- MANDATORY: Break long thoughts into separate paragraphs with blank lines between them
 - Keep the same core message and tone
 - Maintain the brand voice
 - Sound like a real person, not AI
@@ -405,6 +409,6 @@ CRITICAL RULES FOR THE REWRITE:
 Original caption:
 {caption}
 
-Write ONLY the fixed caption. No explanations."""
+Write ONLY the fixed caption with proper blank line spacing. No explanations."""
 
         return fix_prompt

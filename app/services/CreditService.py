@@ -79,34 +79,56 @@ class CreditService:
         """
         Get user credit balance with low credit warning
         PRD 7.3: Low Credit Warning when credits ≤ 3
+
+        Includes any still-unexpired trial credits in the total — a trial
+        isn't cut short by subscribing, it keeps counting down on its own
+        clock, and the credits it still has should be usable alongside the
+        subscription balance until it naturally runs out (date passes or its
+        own credits hit 0). Confirmed live: a starter subscriber with 20 real
+        credits and 10 unexpired trial credits was shown only "10 credits" —
+        the wallet-only number — instead of the combined 30 they actually had.
         """
         wallet = await self.get_user_wallet(user_id)
 
+        # Trial contribution is independent of whether a wallet/subscription
+        # exists at all — imported here (not at module level) to avoid a
+        # CreditService <-> TrialService import-order dependency at startup.
+        from app.services.TrialService import trial_service
+        trial_status = await trial_service.get_trial_status(user_id)
+        trial_credits_included = trial_status.credits_remaining if trial_status.trial_active else 0
+
         if not wallet:
-            # User never subscribed - return zero balance
+            # No subscription/bonus wallet — balance is whatever unexpired trial credits remain
             return CreditBalanceResponse(
-                total_credits=0,
+                total_credits=trial_credits_included,
                 credits_used=0,
-                credits_remaining=0,
+                credits_remaining=trial_credits_included,
                 subscription_tier=None,
+                subscription_source=None,
+                start_date=None,
+                end_date=None,
                 next_renewal=None,
-                low_credit_warning=True  # Show warning to subscribe
+                low_credit_warning=trial_credits_included == 0,
+                trial_credits_included=trial_credits_included,
             )
 
+        total_remaining = wallet.credits_remaining + trial_credits_included
+
         # PRD 7.3: Trigger warning when credits ≤ 3
-        low_credit_warning = wallet.credits_remaining <= 3
+        low_credit_warning = total_remaining <= 3
 
         return CreditBalanceResponse(
             has_had_plan=bool(wallet.subscription_tier) or await self.has_had_plan(user_id),
             total_credits=wallet.total_credits,
             credits_used=wallet.credits_used,
-            credits_remaining=wallet.credits_remaining,
+            credits_remaining=total_remaining,
             subscription_tier=wallet.subscription_tier,
             subscription_source=wallet.subscription_source,
             start_date=wallet.start_date,
             end_date=wallet.end_date,
             next_renewal=wallet.next_renewal,
-            low_credit_warning=low_credit_warning
+            low_credit_warning=low_credit_warning,
+            trial_credits_included=trial_credits_included
         )
 
     async def has_had_plan(self, user_id: str) -> bool:
@@ -226,6 +248,90 @@ class CreditService:
         wallet.credits_remaining = new_remaining
         return wallet
 
+    async def admin_adjust_credits(self, user_id: str, amount: int, notes: Optional[str] = None) -> UserCreditWallet:
+        """
+        Signed delta to bonus_credits, floored at 0 — never negative (an admin
+        correcting an over-grant reduces to zero, not into debt). Logs a real
+        credit_transactions entry with type="admin_adjustment" so this is
+        auditable exactly like every other balance change, unlike a raw DB edit.
+        Distinct from add_bonus_credits (always-positive, reason from a fixed
+        set) — this accepts a signed amount and a free-text admin note.
+        """
+        wallet = await self.get_user_wallet(user_id)
+
+        if not wallet:
+            new_bonus = max(0, amount)
+            new_wallet = UserCreditWallet(
+                user_id=user_id,
+                bonus_credits=new_bonus,
+                subscription_credits=0,
+                frozen_credits=0,
+                total_credits=new_bonus,
+                credits_used=0,
+                credits_remaining=new_bonus,
+                subscription_tier=None,
+                next_renewal=None,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            await self.user_credits_collection.insert_one(new_wallet.dict(exclude_none=True))
+
+            await self.credit_transactions_collection.insert_one(
+                CreditTransaction(
+                    user_id=user_id,
+                    type="admin_adjustment",
+                    amount=new_bonus,  # actual amount applied, may differ from `amount` if floored
+                    balance_before=0,
+                    balance_after=new_bonus,
+                    reason="admin_adjustment",
+                    notes=notes,
+                    created_at=datetime.utcnow()
+                ).dict(exclude_none=True)
+            )
+            return new_wallet
+
+        current_bonus = getattr(wallet, 'bonus_credits', 0)
+        new_bonus = max(0, current_bonus + amount)
+        new_total = new_bonus + getattr(wallet, 'subscription_credits', 0)
+        # bonus_credits/subscription_credits are already net of usage (see
+        # get_user_wallet()'s own recompute, which never subtracts
+        # credits_used again) — subtracting it here double-counted every
+        # credit the user had ever used, so a grant meant to bring someone
+        # back to e.g. 20 credits could write a negative credits_remaining
+        # once their lifetime credits_used passed the grant amount.
+        new_remaining = new_total
+        applied_amount = new_bonus - current_bonus  # what actually changed, after flooring
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "bonus_credits": new_bonus,
+                    "total_credits": new_total,
+                    "credits_remaining": new_remaining,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=applied_amount,
+                balance_before=wallet.credits_remaining,
+                balance_after=new_remaining,
+                reason="admin_adjustment",
+                notes=notes,
+                created_at=datetime.utcnow()
+            ).dict(exclude_none=True)
+        )
+
+        wallet.bonus_credits = new_bonus
+        wallet.total_credits = new_total
+        wallet.credits_remaining = new_remaining
+        return wallet
+
     # ==================== PRD 7.2: Deduction Logic ====================
 
     async def check_sufficient_credits(self, user_id: str, required: int = 1) -> bool:
@@ -233,13 +339,13 @@ class CreditService:
         Check if user has sufficient credits
         PRD 7.2: if credits_remaining >= 1: allow, else: block action
 
-        Legacy users (without wallet) get unlimited access for backward compatibility
+        Users without wallet are blocked (must have trial or subscription)
         """
         wallet = await self.get_user_wallet(user_id)
 
         if not wallet:
-            # Legacy user from before billing system - allow unlimited access
-            return True
+            # No wallet = never subscribed = blocked
+            return False
 
         return wallet.credits_remaining >= required
 
@@ -712,90 +818,6 @@ class CreditService:
         )
 
         return True
-
-    async def admin_adjust_credits(self, user_id: str, amount: int, notes: Optional[str] = None) -> UserCreditWallet:
-        """
-        Signed delta to bonus_credits, floored at 0 — never negative (an admin
-        correcting an over-grant reduces to zero, not into debt). Logs a real
-        credit_transactions entry with type="admin_adjustment" so this is
-        auditable exactly like every other balance change, unlike a raw DB edit.
-        Distinct from add_bonus_credits (always-positive, reason from a fixed
-        set) — this accepts a signed amount and a free-text admin note.
-        """
-        wallet = await self.get_user_wallet(user_id)
-
-        if not wallet:
-            new_bonus = max(0, amount)
-            new_wallet = UserCreditWallet(
-                user_id=user_id,
-                bonus_credits=new_bonus,
-                subscription_credits=0,
-                frozen_credits=0,
-                total_credits=new_bonus,
-                credits_used=0,
-                credits_remaining=new_bonus,
-                subscription_tier=None,
-                next_renewal=None,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            await self.user_credits_collection.insert_one(new_wallet.dict(exclude_none=True))
-
-            await self.credit_transactions_collection.insert_one(
-                CreditTransaction(
-                    user_id=user_id,
-                    type="admin_adjustment",
-                    amount=new_bonus,  # actual amount applied, may differ from `amount` if floored
-                    balance_before=0,
-                    balance_after=new_bonus,
-                    reason="admin_adjustment",
-                    notes=notes,
-                    created_at=datetime.utcnow()
-                ).dict(exclude_none=True)
-            )
-            return new_wallet
-
-        current_bonus = getattr(wallet, 'bonus_credits', 0)
-        new_bonus = max(0, current_bonus + amount)
-        new_total = new_bonus + getattr(wallet, 'subscription_credits', 0)
-        # bonus_credits/subscription_credits are already net of usage (see
-        # get_user_wallet()'s own recompute, which never subtracts
-        # credits_used again) — subtracting it here double-counted every
-        # credit the user had ever used, so a grant meant to bring someone
-        # back to e.g. 20 credits could write a negative credits_remaining
-        # once their lifetime credits_used passed the grant amount.
-        new_remaining = new_total
-        applied_amount = new_bonus - current_bonus  # what actually changed, after flooring
-
-        await self.user_credits_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "bonus_credits": new_bonus,
-                    "total_credits": new_total,
-                    "credits_remaining": new_remaining,
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
-
-        await self.credit_transactions_collection.insert_one(
-            CreditTransaction(
-                user_id=user_id,
-                type="admin_adjustment",
-                amount=applied_amount,
-                balance_before=wallet.credits_remaining,
-                balance_after=new_remaining,
-                reason="admin_adjustment",
-                notes=notes,
-                created_at=datetime.utcnow()
-            ).dict(exclude_none=True)
-        )
-
-        wallet.bonus_credits = new_bonus
-        wallet.total_credits = new_total
-        wallet.credits_remaining = new_remaining
-        return wallet
 
     async def admin_set_subscription(
         self,

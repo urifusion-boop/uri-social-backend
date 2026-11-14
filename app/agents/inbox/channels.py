@@ -322,6 +322,34 @@ async def granted_scopes(token: str) -> list[str]:
         return []
 
 
+async def page_view(page_id: str, page_token: str) -> dict:
+    """What Meta itself reports for a Page: the app's subscribed fields and the Instagram
+    account it believes is linked. Answers "is Meta sending us this Page's messages" with
+    Meta's own record instead of our own."""
+    import httpx
+
+    from app.core.config import settings
+
+    version = getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0"
+    base = f"https://graph.facebook.com/{version}/{page_id}"
+    out: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            subs = (await client.get(f"{base}/subscribed_apps", params={"access_token": page_token})).json()
+            ig = (await client.get(base, params={
+                "fields": "instagram_business_account{id,username}", "access_token": page_token})).json()
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    out["subscribed_apps"] = [{"app": a.get("name") or a.get("id"), "fields": a.get("subscribed_fields", [])}
+                              for a in subs.get("data") or []]
+    if subs.get("error"):
+        out["subscribed_error"] = (subs["error"].get("message") or "")[:200]
+    out["instagram_business_account"] = ig.get("instagram_business_account")
+    if ig.get("error"):
+        out["instagram_error"] = (ig["error"].get("message") or "")[:200]
+    return out
+
+
 async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:
     """Subscribe the Page to this app so Meta actually delivers its events.
 
@@ -360,13 +388,20 @@ async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, 
     if ok:
         return True, ""
 
-    # Only the messaging fields need pages_messaging; comments ride on feed.
-    if "pages_messaging" in err or "(#200)" in err:
-        ok_partial, err_partial = await attempt("feed")
-        if ok_partial:
+    # Each field group needs its own permission: the messaging fields need pages_messaging,
+    # `feed` (comments) needs pages_manage_metadata, which Meta only grants users with a role
+    # on the app until it is approved. DMs are the core of the inbox, so a token lacking
+    # pages_manage_metadata still gets them rather than nothing.
+    if "(#200)" in err or "pages_messaging" in err or "pages_manage_metadata" in err:
+        ok_dm, err_dm = await attempt("messages,messaging_postbacks,message_reactions")
+        if ok_dm:
+            return True, ("DMs only — the token lacks pages_manage_metadata, so comments "
+                          "will not be delivered until that permission is granted")
+        ok_feed, err_feed = await attempt("feed")
+        if ok_feed:
             return True, ("comments only — the token lacks pages_messaging, so DMs "
                           "will not be delivered until that scope is granted")
-        return False, f"{err} | feed-only also failed: {err_partial}"
+        return False, f"{err} | messages-only also failed: {err_dm} | feed-only also failed: {err_feed}"
 
     return False, err
 async def fetch_contact_name(external_user_id: str, access_token: str) -> str:

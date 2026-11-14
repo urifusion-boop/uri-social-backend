@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     ADS_OPENAI_API_KEY: str = ""
     AUTHJWT_SECRET_KEY: str
 
+    # Shared secret between the SDK Gateway and this backend for internal
+    # service-to-service trust (see app/middleware/sdk_gateway_auth.py).
+    # Left empty by default so an unconfigured deployment fails closed
+    # (no value can ever match an empty secret) rather than trusting a
+    # guessable default.
+    SDK_GATEWAY_INTERNAL_SECRET: str = ""
+
     # URI microservices
     URI_GATEWAY_BASE_API_URL: str
     URI_BACKEND_BASE_URL: str
@@ -193,6 +200,10 @@ class Settings(BaseSettings):
     # domain verification needed, unlike PULL_FROM_URL) as an alternative to
     # the existing Outstand-mediated TikTok connection. See
     # app/agents/social_media_manager/services/tiktok_direct_service.py.
+    # Outstand is no longer used: every OutstandService call refuses without contacting
+    # Outstand, so nothing publishes/schedules/looks up through it. Accounts that were
+    # connected through Outstand are told to reconnect directly (Meta / TikTok login).
+    OUTSTAND_ENABLED: bool = False
     TIKTOK_APP_CLIENT_KEY: str = ""
     TIKTOK_APP_CLIENT_SECRET: str = ""
 
@@ -259,6 +270,19 @@ class Settings(BaseSettings):
     ZAPCAP_API_KEY: Optional[str] = None
     OPUSCLIP_API_KEY: Optional[str] = None   # Phase 0 testing only
     VIZARD_API_KEY: Optional[str] = None      # Phase 0 testing only
+
+    # ── Video Editing Billing PRD — default rate, overridden at runtime by
+    # platform_settings once an admin sets one (see VideoBillingService.get_video_edit_rate) ──
+    VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
+    # Comma-separated allowlist gating PATCH /video-editing/pricing. Empty = nobody can change it.
+    BILLING_ADMIN_EMAILS: str = ""
+    # Comma-separated allowlist gating the /admin/* user-management router (view all
+    # users, adjust credits/trial). Defaults to the same email the frontend's
+    # AdminService.isAdmin() already hardcodes, so this matches today's real
+    # security posture rather than silently locking everyone out until a .env
+    # change ships — extend via env var for additional admins, never widen this
+    # default to something guessable.
+    ADMIN_EMAILS: str = "urisocialingsight@gmail.com,ujahnaomi104@gmail.com"
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 
@@ -270,6 +294,15 @@ class Settings(BaseSettings):
     # Credits for AI video generation (see video_generation_billing.py). off = free, as before;
     # shadow = record what would be charged without charging; on = charge. Prices: video_pricing.py.
     VIDEO_GENERATION_BILLING_MODE: str = "off"
+
+    # jane-whatsapp-reply — shared secret this backend presents (as
+    # X-Internal-Service) when proxying support-team requests to jane's own
+    # /internal/* endpoints (see app/services/JaneEscalationClient.py). Must match
+    # jane-whatsapp-reply's own JANE_WA_INTERNAL_SECRET exactly. Empty by default
+    # so an unconfigured deployment fails closed on jane's side, same reasoning as
+    # SDK_GATEWAY_INTERNAL_SECRET above.
+    JANE_WA_INTERNAL_SECRET: str = ""
+    JANE_WA_BASE_URL: str = "https://jane-whatsapp.urisocial.com"
 
     # Bypass flags for local development
     # VSG-01's composited ad formats (Us vs Them, Borrowed Interface, Problem/Solution)
@@ -338,9 +371,13 @@ class Settings(BaseSettings):
         the shared one. Keeps ad usage/quota isolated from the rest of the app."""
         return self.ADS_OPENAI_API_KEY or self.OPENAI_API_KEY
 
+    # SDK Gateway Database (for API key authentication only)
+    SDK_GATEWAY_MONGODB_URI: Optional[str] = None
+    SDK_GATEWAY_DB: str = "sdk-gateway"
     class Config:
         env_file = ".env"
         extra = "ignore"
 
 
 settings = Settings()
+
