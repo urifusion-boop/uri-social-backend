@@ -39,8 +39,9 @@ jobs:
       - run: python -c "import app.main as m; print('routes:', len(m.app.routes))"
 
   tests:
-    # Informational until the known-broken tests are fixed; then make it required too.
-    # test_01..test_09 call a running API and are skipped here.
+    # Tests that call a running API (the `client` fixture) skip themselves unless
+    # TEST_API_URL is set (tests/conftest.py). ffmpeg and the DejaVu fonts match the
+    # production image (Dockerfile), so video and ad-layout tests measure what prod does.
     name: Backend tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -50,5 +51,6 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
       - run: pip install -r requirements.txt mongomock-motor
-      - run: python -m pytest -q -p no:cacheprovider --ignore-glob='tests/test_0[0-9]_*.py'
+      - run: python -m pytest -q -p no:cacheprovider

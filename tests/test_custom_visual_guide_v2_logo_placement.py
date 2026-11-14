@@ -5,9 +5,8 @@ it at all, on any post, regardless of platform — confirmed live: an account
 with 3 custom guides selected had zero logo_placement data across every
 recent post, while a guide-free account had it on every post.
 
-generate_image_with_v2_guide already composited the logo via the same
-smart-overlay path AI-generated images use (overlay_logo_smart), but called
-it without return_placement=True and never captured the pre-overlay
+generate_image_with_v2_guide already composited the logo, but never
+captured where it landed or the pre-overlay
 background, so there was nothing to persist and nothing to later re-paste
 the logo onto. The result was also normalized down to just {"image_url":
 ...} one level up in complete_social_manager.py, silently discarding
@@ -51,18 +50,16 @@ class TestV2GuideReturnsLogoPlacement:
             "logo_size": "large",
         }
 
-        # overlay_logo_smart(return_placement=True) returns a flat
-        # (b64, chosen_position, chosen_geometry) tuple, not a nested one —
-        # chosen_position can differ from the preferred one if the smart
-        # ranking moved off it to avoid a busy area.
+        # The logo goes in the brand's chosen corner (the fast, fixed-position overlay);
+        # _overlay_logo(return_geometry=True) returns (b64, geometry).
         fake_geometry = {"x": 820, "y": 15, "width": 200, "height": 200}
 
-        async def fake_overlay_logo_smart(b64, logo_url, logo_size, preferred_position, return_placement=False):
-            assert return_placement is True
-            return "ZmFrZQ==", "top_left", fake_geometry
+        def fake_overlay_logo(b64, logo_url, position, logo_size, return_geometry=False):
+            assert return_geometry is True and position == "top_right"
+            return "ZmFrZQ==", fake_geometry
 
         with patch.object(ImageContentService, "_call_dalle_api", side_effect=fake_call_dalle_api), patch.object(
-            ImageContentService, "overlay_logo_smart", side_effect=fake_overlay_logo_smart
+            ImageContentService, "_overlay_logo", side_effect=fake_overlay_logo
         ), patch("app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.png")):
             result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id="507f1f77bcf86cd799439011",
@@ -76,9 +73,8 @@ class TestV2GuideReturnsLogoPlacement:
             )
 
         assert result["success"] is True
-        # The corner the smart ranking actually chose, not the preferred one
-        # — logo_placement must reflect where the logo really landed.
-        assert result["logo_placement"] == {**fake_geometry, "position": "top_left", "logo_size": "large"}
+        # Where the logo landed, so Move Logo can reposition it later.
+        assert result["logo_placement"] == {**fake_geometry, "position": "top_right", "logo_size": "large"}
         assert result["background_image_url"] == "data:image/webp;base64,ZmFrZQ=="
         # responseData mirrors the top-level fields — this is what the
         # caller (complete_social_manager.py) actually reads from.
