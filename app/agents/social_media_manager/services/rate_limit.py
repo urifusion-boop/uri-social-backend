@@ -359,8 +359,7 @@ def http_limit_response(exc: BaseException, platform: str,
 # ── Per-account gate ──────────────────────────────────────────────────────────
 
 def account_key(platform: str, identifier: str) -> str:
-    """e.g. account_key("tiktok", conn["id"]), ("outstand", outstand_account_id),
-    ("instagram", ig_user_id), ("facebook", page_id)."""
+    """e.g. account_key("tiktok", conn["id"]), ("instagram", ig_user_id), ("facebook", page_id)."""
     return f"{platform}:{identifier}"
 
 
@@ -372,22 +371,15 @@ def gate_target_for_connection(platform: str, conn: Optional[Dict[str, Any]]):
     cfg = get_settings()
     conn = conn or {}
     p = (platform or "").lower()
-    via = conn.get("connected_via") or ""
     if p == "tiktok":
-        if via == "tiktok_direct_oauth":
-            ident, kind = conn.get("id"), "tiktok"
-        else:
-            ident, kind = conn.get("outstand_account_id"), "outstand"
-        return (account_key(kind, ident) if ident else None), cfg.tiktok_min_gap_s, "tiktok"
+        ident = conn.get("id")
+        return (account_key("tiktok", ident) if ident else None), cfg.tiktok_min_gap_s, "tiktok"
     if p == "instagram":
         ident = conn.get("ig_user_id") or conn.get("id")
         return (account_key("instagram", ident) if ident else None), cfg.meta_min_gap_s, "instagram"
     if p == "facebook":
-        if via == "outstand" and conn.get("outstand_account_id"):
-            ident, kind = conn["outstand_account_id"], "outstand"
-        else:
-            ident, kind = conn.get("page_id") or conn.get("id"), "facebook"
-        return (account_key(kind, ident) if ident else None), cfg.meta_min_gap_s, "facebook"
+        ident = conn.get("page_id") or conn.get("id")
+        return (account_key("facebook", ident) if ident else None), cfg.meta_min_gap_s, "facebook"
     return None, 0.0, p
 
 

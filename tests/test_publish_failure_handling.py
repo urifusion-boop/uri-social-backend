@@ -1,25 +1,14 @@
 """
-publish_scheduled_content's Outstand-poll branch must detect a real platform
-failure, not just "not published yet".
-
-Live-reported: a post scheduled for 16:24 UTC was still showing "Publishing
-soon..." well after its time passed. Traced via Outstand's own get_post API:
-Facebook had rejected it outright (socialAccounts[0].status == "failed",
-with a real, specific error — "Confirm your identity before you can publish
-as this Page"). Our own polling code only ever checked post.publishedAt,
-never each socialAccounts[] entry's own status, so a genuine platform-side
-failure was silently indistinguishable from "hasn't published yet" — the
-draft stayed status="scheduled" forever, with the real, actionable error
-from Outstand/Facebook never reaching the user.
+Publish failures, explained and acted on: a Facebook error is turned into plain words the owner
+understands, a known "this login has lapsed" error flags the connection for reconnecting straight
+away, and an unrecognised error only does so once it keeps happening on the same connection
+(a success in between resets the count).
 """
 import asyncio
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.agents.social_media_manager.services.approval_workflow_service import (
-    ApprovalWorkflowService,
     _friendlier_facebook_error,
     _should_flag_connection,
     _record_publish_success,
@@ -130,95 +119,6 @@ class FakeDb:
 
     def __getitem__(self, name):
         return self._colls.setdefault(name, FakeCollection())
-
-
-def _outstand_scheduled_draft():
-    now = datetime.utcnow()
-    return {
-        "id": "draft-A", "user_id": "user-1", "platform": "facebook",
-        "post_type": "feed", "content": "Mondays can set the tone...", "status": "scheduled",
-        "scheduled_date": now - timedelta(minutes=30), "created_at": now - timedelta(hours=1),
-        "platform_post_id": "Npl7E",
-    }
-
-
-def _outstand_response_with_failed_account(error="Confirm your identity before you can publish as this Page."):
-    return {
-        "success": True,
-        "post": {
-            "id": "Npl7E",
-            "publishedAt": None,
-            "isDraft": False,
-            "socialAccounts": [
-                {"id": "LdZGV", "network": "facebook", "status": "failed", "error": f"Error publishing post to Facebook: {error}"},
-            ],
-        },
-    }
-
-
-def test_a_platform_side_failure_is_detected_and_surfaced():
-    db = FakeDb({"content_drafts": [_outstand_scheduled_draft()]})
-
-    with patch(
-        "app.agents.social_media_manager.services.outstand_service.OutstandService.get_post",
-        new=AsyncMock(return_value=_outstand_response_with_failed_account()),
-    ):
-        result = _run(ApprovalWorkflowService.publish_scheduled_content(db))
-
-    draft = db["content_drafts"].docs[0]
-    assert draft["status"] == "publish_failed"
-    assert "Confirm your identity" in draft["error_message"]
-    # Dead submission — must not keep polling the same failed Outstand post.
-    assert draft["platform_post_id"] is None
-    assert result["published_count"] == 0
-
-
-def test_a_post_with_no_failed_accounts_yet_is_left_alone_as_pending():
-    """Not every unpublished post is a failure — most are just not there yet.
-    Must not be marked failed prematurely."""
-    db = FakeDb({"content_drafts": [_outstand_scheduled_draft()]})
-
-    pending_response = {
-        "success": True,
-        "post": {
-            "id": "Npl7E", "publishedAt": None, "isDraft": False,
-            "socialAccounts": [{"id": "LdZGV", "network": "facebook", "status": "queued"}],
-        },
-    }
-
-    with patch(
-        "app.agents.social_media_manager.services.outstand_service.OutstandService.get_post",
-        new=AsyncMock(return_value=pending_response),
-    ):
-        _run(ApprovalWorkflowService.publish_scheduled_content(db))
-
-    draft = db["content_drafts"].docs[0]
-    assert draft["status"] == "scheduled"  # untouched — genuinely still pending
-    assert draft.get("error_message") is None
-
-
-def test_a_successfully_published_post_is_still_marked_published_not_failed():
-    """Regression guard: the new failed-account check must not interfere
-    with the existing, already-working success path."""
-    db = FakeDb({"content_drafts": [_outstand_scheduled_draft()]})
-
-    published_response = {
-        "success": True,
-        "post": {
-            "id": "Npl7E", "publishedAt": "2026-09-28T16:25:00.000Z", "isDraft": False,
-            "socialAccounts": [{"id": "LdZGV", "network": "facebook", "status": "published"}],
-        },
-    }
-
-    with patch(
-        "app.agents.social_media_manager.services.outstand_service.OutstandService.get_post",
-        new=AsyncMock(return_value=published_response),
-    ):
-        result = _run(ApprovalWorkflowService.publish_scheduled_content(db))
-
-    draft = db["content_drafts"].docs[0]
-    assert draft["status"] == "published"
-    assert result["published_count"] == 1
 
 
 # ── _friendlier_facebook_error ───────────────────────────────────────────────

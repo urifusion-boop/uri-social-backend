@@ -4,7 +4,6 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.domain.responses.uri_response import UriResponse
 from app.core.config import settings
-from .outstand_service import OutstandService, PLATFORM_TO_NETWORK, SUPPORTED_PLATFORMS
 
 # force_account_selection maps to a real per-network re-auth override on
 # Outstand's side (disable_auto_auth for TikTok, auth_type=reauthenticate for
@@ -48,249 +47,37 @@ async def _release_inbox_claim(
                   flush=True)
 
 
+def _brand_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    """The active brand's connections: a personal brand's are the user's own (excluding any agency
+    brand's), an agency brand's are matched by brand_id alone."""
+    from app.models.brand_account import BrandAccount
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+    if (not brand_id) or brand_id == personal_bid:
+        return {"user_id": user_id,
+                "$or": [{"brand_id": {"$exists": False}}, {"brand_id": None}, {"brand_id": personal_bid}]}
+    return {"brand_id": brand_id}
+
+
+def _tombstone_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    from app.models.brand_account import BrandAccount
+    if (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id):
+        return {"user_id": user_id}
+    return {"brand_id": brand_id}
+
+
 class SocialAccountService:
 
     # -------------------------------------------------------------------------
     # 1. Initiate OAuth flow — returns auth URLs for each requested platform
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    async def initiate_connection_flow(
-        user_id: str,
-        platforms: List[str],
-        source: str = "onboarding",
-        brand_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Build Outstand OAuth URLs for each requested platform.
-        For agency brands, tenant_id is the brand_id so Outstand keeps
-        each brand's accounts isolated. Personal brands use user_id.
-        """
-        from app.models.brand_account import BrandAccount
-        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-        tenant_id = user_id if is_personal else brand_id
-
-        outstand = OutstandService()
-        # Use PUBLIC_API_URL if set (browser-reachable), otherwise fall back to gateway URL
-        _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
-
-        auth_urls: Dict[str, str] = {}
-        unsupported: List[str] = []
-
-        failed: List[Dict[str, str]] = []
-
-        for platform in platforms:
-            network = PLATFORM_TO_NETWORK.get(platform.lower())
-            if not network:
-                unsupported.append(platform)
-                continue
-
-            # requested_network round-trips through Outstand's own redirect_uri
-            # handling (confirmed live: it preserves query params already on the
-            # redirect_uri and only appends its own on top) — the "direct" callback
-            # shape (TikTok, X) doesn't reliably echo back which network was
-            # connected on its own, so this is the only dependable way the
-            # callback can know without a live Outstand lookup.
-            callback_url = f"{_base}/social-media/connect/callback/outstand?source={source}&requested_network={network}"
-
-            try:
-                url = await outstand.get_auth_url(
-                    network=network,
-                    tenant_id=tenant_id,
-                    redirect_uri=callback_url,
-                    force_account_selection=network in NETWORKS_REQUIRING_ACCOUNT_SELECTION,
-                )
-                auth_urls[platform.lower()] = url
-            except Exception as e:
-                err_str = str(e)
-                print(f"Failed to get auth URL for {platform}: {err_str}")
-                # Surface Outstand credential/config errors clearly
-                if "401" in err_str:
-                    return UriResponse.error_response(
-                        f"Outstand API key is invalid or not configured. "
-                        f"Check OUTSTAND_API_KEY in your environment and ensure the "
-                        f"'{network}' network is registered via setup_outstand_networks.py.",
-                        code=401,
-                    )
-                if "404" in err_str:
-                    return UriResponse.error_response(
-                        f"The '{network}' network is not configured in Outstand. "
-                        f"Run setup_outstand_networks.py to register it first.",
-                        code=404,
-                    )
-                failed.append({"platform": platform, "error": err_str})
-
-        if not auth_urls:
-            failure_detail = f" Failures: {failed}" if failed else ""
-            return UriResponse.error_response(
-                f"Could not generate auth URLs for any requested platform.{failure_detail} "
-                f"Unsupported: {unsupported}. Supported: {sorted(SUPPORTED_PLATFORMS)}",
-                code=400,
-            )
-
-        return UriResponse.get_single_data_response("connection_flow", {
-            "user_id": user_id,
-            "auth_urls": auth_urls,
-            "platforms": list(auth_urls.keys()),
-            "unsupported_platforms": unsupported,
-            "failed_platforms": failed,
-            "instructions": (
-                "Open each auth_url for the user to authorise. "
-                "After authorisation, Outstand will redirect to the callback URL. "
-                "Then call GET /connect/pending/{sessionToken} and "
-                "POST /connect/finalize to complete the connection."
-            ),
-        })
-
     # -------------------------------------------------------------------------
     # 2. Get pending connection — returns pages available for the user to select
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    async def get_pending_connection(session_token: str, db=None) -> Dict[str, Any]:
-        """
-        After Outstand OAuth redirect, retrieve available pages/accounts.
-        The frontend shows these to the user for selection before finalising.
-        """
-        outstand = OutstandService()
-        try:
-            result = await outstand.get_pending_connection(session_token)
-            pending_data = result.get("data", {})
-            raw_pages = pending_data.get("availablePages", [])
-            print(f"[PendingConnection] raw availablePages: {raw_pages}")
-
-            augmented_pages = list(raw_pages)
-
-            return UriResponse.get_single_data_response("pending_connection", {
-                "session_token": session_token,
-                "network": pending_data.get("network"),
-                "expires_at": pending_data.get("expiresAt"),
-                "available_pages": augmented_pages,
-            })
-        except Exception as e:
-            return UriResponse.error_response(
-                f"Could not retrieve pending connection. "
-                f"The session may have expired — please restart the connection flow. "
-                f"Detail: {str(e)}",
-                code=400,
-            )
-
     # -------------------------------------------------------------------------
     # 3. Finalize connection — selects pages and stores accounts
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    async def finalize_connection(
-        db: AsyncIOMotorDatabase,
-        user_id: str,
-        session_token: str,
-        selected_page_ids: List[str],
-        brand_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Complete the OAuth flow by finalising the selected pages.
-        Stores the connected account IDs in our local DB for fast publishing lookups.
-        """
-        from app.models.brand_account import BrandAccount
-        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-
-        outstand = OutstandService()
-        try:
-            result = await outstand.finalize_connection(session_token, selected_page_ids)
-            print(f"[Finalize] raw result: {result}")
-            accounts = result.get("connectedAccounts") or result.get("data", [])
-            if not isinstance(accounts, list):
-                accounts = [accounts]
-            print(f"[Finalize] accounts: {accounts}")
-
-            now = datetime.utcnow()
-            stored = []
-            brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
-
-            # Wipe existing connections for every network being (re)connected in
-            # this batch — ONCE, before the loop. Doing this per-account inside
-            # the loop (the previous approach) meant finalizing page B deleted
-            # page A's own record from earlier in the very same loop, via the
-            # platform-wide clause — so selecting multiple pages of the same
-            # platform in the picker could never leave more than one connected
-            # locally, no matter how many were actually selected. Outstand's own
-            # side was never affected by this — only our local mirror was.
-            # Only Outstand's own records are replaced: a direct Meta connection carries the
-            # Page token the inbox needs, which Outstand never provides, so wiping it here
-            # silently stopped DMs and auto-replies for that brand.
-            networks_in_batch = {acc.get("network") for acc in accounts if acc.get("network")}
-            for network in networks_in_batch:
-                await db["social_connections"].delete_many(
-                    {**brand_scope, "platform": network, "connected_via": "outstand"}
-                )
-
-            for acc in accounts:
-                outstand_account_id = acc.get("id")
-                network = acc.get("network")
-
-                doc = {
-                    "id": outstand_account_id,
-                    "user_id": user_id,
-                    "platform": network,
-                    # Outstand-managed docs have no real Facebook/TikTok page id of
-                    # their own, but the collection's unique index is
-                    # (user_id, platform, brand_id, page_id) — leaving this unset
-                    # means every page in a multi-page batch indexes as page_id:
-                    # null, so the 2nd+ insert collides as a duplicate of the 1st
-                    # and the whole finalize fails. outstand_account_id is already
-                    # unique per page, so reusing it here satisfies the index.
-                    "page_id": outstand_account_id,
-                    "outstand_account_id": outstand_account_id,
-                    "username": acc.get("username"),
-                    "account_name": acc.get("nickname") or acc.get("username"),
-                    "profile_picture_url": acc.get("profilePictureUrl") or acc.get("profile_picture_url"),
-                    "account_type": acc.get("accountType"),
-                    "network_unique_id": acc.get("network_unique_id") or acc.get("networkUniqueId"),
-                    "connection_status": "active",
-                    "connected_via": "outstand",
-                    "connected_at": now,
-                    "updated_at": now,
-                }
-                if not is_personal:
-                    doc["brand_id"] = brand_id
-
-                # Exact-id cleanup only, for idempotent re-finalize of the same
-                # account within this batch — the platform-wide wipe already
-                # happened once, above.
-                await db["social_connections"].delete_one({"id": outstand_account_id})
-                await db["social_connections"].insert_one(doc)
-
-                # A fresh, intentional (re)connect un-hides this account if the
-                # customer had previously disconnected it — otherwise it would
-                # stay filtered out of their own newly-reconnected list forever.
-                await db["disconnected_accounts"].delete_many({
-                    **brand_scope, "outstand_account_id": outstand_account_id,
-                })
-
-                stored.append({
-                    "outstand_account_id": outstand_account_id,
-                    "platform": network,
-                    "username": acc.get("username"),
-                    "account_name": acc.get("nickname") or acc.get("username"),
-                })
-
-            print(f"[Finalize] stored platforms: {[s['platform'] for s in stored]}")
-            await db["pending_page_tokens"].delete_many({"session_token": session_token})
-
-            return UriResponse.get_single_data_response("accounts_connected", {
-                "user_id": user_id,
-                "accounts_connected": stored,
-                "total": len(stored),
-                "connected_at": now.isoformat(),
-            })
-
-        except Exception as e:
-            import traceback as _tb
-            print(f"[Finalize] EXCEPTION: {e}\n{_tb.format_exc()}")
-            return UriResponse.error_response(
-                f"Failed to finalise connection: {str(e)}",
-                code=500,
-            )
 
     # -------------------------------------------------------------------------
     # 4. List connections — queries Outstand directly for live status
@@ -308,13 +95,12 @@ class SocialAccountService:
         Agency Accounts isolation: connections are scoped per brand. A solo
         user's personal brand keeps its legacy connections (tenant_id=user_id);
         each agency brand has its own isolated set (tenant_id=brand_id).
-        Queries Outstand then merges direct connections from the local DB.
+        All connections are direct ones held in the local DB.
         """
         from app.models.brand_account import BrandAccount
 
         is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
         personal_bid = BrandAccount.personal_brand_id(user_id)
-        tenant = user_id if is_personal else brand_id
         # Personal brand: exclude docs that belong to an agency brand (they store
         # user_id too, so a plain user_id filter would leak them across brands).
         # Agency brand: match strictly by brand_id only.
@@ -333,75 +119,31 @@ class SocialAccountService:
 
         by_platform: Dict[str, list] = {}
 
-        # Accounts the customer explicitly disconnected — filtered out below
-        # regardless of what Outstand's live list or the local mirror still
-        # say, since Outstand's own side-delete can silently fail or lag
-        # behind indefinitely. See disconnect_account for where this is
-        # written; a fresh reconnect through finalize_connection clears it.
+        # Accounts the customer explicitly disconnected (see disconnect_account).
         tombstone_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
         disconnected_ids = {
-            doc["outstand_account_id"]
+            doc.get("account_id") or doc.get("outstand_account_id")
             async for doc in db["disconnected_accounts"].find(
-                tombstone_scope, {"outstand_account_id": 1}
+                tombstone_scope, {"account_id": 1, "outstand_account_id": 1}
             )
         }
 
-        # 1. Outstand-managed accounts — failures must not prevent direct connections
         try:
-            outstand = OutstandService()
-            result = await outstand.list_accounts(tenant_id=tenant)
-            for acc in result.get("data", []):
-                if acc.get("id") in disconnected_ids:
-                    continue
-                platform = acc.get("network", "unknown")
-                by_platform.setdefault(platform, []).append({
-                    "outstand_account_id": acc.get("id"),
-                    "platform": platform,
-                    "username": acc.get("username"),
-                    "account_name": acc.get("nickname"),
-                    "profile_picture_url": acc.get("profile_picture_url"),
-                    "account_type": acc.get("accountType"),
-                    # Preserve None (Outstand didn't return this field for this
-                    # account/network) distinctly from an explicit False — collapsing
-                    # both to False here would make the frontend flag accounts as
-                    # "needs reconnecting" just because Outstand's response happened
-                    # not to include the field, not because anything is actually wrong.
-                    # Only an explicit isActive: false is a real signal worth surfacing.
-                    "is_active": acc.get("isActive"),
-                    "connected_at": acc.get("createdAt"),
-                })
-        except Exception as e:
-            print(f"[get_user_connections] Outstand list_accounts failed (non-fatal): {e}")
-
-        try:
-            # 2. All active connections from local DB.
-            # For Outstand-managed accounts already returned in step 1, skip to avoid duplicates.
-            # This ensures connections are shown even when the Outstand API is unavailable.
-            outstand_ids_seen = {
-                acc.get("outstand_account_id")
-                for accs in by_platform.values()
-                for acc in accs
-                if acc.get("outstand_account_id")
-            }
-            local_cursor = db["social_connections"].find(local_filter)
-            # Connections a post just failed on because the network ended URI's
-            # access (publish_confirmation): shown as needing a reconnect.
+            # Every connection is a direct one held in our own database. An account still
+            # recorded as connected through Outstand (retired) can't be posted to: it is listed
+            # as needing a reconnect (unless the brand has connected that network directly
+            # since), and its network does not count as connected.
             expired: Dict[str, Any] = {}
-            async for doc in local_cursor:
+            retired: Dict[str, list] = {}
+            async for doc in db["social_connections"].find(local_filter):
                 platform = doc.get("platform", "unknown")
-                doc_outstand_id = doc.get("outstand_account_id") or doc.get("id")
-                if doc.get("needs_reconnect"):
-                    expired[doc_outstand_id or f"platform:{platform}"] = doc.get("reconnect_reason")
-                    expired.setdefault(f"platform:{platform}", doc.get("reconnect_reason"))
-                if doc_outstand_id and doc_outstand_id in outstand_ids_seen:
+                key = doc.get("id") or doc.get("outstand_account_id")
+                if key and key in disconnected_ids:
                     continue
-                if doc_outstand_id and doc_outstand_id in disconnected_ids:
-                    continue
-                by_platform.setdefault(platform, []).append({
+                entry = {
                     "id": doc.get("id"),
                     "platform": platform,
                     "connected_via": doc.get("connected_via"),
-                    "outstand_account_id": doc.get("outstand_account_id"),
                     "username": doc.get("username"),
                     "account_name": doc.get("account_name"),
                     "profile_picture_url": doc.get("profile_picture_url"),
@@ -409,11 +151,23 @@ class SocialAccountService:
                     "connected_at": doc.get("connected_at"),
                     "page_name": doc.get("account_name"),
                     "ig_user_id": doc.get("ig_user_id"),
-                })
+                }
+                if doc.get("connected_via") == "outstand":
+                    entry.update({
+                        "is_active": False,
+                        "needs_reconnect": True,
+                        "reconnect_reason": "Reconnect this account to keep posting to it.",
+                    })
+                    retired.setdefault(platform, []).append(entry)
+                    continue
+                if doc.get("needs_reconnect"):
+                    expired[key or f"platform:{platform}"] = doc.get("reconnect_reason")
+                    expired.setdefault(f"platform:{platform}", doc.get("reconnect_reason"))
+                by_platform.setdefault(platform, []).append(entry)
 
             for platform, accs in by_platform.items():
                 for acc in accs:
-                    key = acc.get("outstand_account_id") or acc.get("id")
+                    key = acc.get("id")
                     hit = key in expired if key else False
                     # A flagged brand doc with no account id covers that network's card.
                     if not hit and f"platform:{platform}" in expired and len(accs) == 1:
@@ -423,10 +177,15 @@ class SocialAccountService:
                         acc["needs_reconnect"] = True
                         acc["reconnect_reason"] = expired.get(key)
 
+            connected_platforms = list(by_platform.keys())
+            for platform, accs in retired.items():
+                if platform not in by_platform:
+                    by_platform[platform] = accs
+
             total = sum(len(v) for v in by_platform.values())
             return UriResponse.get_single_data_response("user_connections", {
                 "user_id": user_id,
-                "connected_platforms": list(by_platform.keys()),
+                "connected_platforms": connected_platforms,
                 "connections": by_platform,
                 "total_connections": total,
             })
@@ -444,57 +203,18 @@ class SocialAccountService:
     async def disconnect_account(
         db: AsyncIOMotorDatabase,
         user_id: str,
-        outstand_account_id: str,
+        account_id: str,
         brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Permanently disconnect a social account scoped to the active brand.
-        outstand_account_id is the ID returned by Outstand (e.g. '9dyJS').
-
-        Always ends by recording this id in `disconnected_accounts`,
-        regardless of whether the local mirror or the Outstand-side delete
-        actually succeeded. get_user_connections filters every read against
-        that record, so the account stops appearing to this customer
-        immediately and permanently — even if Outstand's own delete keeps
-        silently failing behind the scenes. That's deliberate: making
-        disconnect visibly work for the customer must not depend on a
-        third party's cooperation.
+        Permanently disconnect one social account of the active brand: the connection's own `id`
+        (or, for an account recorded from the retired Outstand, its old outstand_account_id).
+        Recorded in `disconnected_accounts` so it never reappears.
         """
-        import asyncio
-        from app.models.brand_account import BrandAccount
-        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-        personal_bid = BrandAccount.personal_brand_id(user_id)
-        if is_personal:
-            brand_scope = {
-                "user_id": user_id,
-                "$or": [
-                    {"brand_id": {"$exists": False}},
-                    {"brand_id": None},
-                    {"brand_id": personal_bid},
-                ],
-            }
-        else:
-            brand_scope = {"brand_id": brand_id}
-
-        # Grab local record for metadata (platform/username) — not required to proceed.
-        local = await db["social_connections"].find_one({
-            **brand_scope,
-            "outstand_account_id": outstand_account_id,
-        })
-
-        outstand = OutstandService()
-
-        # Always remove from local DB first (best-effort) so the user is never stuck.
-        del_result = await db["social_connections"].delete_one({
-            **brand_scope,
-            "outstand_account_id": outstand_account_id,
-        })
-        if del_result.deleted_count == 0:
-            print(
-                f"[Disconnect] No local record for {outstand_account_id} "
-                "(may have been removed by a prior attempt) — still removing from Outstand.",
-                flush=True,
-            )
+        brand_scope = _brand_scope(user_id, brand_id)
+        match = {**brand_scope, "$and": [{"$or": [{"id": account_id}, {"outstand_account_id": account_id}]}]}
+        local = await db["social_connections"].find_one(match)
+        await db["social_connections"].delete_many(match)
 
         # Release the inbox's claim on this account too. A channel row outlives
         # the connection otherwise, and a workspace that still claims a Page it
@@ -502,47 +222,21 @@ class SocialAccountService:
         # claimant — at which point webhooks for that Page are dropped, for both.
         await _release_inbox_claim(db, local, user_id, brand_id)
 
-        # Best-effort Outstand delete, with a couple of retries — a transient
-        # timeout/500 on Outstand's side is common and often just needs a
-        # second attempt. Every failure mode (404/500/timeout/auth) still
-        # collapses to a generic exception here; the tombstone write below is
-        # what actually makes the disconnect stick regardless of how this
-        # resolves.
-        outstand_ok = False
-        last_error: Optional[Exception] = None
-        for attempt in range(3):
-            try:
-                await outstand.delete_account(outstand_account_id)
-                outstand_ok = True
-                break
-            except Exception as e:
-                last_error = e
-                if attempt < 2:
-                    await asyncio.sleep(1.5 * (attempt + 1))
-        if not outstand_ok:
-            print(
-                f"[Disconnect] Outstand delete failed for {outstand_account_id} "
-                f"after 3 attempts: {last_error}",
-                flush=True,
-            )
-
-        # Tombstone regardless of the outcome above — see docstring.
         now = datetime.utcnow()
-        tombstone_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+        tombstone_scope = _tombstone_scope(user_id, brand_id)
         await db["disconnected_accounts"].update_one(
-            {**tombstone_scope, "outstand_account_id": outstand_account_id},
+            {**tombstone_scope, "account_id": account_id},
             {"$set": {
                 **tombstone_scope,
-                "outstand_account_id": outstand_account_id,
+                "account_id": account_id,
                 "platform": local.get("platform") if local else None,
                 "disconnected_at": now,
-                "outstand_delete_confirmed": outstand_ok,
             }},
             upsert=True,
         )
 
         return UriResponse.get_single_data_response("disconnection", {
-            "outstand_account_id": outstand_account_id,
+            "account_id": account_id,
             "platform": local.get("platform") if local else None,
             "username": local.get("username") if local else None,
             "status": "disconnected",
@@ -561,51 +255,21 @@ class SocialAccountService:
         brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Disconnect every currently-visible account for one platform, scoped to
-        the active brand — Outstand-managed AND direct-OAuth accounts alike.
-        Reuses get_user_connections to find exactly what the customer would
-        see connected right now.
-
-        Outstand-managed accounts (have outstand_account_id) go through the
-        same disconnect_account path individually (retries + tombstone), same
-        as clicking Disconnect on that one row. Direct-OAuth accounts
-        (facebook_direct/instagram_direct/tiktok_direct — never touched
-        Outstand, so there's nothing on a third party to retry or tombstone
-        against) are just removed from the local mirror directly; a plain
-        delete is already permanent for these since nothing external can make
-        them reappear.
+        Disconnect every account of one platform for the active brand (what get_user_connections
+        shows the customer for it, including accounts that need reconnecting).
         """
-        from app.models.brand_account import BrandAccount
-        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-        personal_bid = BrandAccount.personal_brand_id(user_id)
-        if is_personal:
-            brand_scope = {
-                "user_id": user_id,
-                "$or": [
-                    {"brand_id": {"$exists": False}},
-                    {"brand_id": None},
-                    {"brand_id": personal_bid},
-                ],
-            }
-        else:
-            brand_scope = {"brand_id": brand_id}
-
+        brand_scope = _brand_scope(user_id, brand_id)
         current = await SocialAccountService.get_user_connections(db, user_id, brand_id)
         accounts = (current.get("responseData") or {}).get("connections", {}).get(platform, [])
 
         results = []
         for acc in accounts:
-            acc_id = acc.get("outstand_account_id")
-            if acc_id:
-                result = await SocialAccountService.disconnect_account(db, user_id, acc_id, brand_id)
-                results.append({"outstand_account_id": acc_id, "status": result.get("status")})
+            if acc.get("id"):
+                result = await SocialAccountService.disconnect_account(db, user_id, acc["id"], brand_id)
+                results.append({"account_id": acc["id"], "status": (result.get("responseData") or {}).get("status")})
                 continue
-
-            # Direct-OAuth account — no outstand_account_id, so nothing to
-            # retry/tombstone against a third party. Match the same way each
-            # direct flow's own disconnect endpoint does: Instagram by
-            # ig_user_id, everything else (one connection per platform) by
-            # platform + brand scope alone.
+            # A connection without an id: match it the way each direct flow's own disconnect does —
+            # Instagram by ig_user_id, everything else (one connection per platform) by platform.
             direct_filter: Dict[str, Any] = {**brand_scope, "platform": platform}
             if platform == "instagram" and acc.get("ig_user_id"):
                 direct_filter["ig_user_id"] = acc["ig_user_id"]
@@ -641,23 +305,12 @@ class SocialAccountService:
         brand_profile = await db["brand_profiles"].find_one({"user_id": user_id})
         step_1_complete = brand_profile is not None and bool(brand_profile.get("brand_name"))
 
-        # Step 2: social accounts connected (check local mirror first, then Outstand)
-        local_connections = await db["social_connections"].count_documents({
+        # Step 2: a social account connected (directly; Outstand is retired)
+        step_2_complete = await db["social_connections"].count_documents({
             "user_id": user_id,
             "connection_status": "active",
-        })
-
-        if local_connections == 0:
-            # Double-check with Outstand in case mirror is stale
-            try:
-                outstand = OutstandService()
-                result = await outstand.list_accounts(tenant_id=user_id)
-                live_count = len(result.get("data", []))
-                step_2_complete = live_count > 0
-            except Exception:
-                step_2_complete = False
-        else:
-            step_2_complete = True
+            "connected_via": {"$ne": "outstand"},
+        }) > 0
 
         onboarding_complete = step_1_complete and step_2_complete
 

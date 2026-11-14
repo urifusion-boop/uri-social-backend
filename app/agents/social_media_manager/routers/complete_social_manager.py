@@ -26,7 +26,6 @@ from ..services.social_account_service import SocialAccountService
 from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
-from ..services.outstand_service import OutstandService
 from ..services.meta_oauth import build_authorize_url as build_meta_authorize_url
 from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
@@ -263,14 +262,6 @@ class ContentGenerationRequest(BaseModel):
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
     style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
-
-class SocialConnectionRequest(BaseModel):
-    platforms: List[str] = Field(..., min_items=1, max_items=10)
-    source: str = "onboarding"  # "onboarding" | "settings"
-
-class FinalizeConnectionRequest(BaseModel):
-    session_token: str
-    selected_page_ids: List[str] = Field(..., min_items=1)
 
 class ApprovalRequest(BaseModel):
     draft_ids: List[str] = Field(..., min_items=1)
@@ -1702,29 +1693,6 @@ async def get_download_url(
 # SOCIAL ACCOUNT CONNECTION ENDPOINTS
 # ==============================================================================
 
-@router.post("/connect/initiate")
-async def initiate_social_connections(
-    request: SocialConnectionRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
-):
-    """
-    Step 1 of the social connection flow (onboarding step 2).
-
-    Returns Outstand OAuth URLs for each requested platform.
-    The frontend opens each auth_url so the user can authorise.
-    After authorisation, Outstand redirects back to /connect/callback/outstand.
-
-    Supported platforms: facebook, instagram, linkedin, x/twitter,
-    tiktok, youtube, pinterest, threads, bluesky, google_business
-    """
-    return await SocialAccountService.initiate_connection_flow(
-        user_id=ctx["user_id"],
-        platforms=request.platforms,
-        source=request.source,
-        brand_id=ctx["brand_id"],
-    )
-
-
 @router.get("/connect/facebook-direct/initiate")
 async def facebook_direct_initiate(source: Optional[str] = Query("settings"), rerequest: int = Query(0)):
     """
@@ -2829,7 +2797,7 @@ async def instagram_direct_pending(token: str, db: AsyncIOMotorDatabase = Depend
     Returns the Instagram account candidates awaiting a user pick, stashed by
     the callback when more than one Facebook Page had a linked Instagram
     Business Account. No JWT required — reachable right after the OAuth
-    redirect, same as the Outstand pending-connection endpoint.
+    redirect.
     """
     pending = await db["pending_instagram_connections"].find_one({"token": token})
     if not pending:
@@ -2931,175 +2899,6 @@ async def instagram_direct_finalize_pending(
     })
 
 
-@router.get("/connect/callback/outstand")
-async def outstand_oauth_callback(
-    sessionToken: Optional[str] = Query(None),
-    session_token: Optional[str] = Query(None),
-    session: Optional[str] = Query(None),
-    account_id: Optional[str] = Query(None),
-    username: Optional[str] = Query(None),
-    network_unique_id: Optional[str] = Query(None),
-    network: Optional[str] = Query(None),
-    requested_network: Optional[str] = Query(None),
-    success: Optional[str] = Query(None),
-    error: Optional[str] = Query(None),
-    source: Optional[str] = Query(None),
-):
-    """
-    OAuth callback — Outstand redirects the user's browser here after they
-    authorise on the social platform. No JWT required.
-
-    Two possible flows:
-    1. Session token flow (Facebook, LinkedIn etc.):
-       Outstand sends sessionToken → redirect frontend to pending/finalize.
-    2. Direct flow (X/Twitter OAuth 2.0, TikTok):
-       Outstand sends account_id + username directly → redirect frontend
-       with account details so it can call POST /connect/finalize-outstand-direct.
-       Outstand doesn't reliably echo back which network this is (confirmed
-       live for TikTok — no `network` param on the callback at all), so
-       `requested_network` — the network we asked for, round-tripped through
-       our own redirect_uri at initiate time (see initiate_connection_flow) —
-       is the dependable source; `network` (if Outstand ever does send it) wins
-       when present.
-
-    source: "onboarding" → redirect to brand-setup, "settings" → redirect to settings/social-accounts
-    """
-    import urllib.parse
-
-    web_app_url = settings.WEB_APP_URL.strip("'\"")
-    is_settings = source == "settings"
-    base_redirect = f"{web_app_url}/settings/social-accounts/" if is_settings else f"{web_app_url}/social-media/brand-setup/"
-
-    if error:
-        encoded_error = urllib.parse.quote(error)
-        return RedirectResponse(f"{base_redirect}?connected=false&error={encoded_error}")
-
-    # Direct flow — X OAuth 2.0 / TikTok return account_id immediately
-    if success == "true" and account_id:
-        params = f"account_id={urllib.parse.quote(account_id)}&connected=direct"
-        if username:
-            params += f"&username={urllib.parse.quote(username)}"
-        if network_unique_id:
-            params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
-        effective_network = network or requested_network
-        if effective_network:
-            params += f"&network={urllib.parse.quote(effective_network)}"
-        return RedirectResponse(f"{base_redirect}?{params}")
-
-    # Session token flow
-    token_value = sessionToken or session_token or session
-    if not token_value:
-        return RedirectResponse(f"{base_redirect}?connected=false&error=missing_session_token")
-
-    return RedirectResponse(
-        f"{base_redirect}?sessionToken={urllib.parse.quote(token_value)}&connected=pending"
-    )
-
-
-@router.get("/connect/pending/{session_token}")
-async def get_pending_connection(
-    session_token: str,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(flexible_token),
-):
-    """
-    Step 2 of the social connection flow.
-
-    Returns the list of pages/accounts the user can connect for this session.
-    The frontend shows these to the user for selection before finalising.
-    Session tokens expire — call this promptly after the OAuth callback.
-    """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
-    return await SocialAccountService.get_pending_connection(session_token, db=db)
-
-
-@router.post("/connect/finalize")
-async def finalize_social_connection(
-    request: FinalizeConnectionRequest,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_flexible_brand_context),
-):
-    """
-    Step 3 of the social connection flow (completes onboarding step 2).
-
-    Finalises the OAuth connection for the selected pages/accounts.
-    Stores the connected account IDs locally for publishing.
-    Call GET /connections after this to see all connected accounts.
-    """
-    return await SocialAccountService.finalize_connection(
-        db=db,
-        user_id=ctx["user_id"],
-        session_token=request.session_token,
-        selected_page_ids=request.selected_page_ids,
-        brand_id=ctx["brand_id"],
-    )
-
-
-@router.post("/connect/finalize-outstand-direct")
-async def finalize_outstand_direct(
-    account_id: str,
-    network: str,
-    username: Optional[str] = None,
-    network_unique_id: Optional[str] = None,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_flexible_brand_context),
-):
-    """
-    Finalizes an Outstand connection that used the "direct" callback shape —
-    Outstand returns the connected account_id immediately (TikTok, X) instead
-    of a session token requiring a separate page-selection step, so there was
-    never a finalize call to persist it. Was previously silently unhandled by
-    the frontend, so the connection only ever surfaced via a live Outstand
-    lookup at publish time — the account never showed as "Connected" and the
-    doc that fallback wrote had no `id` field, colliding with the unique
-    index the moment a second such doc landed (the `id: null` duplicate-key
-    errors seen repeatedly in logs). Mirrors finalize_connection's doc shape
-    (explicit `id: account_id`) to avoid that collision.
-    """
-    from app.models.brand_account import BrandAccount
-    user_id = ctx["user_id"]
-    brand_id = ctx["brand_id"]
-    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-
-    now = datetime.utcnow()
-    doc = {
-        "id": account_id,
-        "user_id": user_id,
-        "platform": network,
-        "outstand_account_id": account_id,
-        "username": username,
-        "account_name": username,
-        "network_unique_id": network_unique_id,
-        "connection_status": "active",
-        "connected_via": "outstand",
-        "connected_at": now,
-        "updated_at": now,
-    }
-    if not is_personal:
-        doc["brand_id"] = brand_id
-
-    # Only an earlier Outstand connection is replaced. A direct Meta connection for the same
-    # platform carries the Page token the inbox needs, which Outstand never provides, so
-    # deleting it here silently stopped DMs and auto-replies for that brand.
-    brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
-    await db["social_connections"].delete_many({
-        "$or": [
-            {"id": account_id},
-            {**brand_scope, "platform": network, "connected_via": "outstand"},
-        ]
-    })
-    await db["social_connections"].insert_one(doc)
-
-    return UriResponse.get_single_data_response("account_connected", {
-        "outstand_account_id": account_id,
-        "platform": network,
-        "username": username,
-    })
-
-
 @router.get("/connections")
 async def get_user_connections(
     ctx: dict = Depends(get_flexible_brand_context),
@@ -3111,21 +2910,20 @@ async def get_user_connections(
     )
 
 
-@router.delete("/connections/account/{outstand_account_id}")
+@router.delete("/connections/account/{account_id}")
 async def disconnect_social_account(
-    outstand_account_id: str,
+    account_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
-    Permanently disconnect a social account for the active brand.
-    Use the outstand_account_id returned by GET /connections.
-    This revokes OAuth tokens — the user must reconnect via /connect/initiate.
+    Permanently disconnect a social account of the active brand: the `id` returned by
+    GET /connections. The owner connects it again from Connected Accounts.
     """
     return await SocialAccountService.disconnect_account(
         db=db,
         user_id=ctx["user_id"],
-        outstand_account_id=outstand_account_id,
+        account_id=account_id,
         brand_id=ctx["brand_id"],
     )
 
@@ -4563,7 +4361,7 @@ async def get_performance(
     ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
-    Fetch real-time post analytics from Outstand for the active brand's published drafts.
+    Real-time post analytics for the active brand's published drafts, read directly from each network.
     Returns aggregated summary + per-post breakdown + per-platform summary.
     """
     user_id = ctx["user_id"]
@@ -4666,7 +4464,6 @@ async def get_performance(
                         "account_name": conn.get("account_name") or conn.get("page_name")}
             return {"account_id": conn.get("id"), "account_name": conn.get("account_name") or conn.get("username")}
 
-        outstand = OutstandService()
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
 
         async def _fetch_instagram_by_timestamp(draft, conn):
@@ -4983,25 +4780,15 @@ async def get_performance(
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
             platform = draft.get("platform", "unknown")
-            # Outstand stores the NATIVE social media ID as platform_post_id (e.g. Instagram
-            # media IDs are 15-18 digit numbers).  Outstand's own internal post IDs are short
-            # base64 strings (EgFFA, ZxDCu) or LinkedIn URNs.
-            # Route numeric IG IDs directly to Instagram Graph API — Outstand analytics fails on them.
+            # Instagram media ids are 15-18 digit numbers; older posts sent through Outstand
+            # (retired) carry its own short ids and are matched by publish time instead.
             is_ig_media_id = bool(post_id and platform == "instagram" and _re.match(r'^\d{15,}$', str(post_id)))
-            # "queued" means Outstand accepted the post and will publish it (or already has).
-            # Treat queued + any publish_response as an Outstand-routed post.
-            is_outstand_post = bool(
-                draft.get("outstand_post_status")  # "queued", "published", etc.
-                or draft.get("publish_response")
-                or (post_id and isinstance(post_id, str) and post_id.startswith("urn:li:"))  # LinkedIn URN
-            )
 
             live_result = None
-            print(f"[_fetch] platform={platform} post_id={repr(post_id)} is_ig={is_ig_media_id} is_outstand={is_outstand_post}", flush=True)
+            print(f"[_fetch] platform={platform} post_id={repr(post_id)} is_ig={is_ig_media_id}", flush=True)
 
             # Strategy 1: real Instagram media ID — use Graph API directly.
             # Always run this when post_id looks like a real IG media ID (15+ digits),
-            # regardless of outstand_post_status — Outstand queues real IG media IDs too.
             if post_id and platform == "instagram" and is_ig_media_id:
                 for conn in (ig_conns or [c for c in [direct_conn_map.get(platform)] if c]):
                     if not conn.get("page_access_token"):
@@ -5036,80 +4823,6 @@ async def get_performance(
                     **_acct(_tt_conn, "tiktok"),
                     "insights_available": True,
                 }
-
-            # Strategy 2: Outstand-published post — get what Outstand has (likes/comments)
-            if live_result is None and post_id and is_outstand_post and not str(post_id).startswith("urn:li:"):
-                # Pre-check: if Outstand says the post failed to publish, skip analytics
-                # and mark the result so the frontend can surface the failure.
-                try:
-                    post_status_data = await outstand.get_post(post_id)
-                    outstand_post = post_status_data.get("post", {})
-                    _outstand_containers = outstand_post.get("socialAccounts") or []
-                    _any_failed = any(c.get("status") == "failed" for c in _outstand_containers)
-                    if _any_failed and not outstand_post.get("publishedAt"):
-                        _err = next((c.get("error") for c in _outstand_containers if c.get("status") == "failed"), "")
-                        print(f"[Outstand] post {post_id} failed to publish: {_err[:120]}")
-                        return {
-                            "draft_id": draft.get("id"),
-                            "platform_post_id": post_id,
-                            "platform": platform,
-                            "content_preview": (draft.get("content") or "")[:120],
-                            "published_at": draft.get("published_date", ""),
-                            "image_url": draft.get("image_url"),
-                            "likes": 0, "comments": 0, "shares": 0,
-                            "views": 0, "impressions": 0, "reach": 0,
-                            "engagement_rate": None,
-                            "publish_failed": True,
-                            "publish_error": _err[:200] if _err else "Post failed to publish",
-                        }
-                except Exception:
-                    pass  # non-critical — continue to analytics fetch
-                try:
-                    data = await outstand.get_post_analytics(post_id)
-                    agg = data.get("aggregated_metrics") or {}
-                    by_account = data.get("metrics_by_account") or []
-                    # Log the full response so we can see what fields Outstand actually returns
-                    print(f"[Outstand analytics] post_id={post_id} agg_keys={list(agg.keys())} agg={agg}")
-                    if by_account:
-                        print(f"[Outstand by_account] sample={by_account[0]}")
-                    network = by_account[0]["social_account"]["network"] if by_account else platform
-
-                    # Try multiple field name variants — Outstand may differ by plan/version
-                    def _pick(*keys):
-                        for k in keys:
-                            v = agg.get(k)
-                            if v:
-                                return int(v)
-                        # Also check per-account metrics
-                        for acc in by_account:
-                            m = acc.get("metrics") or acc.get("aggregated_metrics") or {}
-                            for k in keys:
-                                v = m.get(k)
-                                if v:
-                                    return int(v)
-                        return 0
-
-                    _os_acct = (by_account[0].get("social_account") or {}) if by_account else {}
-                    live_result = {
-                        "account_id": _os_acct.get("id"),
-                        "account_name": _os_acct.get("username") or _os_acct.get("nickname"),
-                        "draft_id": draft.get("id"),
-                        "platform_post_id": post_id,
-                        "platform": network or platform,
-                        "content_preview": (draft.get("content") or "")[:120],
-                        "published_at": draft.get("published_date", ""),
-                        "image_url": draft.get("image_url"),
-                        "likes":       _pick("total_likes", "likes", "reactions_count"),
-                        "comments":    _pick("total_comments", "comments", "comments_count"),
-                        "shares":      _pick("total_shares", "shares", "reposts"),
-                        "views":       _pick("total_views", "views", "video_views", "plays"),
-                        "impressions": _pick("total_impressions", "impressions", "total_reach", "reach"),
-                        "reach":       _pick("total_reach", "reach", "unique_reach"),
-                        "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
-                    }
-                    print(f"[Outstand analytics mapped] likes={live_result['likes']} imp={live_result['impressions']} reach={live_result['reach']}")
-                except Exception as e:
-                    print(f"⚠️ Outstand analytics failed for post {post_id}: {e}")
 
             # Strategy 2b: LinkedIn URN — query LinkedIn socialActions API directly
             if live_result is None and platform == "linkedin" and post_id and str(post_id).startswith("urn:li:"):
@@ -5385,13 +5098,10 @@ async def get_account_metrics(
 ):
     """
     Fetch account-level metrics (followers, engagement totals) for the active brand's
-    connected social accounts via Outstand.
+    connected social accounts, read directly from each network.
     """
     user_id = ctx["user_id"]
     brand_id = ctx["brand_id"]
-    # Outstand tenant = brand_id for agency brands, user_id for personal brand
-    from app.models.brand_account import BrandAccount as _BA
-    _outstand_tenant = brand_id if brand_id and brand_id != _BA.personal_brand_id(user_id) else user_id
     _conn_scope = _brand_scope(user_id, brand_id)
 
     import asyncio as _asyncio
@@ -5400,63 +5110,10 @@ async def get_account_metrics(
     from datetime import timedelta
 
     try:
-        outstand = OutstandService()
         until_ts = int(_time.time())
         since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
-        # ── Outstand accounts (scoped to this brand's tenant) ─────────────────
-        try:
-            result = await outstand.list_accounts(tenant_id=_outstand_tenant)
-            outstand_accounts = result.get("data", [])
-        except Exception as _os_err:
-            print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
-            outstand_accounts = []
-
-        # Accounts the user explicitly disconnected stay out even if Outstand still lists them
-        # (the same record the Connected Accounts page filters on).
-        _is_personal = (not brand_id) or brand_id == _BA.personal_brand_id(user_id)
-        _tombstone_scope = {"user_id": user_id} if _is_personal else {"brand_id": brand_id}
-        _disconnected_ids = {
-            d["outstand_account_id"]
-            async for d in db["disconnected_accounts"].find(_tombstone_scope, {"outstand_account_id": 1})
-        }
-        outstand_accounts = [a for a in outstand_accounts if a.get("id") not in _disconnected_ids]
-
-        async def _fetch_outstand_metrics(acc):
-            account_id = acc.get("id")
-            if not account_id:
-                return None
-            try:
-                data = await outstand.get_account_metrics(account_id, since=since_ts, until=until_ts)
-                m = data.get("data", {})
-                eng = m.get("engagement")
-                period = m.get("period") or {}
-                ps = m.get("platform_specific") or {}
-                return {
-                    "account_id": account_id,
-                    "network": acc.get("network", "unknown"),
-                    "page_name": ps.get("page_name") or acc.get("nickname") or acc.get("username"),
-                    "category": ps.get("category"),
-                    "followers_count": m.get("followers_count") or ps.get("followers_count") or ps.get("fan_count") or 0,
-                    "following_count": m.get("following_count"),
-                    "posts_count": m.get("posts_count"),
-                    "engagement": {
-                        "views": eng.get("views", 0),
-                        "likes": eng.get("likes", 0),
-                        "comments": eng.get("comments", 0),
-                        "shares": eng.get("shares", 0),
-                        "reposts": eng.get("reposts", 0),
-                        "quotes": eng.get("quotes", 0),
-                    } if eng else None,
-                    "engagement_note": period.get("note"),
-                    "platform_specific": ps,
-                    "period": {"since": since_ts, "until": until_ts},
-                }
-            except Exception as e:
-                print(f"⚠️ Outstand account metrics failed for {account_id}: {e}")
-                return None
-
-        # ── Direct (non-Outstand) connections scoped to active brand ──────────
+        # ── The brand's connections ───────────────────────────────────────────
         direct_conns = await db["social_connections"].find(
             {**_conn_scope, "connected_via": {"$ne": "outstand"}, "connection_status": "active"},
             {"_id": 0, "id": 1, "platform": 1, "connected_via": 1, "connection_status": 1,
@@ -5882,35 +5539,12 @@ async def get_account_metrics(
                 return await _fetch_facebook_direct_metrics(conn)
             return None
 
-        outstand_results, direct_results, linkedin_results = await _asyncio.gather(
-            _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
+        direct_results, linkedin_results = await _asyncio.gather(
             _asyncio.gather(*[_fetch_direct_metrics(c) for c in direct_conns]),
             _asyncio.gather(*[_fetch_linkedin_direct_metrics(c) for c in linkedin_conns]),
         )
 
-        # A TikTok account connected both ways would show twice: keep the direct one, which
-        # carries the richer numbers.
-        _has_tiktok_direct = any(r and r.get("network") == "tiktok" for r in direct_results)
-        if _has_tiktok_direct:
-            outstand_results = [r for r in outstand_results if not (r and r.get("network") == "tiktok")]
-
-        # The same Instagram / Facebook account connected both through Outstand and directly would
-        # list twice: keep the direct one (richer numbers), matched on network + name.
-        def _acct_names(r):
-            ps = r.get("platform_specific") or {}
-            return {str(n).strip().lower().lstrip("@") for n in (r.get("page_name"), ps.get("username")) if n}
-        _direct_seen = {
-            (r["network"], n)
-            for r in direct_results if r and r.get("network") in ("instagram", "facebook")
-            for n in _acct_names(r)
-        }
-        outstand_results = [
-            r for r in outstand_results
-            if not (r and r.get("network") in ("instagram", "facebook")
-                    and any((r["network"], n) in _direct_seen for n in _acct_names(r)))
-        ]
-
-        account_metrics = [r for r in (*outstand_results, *direct_results, *linkedin_results) if r is not None]
+        account_metrics = [r for r in (*direct_results, *linkedin_results) if r is not None]
 
         return UriResponse.get_single_data_response("account_metrics", {
             "has_data": len(account_metrics) > 0,
@@ -5952,7 +5586,7 @@ async def get_draft_image(
 ):
     """
     Serve the AI-generated image for a draft as a binary response.
-    Used by Outstand to fetch image media when publishing.
+    A public URL for a draft's image (networks fetch media from it when publishing).
     No auth required — URL is unguessable via draft_id.
     """
     from fastapi.responses import Response
@@ -8557,18 +8191,12 @@ async def publish_tiktok_photo_draft(
         )
 
     tiktok_settings = TikTokPostSettings(**request.tiktok.model_dump())
-    # Signed links on our own API: TikTok pulls from them directly (direct connections,
-    # which need a verified domain), and Outstand re-hosts from them (Outstand ones).
+    # Signed links on our own API: TikTok pulls the images from them directly.
     image_urls = tiktok_media_proxy.signed_urls(request.draft_id, image_count)
 
     job_id = await VideoPublishService.create_job(request.draft_id, "tiktok", user_id)
-    runner = (
-        VideoPublishService.run_tiktok_photo_job
-        if conn_type == "direct"
-        else VideoPublishService.run_tiktok_photo_job_outstand
-    )
     background_tasks.add_task(
-        runner,
+        VideoPublishService.run_tiktok_photo_job,
         job_id,
         request.draft_id,
         image_urls,
@@ -8623,13 +8251,12 @@ async def get_tiktok_creator_info(
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Creator info for the Post to TikTok screen, from whichever TikTok connection the
-    user has (direct TikTok login, or Outstand). TikTok requires it be fetched fresh
+    Creator info for the Post to TikTok screen, from the user's TikTok connection
+    (TikTok login). TikTok requires it be fetched fresh
     each time that screen renders: the account's nickname and avatar, the privacy
     levels it may post with, which interactions it has disabled, and the longest
     video it can post.
     """
-    from app.agents.social_media_manager.services.outstand_service import OutstandService
     from app.agents.social_media_manager.services.tiktok_direct_service import (
         fetch_creator_info,
         get_valid_tiktok_access_token,
@@ -8648,11 +8275,8 @@ async def get_tiktok_creator_info(
         )
 
     try:
-        if conn_type == "direct":
-            access_token = await get_valid_tiktok_access_token(db, conn)
-            info = await fetch_creator_info(access_token)
-        else:
-            info = await OutstandService().get_tiktok_creator_info(conn["outstand_account_id"])
+        access_token = await get_valid_tiktok_access_token(db, conn)
+        info = await fetch_creator_info(access_token)
     except (TikTokDirectAPIError, ValueError) as e:
         # Creator info is capped at 20 requests a minute per token. Say so (429 + Retry-After),
         # instead of a generic "couldn't load" the user would just keep retrying.
@@ -9057,7 +8681,7 @@ _AGENT_SYSTEM_PROMPT_TEMPLATE = """You are URI Agent, the built-in AI assistant 
 - **Approval workflow**: "Auto-approve" publishes immediately; "Manual review" sends drafts to Needs Review first. Configurable in Settings.
 - **Scheduling**: Pick a date/time per post. The cron job publishes every 5 minutes — posts go live within 5 min of their scheduled time.
 - **Images**: Generate AI images per post. Instagram requires an image to publish. Carousel posts have per-slide images.
-- **Connected Accounts**: Facebook uses Outstand OAuth; Instagram uses Meta direct OAuth. They connect independently.
+- **Connected Accounts**: every network connects directly with its own login (Meta for Facebook and Instagram, TikTok, LinkedIn, X).
 - **Credits**: Each content generation costs 1 credit. Credits can be topped up in Billing.
 - **Blog Generator**: Generates long-form SEO blog posts separately from social posts.
 - **Brand Playbook**: Stores brand voice, tone, colours, and audience — used to personalise generated content.
