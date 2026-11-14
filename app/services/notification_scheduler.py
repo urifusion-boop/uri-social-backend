@@ -114,18 +114,6 @@ def _job_google_ads_link_reminders():
     _run_async("google_ads_link_reminders", _run)
 
 
-def _job_publish_confirmations():
-    """Posts Outstand accepted but hasn't confirmed live yet: ask what happened,
-    mark them published or failed (with the reason), and flag expired logins."""
-    async def _run():
-        from app.database import get_db
-        from app.agents.social_media_manager.services import publish_confirmation
-        result = await publish_confirmation.run(get_db())
-        if result["published"] or result["failed"] or result["pending"]:
-            print(f"🔎 publish_confirmations: {result}")
-    _run_async("publish_confirmations", _run)
-
-
 def _job_sweep_publish_jobs():
     """Publish jobs whose worker went away mid-publish (a restart) are failed with a clear message
     instead of showing "uploading" forever."""
@@ -135,19 +123,6 @@ def _job_sweep_publish_jobs():
         if marked:
             print(f"🧹 sweep_publish_jobs: marked {marked} interrupted publish job(s) as failed")
     _run_async("sweep_publish_jobs", _run)
-
-
-def _job_connection_health_check():
-    """Asks Outstand directly whether each connected account's session is
-    still alive, instead of only finding out reactively when a publish
-    attempt fails (see connection_health_check.py's module docstring for
-    the live-confirmed gap this closes)."""
-    async def _run():
-        from app.database import get_db
-        from app.agents.social_media_manager.services import connection_health_check
-        result = await connection_health_check.check_all_connections(get_db())
-        print(f"🔌 connection_health_check: {result}")
-    _run_async("connection_health_check", _run)
 
 
 def _job_weekly_reports():
@@ -418,24 +393,6 @@ def _job_publish_scheduled_content():
     _run_async("publish_scheduled_content", _run)
 
 
-def _job_reconcile_published_posts():
-    """Catches an immediately-published ("Publish Now") draft whose platform
-    dispatch actually failed after Outstand accepted the submission — the
-    publish_scheduled_content cron only ever re-checks "scheduled" drafts, so
-    a "published" one that silently failed on Facebook's (or any platform's)
-    side had nothing to ever correct it. See
-    ApprovalWorkflowService.reconcile_published_posts for the live-reported
-    bug this closes."""
-    async def _run():
-        from app.database import get_db
-        from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
-        db = get_db()
-        result = await ApprovalWorkflowService.reconcile_published_posts(db=db)
-        if result.get("checked") or result.get("corrected"):
-            print(f"🔁 Published-post reconciliation: {result}")
-    _run_async("reconcile_published_posts", _run)
-
-
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
     global _scheduler, _main_loop
@@ -671,12 +628,6 @@ def start_notification_scheduler():
     )
 
     # Confirm that accepted posts actually reached the network.
-    _scheduler.add_job(
-        _job_publish_confirmations,
-        CronTrigger(minute="*/2"),
-        id="publish_confirmations",
-        **_JOB_DEFAULTS,
-    )
 
     # Fail publish jobs whose worker restarted mid-publish, so they don't spin forever.
     _scheduler.add_job(
@@ -686,17 +637,8 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
-    # Proactively check every Outstand-managed connection's session health —
-    # the push side of what get_user_connections already does on pull.
-    _scheduler.add_job(
-        _job_connection_health_check,
-        CronTrigger(hour="*/6", minute=50),
-        id="connection_health_check",
-        **_JOB_DEFAULTS,
-    )
-
     _scheduler.start()
-    print("📅 Notification scheduler started with 24 jobs")
+    print(f"📅 Notification scheduler started with {len(_scheduler.get_jobs())} jobs")
 
 
 def stop_notification_scheduler():

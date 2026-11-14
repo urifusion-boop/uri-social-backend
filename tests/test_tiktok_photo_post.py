@@ -304,14 +304,10 @@ def test_direct_connection_is_used_when_there_is_one():
     assert _run(svc.resolve_tiktok_connection(_db([OUTSTAND, DIRECT]), "u1"))[0] == "direct"
 
 
-def test_outstand_connection_is_used_when_that_is_all_there_is():
-    kind, conn = _run(svc.resolve_tiktok_connection(_db([OUTSTAND]), "u1"))
-    assert kind == "outstand" and conn["outstand_account_id"] == "odpTc"
-
-
 def test_pending_direct_connection_does_not_count():
     pending = {**DIRECT, "connection_status": "pending_user_match"}
-    assert _run(svc.resolve_tiktok_connection(_db([pending, OUTSTAND]), "u1"))[0] == "outstand"
+    # Not usable yet, and an account recorded as connected through Outstand (retired) is never used.
+    assert _run(svc.resolve_tiktok_connection(_db([pending, OUTSTAND]), "u1")) == (None, None)
 
 
 def test_no_connection_resolves_to_none():
@@ -324,32 +320,6 @@ def test_other_users_connections_are_never_used():
 
 
 # ── what is sent to Outstand ──────────────────────────────────────────────────
-
-def test_outstand_config_carries_the_users_choices():
-    from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
-
-    cfg = outstand_tiktok_config(_settings(privacy_level="SELF_ONLY", allow_comment=True, brand_content=True))
-    assert cfg["postMode"] == "DIRECT_POST"
-    assert cfg["privacyLevel"] == "SELF_ONLY"
-    assert cfg["disableComment"] is False
-    assert cfg["disableDuet"] is True and cfg["disableStitch"] is True
-    assert cfg["brandContentToggle"] is True and cfg["brandOrganicToggle"] is False
-    assert "autoAddMusic" not in cfg
-
-
-def test_outstand_config_for_photos_omits_duet_and_stitch_and_adds_music_only_when_asked():
-    from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
-
-    cfg = outstand_tiktok_config(_settings(), auto_add_music=True, photo=True)
-    assert "disableDuet" not in cfg and "disableStitch" not in cfg
-    assert cfg["autoAddMusic"] is True and cfg["disableComment"] is True
-
-
-def test_outstand_config_without_settings_keeps_the_legacy_default():
-    from app.agents.social_media_manager.services.video_publish_service import outstand_tiktok_config
-
-    assert outstand_tiktok_config(None) == {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
-
 
 # ── Outstand failures are reported as what they really are ────────────────────
 
@@ -380,32 +350,3 @@ def _publish_via_outstand(fake, settings_):
 OWNERSHIP = "TikTok API error (url_ownership_unverified): Please review our URL ownership verification rules"
 UNAUDITED = "TikTok API error (unaudited_client_can_only_post_to_private_accounts): Please review our integration guidelines"
 
-
-def test_unverified_media_domain_is_explained_and_does_not_fall_back_to_a_draft():
-    fake = _FakeOutstand({"p1": OWNERSHIP})
-    with pytest.raises(ValueError, match="Outstand's domain") as exc:
-        _publish_via_outstand(fake, _settings(privacy_level="SELF_ONLY"))
-    assert "url_ownership_unverified" in str(exc.value)
-    assert len(fake.published) == 1          # no MEDIA_UPLOAD attempt
-
-
-def test_a_rejected_inbox_draft_is_not_reported_as_delivered():
-    fake = _FakeOutstand({"p1": UNAUDITED, "p2": OWNERSHIP})
-    with pytest.raises(ValueError) as exc:
-        _publish_via_outstand(fake, _settings(privacy_level="SELF_ONLY"))
-    assert "delivered" not in str(exc.value).lower()
-    assert "url_ownership_unverified" in str(exc.value)
-    assert fake.published[1] == {"postMode": "MEDIA_UPLOAD"}
-
-
-def test_an_inbox_draft_that_was_accepted_is_reported_as_delivered():
-    fake = _FakeOutstand({"p1": UNAUDITED})   # p2 (the draft) reports no failure
-    with pytest.raises(ValueError, match="delivered to the connected TikTok account's inbox"):
-        _publish_via_outstand(fake, _settings(privacy_level="SELF_ONLY"))
-
-
-def test_users_privacy_choice_is_not_downgraded_when_the_audit_blocks_it():
-    fake = _FakeOutstand({"p1": UNAUDITED, "p2": OWNERSHIP})
-    with pytest.raises(ValueError):
-        _publish_via_outstand(fake, _settings(privacy_level="PUBLIC_TO_EVERYONE"))
-    assert [c.get("privacyLevel") for c in fake.published if c.get("postMode") == "DIRECT_POST"] == ["PUBLIC_TO_EVERYONE"]

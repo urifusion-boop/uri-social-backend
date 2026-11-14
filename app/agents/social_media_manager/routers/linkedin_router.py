@@ -62,6 +62,7 @@ async def _get_linkedin_connection(user_id: str, db: AsyncIOMotorDatabase, brand
         }
     else:
         query = {"brand_id": brand_id, "platform": "linkedin", "connection_status": "active"}
+    query["connected_via"] = {"$ne": "outstand"}  # Outstand is retired
     return await db["social_connections"].find_one(query)
 
 
@@ -253,15 +254,8 @@ async def linkedin_status(
     user_id = ctx["user_id"]
     brand_id = ctx["brand_id"]
     conn = await _get_linkedin_connection(user_id, db, brand_id)
-
-    from app.models.brand_account import BrandAccount
-    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-    outstand_filter = {"platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
-    outstand_filter.update({"user_id": user_id} if is_personal else {"brand_id": brand_id})
-    outstand_conn = await db["social_connections"].find_one(outstand_filter)
-
-    linked = conn is not None or outstand_conn is not None
-    active = outstand_conn or conn
+    linked = conn is not None
+    active = conn
 
     return {
         "status": True,
@@ -292,41 +286,16 @@ async def publish_to_linkedin(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Publish a post to LinkedIn for the active brand.
-    Prefers Outstand connection (supports org/company pages) over direct connection.
+    Publish a post to LinkedIn for the active brand, through its LinkedIn connection.
     """
     user_id = ctx["user_id"]
     brand_id = ctx["brand_id"]
-
-    from app.models.brand_account import BrandAccount
-    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
-    outstand_filter = {"platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
-    outstand_filter.update({"user_id": user_id} if is_personal else {"brand_id": brand_id})
-
-    outstand_conn = await db["social_connections"].find_one(outstand_filter)
-    if outstand_conn:
-        from app.agents.social_media_manager.services.outstand_service import OutstandService
-        try:
-            outstand = OutstandService()
-            result = await outstand.publish_post(
-                outstand_account_ids=[outstand_conn["outstand_account_id"]],
-                content=body.content,
-            )
-            post_id = result.get("data", {}).get("id") or result.get("id", "")
-            return {
-                "status": True,
-                "responseCode": 200,
-                "responseMessage": "Post published to LinkedIn successfully.",
-                "responseData": {"post_id": post_id, "content": body.content},
-            }
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to post to LinkedIn: {e}")
 
     conn = await _get_linkedin_connection(user_id, db, brand_id)
     if not conn:
         raise HTTPException(
             status_code=400,
-            detail="No LinkedIn account connected. Use POST /social-media/connect with platform=linkedin (supports company pages) or POST /linkedin/connect.",
+            detail="No LinkedIn account connected. Connect LinkedIn on Connected Accounts first.",
         )
 
     access_token = conn.get("linkedin_access_token")

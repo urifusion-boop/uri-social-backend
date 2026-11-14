@@ -408,14 +408,6 @@ def test_an_account_we_cannot_identify_is_not_gated(env):
     assert job["status"] == "published" and not db.gate.docs
 
 
-def test_outstand_and_direct_accounts_get_their_own_keys():
-    assert VPS._gate_target("tiktok", {"connected_via": "outstand", "outstand_account_id": "7ylKW"})[0] == "outstand:7ylKW"
-    assert VPS._gate_target("tiktok", DIRECT)[0] == KEY
-    assert VPS._gate_target("instagram_reels", {"ig_user_id": "1784"})[0] == "instagram:1784"
-    assert VPS._gate_target("facebook_reels", {"page_id": "99"})[0] == "facebook:99"
-    assert VPS._gate_target("tiktok", {})[0] is None
-
-
 # ── Outstand ──────────────────────────────────────────────────────────────────
 
 def _status_error(code):
@@ -448,38 +440,6 @@ class FakeOutstand:
 def _via_outstand(fake, settings_=SETTINGS):
     with patch.object(vps, "OutstandService", lambda: fake), patch.object(asyncio, "sleep", AsyncMock()):
         return _run(VPS._publish_tiktok_via_outstand("acc", "caption", ["u"], settings_))
-
-
-def test_outstand_rate_limiting_a_status_check_does_not_fail_the_post():
-    fake = FakeOutstand(post_errors=[_status_error(429)])
-    assert _via_outstand(fake) == ("p1", "https://tiktok/p")
-    assert fake.polls == 2 and len(fake.published) == 1
-
-
-def test_outstand_rate_limiting_the_post_itself_is_retried():
-    fake = FakeOutstand(publish_errors=[httpx.HTTPStatusError("429 Too Many Requests for url", request=None, response=None)])
-    assert _via_outstand(fake)[0] == "p1"
-    assert len(fake.published) == 1
-
-
-@pytest.mark.parametrize("reason,error_code", [
-    ("TikTok API error (rate_limit_exceeded): slow down [rate_limit_exceeded, log_id=a]", "rate_limited"),
-    ("TikTok API error (spam_risk_too_many_posts): daily cap", "daily_cap"),
-    ("TikTok API error (reached_active_user_cap): cap", "app_cap"),
-])
-def test_a_limit_reported_by_outstand_is_explained_and_never_re_submitted(reason, error_code):
-    fake = FakeOutstand(failures={"p1": reason})
-    with pytest.raises(rl.RateLimitedError) as exc:
-        _via_outstand(fake)
-    assert len(fake.published) == 1                      # no SELF_ONLY / MEDIA_UPLOAD fallback posts
-    assert VPS._failure_update(exc.value)["error_code"] == error_code
-
-
-def test_the_audit_fallback_still_works_for_errors_that_are_not_limits():
-    fake = FakeOutstand(failures={"p1": "TikTok API error (unaudited_client_can_only_post_to_private_accounts): x"})
-    with pytest.raises(ValueError):
-        _via_outstand(fake)
-    assert fake.published[1] == {"postMode": "MEDIA_UPLOAD"}
 
 
 # ── Jobs whose worker went away ───────────────────────────────────────────────

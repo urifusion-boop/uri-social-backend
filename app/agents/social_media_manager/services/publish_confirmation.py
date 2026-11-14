@@ -1,22 +1,9 @@
 """
-Confirming that a post published through Outstand actually reached the network.
+Plain-language publish failures, and flagging a connection for reconnecting.
 
-Outstand answers "accepted, queued" straight away and publishes a moment later.
-Drafts used to be marked "published" on that first answer, so a post Facebook
-rejected (e.g. "Error validating access token: the session has been invalidated
-because the user changed their password") still showed as published in URI and
-the customer never knew (seen in production, October 2026).
-
-Now an accepted post is "confirming" until Outstand says what happened:
-  • live                → published
-  • failed, with reason → publish_failed, with the reason in plain words; a
-                          lapsed login also flags the connection for reconnecting
-  • no answer yet       → stays confirming; after 30 minutes it is shown as
-                          taking longer than usual; after 24 hours with still no
-                          answer it is marked failed, saying it couldn't be
-                          confirmed (Outstand settles posts long before that)
-Nothing is ever called failed just because the answer hasn't come yet, and a
-late "live" always wins while the post is being confirmed.
+When a network refuses a post, failed_on_submit turns its error into words the owner
+understands (explain / specific_message), flags the connection when its login has lapsed,
+and tells the owner. (Outstand, which used to need a separate "confirming" step, is retired.)
 """
 from __future__ import annotations
 
@@ -171,61 +158,26 @@ def explain(platform: str, raw: str, limit: Optional["_rate_limit.RateLimitInfo"
     )}
 
 
-def read_outcome(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """{"state": "published"|"failed"|"pending", "error": str} from Outstand's
-    GET /v1/posts/{id}. Per-account results win: that is where a network's
-    rejection is reported (socialAccounts[].status/error)."""
-    post = (payload or {}).get("post") or (payload or {}).get("data") or {}
-    if isinstance(post, list):
-        post = post[0] if post else {}
-    accounts = [a for a in (post.get("socialAccounts") or []) if isinstance(a, dict)]
-    failed = next((a for a in accounts if str(a.get("status", "")).lower() == "failed"), None)
-    if failed:
-        return {"state": "failed", "error": failed.get("error") or failed.get("errorMessage") or ""}
-    if str(post.get("status", "")).lower() == "failed":
-        return {"state": "failed", "error": post.get("error") or ""}
-    done = {"published", "success", "posted", "completed"}
-    if post.get("publishedAt") and not post.get("isDraft"):
-        if not accounts or all(str(a.get("status", "published")).lower() in done for a in accounts):
-            return {"state": "published", "error": ""}
-    if accounts and all(str(a.get("status", "")).lower() in done for a in accounts):
-        return {"state": "published", "error": ""}
-    return {"state": "pending", "error": ""}
-
-
 def _reconnect_match(draft: Dict[str, Any]) -> Dict[str, Any]:
-    # The account that failed, and the brand's own connection for that
-    # network (the card the owner sees).
-    account_id = draft.get("outstand_account_id")
-    brand_id = draft.get("brand_id")
-    which = ([{"outstand_account_id": account_id}] if account_id else []) + ([{"brand_id": brand_id}] if brand_id else [])
+    # The brand's own connection for that network (the card the owner sees).
     query: Dict[str, Any] = {"platform": draft.get("platform"), "user_id": draft.get("user_id")}
-    if which:
-        query["$or"] = which
+    if draft.get("brand_id"):
+        query["brand_id"] = draft["brand_id"]
     return query
 
 
 async def _flag_reconnect(db, draft: Dict[str, Any], message: str) -> None:
-    # Reconnecting replaces these docs, which clears it (see _clear_reconnect).
+    # Reconnecting replaces these docs, which clears it.
     await db["social_connections"].update_many(_reconnect_match(draft), {"$set": {
         "needs_reconnect": True, "reconnect_reason": message, "needs_reconnect_since": datetime.utcnow(),
     }})
-
-
-async def _clear_reconnect(db, draft: Dict[str, Any]) -> None:
-    account_id = draft.get("outstand_account_id")
-    if account_id:
-        await db["social_connections"].update_many(
-            {"outstand_account_id": account_id, "needs_reconnect": True},
-            {"$unset": {"needs_reconnect": "", "reconnect_reason": "", "needs_reconnect_since": ""}},
-        )
 
 
 # How many consecutive publish failures on one connection, none of them a
 # signature we recognize, before treating it as needing the owner's
 # attention anyway. A catalogued signature (explain()'s category "known")
 # escalates on the very first occurrence — this is the backstop for
-# everything else: without it, a Facebook/Outstand error we've never
+# everything else: without it, a network error we've never
 # specifically catalogued gets no fallback action at all, no matter how many
 # times in a row it keeps failing, an indefinite game of catching up to
 # error text one string at a time instead of a system that degrades
@@ -236,7 +188,7 @@ UNKNOWN_FAILURE_ESCALATION_THRESHOLD = 3
 async def _should_flag_connection(db, draft: Dict[str, Any], category: str, message: str) -> bool:
     """Whether an "unknown"-category failure means this connection needs the
     owner's attention right now. A single one-off failure (a bad image, a
-    transient Outstand hiccup) must not trigger a "reconnect your account"
+    transient network hiccup) must not trigger a "reconnect your account"
     alert on its own — only a real, repeated pattern on the same connection
     does, the same bar a human reading the logs would use before concluding
     "this connection is actually broken". Known and content-issue categories
@@ -257,18 +209,6 @@ async def _should_flag_connection(db, draft: Dict[str, Any], category: str, mess
         return False
     count = (updated or {}).get("consecutive_publish_failures", 0)
     return count >= UNKNOWN_FAILURE_ESCALATION_THRESHOLD
-
-
-async def _record_publish_success(db, draft: Dict[str, Any]) -> None:
-    """Resets the unrecognized-failure counter on an actual successful
-    publish, so a connection that struggled once and recovered doesn't carry
-    a stale count toward a future, unrelated run of failures."""
-    if db is None:
-        return
-    try:
-        await db["social_connections"].update_many(_reconnect_match(draft), {"$set": {"consecutive_publish_failures": 0}})
-    except Exception as e:
-        print(f"⚠️ _record_publish_success: counter reset failed: {e}")
 
 
 async def _notify(db, draft: Dict[str, Any], published: bool, message: str = "") -> None:
@@ -296,97 +236,13 @@ async def _notify(db, draft: Dict[str, Any], published: bool, message: str = "")
         print(f"⚠️ publish confirmation notify failed for {draft.get('id')}: {e}")
 
 
-async def confirm(db, draft: Dict[str, Any], outstand=None, now: Optional[datetime] = None) -> str:
-    """Check one confirming draft with Outstand and apply the answer.
-    Returns the draft's state afterwards."""
-    now = now or datetime.utcnow()
-    post_id = draft.get("platform_post_id")
-    if not post_id:
-        return "pending"
-    if outstand is None:
-        from app.agents.social_media_manager.services.outstand_service import OutstandService
-        outstand = OutstandService()
-    try:
-        outcome = read_outcome(await outstand.get_post(post_id))
-    except Exception as e:
-        if "404" in str(e):
-            outcome = {"state": "failed", "error": "", "missing": True}
-        else:
-            print(f"⚠️ confirm {draft.get('id')}: Outstand unreachable, will retry: {e}")
-            outcome = {"state": "pending", "error": ""}
-
-    if outcome["state"] == "published":
-        await db["content_drafts"].update_one({"id": draft["id"], "status": CONFIRMING}, {
-            "$set": {"status": "published", "published_date": now, "updated_at": now, "error_message": None},
-            "$unset": {"publish_slow": ""},
-        })
-        await _clear_reconnect(db, draft)
-        await _record_publish_success(db, draft)
-        await _notify(db, draft, published=True)
-        return "published"
-
-    if outcome["state"] == "failed":
-        if outcome.get("missing"):
-            message = (f"The publishing service no longer has this post, so it can't be confirmed on "
-                       f"{network_name(draft.get('platform', ''))}. Check your page, and publish it again if it isn't there.")
-            reconnect = False
-        else:
-            info = explain(draft.get("platform", ""), outcome["error"])
-            message, reconnect = info["message"], info["reconnect"]
-            # A known signature already set reconnect=True above. An
-            # uncatalogued error doesn't just get ignored — it counts toward
-            # the per-connection repeated-failure threshold instead.
-            if not reconnect and info.get("category") == "unknown":
-                reconnect = await _should_flag_connection(db, draft, info["category"], message)
-        await db["content_drafts"].update_one({"id": draft["id"], "status": CONFIRMING}, {
-            "$set": {"status": "publish_failed", "error_message": message, "updated_at": now,
-                     "network_error": outcome["error"][:1000] if outcome["error"] else None},
-            "$unset": {"publish_slow": ""},
-        })
-        if reconnect:
-            await _flag_reconnect(db, draft, message)
-        await _notify(db, draft, published=False, message=message)
-        return "failed"
-
-    submitted = draft.get("publish_submitted_at") or draft.get("updated_at") or now
-    age = now - submitted
-    if age >= GIVE_UP_AFTER:
-        message = (f"We couldn't confirm this post reached {network_name(draft.get('platform', ''))} after 24 hours. "
-                   f"Check your page — if it isn't there, publish it again.")
-        await db["content_drafts"].update_one({"id": draft["id"], "status": CONFIRMING}, {
-            "$set": {"status": "publish_failed", "error_message": message, "updated_at": now},
-            "$unset": {"publish_slow": ""},
-        })
-        await _notify(db, draft, published=False, message=message)
-        return "failed"
-    if age >= SLOW_AFTER and not draft.get("publish_slow"):
-        await db["content_drafts"].update_one({"id": draft["id"], "status": CONFIRMING},
-                                              {"$set": {"publish_slow": True}})
-    return "pending"
-
-
-async def run(db, limit: int = 200) -> Dict[str, int]:
-    """Check every post still being confirmed (the 2-minute background job)."""
-    counts = {"published": 0, "failed": 0, "pending": 0}
-    from app.agents.social_media_manager.services.outstand_service import OutstandService
-    outstand = OutstandService()
-    drafts = await db["content_drafts"].find({"status": CONFIRMING}).to_list(length=limit)
-    for draft in drafts:
-        try:
-            counts[await confirm(db, draft, outstand=outstand)] += 1
-        except Exception as e:
-            print(f"⚠️ confirm {draft.get('id')} failed: {e}")
-            counts["pending"] += 1
-    return counts
-
-
 async def failed_on_submit(db, draft: Dict[str, Any], connection: Dict[str, Any], raw_error: str,
                            limit: Optional["_rate_limit.RateLimitInfo"] = None) -> str:
     """A post the network refused outright when it was sent. Returns the message
     to store; flags the connection when its login has lapsed and tells the owner."""
     info = explain(draft.get("platform", ""), raw_error or "", limit)
     try:
-        _draft = {**draft, "outstand_account_id": (connection or {}).get("outstand_account_id")}
+        _draft = dict(draft)
         reconnect = info["reconnect"]
         if not reconnect and info.get("category") == "unknown":
             reconnect = await _should_flag_connection(db, _draft, info["category"], info["message"])
@@ -398,23 +254,3 @@ async def failed_on_submit(db, draft: Dict[str, Any], connection: Dict[str, Any]
     return info["message"]
 
 
-def awaiting_fields(publish_result: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
-    """What a draft gets when Outstand has accepted it but not yet published it."""
-    now = now or datetime.utcnow()
-    return {
-        "status": CONFIRMING,
-        "platform_post_id": publish_result.get("post_id"),
-        "outstand_post_status": publish_result.get("outstand_status", "queued"),
-        "outstand_account_id": publish_result.get("outstand_account_id"),
-        "publish_response": publish_result.get("raw_response"),
-        "publish_submitted_at": now,
-        "published_date": None,
-        "updated_at": now,
-        "error_message": None,
-    }
-
-
-def needs_confirmation(publish_result: Dict[str, Any]) -> bool:
-    """An Outstand post that isn't already confirmed live. TikTok is confirmed
-    before it returns (its own poll), so it never needs this."""
-    return bool(publish_result.get("via") == "outstand" and not publish_result.get("confirmed"))
