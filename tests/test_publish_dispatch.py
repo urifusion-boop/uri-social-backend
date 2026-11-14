@@ -108,11 +108,11 @@ def test_a_platform_rate_limit_pauses_the_account_and_defers_the_post():
 
 
 def test_a_limit_reported_only_as_text_is_recognised_too():
-    """Outstand and wrapped Meta errors arrive as strings, with no typed info attached."""
+    """Wrapped errors can arrive as plain strings, with no typed info attached."""
     db = GateDb()
-    publish = AsyncMock(return_value={"success": False, "error": "429 Too Many Requests for url https://api.outstand.so"})
-    out = _run(pd.dispatch(db, "tiktok", {"outstand_account_id": "7ylKW", "connected_via": "outstand"}, publish))
-    assert out.deferred and "outstand:7ylKW" in db.gate.docs
+    publish = AsyncMock(return_value={"success": False, "error": "429 Too Many Requests for url https://open.tiktokapis.com"})
+    out = _run(pd.dispatch(db, "tiktok", TIKTOK_CONN, publish))
+    assert out.deferred and KEY in db.gate.docs
 
 
 def test_a_cap_is_not_deferred_and_does_not_pause_the_account():
@@ -218,7 +218,7 @@ def notes(monkeypatch):
 
 @pytest.mark.parametrize("raw,category", [
     ("TikTok API error (rate_limit_exceeded): slow down", "rate_limit"),
-    ("429 Too Many Requests for url https://api.outstand.so", "rate_limit"),
+    ("429 Too Many Requests for url https://open.tiktokapis.com", "rate_limit"),
     ("TikTok API error (spam_risk_too_many_posts): cap", "daily_cap"),
     ("TikTok API error (reached_active_user_cap): cap", "daily_cap"),
 ])
@@ -234,10 +234,10 @@ def test_meta_limits_are_recognised_by_explain_too():
 
 def test_many_rate_limits_in_a_row_never_flag_the_connection(notes):
     db = _DB()
-    db["social_connections"] = _Coll([{"outstand_account_id": "acc1", "platform": "tiktok", "user_id": "u1"}])
+    db["social_connections"] = _Coll([{"id": "tt_1", "platform": "tiktok", "user_id": "u1"}])
     draft = {"id": "d1", "user_id": "u1", "platform": "tiktok", "brand_id": None}
     for _ in range(5):                      # the unknown-error threshold is 3
-        _run(pc.failed_on_submit(db, draft, {"outstand_account_id": "acc1"}, "429 Too Many Requests"))
+        _run(pc.failed_on_submit(db, draft, TIKTOK_CONN, "429 Too Many Requests"))
     conn = db["social_connections"].docs[0]
     assert "needs_reconnect" not in conn and "consecutive_publish_failures" not in conn
 
@@ -316,7 +316,7 @@ def test_a_cap_during_approve_fails_clearly_and_is_tagged_not_to_be_retried(appr
     assert "paused_until" not in db[rl.GATE_COLLECTION].docs[KEY]
 
 
-def test_scheduling_with_outstand_is_a_submission_and_is_not_gated(approve):
+def test_a_send_with_a_future_time_is_not_gated(approve):
     db, go = approve
     _run(rl.pause(db, KEY, until=rl.utcnow() + timedelta(minutes=10)))
     result, draft, publish = go(scheduled_datetime=datetime.utcnow() + timedelta(hours=2))

@@ -1,20 +1,15 @@
 """
-Posting to a Facebook Page connected directly with Meta.
-
-A direct connection that holds the Page and its token posts straight to the Page (Graph API) and
-is picked ahead of a newer Outstand connection. The result is a plain pageId_postId with no `via`, so
-nothing polls Outstand for it (that polling once produced duplicate posts). FACEBOOK_POST_DIRECT=false
-restores the old routing. A draft belonging to one brand never borrows another brand's Page.
+Facebook posts go straight to the brand's Page through its direct Meta connection (Graph API);
+the brand's own Page is picked, never another brand's. An account still recorded as connected
+through Outstand (retired) is asked to reconnect instead of being posted to.
 """
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from app.agents.social_media_manager.services import publish_confirmation as pc
 from app.agents.social_media_manager.services import publish_dispatch as pd
 from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
 from app.services.FacebookService import FacebookService
 
-OUTSTAND_LIST = "app.agents.social_media_manager.services.outstand_service.OutstandService.list_accounts"
 
 
 def _run(coro):
@@ -83,26 +78,6 @@ def outstand_conn():
 
 # ── posts_directly ────────────────────────────────────────────────────────────
 
-def test_a_direct_connection_with_a_page_and_token_posts_directly():
-    assert pd.posts_directly("facebook", direct())
-
-
-def test_it_needs_the_page_and_its_token():
-    assert not pd.posts_directly("facebook", direct(page_access_token=None))
-    assert not pd.posts_directly("facebook", direct(page_id=None))
-
-
-def test_an_outstand_connection_or_another_platform_does_not():
-    assert not pd.posts_directly("facebook", outstand_conn())
-    assert not pd.posts_directly("instagram", direct())
-    assert not pd.posts_directly("facebook", None)
-
-
-def test_the_switch_turns_it_off(monkeypatch):
-    monkeypatch.setenv("FACEBOOK_POST_DIRECT", "false")
-    assert not pd.posts_directly("facebook", direct())
-
-
 # ── which connection is picked ────────────────────────────────────────────────
 
 def test_the_direct_page_wins_even_when_a_newer_outstand_connection_exists():
@@ -130,42 +105,29 @@ def test_a_brand_may_use_a_connection_that_belongs_to_no_brand():
     assert _run(pd.preferred_direct_facebook(db, "u1", "C"))["page_id"] == "pLegacy"
 
 
-def test_the_switch_turns_the_preference_off(monkeypatch):
-    monkeypatch.setenv("FACEBOOK_POST_DIRECT", "false")
-    assert _run(pd.preferred_direct_facebook(Db([direct()]), "u1")) is None
-
-
 # ── publishing ────────────────────────────────────────────────────────────────
 
 DRAFT = {"id": "d1", "platform": "facebook", "content": "Jollof Friday", "post_type": "feed", "brand_id": None}
 POSTED = {"status": True, "responseData": {"id": "p1_9001"}}
 
 
-def test_a_direct_page_posts_to_facebook_and_never_asks_outstand():
-    list_accounts = AsyncMock(return_value={"data": [{"id": "P94f0", "network_unique_id": "p1"}]})
+def test_a_direct_page_posts_straight_to_facebook():
     post = AsyncMock(return_value=POSTED)
-    with patch(OUTSTAND_LIST, new=list_accounts), patch.object(FacebookService, "post_on_facebook", new=post):
+    with patch.object(FacebookService, "post_on_facebook", new=post):
         result = _run(ApprovalWorkflowService._publish_to_platform("facebook", dict(DRAFT), direct(), None, db=Db([])))
     assert result["success"] is True and result["post_id"] == "p1_9001"
     assert post.await_count == 1 and post.await_args.kwargs["access_token"] == "tok"
     assert post.await_args.kwargs["page_id"] == "p1"
-    assert list_accounts.await_count == 0
+    assert "via" not in result
 
 
-def test_a_direct_post_is_already_live_so_nothing_polls_for_it():
+def test_an_account_recorded_as_connected_through_outstand_is_asked_to_reconnect():
     post = AsyncMock(return_value=POSTED)
     with patch.object(FacebookService, "post_on_facebook", new=post):
-        result = _run(ApprovalWorkflowService._publish_to_platform("facebook", dict(DRAFT), direct(), None, db=Db([])))
-    assert "via" not in result and not pc.needs_confirmation(result)
-
-
-def test_with_the_switch_off_a_direct_page_goes_through_outstand_again(monkeypatch):
-    monkeypatch.setenv("FACEBOOK_POST_DIRECT", "false")
-    list_accounts = AsyncMock(return_value={"data": []})
-    post = AsyncMock(return_value=POSTED)
-    with patch(OUTSTAND_LIST, new=list_accounts), patch.object(FacebookService, "post_on_facebook", new=post):
-        _run(ApprovalWorkflowService._publish_to_platform("facebook", dict(DRAFT), direct(), None, db=Db([])))
-    assert list_accounts.await_count == 1   # looked for the Page at Outstand first, as before
+        result = _run(ApprovalWorkflowService._publish_to_platform("facebook", dict(DRAFT), outstand_conn(), None, db=Db([])))
+    assert result["success"] is False and result.get("needs_reconnect") is True
+    assert "Reconnect your Facebook account" in result["error"]
+    assert post.await_count == 0
 
 
 def test_a_meta_throttle_on_a_direct_post_comes_back_typed():

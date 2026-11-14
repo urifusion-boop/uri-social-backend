@@ -78,8 +78,8 @@ def _draft(draft_id, scheduled_date, created_at):
 def _facebook_connection():
     return {
         "id": "conn-1", "user_id": "user-1", "platform": "facebook",
-        "connection_status": "active", "connected_via": "outstand",
-        "outstand_account_id": "os-acc-1",
+        "connection_status": "active", "connected_via": "facebook_direct_oauth",
+        "page_id": "page-1", "page_access_token": "tok",
     }
 
 
@@ -110,33 +110,29 @@ def test_two_legitimately_different_scheduled_posts_are_both_processed_not_cance
     assert result["published_count"] == 1
 
 
-def test_a_future_dated_outstand_scheduled_post_is_not_cancelled_by_a_newer_one():
-    """The other half of the live bug: an already-submitted-to-Outstand post
-    (platform_post_id set, genuinely scheduled for later) must not be wiped
-    out just because a second, newer draft exists for the same platform."""
+def test_a_post_handed_to_outstand_earlier_is_not_cancelled_and_waits_for_its_time():
+    """Posts handed to Outstand (retired) before it was switched off carry its post id. One scheduled
+    for later is not cancelled by a newer one and stays scheduled until its time; once well past it,
+    with nothing left to confirm it, it is marked unconfirmed so the owner can check and reschedule."""
     now = datetime.utcnow()
-    already_submitted = _draft("draft-A", scheduled_date=now + timedelta(days=3), created_at=now - timedelta(days=2))
-    already_submitted["platform_post_id"] = "os_post_abc"
-    newly_created = _draft("draft-B", scheduled_date=now + timedelta(days=5), created_at=now)
-    newly_created["platform_post_id"] = "os_post_xyz"
+    later = _draft("draft-A", scheduled_date=now + timedelta(days=3), created_at=now - timedelta(days=2))
+    later["platform_post_id"] = "os_post_abc"
+    newer = _draft("draft-B", scheduled_date=now + timedelta(days=5), created_at=now)
+    newer["platform_post_id"] = "os_post_xyz"
+    overdue = _draft("draft-C", scheduled_date=now - timedelta(hours=3), created_at=now - timedelta(days=3))
+    overdue["platform_post_id"] = "os_post_old"
     db = FakeDb({
-        "content_drafts": [already_submitted, newly_created],
+        "content_drafts": [later, newer, overdue],
         "social_connections": [_facebook_connection()],
     })
 
-    async def fake_get_post(post_id):
-        return {"post": {"publishedAt": None, "isDraft": False}}  # not yet published — still pending
+    _run(ApprovalWorkflowService.publish_scheduled_content(db))
 
-    with patch(
-        "app.agents.social_media_manager.services.outstand_service.OutstandService.get_post",
-        new=AsyncMock(side_effect=fake_get_post),
-    ):
-        _run(ApprovalWorkflowService.publish_scheduled_content(db))
-
-    statuses = {d["id"]: d["status"] for d in db["content_drafts"].docs}
-    # Both remain scheduled/pending — neither was cancelled to "replaced".
-    assert statuses["draft-A"] == "scheduled"
-    assert statuses["draft-B"] == "scheduled"
+    drafts = {d["id"]: d for d in db["content_drafts"].docs}
+    assert drafts["draft-A"]["status"] == "scheduled"
+    assert drafts["draft-B"]["status"] == "scheduled"
+    assert drafts["draft-C"]["status"] == "publish_failed"
+    assert "couldn't confirm this post went out" in drafts["draft-C"]["error_message"]
 
 
 def test_atomic_claim_still_prevents_double_publishing_the_same_draft():

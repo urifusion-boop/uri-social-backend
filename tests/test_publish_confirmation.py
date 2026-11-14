@@ -140,28 +140,6 @@ def _run(coro):
         loop.close()
 
 
-class TestReadOutcome:
-    def test_accepted_but_not_out_yet_is_pending(self):
-        assert pc.read_outcome({"post": {"id": "x", "publishedAt": None,
-                                         "socialAccounts": [{"status": "pending"}]}})["state"] == "pending"
-        assert pc.read_outcome({"data": {"id": "x", "status": "queued"}})["state"] == "pending"
-        assert pc.read_outcome({})["state"] == "pending"
-
-    def test_per_account_failure_is_failed_with_the_networks_words(self):
-        out = pc.read_outcome({"post": {"publishedAt": None, "socialAccounts": [
-            {"status": "failed", "error": VCHAIN_ERROR}]}})
-        assert out == {"state": "failed", "error": VCHAIN_ERROR}
-
-    def test_live(self):
-        assert pc.read_outcome({"post": {"publishedAt": "2026-10-15T09:00:04Z", "isDraft": False,
-                                         "socialAccounts": [{"status": "published"}]}})["state"] == "published"
-        assert pc.read_outcome({"post": {"publishedAt": "2026-10-15T09:00:04Z"}})["state"] == "published"
-
-    def test_published_at_with_one_account_still_going_is_not_yet_published(self):
-        assert pc.read_outcome({"post": {"publishedAt": "2026-10-15T09:00:04Z", "socialAccounts": [
-            {"status": "published"}, {"status": "processing"}]}})["state"] == "pending"
-
-
 class TestExplain:
     def test_expired_facebook_login_says_reconnect(self):
         info = pc.explain("facebook", VCHAIN_ERROR)
@@ -196,140 +174,6 @@ class TestExplain:
         assert "confirm your identity" in info["message"].lower()
 
 
-class TestConfirm:
-    def test_vchain_case_marks_failed_flags_reconnect_and_tells_the_owner(self, _quiet_notifications):
-        db, draft = _setup()
-        answer = {"post": {"publishedAt": None, "socialAccounts": [{"status": "failed", "error": VCHAIN_ERROR}]}}
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "failed"
-        saved = db["content_drafts"].docs[0]
-        assert saved["status"] == "publish_failed"
-        assert "Reconnect Facebook" in saved["error_message"]
-        assert saved["network_error"] == VCHAIN_ERROR
-        conns = {c["id"]: c for c in db["social_connections"].docs}
-        assert conns["c1"].get("needs_reconnect") is True
-        assert not conns["c2"].get("needs_reconnect")          # the other brand's page is untouched
-        assert _quiet_notifications == [(False, saved["error_message"])]
-
-    def test_unrecognized_error_does_not_flag_reconnect_on_one_failure(self, _quiet_notifications):
-        db, draft = _setup()
-        answer = {"post": {"publishedAt": None, "socialAccounts": [
-            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
-        ]}}
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "failed"
-        assert not db["social_connections"].docs[0].get("needs_reconnect")
-
-    def test_unrecognized_error_flags_reconnect_once_it_keeps_happening(self, _quiet_notifications):
-        # The same uncatalogued error, repeated on the same connection, is a
-        # real pattern — it must escalate even though nobody's written a
-        # pattern for this exact text, instead of being silently ignored
-        # forever.
-        db, draft = _setup()
-        answer = {"post": {"publishedAt": None, "socialAccounts": [
-            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
-        ]}}
-        result = None
-        for _ in range(pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD):
-            draft["status"] = pc.CONFIRMING  # each call re-confirms as if resubmitted/re-polled
-            result = _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
-        assert result == "failed"
-        assert db["social_connections"].docs[0].get("needs_reconnect") is True
-
-    def test_a_success_in_between_resets_the_unrecognized_failure_count(self, _quiet_notifications):
-        db, draft = _setup()
-        answer = {"post": {"publishedAt": None, "socialAccounts": [
-            {"status": "failed", "error": "Some brand-new Outstand error nobody has seen before"},
-        ]}}
-        for _ in range(pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD - 1):
-            draft["status"] = pc.CONFIRMING
-            _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW))
-        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == pc.UNKNOWN_FAILURE_ESCALATION_THRESHOLD - 1
-        live = {"post": {"publishedAt": "2026-10-15T09:01:00Z", "socialAccounts": [{"status": "published"}]}}
-        draft["status"] = pc.CONFIRMING
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(live), now=NOW)) == "published"
-        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 0
-
-    def test_live_marks_published_and_clears_a_reconnect_flag(self, _quiet_notifications):
-        db, draft = _setup()
-        db["social_connections"].docs[0]["needs_reconnect"] = True
-        answer = {"post": {"publishedAt": "2026-10-15T09:01:00Z", "socialAccounts": [{"status": "published"}]}}
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(answer), now=NOW)) == "published"
-        assert db["content_drafts"].docs[0]["status"] == "published"
-        assert "needs_reconnect" not in db["social_connections"].docs[0]
-        assert _quiet_notifications == [(True, "")]
-
-    def test_still_going_is_never_called_failed(self, _quiet_notifications):
-        db, draft = _setup(submitted_minutes_ago=5)
-        pending = {"post": {"publishedAt": None, "socialAccounts": [{"status": "processing"}]}}
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(pending), now=NOW)) == "pending"
-        assert db["content_drafts"].docs[0]["status"] == pc.CONFIRMING
-        assert "publish_slow" not in db["content_drafts"].docs[0]
-        assert _quiet_notifications == []
-
-    def test_after_30_minutes_it_shows_as_taking_longer(self):
-        db, draft = _setup(submitted_minutes_ago=31)
-        pending = {"post": {"publishedAt": None}}
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(pending), now=NOW)) == "pending"
-        assert db["content_drafts"].docs[0]["publish_slow"] is True
-        assert db["content_drafts"].docs[0]["status"] == pc.CONFIRMING
-
-    def test_late_success_after_slow_still_wins(self):
-        db, draft = _setup(submitted_minutes_ago=300, slow=True)
-        live = {"post": {"publishedAt": "2026-10-15T08:59:00Z"}}
-        assert _run(pc.confirm(db, draft, outstand=_Outstand(live), now=NOW)) == "published"
-        saved = db["content_drafts"].docs[0]
-        assert saved["status"] == "published" and "publish_slow" not in saved
-
-    def test_no_answer_after_24_hours_is_failed_honestly(self, _quiet_notifications):
-        db, draft = _setup(submitted_minutes_ago=24 * 60 + 1)
-        assert _run(pc.confirm(db, draft, outstand=_Outstand({"post": {}}), now=NOW)) == "failed"
-        saved = db["content_drafts"].docs[0]
-        assert saved["status"] == "publish_failed"
-        assert "couldn't confirm" in saved["error_message"]
-        assert not db["social_connections"].docs[0].get("needs_reconnect")
-
-    def test_outstand_down_just_waits(self, _quiet_notifications):
-        db, draft = _setup()
-        out = _Outstand(raises=RuntimeError("connection reset"))
-        assert _run(pc.confirm(db, draft, outstand=out, now=NOW)) == "pending"
-        assert db["content_drafts"].docs[0]["status"] == pc.CONFIRMING
-        assert _quiet_notifications == []
-
-    def test_post_gone_from_outstand_is_no_longer_called_published(self):
-        db, draft = _setup()
-        out = _Outstand(raises=RuntimeError("Client error '404 Not Found'"))
-        assert _run(pc.confirm(db, draft, outstand=out, now=NOW)) == "failed"
-        saved = db["content_drafts"].docs[0]
-        assert saved["status"] == "publish_failed" and "Check your page" in saved["error_message"]
-
-    def test_only_a_draft_still_confirming_is_changed(self):
-        """If the owner already republished or the post was settled elsewhere,
-        a stale answer must not overwrite it."""
-        db, draft = _setup()
-        db["content_drafts"].docs[0]["status"] = "published"
-        failed = {"post": {"socialAccounts": [{"status": "failed", "error": "x"}]}}
-        _run(pc.confirm(db, draft, outstand=_Outstand(failed), now=NOW))
-        assert db["content_drafts"].docs[0]["status"] == "published"
-
-
-class TestSubmitHelpers:
-    def test_accepted_outstand_post_needs_confirming(self):
-        assert pc.needs_confirmation({"success": True, "via": "outstand", "confirmed": False})
-        assert not pc.needs_confirmation({"success": True, "via": "outstand", "confirmed": True})   # TikTok's own poll
-        assert not pc.needs_confirmation({"success": True, "post_id": "123_456"})                    # direct API, already live
-
-    def test_awaiting_fields(self):
-        f = pc.awaiting_fields({"post_id": "gQXux", "outstand_status": "queued", "outstand_account_id": "acc1"}, now=NOW)
-        assert f["status"] == pc.CONFIRMING and f["platform_post_id"] == "gQXux"
-        assert f["publish_submitted_at"] == NOW and f["published_date"] is None
-
-    def test_refused_on_submit_flags_reconnect(self, _quiet_notifications):
-        db, draft = _setup()
-        msg = _run(pc.failed_on_submit(db, draft, {"outstand_account_id": "acc1"}, f"Outstand publish failed: {VCHAIN_ERROR}"))
-        assert "Reconnect Facebook" in msg
-        assert db["social_connections"].docs[0]["needs_reconnect"] is True
-        assert _quiet_notifications == [(False, msg)]
-
-
 class _MotorLikeDB(_DB):
     """A real Motor database raises if it is used as a boolean ("Database objects do not implement
     truth value testing"); a plain dict never does, which is how this went unnoticed."""
@@ -345,13 +189,6 @@ class TestARealDatabaseIsNeverTestedForTruth:
         msg = _run(pc.failed_on_submit(db, draft, {"outstand_account_id": "acc1"}, "something nobody has seen before"))
         assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 1
         assert _quiet_notifications == [(False, msg)]  # the owner is told; bookkeeping did not abort first
-
-    def test_a_successful_publish_resets_the_counter(self):
-        db, draft = _setup()
-        db["social_connections"].docs[0]["consecutive_publish_failures"] = 2
-        _run(pc._record_publish_success(_MotorLikeDB(db), draft))
-        assert db["social_connections"].docs[0]["consecutive_publish_failures"] == 0
-
 
 class TestFailureAlertIsAlwaysOn:
     def test_post_failed_reaches_the_owner_whatever_they_picked(self):
