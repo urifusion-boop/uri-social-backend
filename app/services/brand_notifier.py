@@ -220,3 +220,12 @@ async def notify(
     results["dashboard"] = {"sent": True, "error": None}
     await _log(db, user_id, event, title, message, meta, results)
     return results
+
+
+async def notify_in_app(db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[str], event: str,
+                        title: str, message: str, link: Optional[str] = None,
+                        metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Only the app's notifications panel (the bell), no email or other channel: for news the
+    owner asked for a moment ago, like a finished website read, that isn't worth an email."""
+    meta = {**(metadata or {}), "brand_id": brand_id, "link": link}
+    await _log(db, user_id, event, title, message, meta, {"dashboard": {"sent": True, "error": None}})

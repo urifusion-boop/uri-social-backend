@@ -261,6 +261,29 @@ def _job_video_billing_reaper():
     _run_async("video_billing_reaper", _run)
 
 
+def _job_background_jobs_check():
+    """Every 15 minutes: alert admins if a background job type is failing a lot or jobs are
+    waiting too long to start (app/jobs/monitor.py)."""
+    async def _run():
+        from app.database import get_db
+        from app.jobs import monitor
+        found = await monitor.check(get_db())
+        if found:
+            print(f"🚨 Background jobs: {found}")
+    _run_async("background_jobs_check", _run)
+
+
+def _job_competitor_refresh():
+    """Daily: queue a fresh competitor search for brands last searched over a week ago."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.competitors import service as competitors
+        queued = await competitors.refresh_due(get_db())
+        if queued:
+            print(f"🔎 Competitor refresh: queued {queued} brand(s)")
+    _run_async("competitor_refresh", _run)
+
+
 def _job_market_intelligence_scheduled_scans():
     """Uri Market Intelligence scheduled collection (PRD §18) — hourly check
     of active keep_updating topics. Dev-only feature (see the module's own
@@ -497,6 +520,20 @@ def start_notification_scheduler():
         _job_video_billing_reaper,
         CronTrigger(minute="*/10"),
         id="video_billing_reaper",
+        **_JOB_DEFAULTS,
+    )
+
+    _scheduler.add_job(
+        _job_background_jobs_check,
+        CronTrigger(minute="*/15"),
+        id="background_jobs_check",
+        **_JOB_DEFAULTS,
+    )
+
+    _scheduler.add_job(
+        _job_competitor_refresh,
+        CronTrigger(hour=3, minute=20),
+        id="competitor_refresh",
         **_JOB_DEFAULTS,
     )
 
