@@ -1,0 +1,54 @@
+# Runs on every pull request into aws/dev or aws/prod. Deploys are separate
+# (deploy-aws-dev.yml / deploy-aws-prod.yml run on push and are not touched here).
+name: PR checks
+
+on:
+  pull_request:
+    branches: [aws/dev, aws/prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Placeholder settings so the app can be imported without any real credentials.
+env:
+  MONGODB_URI: mongodb://localhost:27017
+  MONGODB_DB: ci
+  OPENAI_API_KEY: sk-ci-placeholder
+  AUTHJWT_SECRET_KEY: ci-placeholder
+  URI_GATEWAY_BASE_API_URL: http://localhost
+  URI_BACKEND_BASE_URL: http://localhost
+
+jobs:
+  starts:
+    # Required check: the app must compile and import (all routers load).
+    name: Backend starts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app
+      - run: python -c "import app.main as m; print('routes:', len(m.app.routes))"
+
+  tests:
+    # Informational until the known-broken tests are fixed; then make it required too.
+    # test_01..test_09 call a running API and are skipped here.
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt mongomock-motor
+      - run: python -m pytest -q -p no:cacheprovider --ignore-glob='tests/test_0[0-9]_*.py'

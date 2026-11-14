@@ -1,0 +1,2 @@
+# Every change to aws/prod needs approval from a code owner (enforced by branch protection).
+* @TheSoftNode
