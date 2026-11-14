@@ -858,42 +858,30 @@ async def _ai_rewrite_caption(
         return None
 
 
-# ── Outstand helpers ──────────────────────────────────────────────────────────
+# ── Connected accounts ────────────────────────────────────────────────────────
 
 
 async def _get_connected_accounts(user_id: str, db: Optional[AsyncIOMotorDatabase] = None) -> List[Dict[str, Any]]:
+    """The user's connected social accounts (direct connections; Outstand is retired)."""
     accounts: List[Dict[str, Any]] = []
-
+    if db is None:
+        return accounts
     try:
-        from app.agents.social_media_manager.services.outstand_service import OutstandService
-        outstand = OutstandService()
-        result = await outstand.list_accounts(tenant_id=user_id)
-        for acc in result.get("data", []):
-            acc["source"] = "outstand"
-            accounts.append(acc)
+        cursor = db["social_connections"].find(
+            {"user_id": user_id, "connection_status": "active", "connected_via": {"$ne": "outstand"}},
+            {"platform": 1, "connected_via": 1, "profile_name": 1, "username": 1, "account_name": 1}
+        )
+        async for conn in cursor:
+            platform = conn.get("platform", "")
+            accounts.append({
+                "id": str(conn["_id"]),
+                "network": platform,
+                "name": conn.get("account_name") or conn.get("profile_name") or conn.get("username") or platform.title(),
+                "source": "direct",
+                "_user_id": user_id,
+            })
     except Exception as e:
-        print(f"[WhatsApp] outstand list_accounts error: {e}")
-
-    if db is not None:
-        try:
-            cursor = db["social_connections"].find(
-                {"user_id": user_id, "connection_status": "active"},
-                {"platform": 1, "connected_via": 1, "profile_name": 1, "username": 1, "account_name": 1}
-            )
-            async for conn in cursor:
-                platform = conn.get("platform", "")
-                already = any(a.get("network") == platform and a.get("source") == "outstand" for a in accounts)
-                if not already:
-                    accounts.append({
-                        "id": str(conn["_id"]),
-                        "network": platform,
-                        "name": conn.get("account_name") or conn.get("profile_name") or conn.get("username") or platform.title(),
-                        "source": "direct",
-                        "_user_id": user_id,
-                    })
-        except Exception as e:
-            print(f"[WhatsApp] db connections error: {e}")
-
+        print(f"[WhatsApp] db connections error: {e}")
     return accounts
 
 

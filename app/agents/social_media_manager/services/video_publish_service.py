@@ -7,7 +7,6 @@ import httpx
 
 from app.core.config import settings
 from app.database import get_db
-from app.agents.social_media_manager.services.outstand_service import OutstandService
 from app.agents.social_media_manager.services import rate_limit as rl
 
 GRAPH_BASE = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
@@ -16,58 +15,6 @@ GRAPH_BASE = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
 _IG_POLL_INTERVAL = 8   # seconds between polls
 _IG_MAX_POLLS = 90      # 90 × 8s = 12 minutes max
 
-# Poll limits for Outstand post status (used for TikTok, which has no direct API)
-_OUTSTAND_POLL_INTERVAL = 8   # seconds between polls
-_OUTSTAND_MAX_POLLS = 90      # 90 × 8s = 12 minutes max
-
-
-def outstand_tiktok_config(settings_=None, auto_add_music: bool = False, photo: bool = False) -> Dict[str, Any]:
-    """The `tiktok` block of Outstand's POST /v1/posts/, built from the user's choices on
-    the Post to TikTok screen (so a TikTok post is never sent with a privacy level or
-    interaction the user didn't pick).
-
-    postMode, privacyLevel and autoAddMusic are field names confirmed against live
-    Outstand responses. disable*/brand* follow the same camelCase convention but are NOT
-    yet confirmed against Outstand's schema — Outstand reports unrecognised keys in the
-    response `warnings`, which log_outstand_warnings() makes visible. Photos omit
-    Duet/Stitch (they don't apply). With no settings (legacy callers) the old default is
-    kept."""
-    if settings_ is None:
-        cfg: Dict[str, Any] = {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
-    else:
-        cfg = {
-            "postMode": "DIRECT_POST",
-            "privacyLevel": settings_.privacy_level,
-            "disableComment": not settings_.allow_comment,
-        }
-        if not photo:
-            cfg["disableDuet"] = not settings_.allow_duet
-            cfg["disableStitch"] = not settings_.allow_stitch
-        if settings_.brand_organic or settings_.brand_content:
-            cfg["brandOrganicToggle"] = settings_.brand_organic
-            cfg["brandContentToggle"] = settings_.brand_content
-    if auto_add_music:
-        cfg["autoAddMusic"] = True
-    return cfg
-
-
-def log_outstand_warnings(result: Dict[str, Any]) -> None:
-    warnings = (result or {}).get("warnings")
-    if warnings:
-        print(f"⚠️ Outstand reported warnings for this TikTok post (settings it didn't recognise are ignored): {warnings}")
-
-
-def explain_outstand_tiktok_failure(reason: Optional[str]) -> str:
-    """A customer-readable explanation for a TikTok failure reported through Outstand."""
-    low = (reason or "").lower()
-    if "url_ownership_unverified" in low:
-        return (
-            "TikTok couldn't fetch the media: it is hosted on Outstand's domain, which isn't verified for the "
-            "TikTok app this account was connected with. Use Outstand's own TikTok app (remove your TikTok "
-            "credentials under Social Networks in the Outstand dashboard, then reconnect) or connect TikTok "
-            f"with TikTok login instead. [{reason}]"
-        )
-    return f"TikTok publish failed via Outstand: {reason or 'unknown reason'}"
 
 
 class MetaAPIError(ValueError):
@@ -344,13 +291,8 @@ class VideoPublishService:
                 print(f"✅ Scheduled TikTok photo: publish_id={publish_id} status={status}")
                 return {"success": True, "post_id": publish_id, "raw_response": {"publish_id": publish_id, "status": status}}
 
-            outstand = OutstandService()
-            media_urls = [await outstand.upload_media_from_url(u) for u in image_urls]
-            caption = tiktok_settings.description or tiktok_settings.title or ""
-            post_id, post_url = await VideoPublishService._publish_tiktok_via_outstand(
-                conn["outstand_account_id"], caption, media_urls, tiktok_settings, auto_add_music, photo=True
-            )
-            return {"success": True, "post_id": post_id, "raw_response": {"post_id": post_id, "post_url": post_url}}
+            return {"success": False, "needs_reconnect": True,
+                    "error": "Reconnect your TikTok account on Connected Accounts, then try again."}
         except Exception as e:
             print(f"❌ Scheduled TikTok photo failed: {e}")
             failed: Dict[str, Any] = {"success": False, "error": f"TikTok publish failed: {e}"}
@@ -402,48 +344,6 @@ class VideoPublishService:
             )
         except Exception as e:
             print(f"[TikTokPhotoPublish {job_id}] failed: {e}")
-            await VideoPublishService._fail(job_id, e, net)
-
-    @staticmethod
-    async def run_tiktok_photo_job_outstand(
-        job_id: str,
-        draft_id: str,
-        image_urls: list,
-        conn: Dict[str, Any],
-        db,
-        tiktok_settings,
-        auto_add_music: bool = False,
-    ) -> None:
-        """Same job as run_tiktok_photo_job, for a TikTok account connected through
-        Outstand: the images are handed to Outstand, which posts them with the user's
-        choices from the Post to TikTok screen."""
-        col = _jobs_col()
-        key, gap, net = VideoPublishService._gate_target("tiktok", conn)
-        try:
-            async def publish():
-                outstand = OutstandService()
-                media_urls = [await outstand.upload_media_from_url(u) for u in image_urls]
-                caption = tiktok_settings.description or tiktok_settings.title or ""
-                return await VideoPublishService._publish_tiktok_via_outstand(
-                    conn["outstand_account_id"], caption, media_urls, tiktok_settings, auto_add_music, photo=True
-                )
-
-            post_id, post_url = await VideoPublishService._with_gate(job_id, key, gap, net, publish)
-            await col.update_one(
-                {"job_id": job_id},
-                {"$set": {"status": "published", "platform_post_id": post_id, "post_url": post_url,
-                          "updated_at": datetime.now(timezone.utc).isoformat()}},
-            )
-            await db["content_drafts"].update_one(
-                {"id": draft_id},
-                {"$set": {
-                    "status": "published",
-                    "platform_post_id": post_id,
-                    "published_date": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
-        except Exception as e:
-            print(f"[TikTokPhotoPublishOutstand {job_id}] failed: {e}")
             await VideoPublishService._fail(job_id, e, net)
 
     # ── Instagram Reels ───────────────────────────────────────────────────────
@@ -553,7 +453,7 @@ class VideoPublishService:
             post_url = f"https://www.facebook.com/video/{video_id}"
             return video_id, post_url
 
-    # ── TikTok (direct FILE_UPLOAD when connected that way, else via Outstand) ──
+    # ── TikTok (direct FILE_UPLOAD) ──
 
     @staticmethod
     async def _publish_tiktok(
@@ -573,179 +473,4 @@ class VideoPublishService:
             print(f"✅ TikTok direct publish: publish_id={publish_id} status={status}")
             return publish_id, None
 
-        outstand = OutstandService()
-
-        # TikTok requires media to be fetched from a domain verified in the TikTok
-        # developer portal. Route it through Outstand's own media upload first so
-        # TikTok pulls from Outstand's (already-verified) domain instead.
-        outstand_media_url = await outstand.upload_media_from_url(video_url)
-        return await VideoPublishService._publish_tiktok_via_outstand(
-            conn["outstand_account_id"], caption, [outstand_media_url], tiktok_settings
-        )
-
-    @staticmethod
-    async def _publish_tiktok_via_outstand(
-        outstand_account_id: str,
-        caption: str,
-        media_urls: list,
-        tiktok_settings=None,
-        auto_add_music: bool = False,
-        photo: bool = False,
-    ):
-        """Posts to a TikTok account connected through Outstand and waits for the real
-        outcome. Shared by the video and photo routes."""
-        outstand = OutstandService()
-
-        # DIRECT_POST + PUBLIC_TO_EVERYONE was believed correct per an earlier
-        # note claiming the app's Content Posting API audit passed 2026-08-17.
-        # Live-confirmed 2026-10-16 that's wrong (or no longer true): Outstand's
-        # POST /v1/posts still returns 200 success:true and accepts the post —
-        # TikTok's own "unaudited_client_can_only_post_to_private_accounts"
-        # rejection only shows up later, asynchronously, through the status
-        # poll below. So it can never be caught as an exception around
-        # publish_post() (an earlier version of this tried that and the retry
-        # never fired); it has to be handled after polling confirms the
-        # failure, and recovering means submitting a brand-new post — the
-        # original post_id is already dead on Outstand's side.
-        tiktok_config = outstand_tiktok_config(tiktok_settings, auto_add_music, photo)
-        # A 429 on creating the post means Outstand refused it before creating anything, so a
-        # temporary limit is safe to retry here (it cannot double-post).
-        result = await rl.with_backoff(
-            lambda: outstand.publish_post(
-                outstand_account_ids=[outstand_account_id],
-                content=caption,
-                media_urls=media_urls,
-                platform_config={"tiktok": tiktok_config},
-            ),
-            classify=lambda e: rl.classify_exception(e, "tiktok"),
-        )
-        log_outstand_warnings(result)
-        post_obj = result.get("post") or result.get("data") or {}
-        if isinstance(post_obj, list):
-            post_obj = post_obj[0] if post_obj else {}
-        post_id = post_obj.get("id")
-        if not post_id:
-            raise ValueError(f"Outstand did not return a post id for TikTok publish: {result}")
-        post_url = post_obj.get("url") or post_obj.get("permalink")
-
-        published, post_url, failure_reason = await VideoPublishService._poll_tiktok_outstand_publish(
-            outstand, post_id, post_url
-        )
-
-        # The media domain not being verified is its own problem (fixed by using Outstand's
-        # own TikTok app, not by waiting for an audit) — say so, and don't fall back.
-        if not published and failure_reason and "url_ownership_unverified" in failure_reason.lower():
-            raise ValueError(explain_outstand_tiktok_failure(failure_reason))
-
-        # A rate limit or cap is not a reason to submit more posts: every extra one would spend the
-        # same limit, and the fallbacks below would just add noise. Say what happened instead.
-        limit = rl.classify_text("tiktok", failure_reason) if (not published and failure_reason) else None
-        if limit:
-            raise rl.RateLimitedError(rl.give_up_message(limit), limit)
-
-        audit_block = bool(failure_reason) and (
-            "privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower()
-        )
-
-        # Only for callers with no user-chosen settings: quietly retry privately. When the
-        # user picked a privacy level on the Post to TikTok screen it is never downgraded
-        # behind their back — they get the explanation below instead.
-        if not published and audit_block and tiktok_settings is None:
-            print(f"⚠️ TikTok post {post_id} failed on privacyLevel/audit ({failure_reason}) — submitting a new post as SELF_ONLY")
-            retry_result = await outstand.publish_post(
-                outstand_account_ids=[outstand_account_id],
-                content=caption,
-                media_urls=media_urls,
-                platform_config={"tiktok": {**tiktok_config, "privacyLevel": "SELF_ONLY"}},
-            )
-            retry_post_obj = retry_result.get("post") or retry_result.get("data") or {}
-            if isinstance(retry_post_obj, list):
-                retry_post_obj = retry_post_obj[0] if retry_post_obj else {}
-            retry_post_id = retry_post_obj.get("id")
-            if retry_post_id:
-                post_id = retry_post_id
-                post_url = retry_post_obj.get("url") or retry_post_obj.get("permalink")
-                published, post_url, failure_reason = await VideoPublishService._poll_tiktok_outstand_publish(
-                    outstand, post_id, post_url
-                )
-                audit_block = bool(failure_reason) and (
-                    "privacy" in failure_reason.lower() or "unaudited" in failure_reason.lower() or "audit" in failure_reason.lower()
-                )
-
-        # Live-confirmed 2026-10-16: SELF_ONLY can fail with the exact same
-        # "unaudited_client_can_only_post_to_private_accounts" error — the real
-        # block is DIRECT_POST itself (likely under TikTok re-review), not the
-        # privacy value. Fall back to TikTok's third suggested option,
-        # MEDIA_UPLOAD, which drops privacyLevel and delivers to the creator's
-        # TikTok inbox as a draft instead of posting directly.
-        if not published and audit_block:
-            print(f"⚠️ TikTok post {post_id} still failed on privacyLevel/audit ({failure_reason}) — submitting a new post as MEDIA_UPLOAD")
-            media_result = await outstand.publish_post(
-                outstand_account_ids=[outstand_account_id],
-                content=caption,
-                media_urls=media_urls,
-                platform_config={"tiktok": {"postMode": "MEDIA_UPLOAD"}},
-            )
-            media_post_obj = media_result.get("post") or media_result.get("data") or {}
-            if isinstance(media_post_obj, list):
-                media_post_obj = media_post_obj[0] if media_post_obj else {}
-            media_post_id = media_post_obj.get("id")
-            if media_post_id:
-                # A draft that TikTok rejected (e.g. media domain not verified) was never
-                # delivered, so check it briefly before saying it was.
-                _, _, media_failure = await VideoPublishService._poll_tiktok_outstand_publish(
-                    outstand, media_post_id, None, max_polls=8
-                )
-                if media_failure:
-                    raise ValueError(explain_outstand_tiktok_failure(media_failure))
-                # MEDIA_UPLOAD never sets publishedAt until the creator manually
-                # finishes it in the TikTok app — not a real publish, so raise
-                # instead of returning a success tuple, with a clear explanation.
-                raise ValueError(
-                    "TikTok is currently blocking direct posting for this app (likely under review). "
-                    f"This was delivered to the connected TikTok account's inbox as a draft (post {media_post_id}) "
-                    "instead — open the TikTok app to review and publish it manually."
-                )
-
-        if not published:
-            if failure_reason:
-                raise ValueError(explain_outstand_tiktok_failure(failure_reason))
-            raise TimeoutError("TikTok publish via Outstand timed out")
-
-        return post_id, post_url
-
-    @staticmethod
-    async def _poll_tiktok_outstand_publish(
-        outstand: "OutstandService", post_id: str, post_url: Optional[str], max_polls: Optional[int] = None
-    ):
-        """Poll Outstand until a TikTok post is confirmed published or fails.
-
-        Returns (published, post_url, failure_reason). See the caller for why
-        this can't be caught synchronously around publish_post().
-        """
-        for _ in range(max_polls or _OUTSTAND_MAX_POLLS):
-            await asyncio.sleep(_OUTSTAND_POLL_INTERVAL)
-            try:
-                post_data = await outstand.get_post(post_id)
-            except httpx.HTTPStatusError as e:
-                # The post is already created: Outstand telling us to slow down on a status check
-                # must not fail it. Wait it out (a missed poll) and carry on.
-                if e.response is not None and e.response.status_code == 429:
-                    await asyncio.sleep(min(rl.parse_retry_after(e.response.headers) or _OUTSTAND_POLL_INTERVAL * 2, 60.0))
-                    continue
-                raise
-            post = post_data.get("post") or post_data.get("data") or {}
-            if isinstance(post, list):
-                post = post[0] if post else {}
-            if post.get("publishedAt") and not post.get("isDraft"):
-                return True, (post.get("url") or post.get("permalink") or post_url), None
-            # The failure reason lives per-account, not on the post itself —
-            # live-confirmed via Outstand's own dashboard: socialAccounts[].status
-            # == "failed" with socialAccounts[].error holding the real detail.
-            failed_acct = next(
-                (a for a in (post.get("socialAccounts") or []) if a.get("status") == "failed"),
-                None,
-            )
-            if failed_acct:
-                return False, post_url, (failed_acct.get("error") or "unknown reason")
-        return False, post_url, None
+        raise ValueError("Reconnect your TikTok account on Connected Accounts, then try again.")

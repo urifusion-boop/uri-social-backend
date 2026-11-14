@@ -92,11 +92,8 @@ class Settings(BaseSettings):
     INSTAGRAM_APP_ID: str = ""
     INSTAGRAM_APP_SECRET: str = ""
 
-    # Outstand
-    OUTSTAND_API_KEY: Optional[str] = None
-    OUTSTAND_WEBHOOK_SECRET: Optional[str] = None  # For verifying Outstand webhook signatures
 
-    # X (Twitter) OAuth 1.0a — direct posting without Outstand
+    # X (Twitter) OAuth 1.0a — direct posting
     X_API_KEY: Optional[str] = None         # Consumer Key
     X_API_SECRET: Optional[str] = None      # Consumer Secret
     X_OAUTH_CALLBACK_URL: Optional[str] = None  # Public backend URL, e.g. https://api.yourdomain.com/x/callback
@@ -197,13 +194,8 @@ class Settings(BaseSettings):
     # TikTok Login Kit + Content Posting API — the "urisocial" app's own
     # credentials, distinct from TIKTOK_ADS_* above (a separate TikTok product/
     # app entirely). Powers direct organic posting (FILE_UPLOAD mode — no
-    # domain verification needed, unlike PULL_FROM_URL) as an alternative to
-    # the existing Outstand-mediated TikTok connection. See
+    # domain verification needed, unlike PULL_FROM_URL). See
     # app/agents/social_media_manager/services/tiktok_direct_service.py.
-    # Outstand is no longer used: every OutstandService call refuses without contacting
-    # Outstand, so nothing publishes/schedules/looks up through it. Accounts that were
-    # connected through Outstand are told to reconnect directly (Meta / TikTok login).
-    OUTSTAND_ENABLED: bool = False
     TIKTOK_APP_CLIENT_KEY: str = ""
     TIKTOK_APP_CLIENT_SECRET: str = ""
 
