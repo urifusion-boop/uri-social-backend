@@ -41,7 +41,7 @@ class TestBuildLogoSpaceNote:
         )
         assert "top-right corner" in note
         assert "CRITICAL" in note
-        assert "MUST be 100% clear" in note
+        assert "PLAIN" in note and "NO text of any kind" in note
 
     def test_defaults_to_bottom_right_when_position_unset(self):
         note = ImageContentService.build_logo_space_note({"logo_url": "https://example.com/logo.png"})
@@ -165,7 +165,7 @@ class TestV2GuideRespectsLogoPosition:
         fake_geometry = {"x": 940, "y": 20, "width": 120, "height": 120}
         with patch.object(ImageContentService, "_call_dalle_api", side_effect=fake_call_dalle_api), patch.object(
             ImageContentService, "_overlay_logo", return_value=("ZmFrZQ==", fake_geometry)
-        ), patch("cloudinary.uploader.upload", return_value={"secure_url": "https://cdn.example/final.png"}):
+        ), patch("app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://cdn.example/final.png")):
             result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id="507f1f77bcf86cd799439011",
                 brand_context=brand_context,
@@ -180,10 +180,10 @@ class TestV2GuideRespectsLogoPosition:
         assert result["success"] is True
         assert "prompt" in captured, "image generation call never happened"
         assert "top-right corner" in captured["prompt"]
-        assert "CRITICAL - LOGO OVERLAY ZONE" in captured["prompt"]
+        assert "CRITICAL - KEEP THE TOP-RIGHT CORNER PLAIN" in captured["prompt"]
         # Highest-weighted position in the prompt, matching the default
         # (non-V2) generation path's convention.
-        assert captured["prompt"].strip().startswith("🚨 CRITICAL - LOGO OVERLAY ZONE")
+        assert captured["prompt"].strip().startswith("🚨 CRITICAL - KEEP THE")
         # Move Logo needs both of these — previously neither was ever
         # returned from the V2 path, regardless of brand or platform, so a
         # V2-guide-generated post could never have its logo repositioned.
@@ -229,7 +229,7 @@ class TestV2GuideRespectsLogoPosition:
             )
 
         assert result["success"] is True
-        assert "LOGO OVERLAY ZONE" not in captured["prompt"]
+        assert "CRITICAL - KEEP THE" not in captured["prompt"]
 
 
 def _fake_response(image: "Image.Image"):
