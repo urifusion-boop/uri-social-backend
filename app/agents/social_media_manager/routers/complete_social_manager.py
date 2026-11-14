@@ -94,6 +94,11 @@ def _apply_intelligent_fallbacks(profile_data: Dict[str, Any], missing_fields: L
     return profile
 
 
+def video_draft_platform(target: str) -> str:
+    """The network behind a video target: "instagram_reels" -> "instagram", "facebook_reels" -> "facebook"."""
+    return target[: -len("_reels")] if target.endswith("_reels") else target
+
+
 def _get_user_id(token: dict) -> str | None:
     """
     Extract user_id from JWT payload.
@@ -2177,6 +2182,8 @@ async def tiktok_direct_callback(
                if refresh_expires_in is not None else {}),
             "account_name": display_name,
             "profile_picture_url": avatar_url,
+            # What the user actually ticked on TikTok's consent screen — they can untick scopes.
+            "granted_scopes": tokens.get("scope", ""),
             "connection_status": "pending_user_match",
             "connected_at": now.isoformat(),
             "updated_at": now.isoformat(),
@@ -3959,6 +3966,70 @@ async def set_tiktok_auto_add_music(
     return {"status": True, "responseMessage": "Updated", "responseData": {"tiktok_auto_add_music": request.enabled}}
 
 
+class InstagramAudioChoice(BaseModel):
+    audio_id: str = Field(..., pattern=r"^\d{1,40}$")
+    title: str = Field("", max_length=200)
+    artist: str = Field("", max_length=200)
+    audio_volume: int = Field(100, ge=1, le=100)   # the music
+    video_volume: int = Field(100, ge=1, le=100)   # the Reel's own sound
+
+
+class InstagramAudioRequest(BaseModel):
+    audio: Optional[InstagramAudioChoice] = None   # None removes the music
+
+
+@router.get("/instagram/audio/search")
+async def search_instagram_audio(
+    q: Optional[str] = Query(None, max_length=100),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Licensed music for an Instagram Reel (Instagram Audio API); trending when `q` is empty. Music
+    can only be attached to Reels — Instagram's API has no audio option for images, carousels or Stories."""
+    from app.agents.social_media_manager.services import instagram_audio
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": "instagram"},
+        {"_id": 0, "page_access_token": 1, "ig_user_id": 1},
+    )
+    if not conn or not conn.get("page_access_token") or not conn.get("ig_user_id"):
+        raise HTTPException(status_code=400, detail="No connected Instagram account found. Connect your account first.")
+    try:
+        tracks = await instagram_audio.search_music(conn["ig_user_id"], conn["page_access_token"], q)
+    except instagram_audio.AudioSearchError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return UriResponse.get_single_data_response("instagram_audio", {"tracks": tracks})
+
+
+@router.patch("/drafts/{draft_id}/instagram-audio")
+async def set_instagram_audio(
+    draft_id: str,
+    request: InstagramAudioRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Choose (or, with audio=null, remove) the music track for a Reel draft. Stored on the draft so an
+    immediate publish and a scheduled one both attach it (approval_workflow_service / video_publish_service)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    draft = await db["content_drafts"].find_one({"id": draft_id, "user_id": user_id}, {"_id": 0, "video_url": 1})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if not draft.get("video_url"):
+        raise HTTPException(status_code=400, detail="Instagram only supports music on Reels (video posts).")
+
+    audio = request.audio.model_dump() if request.audio else None
+    await db["content_drafts"].update_one(
+        {"id": draft_id, "user_id": user_id},
+        {"$set": {"instagram_audio": audio, "updated_at": datetime.utcnow()}},
+    )
+    return UriResponse.get_single_data_response("instagram_audio", {"instagram_audio": audio})
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
@@ -4526,6 +4597,28 @@ async def get_performance(
 
         published = [d for d in all_published if _is_recent(d)]
 
+        # Only what is connected right now: the Connected Accounts page's own list is the source of
+        # truth, so a platform / account that was disconnected (or never connected here) leaves no
+        # trace in the totals, the breakdowns or the top posts. If that list cannot be read, show
+        # everything rather than hide real data on a transient error.
+        def _norm_platform(pl):
+            pl = (pl or "").lower()
+            return "x" if pl == "twitter" else pl
+
+        connected_by_platform = None
+        try:
+            _conn_res = await SocialAccountService.get_user_connections(db, user_id, brand_id)
+            if _conn_res.get("status"):
+                connected_by_platform = {
+                    _norm_platform(pl): accs
+                    for pl, accs in ((_conn_res.get("responseData") or {}).get("connections") or {}).items()
+                    if accs
+                }
+        except Exception as _cn_err:
+            print(f"⚠️ performance: could not read connected accounts, not filtering: {_cn_err}", flush=True)
+        if connected_by_platform is not None:
+            published = [d for d in published if _norm_platform(d.get("platform")) in connected_by_platform]
+
         if not published:
             return UriResponse.get_single_data_response("performance", {
                 "has_data": False,
@@ -4546,18 +4639,32 @@ async def get_performance(
 
         # Load ANY Instagram connection that has a page_access_token (incl. Outstand-linked)
         # so we can look up media from Instagram even for Outstand-published posts.
+        # Every Instagram account connected to this brand, not just the first: a post is read with
+        # the token of the account it was published from, so a second account needs its own.
         all_ig_conns = await db["social_connections"].find(
             {**_conn_scope, "platform": "instagram", "page_access_token": {"$exists": True}},
-            {"_id": 0, "ig_user_id": 1, "page_access_token": 1},
-        ).to_list(length=5)
-        ig_direct = next((c for c in all_ig_conns if c.get("ig_user_id") and c.get("page_access_token")), None)
+            {"_id": 0, "ig_user_id": 1, "page_access_token": 1, "username": 1, "account_name": 1, "page_name": 1},
+        ).to_list(length=20)
+        ig_conns = [c for c in all_ig_conns if c.get("ig_user_id") and c.get("page_access_token")]
+        ig_direct = ig_conns[0] if ig_conns else None
 
         # Load Facebook direct connection for per-post analytics (same pattern as ig_direct)
         all_fb_conns = await db["social_connections"].find(
             {**_conn_scope, "platform": "facebook", "page_access_token": {"$exists": True}},
-            {"_id": 0, "page_id": 1, "page_access_token": 1},
-        ).to_list(length=5)
-        fb_direct = next((c for c in all_fb_conns if c.get("page_id") and c.get("page_access_token")), None)
+            {"_id": 0, "page_id": 1, "page_access_token": 1, "account_name": 1, "page_name": 1},
+        ).to_list(length=20)
+        fb_conns = [c for c in all_fb_conns if c.get("page_id") and c.get("page_access_token")]
+        fb_direct = fb_conns[0] if fb_conns else None
+
+        def _acct(conn, platform):
+            """Which connected account a post's numbers came from."""
+            if platform == "instagram":
+                return {"account_id": conn.get("ig_user_id"),
+                        "account_name": conn.get("username") or conn.get("account_name") or conn.get("page_name")}
+            if platform == "facebook":
+                return {"account_id": conn.get("page_id"),
+                        "account_name": conn.get("account_name") or conn.get("page_name")}
+            return {"account_id": conn.get("id"), "account_name": conn.get("account_name") or conn.get("username")}
 
         outstand = OutstandService()
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
@@ -4600,46 +4707,15 @@ async def get_performance(
                         return None
 
                     media_id = best_match["id"]
-                    media_type = best_match.get("media_type", "IMAGE")
-                    media_product_type = best_match.get("media_product_type", "")
-                    is_reel = media_product_type == "REELS" or media_type == "REELS"
-                    is_video = media_type == "VIDEO" and not is_reel
-
-                    if is_reel:
-                        metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
-                    elif is_video:
-                        metrics = "reach,saved,video_views,total_interactions"
-                    else:
-                        metrics = "reach,saved,total_interactions"
-
-                    impressions = reach = views = 0
-                    try:
-                        ins_resp = await _c.get(
-                            f"{_graph_base}/{media_id}/insights",
-                            params={"metric": metrics, "period": "lifetime", "access_token": token},
-                        )
-                        ins_data_ts = ins_resp.json()
-                        if "error" in ins_data_ts:
-                            print(f"⚠️ IG insights error for {media_id}: {ins_data_ts['error'].get('message')} (code {ins_data_ts['error'].get('code')})")
-                        else:
-                            for item in ins_data_ts.get("data", []):
-                                val = item.get("total_value", {}).get("value") or \
-                                      (item.get("values") or [{}])[0].get("value", 0)
-                                name = item["name"]
-                                if name == "impressions":
-                                    impressions = val
-                                elif name == "reach":
-                                    reach = val
-                                    impressions = impressions or val
-                                elif name in ("plays", "video_views"):
-                                    views = val
-                    except Exception as ins_e:
-                        print(f"⚠️ IG timestamp-lookup insights failed for {media_id}: {ins_e}")
+                    from app.agents.social_media_manager.services import direct_analytics as _da
+                    ins = await _da.instagram_media_insights(_c, _graph_base, media_id, token)
+                    views, reach, saves, shares = ins["views"], ins["reach"], ins["saves"], ins["shares"]
+                    impressions = views or reach
 
                     likes = best_match.get("like_count", 0)
                     comments = best_match.get("comments_count", 0)
                     effective_reach = reach or impressions
-                    print(f"[IG timestamp match] draft={draft.get('id')} media_id={media_id} diff={best_diff:.0f}s imp={impressions} reach={reach}")
+                    print(f"[IG timestamp match] draft={draft.get('id')} media_id={media_id} diff={best_diff:.0f}s views={views} reach={reach}")
                     return {
                         "draft_id": draft.get("id"),
                         "platform_post_id": media_id,
@@ -4649,11 +4725,12 @@ async def get_performance(
                         "image_url": draft.get("image_url"),
                         "likes": likes,
                         "comments": comments,
-                        "shares": 0,
+                        "shares": shares,
+                        "saves": saves,
                         "views": views,
                         "impressions": impressions,
                         "reach": reach,
-                        "engagement_rate": round(((likes + comments) / effective_reach) * 100, 2) if effective_reach else None,
+                        "engagement_rate": round(((likes + comments + shares) / effective_reach) * 100, 2) if effective_reach else None,
                     }
             except Exception as e:
                 print(f"⚠️ Instagram timestamp lookup failed: {e}")
@@ -4705,20 +4782,9 @@ async def get_performance(
                     comments = (best_match.get("comments") or {}).get("summary", {}).get("total_count", 0)
                     shares = (best_match.get("shares") or {}).get("count", 0)
 
-                    impressions = reach = 0
-                    try:
-                        ins_resp = await _c.get(
-                            f"{_graph_base}/{fb_post_id}/insights",
-                            params={"metric": "post_impressions,post_impressions_unique", "access_token": token},
-                        )
-                        for item in ins_resp.json().get("data", []):
-                            val = (item.get("values") or [{}])[-1].get("value", 0)
-                            if item.get("name") == "post_impressions":
-                                impressions = val
-                            elif item.get("name") == "post_impressions_unique":
-                                reach = val
-                    except Exception as ins_e:
-                        print(f"⚠️ FB post insights failed for {fb_post_id}: {ins_e}")
+                    from app.agents.social_media_manager.services import direct_analytics as _da
+                    fb_ins = await _da.facebook_post_insights(_c, _graph_base, fb_post_id, token)
+                    impressions, reach = fb_ins["views"], fb_ins["reach"]
 
                     effective = reach or impressions or 1
                     print(f"[FB timestamp match] draft={draft.get('id')} post_id={fb_post_id} diff={best_diff:.0f}s imp={impressions} reach={reach}")
@@ -4757,47 +4823,11 @@ async def get_performance(
                         print(f"⚠️ IG media fetch error for {media_id}: {media_data['error'].get('message')}")
                         return None
 
-                    media_type = media_data.get("media_type", "IMAGE")
-                    media_product_type = media_data.get("media_product_type", "")
-                    is_reel = media_product_type == "REELS" or media_type == "REELS"
-                    is_video = media_type == "VIDEO" and not is_reel
-
-                    # Instagram Graph API v22+ removed "impressions" from per-media insights.
-                    # Use "reach" + "total_interactions" for images/carousels.
-                    # Reels still support "plays" and "reach".
-                    if is_reel:
-                        metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
-                    elif is_video:
-                        metrics = "reach,saved,video_views,total_interactions"
-                    else:
-                        # IMAGE / CAROUSEL_ALBUM — impressions removed in v22+
-                        metrics = "reach,saved,total_interactions"
-
-                    impressions = reach = views = total_interactions = 0
-                    try:
-                        ins_resp = await _c.get(
-                            f"{_graph_base}/{media_id}/insights",
-                            params={"metric": metrics, "period": "lifetime", "access_token": token},
-                        )
-                        ins_data = ins_resp.json()
-                        if "error" in ins_data:
-                            print(f"⚠️ IG insights error for {media_id}: {ins_data['error'].get('message')} (code {ins_data['error'].get('code')})")
-                        else:
-                            for item in ins_data.get("data", []):
-                                val = item.get("total_value", {}).get("value") or \
-                                      (item.get("values") or [{}])[0].get("value", 0)
-                                name = item["name"]
-                                if name == "impressions":
-                                    impressions = val
-                                elif name == "reach":
-                                    reach = val
-                                    impressions = impressions or val  # use reach as impressions fallback
-                                elif name in ("plays", "video_views"):
-                                    views = val
-                                elif name == "total_interactions":
-                                    total_interactions = val
-                    except Exception as ins_err:
-                        print(f"⚠️ IG insights fetch failed for {media_id}: {ins_err}")
+                    from app.agents.social_media_manager.services import direct_analytics as _da
+                    ins = await _da.instagram_media_insights(_c, _graph_base, media_id, token)
+                    views, reach, saves, shares = ins["views"], ins["reach"], ins["saves"], ins["shares"]
+                    # Instagram retired per-media "impressions"; "views" is its replacement.
+                    impressions = views or reach
 
                 likes = media_data.get("like_count", 0)
                 comments = media_data.get("comments_count", 0)
@@ -4805,7 +4835,7 @@ async def get_performance(
                 # Engagement rate is only meaningful when we have reach/impressions.
                 # Return null when unavailable so the frontend shows "N/A" not "0%".
                 if effective_reach:
-                    eng_rate = round(((likes + comments) / effective_reach) * 100, 2)
+                    eng_rate = round(((likes + comments + shares) / effective_reach) * 100, 2)
                 else:
                     eng_rate = None
                 return {
@@ -4817,7 +4847,8 @@ async def get_performance(
                     "image_url": draft.get("image_url"),
                     "likes": likes,
                     "comments": comments,
-                    "shares": 0,
+                    "shares": shares,
+                    "saves": saves,
                     "views": views,
                     "impressions": impressions,
                     "reach": reach,
@@ -4861,6 +4892,93 @@ async def get_performance(
             }
 
         import re as _re
+        from app.agents.social_media_manager.services import direct_analytics as _da
+        from app.agents.social_media_manager.services import tiktok_direct_service as _ttd
+
+        async def _fetch_facebook_direct(draft, conn):
+            """A Page post published straight through the Graph API: its id is "{page}_{post}",
+            so read it directly instead of matching by time."""
+            post_id = draft.get("platform_post_id")
+            token = conn.get("page_access_token")
+            if not post_id or not token:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    post_resp = await _c.get(
+                        f"{_graph_base}/{post_id}",
+                        params={
+                            "fields": "reactions.summary(total_count),comments.summary(total_count),shares",
+                            "access_token": token,
+                        },
+                    )
+                    post = post_resp.json()
+                    if "error" in post:
+                        print(f"⚠️ FB post fetch error for {post_id}: {post['error'].get('message')}")
+                        return None
+                    likes = (post.get("reactions") or {}).get("summary", {}).get("total_count", 0)
+                    comments = (post.get("comments") or {}).get("summary", {}).get("total_count", 0)
+                    shares = (post.get("shares") or {}).get("count", 0)
+                    ins = await _da.facebook_post_insights(_c, _graph_base, post_id, token)
+                impressions, reach = ins["views"], ins["reach"]
+                effective = reach or impressions
+                return {
+                    "draft_id": draft.get("id"),
+                    "platform_post_id": post_id,
+                    "platform": "facebook",
+                    "content_preview": (draft.get("content") or "")[:120],
+                    "published_at": draft.get("published_date", ""),
+                    "image_url": draft.get("image_url"),
+                    "likes": likes,
+                    "comments": comments,
+                    "shares": shares,
+                    "clicks": ins["clicks"],
+                    "views": impressions,
+                    "impressions": impressions,
+                    "reach": reach,
+                    "engagement_rate": round(((likes + comments + shares) / effective) * 100, 2) if effective else None,
+                    "insights_available": effective > 0,
+                }
+            except Exception as e:
+                print(f"⚠️ Facebook direct analytics failed for {post_id}: {e}")
+                return None
+
+        # TikTok published straight through the Content Posting API is stored under TikTok's
+        # publish_id, not the video id, so read the account's recent videos once and match each
+        # draft to its video. A connection made before the read scopes were requested cannot
+        # be read at all — say so, rather than quietly showing zeros.
+        notices: list = []
+        tt_video_map: dict = {}   # draft id -> (TikTok video, the connection it was found on)
+        tt_drafts = [d for d in published if d.get("platform") == "tiktok"]
+        if tt_drafts:
+            try:
+                tt_conns = await db["social_connections"].find(
+                    {**_conn_scope, "platform": "tiktok", "connected_via": "tiktok_direct_oauth",
+                     "connection_status": "active"},
+                    {"_id": 0},
+                ).to_list(length=20)
+                if any(not _ttd.has_analytics_scopes(c) for c in tt_conns):
+                    notices.append({
+                        "platform": "tiktok",
+                        "code": "reconnect_for_analytics",
+                        "message": "Reconnect TikTok in Connected Accounts to see views, likes, comments and shares for your TikTok posts.",
+                    })
+                unmatched = list(tt_drafts)
+                for tt_conn in [c for c in tt_conns if _ttd.has_analytics_scopes(c)]:
+                    if not unmatched:
+                        break
+                    try:
+                        tt_token = await _ttd.get_valid_tiktok_access_token(db, tt_conn)
+                        tt_videos = await _ttd.list_videos(tt_token, 100)
+                    except Exception as _tt_conn_err:
+                        print(f"⚠️ TikTok direct analytics failed for {tt_conn.get('id')} (non-fatal): {_tt_conn_err}", flush=True)
+                        continue
+                    found = _da.match_tiktok_videos(unmatched, tt_videos)
+                    for draft_id, video in found.items():
+                        tt_video_map[draft_id] = (video, tt_conn)
+                    unmatched = [d for d in unmatched if d.get("id") not in found]
+                    print(f"[TikTok direct] {tt_conn.get('id')}: {len(tt_videos)} videos listed, {len(found)} drafts matched", flush=True)
+            except Exception as _tt_err:
+                print(f"⚠️ TikTok direct analytics failed (non-fatal): {_tt_err}", flush=True)
 
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
@@ -4885,9 +5003,39 @@ async def get_performance(
             # Always run this when post_id looks like a real IG media ID (15+ digits),
             # regardless of outstand_post_status — Outstand queues real IG media IDs too.
             if post_id and platform == "instagram" and is_ig_media_id:
-                conn = ig_direct or direct_conn_map.get(platform)
-                if conn and conn.get("page_access_token"):
+                for conn in (ig_conns or [c for c in [direct_conn_map.get(platform)] if c]):
+                    if not conn.get("page_access_token"):
+                        continue
                     live_result = await _fetch_instagram_direct(draft, conn)
+                    if live_result:
+                        live_result.update(_acct(conn, "instagram"))
+                        break
+
+            # Strategy 1b: Facebook Page post id ("{page}_{post}") — read it directly from Graph.
+            if live_result is None and platform == "facebook" and fb_conns and post_id \
+                    and _re.match(r'^\d+_\d+$', str(post_id)):
+                # The id starts with the Page it was posted on — try that Page first.
+                _page_of_post = str(post_id).split("_", 1)[0]
+                for conn in sorted(fb_conns, key=lambda c: str(c.get("page_id")) != _page_of_post):
+                    live_result = await _fetch_facebook_direct(draft, conn)
+                    if live_result:
+                        live_result.update(_acct(conn, "facebook"))
+                        break
+
+            # Strategy 1c: TikTok direct — the video matched from the account's video list.
+            if live_result is None and platform == "tiktok" and draft.get("id") in tt_video_map:
+                _tt_video, _tt_conn = tt_video_map[draft["id"]]
+                live_result = {
+                    "draft_id": draft.get("id"),
+                    "platform_post_id": _tt_video.get("id") or post_id or "",
+                    "platform": "tiktok",
+                    "content_preview": (draft.get("content") or "")[:120],
+                    "published_at": draft.get("published_date", ""),
+                    "image_url": draft.get("image_url") or _tt_video.get("cover_image_url"),
+                    **_da.tiktok_post_metrics(_tt_video),
+                    **_acct(_tt_conn, "tiktok"),
+                    "insights_available": True,
+                }
 
             # Strategy 2: Outstand-published post — get what Outstand has (likes/comments)
             if live_result is None and post_id and is_outstand_post and not str(post_id).startswith("urn:li:"):
@@ -4941,7 +5089,10 @@ async def get_performance(
                                     return int(v)
                         return 0
 
+                    _os_acct = (by_account[0].get("social_account") or {}) if by_account else {}
                     live_result = {
+                        "account_id": _os_acct.get("id"),
+                        "account_name": _os_acct.get("username") or _os_acct.get("nickname"),
                         "draft_id": draft.get("id"),
                         "platform_post_id": post_id,
                         "platform": network or platform,
@@ -4997,16 +5148,25 @@ async def get_performance(
 
             # Strategy 3: Instagram timestamp lookup — fills in impressions/reach that
             # Outstand doesn't sync, by finding the actual IG media via published_date.
-            if platform == "instagram" and ig_direct:
+            if platform == "instagram" and ig_conns:
                 needs_impressions = live_result is None or (live_result.get("impressions") or 0) == 0
                 if needs_impressions:
-                    ts_result = await _fetch_instagram_by_timestamp(draft, ig_direct)
+                    ts_result = None
+                    for conn in ig_conns:
+                        ts_result = await _fetch_instagram_by_timestamp(draft, conn)
+                        if ts_result:
+                            ts_result.update(_acct(conn, "instagram"))
+                            break
                     if ts_result:
                         if live_result:
                             # Merge: keep Outstand engagement counts, use IG for impressions/reach
                             live_result["impressions"] = ts_result["impressions"]
                             live_result["reach"] = ts_result.get("reach", 0)
                             live_result["views"] = ts_result.get("views", 0)
+                            live_result["saves"] = ts_result.get("saves", 0)
+                            live_result.update({k: ts_result[k] for k in ("account_id", "account_name") if ts_result.get(k)})
+                            if not live_result.get("shares"):
+                                live_result["shares"] = ts_result.get("shares", 0)
                             # Use IG likes/comments if Outstand had none
                             if not live_result.get("likes"):
                                 live_result["likes"] = ts_result.get("likes", 0)
@@ -5020,15 +5180,21 @@ async def get_performance(
                             live_result = ts_result
 
             # Strategy 3b: Facebook timestamp lookup — same pattern as Instagram above.
-            if platform == "facebook" and fb_direct:
+            if platform == "facebook" and fb_conns:
                 needs_fb_metrics = live_result is None or (live_result.get("impressions") or 0) == 0
                 if needs_fb_metrics:
-                    ts_result = await _fetch_facebook_by_timestamp(draft, fb_direct)
+                    ts_result = None
+                    for conn in fb_conns:
+                        ts_result = await _fetch_facebook_by_timestamp(draft, conn)
+                        if ts_result:
+                            ts_result.update(_acct(conn, "facebook"))
+                            break
                     if ts_result:
                         if live_result:
                             live_result["impressions"] = ts_result["impressions"]
                             live_result["reach"] = ts_result.get("reach", 0)
                             live_result["views"] = ts_result.get("impressions", 0)
+                            live_result.update({k: ts_result[k] for k in ("account_id", "account_name") if ts_result.get(k)})
                             if not live_result.get("likes"):
                                 live_result["likes"] = ts_result.get("likes", 0)
                             if not live_result.get("comments"):
@@ -5099,6 +5265,7 @@ async def get_performance(
             "total_comments": _sum("comments"),
             "total_shares": _sum("shares"),
             "total_views": _sum("views"),
+            "total_saves": _sum("saves"),
             "avg_engagement_rate": round(
                 sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
             ) if total_posts else 0,
@@ -5111,14 +5278,84 @@ async def get_performance(
         for p in posts:
             pl = p["platform"]
             if pl not in by_platform:
-                by_platform[pl] = {"posts": 0, "impressions": 0, "reach": 0, "likes": 0, "comments": 0, "shares": 0, "engagement_rate_sum": 0}
+                by_platform[pl] = {"posts": 0, "impressions": 0, "reach": 0, "views": 0, "likes": 0, "comments": 0, "shares": 0, "saves": 0, "engagement_rate_sum": 0}
             by_platform[pl]["posts"] += 1
-            for k in ("impressions", "reach", "likes", "comments", "shares"):
+            for k in ("impressions", "reach", "views", "likes", "comments", "shares", "saves"):
                 by_platform[pl][k] += p.get(k, 0) or 0
             by_platform[pl]["engagement_rate_sum"] += p.get("engagement_rate", 0) or 0
         for pl, data in by_platform.items():
             n = data["posts"]
             data["avg_engagement_rate"] = round(data.pop("engagement_rate_sum") / n, 2) if n else 0
+
+        # Per-account breakdown — every connected account of the brand appears, including ones with
+        # no posts in the range. A post is attributed to the account its numbers were read from;
+        # one that could not be (analytics read from a stored copy) goes to the platform's only
+        # account when there is exactly one, and otherwise stays "unattributed" rather than guessed.
+        _social_platforms = ("instagram", "facebook", "tiktok", "x", "twitter", "youtube", "threads", "bluesky", "pinterest")
+        def _account_key(platform, value):
+            """Facebook direct ids are "fb_<page id>" while posts carry the bare page id."""
+            value = str(value)
+            return value[3:] if platform == "facebook" and value.startswith("fb_") else value
+
+        # One canonical id per connected account, and every other id it is known by (an account
+        # can carry an Instagram / Page id, an Outstand id and a local id) pointing back to it.
+        accounts_by_platform: dict = {}   # platform -> {canonical id: name}
+        alias_to_account: dict = {}       # platform -> {any id: canonical id}
+        for pl, accs in (connected_by_platform or {}).items():
+            if pl not in _social_platforms:
+                continue
+            for a in accs:
+                keys = [_account_key(pl, k) for k in (a.get("ig_user_id"), a.get("outstand_account_id"), a.get("id")) if k]
+                if not keys:
+                    continue
+                accounts_by_platform.setdefault(pl, {})[keys[0]] = (
+                    a.get("username") or a.get("account_name") or a.get("page_name") or pl
+                )
+                for k in keys:
+                    alias_to_account.setdefault(pl, {})[k] = keys[0]
+
+        by_account: dict = {}
+
+        def _bucket(platform, account_id, account_name):
+            key = f"{platform}:{account_id or 'unattributed'}"
+            if key not in by_account:
+                by_account[key] = {
+                    "account_id": account_id, "platform": platform, "account_name": account_name,
+                    "posts": 0, "impressions": 0, "reach": 0, "views": 0, "likes": 0,
+                    "comments": 0, "shares": 0, "saves": 0, "engagement_rate_sum": 0,
+                }
+            return by_account[key]
+
+        for pl, accts in accounts_by_platform.items():
+            for aid, name in accts.items():
+                _bucket(pl, aid, name)
+        for p in posts:
+            pl = _norm_platform(p.get("platform"))
+            known = accounts_by_platform.get(pl, {})
+            aid = alias_to_account.get(pl, {}).get(_account_key(pl, p["account_id"])) if p.get("account_id") else None
+            if not aid and p.get("account_name"):
+                # an id from a system we don't list it under — match the account by name
+                aid = next((k for k, n in known.items() if n.lower() == str(p["account_name"]).lower()), None)
+            if not aid and len(known) == 1:
+                aid = next(iter(known))
+            if aid:
+                name = known[aid]
+            elif len(known) > 1:
+                name = f"{pl} (account not recorded)"
+            else:
+                continue   # nothing connected on this platform — not shown
+            b = _bucket(pl, aid, name)
+            b["posts"] += 1
+            for k in ("impressions", "reach", "views", "likes", "comments", "shares", "saves"):
+                b[k] += p.get(k, 0) or 0
+            b["engagement_rate_sum"] += p.get("engagement_rate", 0) or 0
+        by_account_list = []
+        for b in by_account.values():
+            n = b["posts"]
+            b["avg_engagement_rate"] = round(b.pop("engagement_rate_sum") / n, 2) if n else 0
+            if n or b["account_id"]:   # an unattributed bucket with no posts is just noise
+                by_account_list.append(b)
+        by_account_list.sort(key=lambda b: (b["platform"], -b["posts"]))
 
         # Top posts by impressions
         top_posts = sorted(posts, key=lambda x: x.get("impressions", 0), reverse=True)[:10]
@@ -5129,7 +5366,9 @@ async def get_performance(
             "date_range_days": days,
             "summary": summary,
             "by_platform": by_platform,
+            "by_account": by_account_list,
             "top_posts": top_posts,
+            "notices": notices,
         })
 
     except Exception as e:
@@ -5173,6 +5412,16 @@ async def get_account_metrics(
             print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
             outstand_accounts = []
 
+        # Accounts the user explicitly disconnected stay out even if Outstand still lists them
+        # (the same record the Connected Accounts page filters on).
+        _is_personal = (not brand_id) or brand_id == _BA.personal_brand_id(user_id)
+        _tombstone_scope = {"user_id": user_id} if _is_personal else {"brand_id": brand_id}
+        _disconnected_ids = {
+            d["outstand_account_id"]
+            async for d in db["disconnected_accounts"].find(_tombstone_scope, {"outstand_account_id": 1})
+        }
+        outstand_accounts = [a for a in outstand_accounts if a.get("id") not in _disconnected_ids]
+
         async def _fetch_outstand_metrics(acc):
             account_id = acc.get("id")
             if not account_id:
@@ -5209,9 +5458,10 @@ async def get_account_metrics(
 
         # ── Direct (non-Outstand) connections scoped to active brand ──────────
         direct_conns = await db["social_connections"].find(
-            {**_conn_scope, "connected_via": {"$ne": "outstand"}},
-            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
-             "ig_user_id": 1, "page_name": 1, "page_id": 1, "account_name": 1},
+            {**_conn_scope, "connected_via": {"$ne": "outstand"}, "connection_status": "active"},
+            {"_id": 0, "id": 1, "platform": 1, "connected_via": 1, "connection_status": 1,
+             "page_access_token": 1, "ig_user_id": 1, "page_name": 1, "page_id": 1, "account_name": 1,
+             "profile_picture_url": 1},
         ).to_list(length=20)
 
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
@@ -5280,6 +5530,9 @@ async def get_account_metrics(
                     except Exception as ig_ins_err:
                         print(f"⚠️ IG account insights failed: {ig_ins_err}")
 
+                    from app.agents.social_media_manager.services import direct_analytics as _da
+                    ig_extras = await _da.instagram_account_extras(_c, _graph_base, ig_user_id, token, since_ts, until_ts)
+
                     # Aggregate per-post engagement in the period
                     posts_resp = await _c.get(
                         f"{_graph_base}/{ig_user_id}/media",
@@ -5340,11 +5593,14 @@ async def get_account_metrics(
                         "views": total_impressions,
                         "likes": total_likes,
                         "comments": total_comments,
-                        "shares": 0,
+                        "shares": ig_extras["shares"],
                         "reposts": 0,
                         "quotes": 0,
                         "reach": total_reach,
                         "profile_views": total_profile_views,
+                        "saves": ig_extras["saves"],
+                        "accounts_engaged": ig_extras["accounts_engaged"],
+                        "profile_link_taps": ig_extras["profile_link_taps"],
                     },
                     "engagement_note": f"Total views (posts + reels + stories) for the last {days} days via Instagram Insights API",
                     "platform_specific": {
@@ -5354,6 +5610,7 @@ async def get_account_metrics(
                         "views": total_views or total_impressions,
                         "reach": total_reach,
                         "profile_views": total_profile_views,
+                        "daily_reach": ig_extras["daily_reach"],
                     },
                     "period": {"since": since_ts, "until": until_ts},
                 }
@@ -5448,6 +5705,7 @@ async def get_account_metrics(
                 total_impressions = total_reach = 0
                 total_likes = total_comments = total_shares = 0
                 posts_count = 0
+                fb_page = {"engagements": 0, "new_follows": 0, "daily_views": [], "daily_reach": []}
 
                 async with _httpx.AsyncClient(timeout=30) as _c:
                     # 1. Page profile — followers, name, category
@@ -5463,26 +5721,12 @@ async def get_account_metrics(
                     else:
                         print(f"⚠️ FB page profile error: {profile.get('error', {}).get('message')}")
 
-                    # 2. Page-level insights — impressions, reach
-                    try:
-                        ins_resp = await _c.get(
-                            f"{_graph_base}/{page_id}/insights",
-                            params={
-                                "metric": "page_impressions,page_reach",
-                                "period": "day",
-                                "since": since_ts,
-                                "until": until_ts,
-                                "access_token": token,
-                            },
-                        )
-                        for item in ins_resp.json().get("data", []):
-                            daily_total = sum(v.get("value", 0) for v in (item.get("values") or []))
-                            if item.get("name") == "page_impressions":
-                                total_impressions = daily_total
-                            elif item.get("name") == "page_reach":
-                                total_reach = daily_total
-                    except Exception as ins_err:
-                        print(f"⚠️ FB insights failed: {ins_err}")
+                    # 2. Page-level insights — views, reach, engagements, new follows (Meta's
+                    # current "media view" metrics; the retired page_impressions is the fallback)
+                    from app.agents.social_media_manager.services import direct_analytics as _da
+                    fb_page = await _da.facebook_page_insights(_c, _graph_base, page_id, token, since_ts, until_ts)
+                    total_impressions = fb_page["views"]
+                    total_reach = fb_page["reach"]
 
                     # 3. Real post engagement — reactions (likes), comments, shares from Graph API
                     try:
@@ -5525,6 +5769,8 @@ async def get_account_metrics(
                         "reposts": 0,
                         "quotes": 0,
                         "reach": total_reach,
+                        "post_engagements": fb_page["engagements"],
+                        "new_follows": fb_page["new_follows"],
                     },
                     "engagement_note": f"Facebook Page metrics for the last {days} days (live Graph API)",
                     "platform_specific": {
@@ -5532,6 +5778,8 @@ async def get_account_metrics(
                         "category": category,
                         "impressions": total_impressions,
                         "reach": total_reach,
+                        "daily_views": fb_page["daily_views"],
+                        "daily_reach": fb_page["daily_reach"],
                     },
                     "period": {"since": since_ts, "until": until_ts},
                 }
@@ -5539,8 +5787,94 @@ async def get_account_metrics(
                 print(f"⚠️ Facebook direct account metrics failed: {e}")
                 return None
 
+        async def _fetch_tiktok_direct_metrics(conn):
+            """A direct TikTok connection: profile totals (followers, likes, videos) and what
+            the account's videos gained in the period, read through TikTok's Display API."""
+            from app.agents.social_media_manager.services import tiktok_direct_service as _ttd
+            if conn.get("connection_status") != "active" or not conn.get("id"):
+                return None
+            account_name = conn.get("account_name") or "TikTok"
+            base = {
+                "account_id": conn["id"],
+                "network": "tiktok",
+                "page_name": account_name,
+                "category": None,
+                "followers_count": 0,
+                "following_count": None,
+                "posts_count": None,
+                "engagement": None,
+                "period": {"since": since_ts, "until": until_ts},
+            }
+            try:
+                full = await db["social_connections"].find_one({"id": conn["id"]}, {"_id": 0})
+                if not full:
+                    return None
+                if not _ttd.has_analytics_scopes(full):
+                    return {**base,
+                            "needs_reconnect": True,
+                            "engagement_note": "Reconnect TikTok in Connected Accounts to see followers, views, likes, comments and shares.",
+                            "platform_specific": {"profile_picture_url": conn.get("profile_picture_url")}}
+                token = await _ttd.get_valid_tiktok_access_token(db, full)
+                stats_r, videos_r = await _asyncio.gather(
+                    _ttd.fetch_user_stats(token), _ttd.list_videos(token, 100), return_exceptions=True
+                )
+                if isinstance(stats_r, Exception) and isinstance(videos_r, Exception):
+                    raise stats_r
+                stats = {} if isinstance(stats_r, Exception) else stats_r
+                videos = [] if isinstance(videos_r, Exception) else videos_r
+                if isinstance(stats_r, Exception):
+                    print(f"⚠️ TikTok user stats failed: {stats_r}")
+                if isinstance(videos_r, Exception):
+                    print(f"⚠️ TikTok video list failed: {videos_r}")
+
+                in_period = [v for v in videos if (v.get("create_time") or 0) >= since_ts]
+                def _t(key):
+                    return sum(int(v.get(key) or 0) for v in in_period)
+                recent = sorted(in_period, key=lambda v: int(v.get("view_count") or 0), reverse=True)[:6]
+                return {
+                    **base,
+                    "page_name": stats.get("display_name") or account_name,
+                    "followers_count": int(stats.get("follower_count") or 0),
+                    "following_count": stats.get("following_count"),
+                    "posts_count": stats.get("video_count"),
+                    "engagement": {
+                        "views": _t("view_count"),
+                        "likes": _t("like_count"),
+                        "comments": _t("comment_count"),
+                        "shares": _t("share_count"),
+                        "reposts": None,
+                        "quotes": None,
+                        "videos_in_period": len(in_period),
+                    },
+                    "engagement_note": f"Views, likes, comments and shares on the {len(in_period)} video(s) you posted in the last {days} days (TikTok totals so far).",
+                    "platform_specific": {
+                        "profile_picture_url": stats.get("avatar_url") or conn.get("profile_picture_url"),
+                        "total_likes_received": stats.get("likes_count"),
+                        "recent_videos": [
+                            {
+                                "id": v.get("id"),
+                                "title": (v.get("title") or v.get("video_description") or "")[:120],
+                                "cover_url": v.get("cover_image_url"),
+                                "share_url": v.get("share_url"),
+                                "created_at": v.get("create_time"),
+                                "duration": v.get("duration"),
+                                "views": int(v.get("view_count") or 0),
+                                "likes": int(v.get("like_count") or 0),
+                                "comments": int(v.get("comment_count") or 0),
+                                "shares": int(v.get("share_count") or 0),
+                            }
+                            for v in recent
+                        ],
+                    },
+                }
+            except Exception as e:
+                print(f"⚠️ TikTok direct account metrics failed: {e}")
+                return None
+
         async def _fetch_direct_metrics(conn):
             platform = conn.get("platform", "")
+            if platform == "tiktok" and conn.get("connected_via") == "tiktok_direct_oauth":
+                return await _fetch_tiktok_direct_metrics(conn)
             connected_via = conn.get("connected_via", "")
             if connected_via in ("instagram_direct", "instagram_direct_oauth") or platform == "instagram":
                 return await _fetch_instagram_direct_metrics(conn)
@@ -5553,6 +5887,28 @@ async def get_account_metrics(
             _asyncio.gather(*[_fetch_direct_metrics(c) for c in direct_conns]),
             _asyncio.gather(*[_fetch_linkedin_direct_metrics(c) for c in linkedin_conns]),
         )
+
+        # A TikTok account connected both ways would show twice: keep the direct one, which
+        # carries the richer numbers.
+        _has_tiktok_direct = any(r and r.get("network") == "tiktok" for r in direct_results)
+        if _has_tiktok_direct:
+            outstand_results = [r for r in outstand_results if not (r and r.get("network") == "tiktok")]
+
+        # The same Instagram / Facebook account connected both through Outstand and directly would
+        # list twice: keep the direct one (richer numbers), matched on network + name.
+        def _acct_names(r):
+            ps = r.get("platform_specific") or {}
+            return {str(n).strip().lower().lstrip("@") for n in (r.get("page_name"), ps.get("username")) if n}
+        _direct_seen = {
+            (r["network"], n)
+            for r in direct_results if r and r.get("network") in ("instagram", "facebook")
+            for n in _acct_names(r)
+        }
+        outstand_results = [
+            r for r in outstand_results
+            if not (r and r.get("network") in ("instagram", "facebook")
+                    and any((r["network"], n) in _direct_seen for n in _acct_names(r)))
+        ]
 
         account_metrics = [r for r in (*outstand_results, *direct_results, *linkedin_results) if r is not None]
 
@@ -5570,110 +5926,6 @@ async def get_account_metrics(
 # ==============================================================================
 # UTILITY ENDPOINTS
 # ==============================================================================
-
-@router.get("/debug/outstand-account-metrics/{account_id}")
-async def debug_outstand_account_metrics(
-    account_id: str,
-    days: int = 30,
-    token: dict = Depends(flexible_token)
-):
-    """Return raw Outstand account metrics response for debugging field mapping."""
-    import time as _time
-    from datetime import timedelta
-    try:
-        until_ts = int(_time.time())
-        since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
-        outstand = OutstandService()
-        data = await outstand.get_account_metrics(account_id, since=since_ts, until=until_ts)
-        return UriResponse.get_single_data_response("debug_account_metrics", data)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/debug/outstand-post/{post_id}")
-async def debug_outstand_post(
-    post_id: str,
-    token: dict = Depends(flexible_token)
-):
-    """Fetch the live status of an Outstand post by its ID."""
-    try:
-        outstand = OutstandService()
-        data = await outstand.get_post(post_id)
-        return UriResponse.get_single_data_response("outstand_post", data)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/debug/outstand-analytics/{post_id}")
-async def debug_outstand_analytics(
-    post_id: str,
-    token: dict = Depends(flexible_token)
-):
-    """Return the raw Outstand analytics response for a post — shows exactly what fields are available."""
-    try:
-        outstand = OutstandService()
-        data = await outstand.get_post_analytics(post_id)
-        return UriResponse.get_single_data_response("outstand_analytics", data)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/debug/performance-raw")
-async def debug_performance_raw(
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(flexible_token),
-):
-    """Show raw published drafts + their platform_post_id and outstand markers for this user."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-    drafts = await db["content_drafts"].find(
-        {"user_id": user_id, "status": "published"},
-        {"_id": 0, "id": 1, "platform": 1, "platform_post_id": 1,
-         "outstand_post_status": 1, "published_date": 1,
-         "publish_response": {"$exists": True}},
-    ).sort("published_date", -1).to_list(length=20)
-    conns = await db["social_connections"].find(
-        {"user_id": user_id},
-        {"_id": 0, "platform": 1, "connected_via": 1, "ig_user_id": 1,
-         "has_page_token": {"$cond": [{"$ifNull": ["$page_access_token", False]}, True, False]}},
-    ).to_list(length=10)
-    return UriResponse.get_single_data_response("debug_performance", {
-        "drafts": drafts,
-        "connections": conns,
-    })
-
-@router.get("/debug/connections-raw")
-async def debug_connections_raw(
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(flexible_token),
-):
-    """
-    Show the raw social_connections documents for the current user.
-    Exposes connected_via, ig_user_id, page_id, and whether page_access_token is present.
-    Used to diagnose Instagram/Facebook routing issues.
-    """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
-    conns = await db["social_connections"].find({"user_id": user_id}).to_list(length=50)
-    result = []
-    for c in conns:
-        result.append({
-            "id": c.get("id"),
-            "platform": c.get("platform"),
-            "connected_via": c.get("connected_via"),
-            "connection_status": c.get("connection_status"),
-            "ig_user_id": c.get("ig_user_id"),
-            "page_id": c.get("page_id"),
-            "has_page_access_token": bool(c.get("page_access_token")),
-            "outstand_account_id": c.get("outstand_account_id"),
-            "username": c.get("username"),
-            "created_at": c.get("created_at"),
-            "updated_at": c.get("updated_at"),
-        })
-    return UriResponse.get_single_data_response("connections_raw", result)
 
 
 @router.get("/platform-requirements/{platform}")
@@ -8124,7 +8376,10 @@ async def save_video_draft(
             "id": draft_id,
             "draft_id": draft_id,
             "request_id": request_id,
-            "platform": platform,
+            # The video screens name a target "instagram_reels" / "facebook_reels", but a draft's `platform`
+            # is the network, which is what the connections, the Library's "is it connected" check and the
+            # approval/scheduling path all look up. `platforms` keeps the name the screen sent.
+            "platform": video_draft_platform(platform),
             "platforms": [platform],
             "user_id": user_id,
             "media_type": "video",
@@ -8256,6 +8511,7 @@ async def publish_video_draft(
         conn,
         db,
         tiktok_settings,
+        instagram_audio=draft.get("instagram_audio") if request.platform == "instagram_reels" else None,
     )
 
     return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})

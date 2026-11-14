@@ -11,11 +11,21 @@ from app.agents.jane_ads.adapters.tiktok import _best_tiktok_interest
 from tests.test_jane_ads_tiktok_adapter import _adapter, _auth, _plan, _run
 from tests.test_jane_ads_tiktok_launch_fixes import _RoutedClient
 
+# TikTok lists video and creator categories together; each says which it is, and ids are only unique within a scene.
 ACTION_CATEGORIES = {"action_categories": [
-    {"action_category_id": "30", "action_category_name": "Education", "sub_category_ids": []},
-    {"action_category_id": "31", "action_category_name": "Food & Beverage", "sub_category_ids": []},
+    {"action_category_id": "30", "action_scene": "VIDEO_RELATED", "name": "Education", "level": 1},
+    {"action_category_id": "31", "action_scene": "VIDEO_RELATED", "name": "Food & Beverage", "level": 1},
+    {"action_category_id": "30", "action_scene": "CREATOR_RELATED", "name": "Education", "level": 1},
+    {"action_category_id": "7", "action_scene": "CREATOR_RELATED", "name": "Comedy", "level": 1},
 ]}
 HASHTAGS = {"hashtags": [{"hashtag_id": "h1", "hashtag_name": "learnontiktok"}, {"hashtag_id": "h2", "hashtag_name": "study"}]}
+
+
+@pytest.fixture(autouse=True)
+def _no_model_calls():
+    """No test reaches a real model: with no key, the category choice answers nothing."""
+    with patch.object(bt.settings, "jane_ads_openai_key", "", create=True):
+        yield
 
 
 def _lookups(**by_path):
@@ -46,17 +56,82 @@ def test_entries_are_found_however_the_response_nests_them():
 def test_video_and_hashtag_audiences_are_built_for_the_plans_topics():
     got = _resolve(["Education"], **{"/tool/action_category/": ACTION_CATEGORIES, "/tool/hashtag/recommend/": HASHTAGS})
     scenes = {a["action_scene"]: a for a in got.actions}
-    assert set(scenes) == {"VIDEO_RELATED", "HASHTAG_RELATED"}              # TikTok rejects creator ids, so none are sent
+    assert set(scenes) == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}
     assert scenes["VIDEO_RELATED"]["action_category_ids"] == ["30"]
     assert scenes["VIDEO_RELATED"]["video_user_actions"] == ["WATCHED_TO_END", "LIKED", "COMMENTED", "SHARED"]
     assert scenes["VIDEO_RELATED"]["action_period"] == 15
+    assert scenes["CREATOR_RELATED"] == {"action_scene": "CREATOR_RELATED", "action_period": 0,
+                                         "video_user_actions": ["FOLLOWING", "VIEW_HOMEPAGE"],
+                                         "action_category_ids": ["30"]}
     assert scenes["HASHTAG_RELATED"] == {"action_scene": "HASHTAG_RELATED", "action_period": 0,
                                          "video_user_actions": ["VIEW_HASHTAG"], "action_category_ids": ["h1", "h2"]}
 
 
-def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience():
+def test_each_scene_is_matched_only_against_its_own_categories():
+    pool = {"action_categories": [
+        {"action_category_id": "1", "action_scene": "VIDEO_RELATED", "name": "Education"},
+        {"action_category_id": "9", "action_scene": "CREATOR_RELATED", "name": "Comedy"},
+    ]}
+    got = _resolve(["Education"], **{"/tool/action_category/": pool})
+    assert [a["action_scene"] for a in got.actions] == ["VIDEO_RELATED"]   # no "Education" creator category exists
+
+
+def test_a_topic_with_no_matching_category_adds_no_video_or_creator_audience_when_no_broad_one_exists():
     got = _resolve(["Quantum plumbing"], **{"/tool/action_category/": ACTION_CATEGORIES})
     assert got.actions == []
+
+
+def test_when_no_category_matches_by_name_the_choice_is_made_from_the_scenes_own_list():
+    pool = {"action_categories": [
+        {"action_category_id": "5", "action_scene": "VIDEO_RELATED", "name": "Culture & Education & Technology"},
+        {"action_category_id": "7", "action_scene": "VIDEO_RELATED", "name": "Comedy"},
+        {"action_category_id": "8", "action_scene": "CREATOR_RELATED", "name": "Motivation & Advice"},
+    ]}
+    chosen = {}
+
+    async def fake_choose(names, scoped, limit):
+        chosen[scoped[0]["name"]] = [e["id"] for e in scoped]
+        return [scoped[0]["id"], "not-in-the-list"][:1]
+
+    with patch.object(bt, "_choose_categories", side_effect=fake_choose):
+        got = _resolve(["Digital marketing (marketing)"], **{"/tool/action_category/": pool})
+    scenes = {a["action_scene"]: a["action_category_ids"] for a in got.actions}
+    assert scenes == {"VIDEO_RELATED": ["5"], "CREATOR_RELATED": ["8"]}
+    assert chosen["Culture & Education & Technology"] == ["5", "7"]            # each scene is offered only its own
+
+
+def test_a_model_answer_is_trusted_only_for_ids_that_are_in_the_list():
+    scoped = [{"id": "5", "name": "A"}, {"id": "6", "name": "B"}]
+
+    class _Completions:
+        async def create(self, **kw):
+            from types import SimpleNamespace as NS
+            return NS(choices=[NS(message=NS(content='{"ids": ["6", "999", "5", "6"]}'))])
+
+    class _Client:
+        def __init__(self, **kw):
+            self.chat = type("C", (), {"completions": _Completions()})()
+
+    import sys, types
+    fake_openai = types.ModuleType("openai"); fake_openai.AsyncOpenAI = _Client
+    with patch.dict(sys.modules, {"openai": fake_openai}), patch.object(bt.settings, "jane_ads_openai_key", "k", create=True):
+        assert _run(bt._choose_categories(["x"], scoped, 2)) == ["6", "5"]
+        assert _run(bt._choose_categories(["x"], [], 2)) == []
+    with patch.object(bt.settings, "jane_ads_openai_key", "", create=True):
+        assert _run(bt._choose_categories(["x"], scoped, 2)) == []              # no key: caller falls back
+
+
+def test_topics_no_category_fits_use_the_broad_business_categories_in_each_scene():
+    pool = {"action_categories": [
+        {"action_category_id": "5", "action_scene": "VIDEO_RELATED", "name": "Business & Finance"},
+        {"action_category_id": "6", "action_scene": "VIDEO_RELATED", "name": "Technology"},
+        {"action_category_id": "7", "action_scene": "VIDEO_RELATED", "name": "Comedy"},
+        {"action_category_id": "8", "action_scene": "CREATOR_RELATED", "name": "Business"},
+    ]}
+    with patch.object(bt, "_choose_categories", new=AsyncMock(return_value=[])):        # model unavailable
+        got = _resolve(["Digital marketing (marketing)", "Email marketing (marketing)"], **{"/tool/action_category/": pool})
+    scenes = {a["action_scene"]: a["action_category_ids"] for a in got.actions}
+    assert scenes == {"VIDEO_RELATED": ["5", "6"], "CREATOR_RELATED": ["8"]}
 
 
 def test_no_topics_means_nothing_is_looked_up():
@@ -81,6 +156,39 @@ def test_purchase_intention_is_looked_up_only_when_asked_for():
     assert _resolve(["Education"], False, **{"/tool/interest_keyword/recommend/": PURCHASE}).purchase_intention_keyword_ids == []
 
 
+def test_a_multi_word_topic_finds_hashtags_through_its_key_word_or_the_run_together_form():
+    asked = []
+
+    async def fake(path, params, token):
+        if path != "/tool/hashtag/recommend/":
+            return None
+        asked.append(params["keywords"])
+        return HASHTAGS if params["keywords"] == '["marketing"]' else {"recommend_keywords": []}
+
+    with patch.object(bt, "_lookup", side_effect=fake):
+        got = _run(bt.resolve_behavior_targeting(["Social media marketing (marketing)"], "adv1", "tok",
+                                                 _best_tiktok_interest))
+    hashtag = [a for a in got.actions if a["action_scene"] == "HASHTAG_RELATED"]
+    assert hashtag and hashtag[0]["action_category_ids"] == ["h1", "h2"]
+    assert '["marketing"]' in asked and '["socialmediamarketing"]' in asked      # the key word, and the run-together form
+
+
+def test_purchase_intention_searches_plain_words_and_falls_back_to_semantic_search():
+    asked = []
+
+    async def fake(path, params, token):
+        if path != "/tool/interest_keyword/recommend/":
+            return None
+        asked.append((params["keyword"], params["mode"]))
+        return PURCHASE if params["mode"] == "SEMANTIC_RECOMMEND" else {"recommended_keywords": []}
+
+    with patch.object(bt, "_lookup", side_effect=fake):
+        got = _run(bt.resolve_behavior_targeting(["Parenting (children and parenting)"], "adv1", "tok",
+                                                 _best_tiktok_interest, True))
+    assert asked == [("Parenting", "FUZZ_MATCH"), ("Parenting", "SEMANTIC_RECOMMEND")]   # no Meta qualifier
+    assert got.purchase_intention_keyword_ids == ["p1", "p2"]
+
+
 def test_purchase_intention_goes_with_the_interactions_on_every_objective():
     t = bt.BehaviorTargeting(actions=[{"action_scene": "VIDEO_RELATED"}], purchase_intention_keyword_ids=["p1"])
     assert t.fields() == {"actions": [{"action_scene": "VIDEO_RELATED"}], "purchase_intention_keyword_ids": ["p1"]}
@@ -92,6 +200,8 @@ def test_attempts_go_from_everything_down_to_nothing():
     assert t.attempts() == [
         {"actions": [video, hashtag], "purchase_intention_keyword_ids": ["p1"]},   # everything
         {"actions": [video, hashtag]},                                              # without purchase intention
+        {"actions": [video], "purchase_intention_keyword_ids": ["p1"]},             # all but the last interaction
+        {"actions": [hashtag], "purchase_intention_keyword_ids": ["p1"]},           # all but the first
         {"actions": [video]}, {"actions": [hashtag]},                               # one interaction at a time
         {"purchase_intention_keyword_ids": ["p1"]},                                 # purchase intention alone
         {},                                                                         # nothing
@@ -143,7 +253,7 @@ def test_the_launched_ad_group_carries_the_interactions_next_to_the_interests():
     body = client.sent("/adgroup/create/")[0]
     assert result.launched is True
     assert body["interest_category_ids"] == ["10"]
-    assert {a["action_scene"] for a in body["actions"]} == {"VIDEO_RELATED", "HASHTAG_RELATED"}
+    assert {a["action_scene"] for a in body["actions"]} == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}
     assert body["purchase_intention_keyword_ids"] == ["p1"]
 
 
@@ -157,12 +267,22 @@ def test_if_tiktok_rejects_every_extra_audience_the_ad_group_is_made_without_the
 
 
 def test_one_scene_tiktok_does_not_accept_does_not_cost_the_others():
-    # whole set rejected, and the hashtag scene is the bad one: the video scene alone is accepted
+    # whole set rejected, and the hashtag scene is the bad one: the video and creator scenes are still accepted
     client = _PickyAdGroup(lambda body: any(a["action_scene"] == "HASHTAG_RELATED" for a in body.get("actions", [])))
     result = _launch_with_interests(client)
     final = client.sent("/adgroup/create/")[-1]
     assert result.launched is True
-    assert [a["action_scene"] for a in final["actions"]] == ["VIDEO_RELATED"]
+    assert {a["action_scene"] for a in final["actions"]} == {"VIDEO_RELATED", "CREATOR_RELATED"}
+    assert final["purchase_intention_keyword_ids"] == ["p1"]
+
+
+def test_if_only_the_creator_scene_is_refused_the_other_interactions_are_kept():
+    client = _PickyAdGroup(lambda body: any(a["action_scene"] == "CREATOR_RELATED" for a in body.get("actions", [])))
+    result = _launch_with_interests(client)
+    final = client.sent("/adgroup/create/")[-1]
+    assert result.launched is True
+    assert {a["action_scene"] for a in final["actions"]} == {"VIDEO_RELATED", "HASHTAG_RELATED"}
+    assert final["purchase_intention_keyword_ids"] == ["p1"]                    # only the refused audience is dropped
 
 
 def test_hashtag_keywords_are_plain_words_not_metas_qualified_names():
@@ -177,4 +297,4 @@ def test_if_tiktok_does_not_accept_purchase_intention_the_interactions_are_kept(
     final = client.sent("/adgroup/create/")[-1]
     assert result.launched is True
     assert "purchase_intention_keyword_ids" not in final
-    assert {a["action_scene"] for a in final["actions"]} == {"VIDEO_RELATED", "HASHTAG_RELATED"}
+    assert {a["action_scene"] for a in final["actions"]} == {"VIDEO_RELATED", "CREATOR_RELATED", "HASHTAG_RELATED"}

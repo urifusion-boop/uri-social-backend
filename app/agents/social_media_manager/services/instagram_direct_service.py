@@ -464,9 +464,11 @@ class InstagramDirectService:
         video_url: str,
         caption: str = "",
         page_id: Optional[str] = None,
+        audio: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Publish a Reel to Instagram via Graph API.
+        Publish a Reel to Instagram via Graph API. `audio` is the draft's chosen music track
+        (see instagram_audio.clean_choice), attached through audio_configuration.
 
         Steps:
           1. POST /{ig_user_id}/media with media_type=REELS and video_url.
@@ -480,22 +482,31 @@ class InstagramDirectService:
         if not video_url.startswith("https://"):
             return {"success": False, "error": f"Reel video_url must be a public HTTPS URL (got: {video_url[:80]})."}
 
+        from app.agents.social_media_manager.services import instagram_audio
+
+        container_params = {
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": caption,
+            "share_to_feed": "true",
+            "access_token": page_access_token,
+        }
+        audio_cfg = instagram_audio.audio_configuration(audio)
+        container_base = GRAPH_BASE
+        if audio_cfg:
+            container_params["audio_configuration"] = audio_cfg
+            container_base = instagram_audio.AUDIO_BASE   # the music option is documented on a newer Graph version
+
         async with httpx.AsyncClient(timeout=60) as client:
-            container_resp = await client.post(
-                f"{GRAPH_BASE}/{ig_user_id}/media",
-                params={
-                    "media_type": "REELS",
-                    "video_url": video_url,
-                    "caption": caption,
-                    "share_to_feed": "true",
-                    "access_token": page_access_token,
-                },
-            )
+            container_resp = await client.post(f"{container_base}/{ig_user_id}/media", params=container_params)
             container_data = container_resp.json()
             creation_id = container_data.get("id")
             if not creation_id:
                 error_msg = (container_data.get("error") or {}).get("message", str(container_data))
                 print(f"❌ Instagram reel container failed: {container_data}")
+                if audio_cfg:
+                    # Never quietly post the Reel without the track the customer chose.
+                    error_msg += " (a music track was attached; if this keeps failing, remove the track and try again)"
                 return {"success": False, "error": f"Reel container error: {error_msg}", **rl.meta_limit_fields(container_resp, container_data)}
 
             print(f"⏳ Reel container {creation_id} created — waiting 30s for Instagram to ingest video...")
