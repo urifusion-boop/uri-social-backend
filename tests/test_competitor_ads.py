@@ -194,6 +194,20 @@ def test_a_crash_on_the_last_attempt_ends_the_request_failed_not_running_forever
     assert [r["headline"] for r in out["results"]] == ["V1"] and credits.deducted == 1
 
 
+def test_a_job_that_ended_without_the_handler_still_ends_the_request():
+    """A worker can give up on a job without the handler running ("took too many tries"): the
+    page polls the recreation, so reading it must notice the job is gone and say so."""
+    db = _db()
+    _ready_ad(db)
+    with patch("app.services.CreditService.credit_service", new=_Credits()):
+        rec = _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_1", count=2))
+    job = _run(queue.claim(db, [A.RECREATE_JOB]))
+    assert _run(A.get_recreation(db, "b1", rec["id"]))["status"] == "running"
+    _run(queue.fail(db, {**job, "attempts": 9}, "This took too many tries. Please start it again.", retry=False))
+    out = _run(A.get_recreation(db, "b1", rec["id"]))
+    assert out["status"] == "failed" and "too many tries" in out["error"]
+
+
 def test_an_ad_still_being_read_cannot_be_recreated_yet():
     db = _db()
     _run(db[A.ADS].insert_one({"ad_id": "cad_9", "brand_id": "b1", "image_url": "https://x", "status": "analyzing"}))

@@ -243,8 +243,9 @@ async def start_recreate(db, *, brand_id: str, user_id: str, ad_id: str, product
                          "analysis": ad.get("analysis", {})},
            "created_at": _now()}
     await db[RECREATIONS].insert_one(dict(doc))
-    await queue.enqueue(db, RECREATE_JOB, {"recreation_id": doc["recreation_id"]}, brand_id=brand_id,
-                        user_id=user_id, key=doc["recreation_id"], max_attempts=2)
+    job = await queue.enqueue(db, RECREATE_JOB, {"recreation_id": doc["recreation_id"]}, brand_id=brand_id,
+                              user_id=user_id, key=doc["recreation_id"], max_attempts=2)
+    await db[RECREATIONS].update_one({"recreation_id": doc["recreation_id"]}, {"$set": {"job_id": job["job_id"]}})
     return public_recreation(doc)
 
 
@@ -319,6 +320,18 @@ async def recreate_job(db, job: dict, ctx) -> dict:
 
 async def get_recreation(db, brand_id: str, recreation_id: str) -> Optional[dict]:
     doc = await db[RECREATIONS].find_one({"brand_id": brand_id, "recreation_id": recreation_id}, {"_id": 0})
+    if doc and doc.get("status") == "running" and doc.get("job_id"):
+        # The job can end without the handler getting a say (a worker gave up on it, or it ran
+        # out of tries). Whatever happened, the page must hear it ended, not wait forever.
+        job = await queue.get(db, doc["job_id"])
+        if job and job.get("status") == queue.FAILED:
+            message = ((job.get("error") or {}).get("message")
+                       or "Jane couldn't finish these. Try again shortly.")
+            change: dict[str, Any] = {"$set": {"status": "failed", "error": message}}
+            if doc.get("results"):
+                change["$unset"] = {f"results.{i}.redoing": "" for i in range(len(doc["results"]))}
+            await db[RECREATIONS].update_one({"recreation_id": recreation_id, "status": "running"}, change)
+            doc = {**doc, "status": "failed", "error": message}
     return public_recreation(doc) if doc else None
 
 
@@ -424,8 +437,9 @@ async def redo_version(db, *, brand_id: str, user_id: str, recreation_id: str, i
         raise PermissionError("Making it again takes 1 content credit. Top up first.")
     await db[RECREATIONS].update_one({"recreation_id": recreation_id},
                                      {"$set": {"status": "running", "error": "", f"results.{index}.redoing": True}})
-    await queue.enqueue(db, RECREATE_JOB, {"recreation_id": recreation_id, "redo_index": index}, brand_id=brand_id,
-                        user_id=user_id, key=f"{recreation_id}:redo:{index}", max_attempts=2)
+    job = await queue.enqueue(db, RECREATE_JOB, {"recreation_id": recreation_id, "redo_index": index},
+                              brand_id=brand_id, user_id=user_id, key=f"{recreation_id}:redo:{index}", max_attempts=2)
+    await db[RECREATIONS].update_one({"recreation_id": recreation_id}, {"$set": {"job_id": job["job_id"]}})
     rec = await db[RECREATIONS].find_one({"recreation_id": recreation_id}, {"_id": 0})
     return public_recreation(rec)
 
