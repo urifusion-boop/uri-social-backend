@@ -309,10 +309,11 @@ async def recreate_job(db, job: dict, ctx) -> dict:
         if not ad.image_url:
             await _give_up(unavailable)
             raise JobError(unavailable, code="ai_unavailable", retry=True)
-        await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
         result = {"image_url": ad.image_url, "headline": ad.headline, "primary_text": ad.primary_text, "angle": a}
         result["draft_id"] = await _save_draft(db, rec, result)
         await db[RECREATIONS].update_one({"recreation_id": rid}, {"$push": {"results": result}})
+        # Charged once the version is safely kept, so a failure after the image never costs a credit.
+        await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
         await ctx.step(f"ad{i}", f"Making version {i + 1} of {rec['count']}", "done", ad.headline)
     await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done"}})
     return {"recreation_id": rid}
@@ -357,7 +358,7 @@ async def use_version(db, *, brand_id: str, user_id: str, recreation_id: str, in
     else:
         draft_id = str(uuid.uuid4())
         await db["content_drafts"].insert_one({
-            "id": draft_id, "user_id": user_id, "brand_id": brand_id, "platform": "instagram",
+            "id": draft_id, "request_id": draft_id, "user_id": user_id, "brand_id": brand_id, "platform": "instagram",
             "content": chosen.get("primary_text", ""), "headline": chosen.get("headline", ""),
             "image_url": chosen["image_url"], "has_image": True, "status": "draft",
             "content_source": "ad_recreate", "recreation_id": recreation_id, "created_at": _now(),
@@ -375,7 +376,7 @@ async def _save_draft(db, rec: dict, result: dict) -> str:
     """Every version is kept in Creatives as soon as it's made, so closing the composer loses nothing."""
     draft_id = str(uuid.uuid4())
     await db["content_drafts"].insert_one({
-        "id": draft_id, "user_id": rec["user_id"], "brand_id": rec["brand_id"], "platform": "instagram",
+        "id": draft_id, "request_id": draft_id, "user_id": rec["user_id"], "brand_id": rec["brand_id"], "platform": "instagram",
         "content": result.get("primary_text", ""), "headline": result.get("headline", ""),
         "image_url": result["image_url"], "has_image": True, "status": "draft",
         "content_source": "ad_recreate", "recreation_id": rec["recreation_id"], "created_at": _now(),
@@ -469,7 +470,6 @@ async def _redo_one(db, rec: dict, index: int, ctx) -> dict:
         await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done", f"results.{index}.redoing": False,
                                                                            "error": "Jane couldn't make that one again just now."}})
         raise JobError("Jane couldn't make that one again just now.", code="ai_unavailable", retry=True)
-    await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
     new = {"image_url": ad.image_url, "headline": ad.headline, "primary_text": ad.primary_text, "angle": angle,
            "draft_id": old.get("draft_id", "")}
     if new["draft_id"]:
@@ -478,5 +478,6 @@ async def _redo_one(db, rec: dict, index: int, ctx) -> dict:
     else:
         new["draft_id"] = await _save_draft(db, rec, new)
     await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {f"results.{index}": new, "status": "done"}})
+    await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
     await ctx.step(f"redo{index}", f"Making version {index + 1} again", "done", ad.headline)
     return {"recreation_id": rid}
