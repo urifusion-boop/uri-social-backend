@@ -6167,7 +6167,12 @@ async def extend_campaign(
 
     ends_at = new_end_time(sched["end_time"], body.days)
     try:
-        confirmed = await adapter.extend_adset(sched["adset_id"], ends_at)
+        # Every ad set: a campaign testing several ads would otherwise keep running only
+        # its first ad while the others stopped on the old end date.
+        confirmed = None
+        for adset_id in sched.get("adset_ids") or [sched["adset_id"]]:
+            done = await adapter.extend_adset(adset_id, ends_at)
+            confirmed = confirmed or done
     except MetaAPIError as e:
         # A deleted/archived ad set cannot be edited at all (subcode 1487056) — Meta
         # says only the name may change. There is nothing to continue, so say what to
@@ -6438,12 +6443,16 @@ async def edit_live_targeting(
 
     try:
         await adapter.update_adset_targeting(live["adset_id"], targeting, validate_only=True)
+        # Targeting is the campaign's: every ad set gets it, not just the first.
+        other_adsets = [a for a in (live.get("adset_ids") or []) if a != live["adset_id"]]
     except MetaAPIError as e:
         return {"campaign_id": campaign_id, "applied": [], "fields": describe_live(current),
                 "baseline": fingerprint, "rejected": [*rejections, f"Meta rejected the change: {e}"]}
 
     try:
         result = await adapter.update_adset_targeting(live["adset_id"], targeting)
+        for adset_id in other_adsets:
+            await adapter.update_adset_targeting(adset_id, targeting)
     except MetaAPIError as e:
         # The write may well have landed — a lost response is not a failed write. Re-read
         # rather than retry, because retrying an unknown mutation is how duplicates happen.

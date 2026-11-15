@@ -74,8 +74,14 @@ async def _mutate(adapter, record: dict, action: str, params: dict) -> dict:
     if action == "resume_campaign":
         return await adapter.set_delivery(record["campaign_id"], True)
     if action == "set_daily_budget":
-        kobo = int(round(float(params["to_ngn"]) * 100))
-        return await _post(adapter, record["adset_id"], {"daily_budget": kobo})
+        # The campaign's daily budget, shared equally by its ad sets (several when it tests
+        # several ads); setting it on the first alone changed only part of the spend.
+        adsets = [a for a in dict.fromkeys([record.get("adset_id"), *(record.get("adset_ids") or [])]) if a]
+        kobo = int(round(float(params["to_ngn"]) * 100 / max(1, len(adsets))))
+        out = {}
+        for adset_id in adsets:
+            out = await _post(adapter, adset_id, {"daily_budget": kobo})
+        return out
     raise ValueError(f"not an executable action: {action}")
 
 

@@ -60,3 +60,38 @@ def test_an_old_single_ad_record_still_switches_on():
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(MetaAdPlatformAdapter(db, ad_account_id="123", access_token="tok").set_delivery("cmp_9", True))
     assert [c.args[0].rsplit("/", 1)[-1] for c in mock_client.post.call_args_list] == ["cmp_9", "as_9", "ad_9"]
+
+
+def _two_adset_db():
+    from mongomock_motor import AsyncMongoMockClient
+    db = AsyncMongoMockClient()["t"]
+    _run(db["jane_ads_meta_campaigns"].insert_one({
+        "campaign_id": "cmp_1", "adset_id": "as_1", "ad_id": "ad_1",
+        "adset_ids": ["as_1", "as_2"], "ad_ids": ["ad_1", "ad_2"]}))
+    return db
+
+
+def test_the_daily_budget_shown_is_every_ad_sets_together():
+    """Reading only the first ad set showed (and quoted 'keep it running' at) half the spend."""
+    db = _two_adset_db()
+    reads = [{"id": "as_1", "status": "ACTIVE", "daily_budget": "1504285", "end_time": "2026-11-22T10:00:00+0000"},
+             {"id": "as_2", "status": "ACTIVE", "daily_budget": "1504285", "end_time": "2026-11-22T10:00:00+0000"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(reads)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        sched = _run(MetaAdPlatformAdapter(db, ad_account_id="1", access_token="t").fetch_adset_schedule("cmp_1"))
+    assert sched["daily_ngn"] == 30085.70 and sched["adset_ids"] == ["as_1", "as_2"]
+
+
+def test_a_new_daily_budget_is_shared_by_every_ad_set():
+    from app.agents.jane_ads.growth import actions
+    posted = []
+
+    async def fake_post(adapter, node_id, body):
+        posted.append((node_id, body))
+        return {"success": True}
+
+    record = {"campaign_id": "cmp_1", "adset_id": "as_1", "adset_ids": ["as_1", "as_2"]}
+    with patch.object(actions, "_post", new=fake_post):
+        _run(actions._mutate(object(), record, "set_daily_budget", {"to_ngn": 20000}))
+    assert posted == [("as_1", {"daily_budget": 1_000_000}), ("as_2", {"daily_budget": 1_000_000})]
