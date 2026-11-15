@@ -1125,24 +1125,30 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             )
             data = resp.json()
             _raise_for_error(data, "pause ad")
+        await self.remember_ad_paused(campaign_id, ad_id, True)
         return bool(data.get("success"))
 
     async def set_delivery(self, campaign_id: str, active: bool) -> dict:
         """Turn a campaign on or off, from the caller's own campaign-management UI —
-        not via Ads Manager. Cascades the SAME status to the campaign, its ad set, and
-        its ad, since Meta only actually delivers when all three levels are ACTIVE;
+        not via Ads Manager. Cascades the SAME status to the campaign, EVERY ad set and
+        EVERY ad, since Meta only actually delivers when all three levels are ACTIVE;
         pausing any one of them stops delivery. Going active is the one genuinely
         consequential action in this whole feature — real money can start being
-        spent from that point on."""
+        spent from that point on.
+
+        A campaign testing several ads has several ad sets and ads (adset_ids/ad_ids). Only
+        the first of each used to be switched on, so every other ad stayed paused forever
+        (found testing on staging 2026-11-15). An ad paused on its own — a losing test ad —
+        stays paused when the campaign is switched back on."""
         record = await self._get_campaign_record(campaign_id)
         status = "ACTIVE" if active else "PAUSED"
+        held = set(record.get("paused_ad_ids") or []) if active else set()
+        adsets = list(dict.fromkeys([*(record.get("adset_ids") or []), record.get("adset_id")]))
+        ads = [a for a in dict.fromkeys([*(record.get("ad_ids") or []), record.get("ad_id")]) if a not in held]
+        nodes = [(campaign_id, "campaign")] + [(a, "adset") for a in adsets] + [(a, "ad") for a in ads]
         updated: dict[str, bool] = {}
         async with httpx.AsyncClient(timeout=30) as client:
-            for node_id, label in (
-                (campaign_id, "campaign"),
-                (record.get("adset_id"), "adset"),
-                (record.get("ad_id"), "ad"),
-            ):
+            for node_id, label in nodes:
                 if not node_id:
                     continue
                 resp = await client.post(
@@ -1152,8 +1158,16 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 )
                 data = resp.json()
                 _raise_for_error(data, f"{label} status update")
-                updated[label] = bool(data.get("success"))
+                ok = bool(data.get("success"))
+                updated[label] = updated.get(label, True) and ok
         return {"status": status, "updated": updated}
+
+    async def remember_ad_paused(self, campaign_id: str, ad_id: str, paused: bool) -> None:
+        """An ad paused (or resumed) on its own, so switching the campaign on respects it."""
+        if not ad_id:
+            return
+        op = "$addToSet" if paused else "$pull"
+        await self._db[COLLECTION].update_one({"campaign_id": campaign_id}, {op: {"paused_ad_ids": ad_id}})
 
     async def fetch_adset_schedule(self, campaign_id: str) -> dict:
         """When this campaign runs and what it spends a day — read fresh from Meta.
