@@ -107,6 +107,9 @@ class PublishBridgeService:
         draft_id = str(uuid4())
         draft_doc: Dict[str, Any] = {
             "id": draft_id,
+            # content_drafts is unique on (request_id, platform): without one, only the first
+            # draft per platform could ever be saved.
+            "request_id": draft_id,
             "user_id": user_id,
             "platform": platform,
             "content": caption,

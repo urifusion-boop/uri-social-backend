@@ -208,6 +208,30 @@ def test_a_job_that_ended_without_the_handler_still_ends_the_request():
     assert out["status"] == "failed" and "too many tries" in out["error"]
 
 
+def test_versions_save_beside_the_drafts_unique_index():
+    """Live-found on staging 2026-11-15: content_drafts is unique on (request_id, platform). Versions
+    were saved with no request_id, so after the first one every version crashed — after its credit
+    had already been taken."""
+    db = _db()
+    _run(db["content_drafts"].create_index([("request_id", 1), ("platform", 1)], unique=True))
+    _ready_ad(db)
+    credits = _Credits()
+
+    async def fake_generate(*a, **kw):
+        return AdCreative(image_url="https://cdn.uri/v.png", headline="V", primary_text="t")
+
+    with patch("app.services.CreditService.credit_service", new=credits), \
+         patch("app.agents.jane_ads.creative.generate_ad_creative", new=fake_generate), \
+         patch.object(A, "_profile", new=AsyncMock(return_value={"brand_name": "Magen"})):
+        for _ in range(2):   # two separate requests, two versions each
+            rec = _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_1", count=2))
+            job = _run(queue.claim(db, [A.RECREATE_JOB]))
+            _run(A.recreate_job(db, job, _Ctx()))
+            assert _run(A.get_recreation(db, "b1", rec["id"]))["status"] == "done"
+    assert _run(db["content_drafts"].count_documents({"content_source": "ad_recreate"})) == 4
+    assert credits.deducted == 4
+
+
 def test_an_ad_still_being_read_cannot_be_recreated_yet():
     db = _db()
     _run(db[A.ADS].insert_one({"ad_id": "cad_9", "brand_id": "b1", "image_url": "https://x", "status": "analyzing"}))
