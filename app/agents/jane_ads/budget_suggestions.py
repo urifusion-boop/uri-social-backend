@@ -16,6 +16,8 @@ from . import constants as C
 # Each Meta ad gets 1.5x the floor a day, so a test isn't sitting right on the minimum.
 META_PER_AD_DAILY = C.MIN_DAILY_SPEND_NGN * 1.5
 GOOGLE_DAILY_TIERS = (1_500.0, 3_500.0, 7_000.0)
+# Meta: the start of three of the PRD budget table's bands (₦5k–15k, ₦15k–30k, ₦30k–75k a day).
+META_DAILY_TIERS = (5_000.0, 15_000.0, 30_000.0)
 
 
 def _round_up(n: float, step: int = 1_000) -> int:
@@ -61,13 +63,18 @@ def suggest(platform: str = "meta", days: int = 7) -> dict:
                             "recommended": i == 1})
         return {"platform": "google", "days": run, "options": options, "note": note}
 
+    # Meta: the PRD's budget table (concepts.BUDGET_TIERS) — each option is one band's
+    # starting daily spend, with the ads and ad sets that band calls for.
+    from .concepts import budget_structure
     options = []
-    for n, label in ((1, "Start small"), (2, "Recommended"), (3, "Test more ideas")):
-        daily = META_PER_AD_DAILY * n
+    for daily, label in ((META_DAILY_TIERS[0], "Start small"), (META_DAILY_TIERS[1], "Recommended"),
+                         (META_DAILY_TIERS[2], "Test more ideas")):
+        st = budget_structure(daily)
+        n, k = st["ads"], st["ad_sets"]
         amount = _stated(daily * run, fee=True)
-        what = f"1 ad · {run} days" if n == 1 else f"Tests {n} ads · {run} days"
-        options.append({"amount_ngn": amount, "label": label, "days": run, "ads": n, "what": what,
-                        "detail": (f"About ₦{daily:,.0f} a day goes to ads"
-                                   + (f", shared by {n} ads so Meta can tell which works." if n > 1 else ".")),
-                        "recommended": n == 2})
+        what = (f"Tests {n} ads" + (f" in {k} ad sets" if k > 1 else "") + f" · {run} days") if n > 1 \
+            else f"1 ad · {run} days"
+        options.append({"amount_ngn": amount, "label": label, "days": run, "ads": n, "ad_sets": k, "what": what,
+                        "detail": f"About ₦{daily:,.0f} a day goes to ads. {st['why']}",
+                        "recommended": label == "Recommended"})
     return {"platform": "meta", "days": run, "options": options, "note": note}

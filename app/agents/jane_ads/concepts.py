@@ -35,6 +35,22 @@ MAX_JANE_MADE = MAX_ADS
 
 SINGLE_AD_SET = "single_ad_set"
 ABO = "abo"
+# Several ad sets, each holding some of the ads (PRD WS5's "2 ad sets, 3–4 creatives").
+GROUPED = "grouped"
+
+# PRD WS5 "Initial Budget Configuration Hypothesis": the daily budget decides how many ads a
+# Meta campaign tests and how many ad sets they run in. (lowest daily ₦, ad sets, ads, label)
+# Where the PRD gives a range ("1–2 ad sets"), the upper number starts halfway up the band.
+# Starting hypotheses, not fixed rules: the owner can still change both before launch.
+BUDGET_TIERS = [
+    (150_000.0, 3, 6, "₦150,000+ a day"),
+    (100_000.0, 3, 6, "₦75,000–₦150,000 a day"),
+    (75_000.0, 2, 4, "₦75,000–₦150,000 a day"),
+    (30_000.0, 2, 4, "₦30,000–₦75,000 a day"),
+    (20_000.0, 2, 3, "₦15,000–₦30,000 a day"),
+    (15_000.0, 1, 3, "₦15,000–₦30,000 a day"),
+    (5_000.0, 1, 2, "₦5,000–₦15,000 a day"),
+]
 
 _DURATION = re.compile(r"\b(?:for|over|next|run(?:s|ning)?(?: it)?(?: for)?)\s+(?:the\s+next\s+)?"
                        r"(\d{1,3}|a|one)\s*(day|week|month)s?\b", re.I)
@@ -66,6 +82,56 @@ def max_concepts(budget_ngn: float, days: int, target_ngn: Optional[float] = Non
     days = max(1, int(days or 1))
     rec = recommend_structure(budget_ngn / days, days, target_ngn)
     return max(1, min(MAX_ADS, int(rec.get("concepts") or 1)))
+
+
+def budget_structure(daily_ngn: float) -> dict:
+    """How many ads, in how many ad sets, a Meta campaign at this daily budget should test.
+
+    Never more ad sets than the budget can give Meta's daily floor each."""
+    daily = max(0.0, float(daily_ngn or 0))
+    ad_sets, ads, band = 1, 1, "under ₦5,000 a day"
+    for lowest, n_sets, n_ads, label in BUDGET_TIERS:
+        if daily >= lowest:
+            ad_sets, ads, band = n_sets, n_ads, label
+            break
+    ad_sets = max(1, min(ad_sets, int(daily // C.MIN_DAILY_SPEND_NGN) or 1))
+    ads = max(ads, ad_sets)
+    if ads == 1:
+        why = "At this budget one ad in one ad set learns fastest."
+    elif ad_sets == 1:
+        why = f"At {band}, {ads} different ads in one ad set let Meta find the one that works."
+    else:
+        why = (f"At {band}, {ads} different ads across {ad_sets} ad sets give each idea its own "
+               "budget while Meta still learns quickly.")
+    return {"ads": ads, "ad_sets": ad_sets, "band": band, "why": why}
+
+
+def layout_for_budget(budget_ngn: float, days: int, ads: int) -> tuple[str, int]:
+    """The ad layout (and ad-set count) the budget table recommends for this many ads."""
+    daily = float(budget_ngn or 0) / max(1, int(days or 1))
+    want = budget_structure(daily)["ad_sets"]
+    k = max(1, min(want, ads))
+    # budget_structure already keeps every ad set above Meta's daily floor.
+    if ads <= 1 or k <= 1:
+        return SINGLE_AD_SET, 1
+    return (ABO, ads) if k == ads else (GROUPED, k)
+
+
+def ad_set_for(index: int, ads: int, layout: str, ad_set_count: int) -> int:
+    """Which ad set (0-based) the ad at `index` runs in."""
+    if layout == ABO:
+        return index
+    if layout == GROUPED and ad_set_count > 1:
+        return index % min(ad_set_count, ads)
+    return 0
+
+
+def ad_set_total(ads: int, layout: str, ad_set_count: int) -> int:
+    if layout == ABO:
+        return max(1, ads)
+    if layout == GROUPED and ad_set_count > 1:
+        return min(ad_set_count, ads)
+    return 1
 
 
 def can_split(budget_ngn: float, days: int, ads: int) -> bool:

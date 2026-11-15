@@ -1077,3 +1077,28 @@ def test_a_temporarily_unavailable_creative_is_retried_and_each_ad_keeps_its_own
     specs = [c.kwargs["json"]["object_story_spec"]["link_data"] for c in mock_client.post.call_args_list
              if "object_story_spec" in c.kwargs["json"]]
     assert [s["name"] for s in specs] == ["First", "Second", "Second"]
+
+
+def test_grouped_layout_spreads_four_ads_across_two_ad_sets_with_an_even_budget():
+    # PRD WS5 budget table: ₦30k–₦75k a day → 2 ad sets, 3–4 creatives.
+    mk = lambda n: AdCreative(image_url=f"https://cdn/{n}.jpg", headline=n, primary_text=n, concept=n)
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop",
+                 ad_layout="grouped", ad_set_count=2, creative=mk("a"), concepts=[mk("b"), mk("c"), mk("d")])
+    responses = [{"id": "cmp_1"},
+                 {"id": "as_1"}, {"id": "cr_1"}, {"id": "ad_1"},
+                 {"id": "as_2"}, {"id": "cr_2"}, {"id": "ad_2"},
+                 {"id": "cr_3"}, {"id": "ad_3"},
+                 {"id": "cr_4"}, {"id": "ad_4"}]
+    db = FakeDb()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter(db).launch_campaign(plan, _auth()))
+
+    posts = [c.kwargs["json"] for c in mock_client.post.call_args_list]
+    adsets = [p for p in posts if "daily_budget" in p]
+    ads = [p for p in posts if "adset_id" in p and "creative" in p]
+    assert len(adsets) == 2 and adsets[0]["daily_budget"] == int(10_000 / 7 / 2 * 100)
+    assert [a["adset_id"] for a in ads] == ["as_1", "as_2", "as_1", "as_2"]
+    record = _run(db["x"].find_one({"campaign_id": "cmp_1"}))
+    assert record["adset_ids"] == ["as_1", "as_2"] and record["ad_ids"] == ["ad_1", "ad_2", "ad_3", "ad_4"]
