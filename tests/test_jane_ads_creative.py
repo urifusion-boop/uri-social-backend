@@ -739,3 +739,17 @@ def test_vsg01_drawn_formats_are_off_by_default():
     itself is untouched — this only skips it."""
     from app.core.config import settings
     assert settings.JANE_ADS_VSG01_ENABLED is False
+
+
+def test_an_ad_made_for_its_own_layout_is_not_replaced_by_the_format_library(monkeypatch):
+    """Staging 2026-11-15: with the format library on, every 'different' version — and every ad
+    in a several-ad test — came out as the same top-ranked before/after format."""
+    from app.agents.jane_ads.creative import use_format_library
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "JANE_ADS_VSG01_ENABLED", True)
+    assert use_format_library("meta") is True                                     # one ad: library first
+    assert use_format_library("meta", image_layout="a Notes-app list") is False   # its own layout wins
+    assert use_format_library("meta", image_layout="x", vsg01_format_id="fmt_1") is True  # owner's pick wins
+    assert use_format_library("tiktok") is False
+    monkeypatch.setattr(settings, "JANE_ADS_VSG01_ENABLED", False)
+    assert use_format_library("meta") is False

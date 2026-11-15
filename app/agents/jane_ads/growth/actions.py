@@ -62,17 +62,26 @@ async def state_of(adapter, record: dict, action: str, params: dict) -> dict:
 
 
 async def _mutate(adapter, record: dict, action: str, params: dict) -> dict:
-    if action == "pause_ad":
-        return await _post(adapter, params.get("ad_id") or record["ad_id"], {"status": "PAUSED"})
-    if action == "resume_ad":
-        return await _post(adapter, params.get("ad_id") or record["ad_id"], {"status": "ACTIVE"})
+    if action in ("pause_ad", "resume_ad"):
+        ad_id = params.get("ad_id") or record["ad_id"]
+        out = await _post(adapter, ad_id, {"status": "PAUSED" if action == "pause_ad" else "ACTIVE"})
+        # Remembered, so switching the whole campaign back on leaves a paused test ad paused.
+        if hasattr(adapter, "remember_ad_paused"):
+            await adapter.remember_ad_paused(record["campaign_id"], ad_id, action == "pause_ad")
+        return out
     if action == "pause_campaign":
         return await adapter.set_delivery(record["campaign_id"], False)
     if action == "resume_campaign":
         return await adapter.set_delivery(record["campaign_id"], True)
     if action == "set_daily_budget":
-        kobo = int(round(float(params["to_ngn"]) * 100))
-        return await _post(adapter, record["adset_id"], {"daily_budget": kobo})
+        # The campaign's daily budget, shared equally by its ad sets (several when it tests
+        # several ads); setting it on the first alone changed only part of the spend.
+        adsets = [a for a in dict.fromkeys([record.get("adset_id"), *(record.get("adset_ids") or [])]) if a]
+        kobo = int(round(float(params["to_ngn"]) * 100 / max(1, len(adsets))))
+        out = {}
+        for adset_id in adsets:
+            out = await _post(adapter, adset_id, {"daily_budget": kobo})
+        return out
     raise ValueError(f"not an executable action: {action}")
 
 

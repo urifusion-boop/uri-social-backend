@@ -1125,24 +1125,30 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             )
             data = resp.json()
             _raise_for_error(data, "pause ad")
+        await self.remember_ad_paused(campaign_id, ad_id, True)
         return bool(data.get("success"))
 
     async def set_delivery(self, campaign_id: str, active: bool) -> dict:
         """Turn a campaign on or off, from the caller's own campaign-management UI —
-        not via Ads Manager. Cascades the SAME status to the campaign, its ad set, and
-        its ad, since Meta only actually delivers when all three levels are ACTIVE;
+        not via Ads Manager. Cascades the SAME status to the campaign, EVERY ad set and
+        EVERY ad, since Meta only actually delivers when all three levels are ACTIVE;
         pausing any one of them stops delivery. Going active is the one genuinely
         consequential action in this whole feature — real money can start being
-        spent from that point on."""
+        spent from that point on.
+
+        A campaign testing several ads has several ad sets and ads (adset_ids/ad_ids). Only
+        the first of each used to be switched on, so every other ad stayed paused forever
+        (found testing on staging 2026-11-15). An ad paused on its own — a losing test ad —
+        stays paused when the campaign is switched back on."""
         record = await self._get_campaign_record(campaign_id)
         status = "ACTIVE" if active else "PAUSED"
+        held = set(record.get("paused_ad_ids") or []) if active else set()
+        adsets = list(dict.fromkeys([*(record.get("adset_ids") or []), record.get("adset_id")]))
+        ads = [a for a in dict.fromkeys([*(record.get("ad_ids") or []), record.get("ad_id")]) if a not in held]
+        nodes = [(campaign_id, "campaign")] + [(a, "adset") for a in adsets] + [(a, "ad") for a in ads]
         updated: dict[str, bool] = {}
         async with httpx.AsyncClient(timeout=30) as client:
-            for node_id, label in (
-                (campaign_id, "campaign"),
-                (record.get("adset_id"), "adset"),
-                (record.get("ad_id"), "ad"),
-            ):
+            for node_id, label in nodes:
                 if not node_id:
                     continue
                 resp = await client.post(
@@ -1152,34 +1158,54 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 )
                 data = resp.json()
                 _raise_for_error(data, f"{label} status update")
-                updated[label] = bool(data.get("success"))
+                ok = bool(data.get("success"))
+                updated[label] = updated.get(label, True) and ok
         return {"status": status, "updated": updated}
+
+    async def remember_ad_paused(self, campaign_id: str, ad_id: str, paused: bool) -> None:
+        """An ad paused (or resumed) on its own, so switching the campaign on respects it."""
+        if not ad_id:
+            return
+        op = "$addToSet" if paused else "$pull"
+        await self._db[COLLECTION].update_one({"campaign_id": campaign_id}, {op: {"paused_ad_ids": ad_id}})
+
+    @staticmethod
+    def adset_ids_of(record: dict) -> list[str]:
+        """Every ad set the campaign runs in — several when it tests several ads."""
+        return [a for a in dict.fromkeys([record.get("adset_id"), *(record.get("adset_ids") or [])]) if a]
 
     async def fetch_adset_schedule(self, campaign_id: str) -> dict:
         """When this campaign runs and what it spends a day — read fresh from Meta.
 
-        `daily_budget` comes back in kobo, like every other Meta money field.
+        `daily_budget` comes back in kobo, like every other Meta money field. A campaign with
+        several ad sets spends the SUM of their budgets: reading only the first showed (and
+        quoted "keep it running" at) a fraction of the real daily spend.
         """
         record = await self._get_campaign_record(campaign_id)
-        adset_id = record.get("adset_id")
-        if not adset_id:
+        adset_ids = self.adset_ids_of(record)
+        if not adset_ids:
             raise MetaAPIError(f"campaign {campaign_id} has no ad set recorded")
+        reads = []
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                f"{self._graph_base}/{adset_id}",
-                params={"access_token": self._access_token,
-                        "fields": "id,status,effective_status,daily_budget,lifetime_budget,"
-                                  "start_time,end_time"},
-            )
-            data = resp.json()
-            _raise_for_error(data, "adset schedule read")
+            for adset_id in adset_ids:
+                resp = await client.get(
+                    f"{self._graph_base}/{adset_id}",
+                    params={"access_token": self._access_token,
+                            "fields": "id,status,effective_status,daily_budget,lifetime_budget,"
+                                      "start_time,end_time"},
+                )
+                data = resp.json()
+                _raise_for_error(data, "adset schedule read")
+                reads.append(data)
+        data = reads[0]
         return {
-            "adset_id": adset_id,
+            "adset_id": adset_ids[0],
+            "adset_ids": adset_ids,
             "ad_id": record.get("ad_id", ""),
             "status": data.get("status"),
             "effective_status": data.get("effective_status"),
-            "daily_ngn": round(float(data.get("daily_budget") or 0) / 100, 2),
-            "lifetime_ngn": round(float(data.get("lifetime_budget") or 0) / 100, 2),
+            "daily_ngn": round(sum(float(r.get("daily_budget") or 0) for r in reads) / 100, 2),
+            "lifetime_ngn": round(sum(float(r.get("lifetime_budget") or 0) for r in reads) / 100, 2),
             "start_time": data.get("start_time"),
             "end_time": data.get("end_time"),
         }
@@ -1228,7 +1254,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             )
             data = resp.json()
             _raise_for_error(data, "adset read")
-        return {"adset_id": adset_id, "status": data.get("status"),
+        return {"adset_id": adset_id, "adset_ids": self.adset_ids_of(record), "status": data.get("status"),
                 "effective_status": data.get("effective_status"),
                 "targeting": data.get("targeting") or {}}
 
