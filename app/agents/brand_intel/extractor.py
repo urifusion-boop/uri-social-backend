@@ -31,7 +31,7 @@ FIELDS: dict[str, tuple[str, str]] = {
     "industry": ("text", "the industry in 1-4 words, e.g. 'Event transport', 'Skincare', 'Accounting software'"),
     "product_description": ("text", "what the business does and for whom, 1-2 plain sentences"),
     "tagline": ("text", "the site's own slogan or tagline, copied exactly; empty if it has none"),
-    "key_products_services": ("list", "each product or service by its name on the site; add the price in brackets only if the site shows it"),
+    "key_products_services": ("list", "each product or service the business actually sells, by its name on the site; add the price in brackets only if the site shows it. Not section headings, slogans or benefit lines (e.g. 'GET MORE CUSTOMERS', 'Show up consistently'); write each in normal capitalisation"),
     "price_range": ("text", "the price level or range stated on the site, e.g. '₦25,000 – ₦80,000' or 'premium'; empty if not stated"),
     "unique_selling_proposition": ("text", "what makes them different from others, one sentence"),
     "ideal_customer_profile": ("text", "who the ideal customer is, one sentence describing a real buyer"),
@@ -117,6 +117,8 @@ def clean(raw: dict, site: dict) -> dict[str, dict[str, Any]]:
             value = " ".join(str(value or "").split())[:400]
             if not value:
                 continue
+        if key == "key_products_services":
+            value = [_unshout(v) for v in value]
         basis = "stated" if item.get("basis") == "stated" else "inferred"
         page = item.get("page") if item.get("page") in pages else site.get("url", "")
         if key in ("proof_points", "tagline", "price_range"):
@@ -132,6 +134,15 @@ def clean(raw: dict, site: dict) -> dict[str, dict[str, Any]]:
                     continue
         out[key] = {"value": value, "basis": basis, "page": page}
     return out
+
+
+def _unshout(v: str) -> str:
+    """'SHOW UP CONSISTENTLY' (a heading copied as shown) reads as 'Show up consistently'.
+    Single all-caps words are left alone: they're usually names (IBM, URI)."""
+    letters = [c for c in v if c.isalpha()]
+    if len(v.split()) > 1 and letters and all(c.isupper() for c in letters):
+        return v[:1].upper() + v[1:].lower()
+    return v
 
 
 def _numbers(s: str) -> set[str]:
