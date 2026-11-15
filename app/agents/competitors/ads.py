@@ -282,17 +282,32 @@ async def recreate_job(db, job: dict, ctx) -> dict:
         return await _redo_one(db, rec, int(redo), ctx)
     done = len(rec.get("results") or [])  # a retry carries on where the last attempt stopped
     await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "running", "error": ""}})
+    # The page polls the recreation, not the job: it must end "failed" when the job gives up,
+    # whatever went wrong — or the composer says "Making version 2…" forever (live-found on
+    # staging 2026-11-15). Until the last attempt it stays "running", since a retry follows.
+    last_attempt = int(job.get("attempts", 1)) >= int(job.get("max_attempts", 1))
+    unavailable = "Jane couldn't make that ad just now. Try again shortly."
+
+    async def _give_up(message: str) -> None:
+        if last_attempt:
+            await db[RECREATIONS].update_one({"recreation_id": rid},
+                                             {"$set": {"status": "failed", "error": message}})
+
     for i in range(done, rec["count"]):
         a = angles[i % len(angles)]
         await ctx.step(f"ad{i}", f"Making version {i + 1} of {rec['count']}")
-        ad = await generate_ad_creative(
-            profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
-            concepts_mod.brief_for(brief, a), user_id=rec["user_id"], db=db, brand_id=rec["brand_id"],
-            city=profile.get("customer_location") or "", image_layout=concepts_mod.layout_for(a))
+        try:
+            ad = await generate_ad_creative(
+                profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
+                concepts_mod.brief_for(brief, a), user_id=rec["user_id"], db=db, brand_id=rec["brand_id"],
+                city=profile.get("customer_location") or "", image_layout=concepts_mod.layout_for(a))
+        except Exception as e:
+            print(f"[recreate] {rid} version {i + 1} failed: {e}", flush=True)
+            await _give_up(unavailable)
+            raise JobError(unavailable, code="ai_unavailable", retry=True)
         if not ad.image_url:
-            await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "failed",
-                                                                               "error": "Jane couldn't make that ad just now. Try again shortly."}})
-            raise JobError("Jane couldn't make that ad just now. Try again shortly.", code="ai_unavailable", retry=True)
+            await _give_up(unavailable)
+            raise JobError(unavailable, code="ai_unavailable", retry=True)
         await credit_service.deduct_credit(rec["user_id"], campaign_id=rid, reason="campaign_generation")
         result = {"image_url": ad.image_url, "headline": ad.headline, "primary_text": ad.primary_text, "angle": a}
         result["draft_id"] = await _save_draft(db, rec, result)
