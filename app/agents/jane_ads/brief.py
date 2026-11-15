@@ -146,12 +146,20 @@ def optimisation_note(plan: dict, brief: dict) -> Optional[dict]:
 
 def structure(plan: dict, req: dict, sibling_plans: int = 1) -> dict:
     """The campaign → ad set → ad layout this plan launches as, with its reason."""
+    from .concepts import budget_structure as budget_structure_for
     from .growth.stages import recommend_structure
     platforms = plan.get("platforms") or [{}]
     budget = float(req.get("budget_ngn") or sum(float(p.get("budget_ngn") or 0) for p in platforms))
     days = max(int(p.get("days") or 1) for p in platforms)
     daily = budget / days if days else budget
     rec = recommend_structure(daily, days)
+    # What the plan card recommends follows the PRD budget table (the same rule that lays
+    # the ads out), so it never contradicts it; the floor-based ceiling is kept for warnings.
+    table = budget_structure_for(daily)
+    recommended = {"concepts": table["ads"], "ad_sets": table["ad_sets"],
+                   "structure": ("single" if table["ad_sets"] == 1
+                                 else "abo" if table["ad_sets"] == table["ads"] else "grouped"),
+                   "why": table["why"], "max_by_daily_floor": rec.get("max_by_daily_floor", 1)}
     from .concepts import ad_set_total, budget_structure
     n = 1 + len(plan.get("concepts") or [])
     k = ad_set_total(n, plan.get("ad_layout") or "", int(plan.get("ad_set_count") or 0))
@@ -161,7 +169,7 @@ def structure(plan: dict, req: dict, sibling_plans: int = 1) -> dict:
            "budget_type": "daily, on the ad set",
            "daily_ngn": round(daily, 2), "days": days, "total_ngn": budget,
            "why": "One campaign, one ad set and one ad keeps the whole budget learning in one place.",
-           "recommended": rec, "warnings": []}
+           "recommended": recommended, "warnings": []}
     if split and k == n:
         out.update({"per_ad_set_daily_ngn": round(daily / n, 2),
                     "why": f"{n} different ads, each in its own ad set with an equal ₦{daily / n:,.0f} "

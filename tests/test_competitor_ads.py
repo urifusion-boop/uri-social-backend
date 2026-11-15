@@ -164,6 +164,36 @@ def test_a_retry_carries_on_from_the_versions_already_made():
     assert out["status"] == "done" and out["error"] == ""
 
 
+def test_a_crash_on_the_last_attempt_ends_the_request_failed_not_running_forever():
+    """Live-found on staging 2026-11-15: version 2's generation raised, the job failed after its
+    retry, and the composer said "Making version 2…" for good — the request was never told."""
+    db = _db()
+    _ready_ad(db)
+    credits = _Credits()
+    calls = {"n": 0}
+
+    async def crashes_second(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("image model timed out")
+        return AdCreative(image_url="https://cdn.uri/v1.png", headline="V1", primary_text="t")
+
+    with patch("app.services.CreditService.credit_service", new=credits), \
+         patch("app.agents.jane_ads.creative.generate_ad_creative", new=crashes_second), \
+         patch.object(A, "_profile", new=AsyncMock(return_value={"brand_name": "Magen"})):
+        rec = _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_1", count=2))
+        job = _run(queue.claim(db, [A.RECREATE_JOB]))
+        with pytest.raises(JobError):
+            _run(A.recreate_job(db, job, _Ctx()))
+        # A retry is still to come: the page keeps waiting.
+        assert _run(A.get_recreation(db, "b1", rec["id"]))["status"] == "running"
+        with pytest.raises(JobError):
+            _run(A.recreate_job(db, {**job, "attempts": job["max_attempts"]}, _Ctx()))
+        out = _run(A.get_recreation(db, "b1", rec["id"]))
+    assert out["status"] == "failed" and "couldn't make that ad" in out["error"]
+    assert [r["headline"] for r in out["results"]] == ["V1"] and credits.deducted == 1
+
+
 def test_an_ad_still_being_read_cannot_be_recreated_yet():
     db = _db()
     _run(db[A.ADS].insert_one({"ad_id": "cad_9", "brand_id": "b1", "image_url": "https://x", "status": "analyzing"}))

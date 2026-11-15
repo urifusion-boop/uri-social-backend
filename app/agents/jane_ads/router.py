@@ -28,7 +28,7 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 from . import constants as C
 from . import measurability as M
 from .adapters.mock import MockAdPlatformAdapter
-from .decision_engine import apply_platform_override, plan_campaign
+from .decision_engine import apply_platform_override, keep_only_platform, plan_campaign
 from .instrumentation import InstrumentationService, MongoInstrumentationStore
 from .models import (
     CampaignPlan,
@@ -3332,14 +3332,14 @@ async def _build_campaign_plan(
         jane_picked_tiktok = (any(p.platform == Platform.TIKTOK for p in plan.platforms)
                               and body.preferred_platform != "meta")
         if jane_picked_tiktok and tiktok_ready:
-            plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
+            plan = keep_only_platform(plan, Platform.TIKTOK)
             forced_to_meta = False
         else:
             forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
             if forced_to_meta:
                 plan = apply_platform_override(plan, [Platform.META])
             else:
-                plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+                plan = keep_only_platform(plan, Platform.META)
 
     if body.preferred_platform in ("meta", "tiktok", "google"):
         plan = as_client_choice(plan)

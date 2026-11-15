@@ -302,3 +302,21 @@ def test_the_campaign_and_its_platforms_agree_on_the_objective(goal, objective):
     plan = _plan(goal=goal, budget_ngn=50_000.0).plan
     assert plan.objective == objective
     assert all(p.objective == objective for p in plan.platforms)
+
+
+def test_keeping_one_platform_of_a_split_plan_gives_it_the_whole_budget():
+    """Live-found on staging 2026-11-15: Jane split ₦210,600 across Meta and TikTok, the owner
+    picked Instagram & Facebook, and the plan kept Meta's half (₦105,300) while the wallet was
+    charged for the whole amount."""
+    from app.agents.jane_ads.decision_engine import keep_only_platform
+    res = _plan(budget_ngn=210_600.0, goal=Goal.SALES, category="fashion",
+                creative=CreativeContext(kind=CreativeKind.VIDEO, has_video=True))
+    assert {p.platform for p in res.plan.platforms} == {Platform.META, Platform.TIKTOK}
+    meta = keep_only_platform(res.plan, Platform.META)
+    assert [p.platform for p in meta.platforms] == [Platform.META]
+    assert meta.platforms[0].budget_ngn == 210_600.0
+    tiktok = keep_only_platform(res.plan, Platform.TIKTOK)
+    assert [p.platform for p in tiktok.platforms] == [Platform.TIKTOK]
+    assert tiktok.platforms[0].budget_ngn == 210_600.0
+    # A plan already on one platform is left exactly as it was.
+    assert keep_only_platform(meta, Platform.META) is meta

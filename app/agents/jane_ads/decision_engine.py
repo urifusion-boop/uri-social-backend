@@ -280,6 +280,23 @@ def choose_platform(
 plan_campaign = choose_platform
 
 
+def keep_only_platform(plan: CampaignPlan, platform: Platform) -> CampaignPlan:
+    """The plan on just `platform`, with the WHOLE budget on it.
+
+    Filtering the split plan instead left the kept platform on its share: a ₦234,000
+    campaign Jane had split across Meta and TikTok, run on Instagram & Facebook only,
+    planned (and launched) ₦105,300 on Meta while the wallet was charged the full amount."""
+    if plan.platforms and all(p.platform == platform for p in plan.platforms):
+        return plan
+    kept = [p for p in plan.platforms if p.platform == platform]
+    out = apply_platform_override(plan, [platform])
+    if kept:
+        # The objective already decided for this platform stays; budget, days and the
+        # test scope follow the whole budget.
+        out.platforms = [out.platforms[0].model_copy(update={"objective": kept[0].objective})]
+    return out
+
+
 def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> CampaignPlan:
     """Rebuild a plan's platform split around the user's explicit choice, overriding
     Jane's recommendation (PRD §1.8 — every override is logged separately by the
