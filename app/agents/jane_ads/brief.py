@@ -152,17 +152,25 @@ def structure(plan: dict, req: dict, sibling_plans: int = 1) -> dict:
     days = max(int(p.get("days") or 1) for p in platforms)
     daily = budget / days if days else budget
     rec = recommend_structure(daily, days)
+    from .concepts import ad_set_total, budget_structure
     n = 1 + len(plan.get("concepts") or [])
-    split = n > 1 and plan.get("ad_layout") == "abo"
-    out = {"campaigns": 1, "ad_sets": n if split else 1, "ads_per_ad_set": 1 if split else n,
+    k = ad_set_total(n, plan.get("ad_layout") or "", int(plan.get("ad_set_count") or 0))
+    split = k > 1
+    out = {"campaigns": 1, "ad_sets": k, "ads_per_ad_set": 1 if k == n else (n if k == 1 else round(n / k, 1)),
+           "prd_budget_table": budget_structure(daily),
            "budget_type": "daily, on the ad set",
            "daily_ngn": round(daily, 2), "days": days, "total_ngn": budget,
            "why": "One campaign, one ad set and one ad keeps the whole budget learning in one place.",
            "recommended": rec, "warnings": []}
-    if split:
+    if split and k == n:
         out.update({"per_ad_set_daily_ngn": round(daily / n, 2),
                     "why": f"{n} different ads, each in its own ad set with an equal ₦{daily / n:,.0f} "
                            "a day, so each gets a fair chance before any is judged."})
+    elif split:
+        out.update({"per_ad_set_daily_ngn": round(daily / k, 2),
+                    "why": f"{n} different ads across {k} ad sets, each ad set with an equal "
+                           f"₦{daily / k:,.0f} a day — set from your daily budget, so each idea gets "
+                           "its own budget while Meta still learns quickly."})
     elif n > 1:
         out["why"] = (f"{n} different ads share one ad set and its budget. Meta shows them to the same "
                       "audience and leans toward whichever is doing better, so it can favour one early.")

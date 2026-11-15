@@ -230,7 +230,11 @@ class CampaignPlan(BaseModel):
     # The other concepts being tested beside `creative`, one ad set each (concepts.py).
     concepts: list["AdCreative"] = Field(default_factory=list)
     # single_ad_set: every ad in one ad set. abo: one ad set each, budget split equally.
+    # grouped: ad_set_count ad sets, the ads spread across them (PRD WS5 budget table).
     ad_layout: str = "single_ad_set"
+    ad_set_count: int = 0
+    # The owner picked the layout themselves: the budget table no longer re-decides it.
+    ad_layout_chosen: bool = False
     # How many ads Jane is still working up to. One request can't make them all before
     # the connection times out, so the rest are added one at a time after the plan.
     concepts_wanted: int = 0

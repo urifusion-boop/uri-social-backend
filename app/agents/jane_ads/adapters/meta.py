@@ -370,9 +370,12 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # Meta also enforces its own daily-budget floor per currency; a too-small
         # budget will come back as a descriptive error from the API, not a silent
         # failure, so this is intentionally not pre-validated here.
-        # One ad set each splits the daily budget equally. Ads sharing an ad set share it.
-        split_adsets = plan.ad_layout == "abo" and bool(plan.concepts)
-        n_adsets = 1 + len(plan.concepts) if split_adsets else 1
+        # The daily budget is split equally across the ad sets; ads sharing one share it.
+        # abo: one ad set per ad. grouped: plan.ad_set_count ad sets, ads spread across them.
+        from ..concepts import ad_set_for, ad_set_total
+        n_ads = 1 + len(plan.concepts)
+        n_adsets = ad_set_total(n_ads, plan.ad_layout, plan.ad_set_count)
+        split_adsets = n_adsets > 1
         daily_budget_minor = max(int((total_budget_ngn / days / n_adsets) * 100), 100)
         # A real end date, not just a `days` number in copy — without this the ad
         # set has no natural stop and would run (and spend) indefinitely once
@@ -800,12 +803,12 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     plan.creative, adset_id, video_id, video_thumbnail_url)
                 ad_ids = [ad_id]
                 adset_ids = [adset_id]
-                # Every other ad being tested: in the same ad set, or in its own with the
-                # same targeting and an equal share of the budget (ABO).
+                # Every other ad being tested: in an ad set already made, or a new one with
+                # the same targeting and an equal share of the budget.
                 for i, extra in enumerate(plan.concepts, start=2):
                     suffix = f"-{extra.concept or i}"
-                    target_adset = adset_id
-                    if split_adsets:
+                    slot = ad_set_for(i - 1, n_ads, plan.ad_layout, plan.ad_set_count) if split_adsets else 0
+                    if slot >= len(adset_ids):
                         extra_resp = await client.post(
                             f"{self._graph_base}/act_{self._ad_account_id}/adsets",
                             params={"access_token": self._access_token},
@@ -813,8 +816,8 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         )
                         extra_data = extra_resp.json()
                         _raise_for_error(extra_data, "ad set creation")
-                        target_adset = extra_data["id"]
-                        adset_ids.append(target_adset)
+                        adset_ids.append(extra_data["id"])
+                    target_adset = adset_ids[slot]
                     extra_vid, extra_thumb = (None, None)
                     if extra.is_video:
                         extra_vid, extra_thumb = await self._upload_video_to_meta(extra.image_url)

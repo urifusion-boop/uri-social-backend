@@ -3,14 +3,15 @@ from app.agents.jane_ads import constants as C
 from app.agents.jane_ads.budget_suggestions import suggest
 
 
-def test_meta_offers_one_two_and_three_ads_with_two_recommended():
+def test_meta_options_follow_the_prd_budget_table():
     out = suggest("meta", 7)
-    assert [o["ads"] for o in out["options"]] == [1, 2, 3]
+    # ₦5k / ₦15k / ₦30k a day: 2 ads in 1 ad set, 3 ads in 1, 4 ads across 2.
+    assert [(o["ads"], o["ad_sets"]) for o in out["options"]] == [(2, 1), (3, 1), (4, 2)]
     assert [o["recommended"] for o in out["options"]] == [False, True, False]
-    assert out["options"][1]["what"] == "Tests 2 ads · 7 days"
+    assert out["options"][2]["what"] == "Tests 4 ads in 2 ad sets · 7 days"
     for o in out["options"]:
         ad_spend = C.ad_spend_from_budget(o["amount_ngn"])
-        assert ad_spend / 7 / o["ads"] >= C.MIN_DAILY_SPEND_NGN        # every ad clears the daily floor
+        assert ad_spend / 7 / o["ad_sets"] >= C.MIN_DAILY_SPEND_NGN     # every ad set clears the daily floor
         assert o["amount_ngn"] >= C.USEFUL_MIN_NGN["meta"] and o["amount_ngn"] % 1000 == 0
 
 

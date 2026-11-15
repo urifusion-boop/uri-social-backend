@@ -4036,6 +4036,8 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "creative": plan.creative.model_dump(mode="json"),
         "concepts": [c.model_dump(mode="json") for c in plan.concepts],
         "ad_layout": plan.ad_layout,
+        "ad_set_count": _ad_set_total(plan),
+        "recommended_structure": _recommended_structure(plan),
         "concepts_wanted": plan.concepts_wanted,
         "can_split": bool(plan.platforms and _can_split_ads(plan)),
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
@@ -4181,6 +4183,20 @@ async def _refund_undelivered_ad(brand_ctx: dict, business_id: str) -> None:
         await credit_service.refund_credit(brand_ctx.get("user_id") or "", campaign_id=business_id)
     except Exception as e:
         print(f"[credits] refund after dropped connection failed: {e}", flush=True)
+
+
+def _ad_set_total(plan) -> int:
+    from . import concepts as concepts_mod
+    return concepts_mod.ad_set_total(1 + len(plan.concepts), plan.ad_layout, plan.ad_set_count)
+
+
+def _recommended_structure(plan) -> Optional[dict]:
+    """The PRD budget table's ads/ad sets for this plan's daily budget (Meta only)."""
+    from . import concepts as concepts_mod
+    if not plan.platforms or plan.platforms[0].platform != Platform.META:
+        return None
+    p = plan.platforms[0]
+    return concepts_mod.budget_structure(p.budget_ngn / max(1, p.days))
 
 
 def _can_split_ads(plan) -> bool:
@@ -4443,15 +4459,29 @@ async def _pending_meta_plan(db, plan_id: str, brand_ctx: dict) -> tuple[dict, C
     return doc, plan
 
 
+def _apply_budget_layout(plan: CampaignPlan) -> None:
+    """Lay the plan's ads out the way the PRD's budget table says — unless the owner chose."""
+    from . import concepts as concepts_mod
+    p = plan.platforms[0]
+    ads = 1 + len(plan.concepts)
+    if not plan.ad_layout_chosen:
+        plan.ad_layout, plan.ad_set_count = concepts_mod.layout_for_budget(p.budget_ngn, p.days, ads)
+    elif plan.ad_layout == concepts_mod.ABO and not concepts_mod.can_split(p.budget_ngn, p.days, ads):
+        plan.ad_layout, plan.ad_set_count = concepts_mod.SINGLE_AD_SET, 1
+
+
 async def _save_plan_ads(db, plan_id: str, plan: CampaignPlan) -> dict:
     from . import concepts as concepts_mod
+    _apply_budget_layout(plan)
     await db["jane_ads_pending_plans"].update_one(
         {"plan_id": plan_id}, {"$set": {"plan": plan.model_dump(mode="json")}})
     p = plan.platforms[0]
     ads = 1 + len(plan.concepts)
     return {"plan_id": plan_id, "concepts": [c.model_dump(mode="json") for c in plan.concepts],
-            "ad_layout": plan.ad_layout, "concepts_wanted": plan.concepts_wanted,
-            "can_split": concepts_mod.can_split(p.budget_ngn, p.days, ads)}
+            "ad_layout": plan.ad_layout, "ad_set_count": concepts_mod.ad_set_total(ads, plan.ad_layout, plan.ad_set_count),
+            "concepts_wanted": plan.concepts_wanted,
+            "can_split": concepts_mod.can_split(p.budget_ngn, p.days, ads),
+            "recommended": concepts_mod.budget_structure(p.budget_ngn / max(1, p.days))}
 
 
 @router.post("/meta/plan/{plan_id}/ads")
@@ -4528,9 +4558,6 @@ async def meta_plan_add_ad(
     plan.concepts.append(ad)
     if 1 + len(plan.concepts) >= plan.concepts_wanted:
         plan.concepts_wanted = 0
-    p = plan.platforms[0]
-    if not concepts_mod.can_split(p.budget_ngn, p.days, 1 + len(plan.concepts)):
-        plan.ad_layout = concepts_mod.SINGLE_AD_SET
     saved = await _save_plan_ads(db, plan_id, plan)
     # Kept on the plan, but the client may never see it: don't charge for that.
     if body.source == "generate" and request is not None and await request.is_disconnected():
@@ -4621,17 +4648,23 @@ async def meta_plan_set_layout(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """All the ads in one ad set, or one ad set each with an equal budget."""
+    """All the ads in one ad set, one ad set each with an equal budget, or "auto": whatever the
+    PRD budget table recommends for this budget (which may group the ads into a few ad sets)."""
     from . import concepts as concepts_mod
-    if body.layout not in (concepts_mod.SINGLE_AD_SET, concepts_mod.ABO):
+    if body.layout not in (concepts_mod.SINGLE_AD_SET, concepts_mod.ABO, "auto"):
         raise HTTPException(status_code=400, detail="Unknown layout.")
     _, plan = await _pending_meta_plan(db, plan_id, brand_ctx)
     p = plan.platforms[0]
     ads = 1 + len(plan.concepts)
+    if body.layout == "auto":
+        plan.ad_layout_chosen = False
+        return await _save_plan_ads(db, plan_id, plan)
     if body.layout == concepts_mod.ABO and not concepts_mod.can_split(p.budget_ngn, p.days, ads):
         raise HTTPException(status_code=400, detail=f"Each ad set needs at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} a day. "
                                                     "Raise the budget or test fewer ads.")
     plan.ad_layout = body.layout
+    plan.ad_set_count = ads if body.layout == concepts_mod.ABO else 1
+    plan.ad_layout_chosen = True
     return await _save_plan_ads(db, plan_id, plan)
 
 
@@ -5455,6 +5488,15 @@ async def budget_suggestions(platform: str = "meta", days: int = 7,
     """Suggested budgets for the campaign builder, each saying what it buys."""
     from .budget_suggestions import suggest
     return suggest(platform, days)
+
+
+@router.get("/budget-structure")
+async def budget_structure(budget_ngn: float = 0.0, days: int = 7,
+                           brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """How many ads, in how many ad sets, this Meta budget should test (PRD WS5 budget table)."""
+    from .concepts import budget_structure as structure_for
+    days = max(1, int(days or 1))
+    return {"days": days, **structure_for(float(budget_ngn or 0) / days)}
 
 
 @router.get("/meta/campaigns")
