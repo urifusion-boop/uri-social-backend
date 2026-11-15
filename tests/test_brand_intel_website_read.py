@@ -420,3 +420,11 @@ def test_the_owner_gets_a_bell_notification_when_a_read_finishes():
     assert args.args[1:4] == ("u1", "b1", "playbook_ready")
     assert args.kwargs["title"] == "Your Playbook is ready to check"
     assert "magen.ng" in args.kwargs["message"]
+
+
+def test_products_copied_as_shouted_headings_read_normally_and_names_are_kept():
+    """Staging 2026-11-15: urisocial.com's section headings came back as 'GET MORE CUSTOMERS'."""
+    from app.agents.brand_intel import extractor
+    raw = {"key_products_services": {"value": ["SHOW UP CONSISTENTLY", "IBM", "Web design"], "basis": "stated"}}
+    out = extractor.clean(raw, {"url": "https://x.com", "text": "", "pages": []})
+    assert out["key_products_services"]["value"] == ["Show up consistently", "IBM", "Web design"]

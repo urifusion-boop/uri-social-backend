@@ -1035,6 +1035,14 @@ async def search_ad_creative(
 
 # ── The three entry points ────────────────────────────────────────────────────
 
+def use_format_library(platform: str, image_layout: str = "", vsg01_format_id: Optional[str] = None) -> bool:
+    """Whether VSG-01's drawn formats go first. Off when the flag is off, on TikTok (square-only
+    library), and when the ad asks for a layout of its own unless the owner picked a format."""
+    if not settings.JANE_ADS_VSG01_ENABLED or platform == "tiktok":
+        return False
+    return bool(vsg01_format_id) or not image_layout
+
+
 async def generate_ad_creative(
     business_name: str, category: str, goal: str = "messages", description: str = "",
     user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
@@ -1099,7 +1107,11 @@ async def generate_ad_creative(
     # campaign, regardless of the flag, until it has real vertical/TikTok
     # format support — confirmed live 2026-10-19: nothing here previously
     # checked platform at all.
-    if db is not None and settings.JANE_ADS_VSG01_ENABLED and platform != "tiktok":
+    # An ad made for a specific layout (one of several being tested, or a version of a competitor's
+    # ad) keeps that layout: the format library ranked the same format first every time, so every
+    # "different" version came out as the same before/after comparison (staging, 2026-11-15).
+    # A format the owner picked themselves (vsg01_format_id) still wins.
+    if db is not None and use_format_library(platform, image_layout, vsg01_format_id):
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
