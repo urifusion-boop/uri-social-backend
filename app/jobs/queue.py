@@ -132,9 +132,15 @@ async def complete(db, job_id: str, result: dict) -> None:
     )
 
 
-async def fail(db, job: dict, message: str, *, code: str = "failed", retry: bool = True) -> None:
-    """Retry later if attempts remain and the failure is worth retrying, else fail for good."""
+async def fail(db, job: dict, message: str, *, code: str = "failed", retry: bool = True,
+               detail: str = "") -> None:
+    """Retry later if attempts remain and the failure is worth retrying, else fail for good.
+    `detail` is what actually went wrong, for admins only (never shown to the person)."""
     now = _now()
+    if detail:
+        await db[COLLECTION].update_one({"job_id": job["job_id"]}, {"$push": {"failures": {
+            "$each": [{"at": now, "attempt": job.get("attempts", 1), "message": message,
+                       "detail": detail[:1500]}], "$slice": -5}}})
     if retry and job.get("attempts", 1) < job.get("max_attempts", 1):
         backoff = min(300, 10 * (2 ** (job.get("attempts", 1) - 1)))
         await db[COLLECTION].update_one(
@@ -150,6 +156,14 @@ async def fail(db, job: dict, message: str, *, code: str = "failed", retry: bool
                   "finished_at": now, "updated_at": now},
          "$unset": {"active_key": "", "lease_until": ""}},
     )
+
+
+async def recent_failures(db, limit: int = 20) -> list[dict]:
+    """The latest attempts that crashed, with what went wrong (admins)."""
+    cur = db[COLLECTION].find({"failures": {"$exists": True}},
+                              {"_id": 0, "job_id": 1, "type": 1, "status": 1, "brand_id": 1, "failures": 1,
+                               "updated_at": 1}).sort("updated_at", -1).limit(limit)
+    return await cur.to_list(length=limit)
 
 
 def public_view(job: dict) -> dict:

@@ -78,8 +78,12 @@ async def run_one(db, job: dict) -> None:
     except JobError as e:
         await queue.fail(db, job, e.message, code=e.code, retry=e.retry)
     except Exception as e:  # unexpected: retry, and say something useful if it keeps failing
+        import traceback
         print(f"[jobs] {job['type']} {job['job_id']} attempt {job.get('attempts')} crashed: {e!r}", flush=True)
-        await queue.fail(db, job, "Something went wrong on our side. We'll try again shortly.")
+        tb = traceback.extract_tb(e.__traceback__)[-4:]
+        where = " <- ".join(f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno} {f.name}" for f in reversed(tb))
+        await queue.fail(db, job, "Something went wrong on our side. We'll try again shortly.",
+                         detail=f"{e!r} at {where}")
     finally:
         beat.cancel()
 
