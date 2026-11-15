@@ -62,10 +62,13 @@ async def state_of(adapter, record: dict, action: str, params: dict) -> dict:
 
 
 async def _mutate(adapter, record: dict, action: str, params: dict) -> dict:
-    if action == "pause_ad":
-        return await _post(adapter, params.get("ad_id") or record["ad_id"], {"status": "PAUSED"})
-    if action == "resume_ad":
-        return await _post(adapter, params.get("ad_id") or record["ad_id"], {"status": "ACTIVE"})
+    if action in ("pause_ad", "resume_ad"):
+        ad_id = params.get("ad_id") or record["ad_id"]
+        out = await _post(adapter, ad_id, {"status": "PAUSED" if action == "pause_ad" else "ACTIVE"})
+        # Remembered, so switching the whole campaign back on leaves a paused test ad paused.
+        if hasattr(adapter, "remember_ad_paused"):
+            await adapter.remember_ad_paused(record["campaign_id"], ad_id, action == "pause_ad")
+        return out
     if action == "pause_campaign":
         return await adapter.set_delivery(record["campaign_id"], False)
     if action == "resume_campaign":
