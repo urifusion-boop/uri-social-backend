@@ -5,6 +5,7 @@
   GET  /brand-intel/website-reads/latest       this brand's latest read, with findings vs Playbook
   GET  /brand-intel/website-reads/{read_id}    one read: progress while running, findings when done
   POST /brand-intel/website-reads/{read_id}/apply   save the fields the owner picked
+  POST /brand-intel/logo                       store a logo the owner chose instead (not saved to the Playbook)
 
 The page polls the read every 1.5–5 s (the response says how long to wait) while it runs.
 """
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 
@@ -115,3 +116,30 @@ async def apply_website_read(read_id: str, body: ApplyBody, db: AsyncIOMotorData
         await db[queue.COLLECTION].update_one(
             {"job_id": read_id}, {"$addToSet": {"applied_fields": {"$each": body.fields}}})
     return {"applied": [k for k in body.fields if k in update], "profile_updates": update}
+
+
+LOGO_MAX_BYTES = 5_000_000
+
+
+@router.post("/logo")
+async def upload_logo_choice(file: UploadFile = File(...), ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """A different logo for the review panel. Only stored and returned: it reaches the Playbook
+    when the owner presses Use, like every other suggestion."""
+    import io
+
+    from PIL import Image
+
+    from app.utils.s3_upload import upload_bytes
+
+    body = await file.read(LOGO_MAX_BYTES + 1)
+    if len(body) > LOGO_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="That image is too large. Use one under 5 MB.")
+    try:
+        img = Image.open(io.BytesIO(body))
+        img.load()
+        buf = io.BytesIO()
+        img.convert("RGBA").save(buf, format="PNG")
+    except Exception:
+        raise HTTPException(status_code=400, detail="That file isn't an image we can use. Try a PNG or JPG.")
+    url = await upload_bytes(buf.getvalue(), folder="uri-social/brand-logos", resource_type="image")
+    return {"logo_url": url}
