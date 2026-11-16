@@ -21,6 +21,14 @@ from app.agents.brand_intel.safe_fetch import (
 )
 from app.jobs import queue, worker
 
+@pytest.fixture(autouse=True)
+def _no_look_model_call():
+    """Reads also pick a look with a model call (tests/test_brand_intel_look.py covers it); keep the
+    other read tests off the network."""
+    with patch("app.agents.brand_intel.look.pick", new=AsyncMock(return_value={})):
+        yield
+
+
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)

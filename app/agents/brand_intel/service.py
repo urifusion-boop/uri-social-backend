@@ -22,6 +22,7 @@ from app.jobs import queue
 from app.jobs.worker import JobError
 
 from . import extractor, social
+from . import look
 from .html_read import add_colors, pick_pages, read_page, top_colors
 from .safe_fetch import TIMEOUT, USER_AGENT, FetchError, fetch, normalize_url, robots_permits, site_key
 
@@ -42,6 +43,8 @@ _EXTRA_FIELDS = {
     "derived_voice": ("Brand voice", "Brand Voice"),
     "social_links": ("Social links", "Brand Identity"),
     "customer_location": ("Areas you serve", "Audience"),
+    "primary_font": ("Headline font", "Typography"),
+    "secondary_font": ("Body font", "Typography"),
 }
 _TEXT_FIELDS = {k for k, (kind, _) in extractor.FIELDS.items() if kind == "text"} | {"website"}
 _LIST_FIELDS = {k for k, (kind, _) in extractor.FIELDS.items() if kind == "list"} | {"brand_colors"}
@@ -117,6 +120,7 @@ async def read_site_job(db, job: dict, ctx) -> dict:
         if colors and "brand_colors" not in fields:
             fields["brand_colors"] = {"value": colors, "basis": "inferred", "page": site["url"]}
     await ctx.step("understand", "Understanding your business", "done", f"Found {len(fields)} things")
+    await _pick_look(fields, site, ctx)
     await ctx.found(_found_preview(fields))
 
     doc = {"site": key, "url": site["url"], "fetched_at": datetime.now(timezone.utc),
@@ -157,6 +161,7 @@ async def _read_social_job(db, job: dict, ctx, source: str) -> dict:
         if colors and "brand_colors" not in fields:
             fields["brand_colors"] = {"value": colors, "basis": "inferred", "page": site["url"]}
     await ctx.step("understand", "Understanding your business", "done", f"Found {len(fields)} things")
+    await _pick_look(fields, site, ctx)
     await ctx.found(_found_preview(fields))
     doc = {"site": site["url"].replace("https://", ""), "url": site["url"], "fetched_at": datetime.now(timezone.utc),
            "fields": fields, "pages": site["page_list"]}
@@ -298,6 +303,21 @@ def _compose(requested: str, final_url: str, reads: list, colors_counter, home) 
     }
 
 
+async def _pick_look(fields: dict, site: dict, ctx) -> None:
+    """Visual style and fonts, chosen to match the business (its post images, when it's a social
+    read). Never fails the read: without them the owner simply picks in the Playbook."""
+    await ctx.step("look", "Choosing a look for your posts")
+    try:
+        picked = await look.pick(fields, site)
+    except Exception as e:
+        print(f"[brand_intel] look not picked: {e!r}", flush=True)
+        picked = {}
+    for key, value in picked.items():
+        fields.setdefault(key, value)
+    await ctx.step("look", "Choosing a look for your posts", "done",
+                   f"{len(picked.get('style_selections', {}).get('value') or [])} styles" if picked else "")
+
+
 def _deterministic_fields(site: dict, fields: dict) -> dict:
     """Facts read straight off the page, not from the model."""
     out: dict[str, dict[str, Any]] = {"website": {"value": site["url"], "basis": "stated", "page": site["url"]},
@@ -384,7 +404,8 @@ def compare(fields: dict, profile: dict) -> list[dict]:
                      "basis": f["basis"], "page": f.get("page", ""), "status": status,
                      "selected": status == "new",
                      "merge": isinstance(found, (list, dict))})
-    order = ["Brand Identity", "Business Details", "Audience", "Brand Voice", "Brand Colors", "Language & Region"]
+    order = ["Brand Identity", "Business Details", "Audience", "Brand Voice", "Brand Colors", "Visual Style",
+             "Typography", "Content Strategy", "Call to Action", "Language & Region"]
     rows.sort(key=lambda r: (order.index(r["section"]) if r["section"] in order else 99))
     return rows
 
@@ -411,6 +432,7 @@ def build_update(fields: dict, chosen: list[str], profile: dict, edits: Optional
             value = {**{k: v for k, v in value.items() if v}, **{k: v for k, v in (current or {}).items() if v}} \
                 if isinstance(current, dict) else value
         data[key] = value
+        data.update(look.companions(key, value, profile))
         sources[key] = {"source": "you" if key in edits else "website",
                         "basis": "stated" if key in edits else fields[key]["basis"],
                         "page": fields[key].get("page", ""), "value": value, "at": now.isoformat()}
