@@ -14,6 +14,14 @@ from mongomock_motor import AsyncMongoMockClient
 from app.features import flags
 from app.jobs import monitor, queue
 
+@pytest.fixture(autouse=True)
+def _no_look_model_call():
+    """Reads also pick a look with a model call (tests/test_brand_intel_look.py covers it); keep the
+    other read tests off the network."""
+    with patch("app.agents.brand_intel.look.pick", new=AsyncMock(return_value={})):
+        yield
+
+
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -145,6 +153,7 @@ def test_a_connected_instagram_is_read_through_the_official_api():
     assert site["url"] == "https://instagram.com/magen.ng" and site["website_found"] == "https://magen.ng"
     assert "BIO: Airport runs" in site["text"] and "₦25,000" in site["text"]
     assert site["logo_candidates"] == ["https://cdn.ig/pic.jpg"] and site["socials"] == {"instagram": "https://instagram.com/magen.ng"}
+    assert site["images"] == []  # captions only in this fixture: no post images to show
 
 
 def test_an_expired_connection_says_to_reconnect():

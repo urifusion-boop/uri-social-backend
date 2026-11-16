@@ -62,7 +62,7 @@ async def read_profile(conn: dict, source: str) -> dict:
         if source == "instagram":
             ig = conn["ig_user_id"]
             p = await _get(client, ig, token, "username,name,biography,website,profile_picture_url")
-            media = await _get(client, f"{ig}/media", token, "caption,media_type,media_product_type", limit=_POSTS)
+            media = await _get(client, f"{ig}/media", token, "caption,media_type,media_product_type,media_url,thumbnail_url", limit=_POSTS)
             username = p.get("username") or conn.get("username") or ""
             url = f"https://instagram.com/{username}" if username else "https://instagram.com/"
             captions = [m.get("caption", "") for m in media.get("data") or [] if m.get("caption")]
@@ -76,11 +76,13 @@ async def read_profile(conn: dict, source: str) -> dict:
             picture = p.get("profile_picture_url") or ""
             name = p.get("name") or username
             formats = _formats(media.get("data") or [])
+            images = [m.get("thumbnail_url") if m.get("media_type") == "VIDEO" else m.get("media_url")
+                      for m in media.get("data") or []]
         else:
             page_id = conn["page_id"]
             p = await _get(client, page_id, token,
                            "name,about,description,category,website,single_line_address,phone,link,picture.type(large)")
-            posts = await _get(client, f"{page_id}/posts", token, "message", limit=_POSTS)
+            posts = await _get(client, f"{page_id}/posts", token, "message,full_picture", limit=_POSTS)
             url = p.get("link") or f"https://facebook.com/{page_id}"
             messages = [m.get("message", "") for m in posts.get("data") or [] if m.get("message")]
             text = "\n".join(filter(None, [
@@ -95,13 +97,14 @@ async def read_profile(conn: dict, source: str) -> dict:
             picture = (((p.get("picture") or {}).get("data") or {}).get("url")) or ""
             name = p.get("name") or ""
             formats = []
+            images = [m.get("full_picture") for m in posts.get("data") or []]
     if len(text) < 80:
         raise FetchError("That account doesn't say enough about the business yet to fill your Playbook.", "thin")
     return {"url": url, "requested": url, "text": text, "pages": [url], "page_list": [{"kind": source, "url": url,
                                                                                          "title": name}],
             "socials": socials, "colors": [], "logo_candidates": [picture] if picture else [],
             "jsonld": [{"name": name}] if name else [], "lang": "", "website_found": website,
-            "formats": formats}
+            "formats": formats, "images": [u for u in images if u][:8]}
 
 
 # Instagram's media types, as the Playbook names its formats.
