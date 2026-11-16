@@ -223,6 +223,11 @@ def _with_city_radius(targeting: dict) -> dict:
     }}
 
 
+def _record_ids(record: dict, many_key: str, one_key: str) -> list[str]:
+    ids = record.get(many_key) or [record.get(one_key)]
+    return [i for i in ids if i]
+
+
 def _raise_not_linked(data: dict, plan) -> None:
     err = data.get("error") or {}
     raise WhatsAppNotLinked(
@@ -1137,14 +1142,13 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         record = await self._get_campaign_record(campaign_id)
         status = "ACTIVE" if active else "PAUSED"
         updated: dict[str, bool] = {}
+        nodes = [
+            (campaign_id, "campaign"),
+            *((i, "adset") for i in _record_ids(record, "adset_ids", "adset_id")),
+            *((i, "ad") for i in _record_ids(record, "ad_ids", "ad_id")),
+        ]
         async with httpx.AsyncClient(timeout=30) as client:
-            for node_id, label in (
-                (campaign_id, "campaign"),
-                (record.get("adset_id"), "adset"),
-                (record.get("ad_id"), "ad"),
-            ):
-                if not node_id:
-                    continue
+            for node_id, label in nodes:
                 resp = await client.post(
                     f"{self._graph_base}/{node_id}",
                     params={"access_token": self._access_token},
@@ -1152,7 +1156,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 )
                 data = resp.json()
                 _raise_for_error(data, f"{label} status update")
-                updated[label] = bool(data.get("success"))
+                updated[label] = updated.get(label, True) and bool(data.get("success"))
         return {"status": status, "updated": updated}
 
     async def fetch_adset_schedule(self, campaign_id: str) -> dict:
