@@ -197,6 +197,95 @@ def test_the_instagram_read_fills_the_playbook_like_a_website_read():
     assert out["fields"]["website"]["value"] == "https://magen.ng"
     assert out["fields"]["social_links"]["value"] == {"instagram": "https://instagram.com/magen.ng"}
     assert out["fields"]["brand_name"]["value"] == "Magen"
+    assert out["fields"]["default_link"]["value"] == "https://magen.ng"
+
+
+# ── a read fills the whole Playbook, not half of it (staging 2026-11-16: 47%) ────
+
+def test_instagram_formats_come_from_what_the_account_actually_posts():
+    from app.agents.brand_intel import social
+    media = [{"media_type": "VIDEO"}, {"media_type": "CAROUSEL_ALBUM"}, {"media_type": "VIDEO"}, {"media_type": "IMAGE"},
+             {"media_type": "SOMETHING_NEW"}]
+    assert social._formats(media) == ["Short Video / Reel", "Carousel", "Single Image"]
+
+
+def test_choice_fields_keep_only_the_playbooks_own_options_spelled_its_way():
+    from app.agents.brand_intel import extractor
+    site = {"url": "https://instagram.com/jtf", "pages": [], "text": "We go to schools every term. Period poverty ends with education, "
+            "and every girl deserves dignity. Send us a DM to volunteer."}
+    raw = {
+        "content_pillars": {"value": ["tips & education", "Customer Stories", "Memes", "Behind the Scenes"], "basis": "inferred"},
+        "cta_styles": {"value": "DM us", "basis": "inferred"},
+        "primary_goal": {"value": ["build community", "Drive Sales"], "basis": "inferred"},
+        "audience_age_range": {"value": ["Gen Z (18-24)", "Millennials (25-40)", "kids"], "basis": "inferred"},
+        "business_stage": {"value": "a start-up", "basis": "inferred"},
+        "voice_sample": {"value": "Period poverty ends with education, and every girl deserves dignity.", "basis": "stated"},
+    }
+    out = extractor.clean(raw, site)
+    assert out["content_pillars"]["value"] == ["Tips & Education", "Customer Stories", "Behind the Scenes"]
+    assert out["cta_styles"]["value"] == ["DM us"]
+    assert out["primary_goal"]["value"] == "Build Community"
+    assert out["audience_age_range"]["value"] == "Gen Z (18-24), Millennials (25-40)"
+    assert "business_stage" not in out          # not one of the options: left for the owner
+    assert out["voice_sample"]["value"].startswith("Period poverty")
+
+
+def test_a_voice_sample_jane_wrote_herself_is_dropped():
+    from app.agents.brand_intel import extractor
+    site = {"url": "u", "pages": [], "text": "Airport runs from 25,000 naira."}
+    raw = {"voice_sample": {"value": "We are passionate about delivering excellence to every valued customer we serve daily.",
+                            "basis": "stated"}}
+    assert "voice_sample" not in extractor.clean(raw, site)
+
+
+def test_the_prompt_lists_the_options_for_choice_fields():
+    from app.agents.brand_intel import extractor
+    prompt = extractor._prompt({"url": "u", "text": "t"})
+    assert '"Build Community"' in prompt and '"Gen Z (18-24)"' in prompt and "social media profile" in prompt
+
+
+def test_a_logo_gives_its_colours_leaving_out_white_black_and_grey():
+    from PIL import Image
+    from app.agents.brand_intel import service
+    img = Image.new("RGB", (100, 100), (255, 255, 255))
+    for x in range(60):
+        for y in range(100):
+            img.putpixel((x, y), (194, 24, 91))
+    for x in range(60, 80):
+        for y in range(100):
+            img.putpixel((x, y), (20, 20, 20))
+    assert service.logo_colors(img) == ["#C01848"]
+
+
+def test_a_social_read_without_website_colours_takes_them_from_the_logo():
+    from app.agents.brand_intel import extractor, service
+    db = _db()
+    _run(db["social_connections"].insert_one({"user_id": "u1", "platform": "instagram", "connection_status": "active",
+                                              "ig_user_id": "ig1", "page_access_token": "t"}))
+    site = {"url": "https://instagram.com/jtf", "text": "x" * 100, "pages": [], "socials": {"instagram": "https://instagram.com/jtf"},
+            "page_list": [{"kind": "instagram", "url": "https://instagram.com/jtf", "title": "JTF"}],
+            "colors": [], "logo_candidates": ["https://cdn/p.jpg"], "jsonld": [], "website_found": "",
+            "formats": ["Carousel", "Single Image"]}
+
+    class Ctx:
+        async def step(self, *a, **k):
+            pass
+
+        async def found(self, items):
+            pass
+
+    logo = {"value": "https://s3/l.png", "basis": "inferred", "page": site["url"], "colors": ["#C01848"]}
+    with patch("app.agents.brand_intel.social.read_profile", new=AsyncMock(return_value=site)), \
+         patch.object(extractor, "extract", new=AsyncMock(return_value={})), \
+         patch.object(service, "find_logo", new=AsyncMock(return_value=logo)), \
+         patch("app.services.brand_notifier.notify_in_app", new=AsyncMock()):
+        out = _run(service.read_site_job(db, {"job_id": "j", "user_id": "u1", "brand_id": "b1",
+                                              "payload": {"source": "instagram", "url": "", "force": True}}, Ctx()))
+    f = out["fields"]
+    assert f["brand_colors"]["value"] == ["#C01848"] and f["brand_colors"]["basis"] == "inferred"
+    assert f["logo_url"] == {"value": "https://s3/l.png", "basis": "inferred", "page": site["url"]}
+    assert f["preferred_formats"]["value"] == ["Carousel", "Single Image"]
+    assert f["default_link"]["value"] == "https://instagram.com/jtf"
 
 
 # ── logo suggestions ────────────────────────────────────────────────────────────
@@ -222,7 +311,8 @@ def test_the_first_real_sized_logo_is_stored_as_a_guess():
          patch("app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://s3/logo.png")) as up:
         out = _run(service.find_logo(["https://x/icon.svg", "https://x/missing.png", "https://x/tiny.png",
                                       "https://x/banner.png", "https://x/logo.png"], "https://x/"))
-    assert out == {"value": "https://s3/logo.png", "basis": "inferred", "page": "https://x/"}
+    # A pink logo also gives its colour, for a profile with no website colours to go on.
+    assert out == {"value": "https://s3/logo.png", "basis": "inferred", "page": "https://x/", "colors": ["#C01848"]}
     assert up.await_count == 1
 
 
