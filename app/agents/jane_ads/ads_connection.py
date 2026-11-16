@@ -56,6 +56,21 @@ class ConnectionState(str, Enum):
                                            # cannot fix it, the Page's owner has to act
 
 
+def page_to_connect(pages: list[dict]) -> dict:
+    """The Page ads can run from. /me/accounts lists every Page the person has any role
+    on, in no useful order, so taking the first connected a Page they could not
+    advertise from and every launch then failed with "page not shared". Prefer one they
+    hold full control of; fall back to the first when Meta reports no tasks at all."""
+    return page_choices(pages)[0]
+
+
+def page_choices(pages: list[dict]) -> list[dict]:
+    """The Pages worth offering for ads: those the person holds full control of, or every Page
+    when Meta reports no tasks at all."""
+    full = [p for p in pages if {"MANAGE", "ADVERTISE"} <= set(p.get("tasks") or [])]
+    return full or pages
+
+
 REGRANT_EVERY = timedelta(minutes=2)
 
 

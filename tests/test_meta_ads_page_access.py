@@ -190,3 +190,12 @@ def test_the_partner_request_goes_from_uris_business_manager():
     url, params = calls[0]
     assert url.endswith("/bm1/client_pages") and params["page_id"] == "pg1"
     assert params["permitted_tasks"] == '["ADVERTISE"]' and params["access_token"] == "sys"
+
+
+def test_only_pages_with_full_control_are_offered_and_one_is_taken_straight_away():
+    pages = [{"id": "a", "tasks": ["ANALYZE"]}, {"id": "b", "tasks": ["MANAGE", "ADVERTISE", "CREATE_CONTENT"]},
+             {"id": "c", "tasks": ["ADVERTISE", "MANAGE"]}]
+    assert [p["id"] for p in AC.page_choices(pages)] == ["b", "c"]
+    assert AC.page_to_connect(pages)["id"] == "b"
+    no_tasks = [{"id": "a"}, {"id": "b"}]
+    assert AC.page_choices(no_tasks) == no_tasks

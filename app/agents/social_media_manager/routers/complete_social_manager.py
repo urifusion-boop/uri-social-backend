@@ -2511,7 +2511,7 @@ async def facebook_ads_callback(
 
             pages_resp = await client.get(
                 f"{graph_base}/me/accounts",
-                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+                params={"access_token": long_token, "fields": "id,name,access_token,picture,tasks"},
             )
             pages_data = pages_resp.json()
             pages = pages_data.get("data", [])
@@ -2520,22 +2520,25 @@ async def facebook_ads_callback(
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
-            if len(pages) > 1:
-                # Several Pages: let the person choose. Taking the first one Facebook listed
-                # connected some people to the wrong Page.
+            # Prefer the Pages the person has full control of (MANAGE + ADVERTISE): taking the
+            # first one Facebook listed connected Pages they couldn't advertise from. One such
+            # Page is connected straight away; several (or none reported) and they choose.
+            from app.agents.jane_ads.ads_connection import page_choices
+            candidates = page_choices(pages)
+            if len(candidates) > 1:
                 import secrets
                 token = secrets.token_urlsafe(24)
                 await db["pending_fb_ads_pages"].insert_one({
                     "token": token,
                     "pages": [{"id": p["id"], "name": p.get("name", ""), "access_token": p.get("access_token", ""),
                                "picture": ((p.get("picture") or {}).get("data") or {}).get("url", "")
-                               if isinstance(p.get("picture"), dict) else ""} for p in pages],
+                               if isinstance(p.get("picture"), dict) else ""} for p in candidates],
                     "long_token": long_token,
                     "created_at": datetime.utcnow(),
                 })
                 return RedirectResponse(f"{base_redirect}&connected=facebook_ads_pick&token={urllib.parse.quote(token)}")
 
-            chosen = await _connect_ads_page(db, pages[0], long_token)
+            chosen = await _connect_ads_page(db, candidates[0], long_token)
             page_id, page_name = chosen["page_id"], chosen["page_name"]
 
             params_out = (
