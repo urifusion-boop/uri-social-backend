@@ -2369,7 +2369,7 @@ async def facebook_ads_callback(
 
             pages_resp = await client.get(
                 f"{graph_base}/me/accounts",
-                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+                params={"access_token": long_token, "fields": "id,name,access_token,picture,tasks"},
             )
             pages_data = pages_resp.json()
             pages = pages_data.get("data", [])
@@ -2378,7 +2378,8 @@ async def facebook_ads_callback(
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
-            page = pages[0]
+            from app.agents.jane_ads.ads_connection import page_to_connect
+            page = page_to_connect(pages)
             page_id = page["id"]
             page_name = page["name"]
             page_token = page["access_token"]

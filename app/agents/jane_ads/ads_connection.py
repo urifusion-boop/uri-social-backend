@@ -55,6 +55,15 @@ class ConnectionState(str, Enum):
                                            # cannot fix it, the Page's owner has to act
 
 
+def page_to_connect(pages: list[dict]) -> dict:
+    """The Page ads can run from. /me/accounts lists every Page the person has any role
+    on, in no useful order, so taking the first connected a Page they could not
+    advertise from and every launch then failed with "page not shared". Prefer one they
+    hold full control of; fall back to the first when Meta reports no tasks at all."""
+    full = [p for p in pages if {"MANAGE", "ADVERTISE"} <= set(p.get("tasks") or [])]
+    return (full or pages)[0]
+
+
 def _bm_share_was_already_done(ads: dict) -> bool:
     """Meta rejects re-sharing a Page that URI's Business Manager ALREADY has with
     "You are trying to assign a duplicated asset to this agency". That reads like a
