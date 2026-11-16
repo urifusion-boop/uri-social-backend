@@ -523,3 +523,19 @@ def test_a_brand_whose_own_page_connection_expired_is_asked_to_reconnect_not_mov
         with pytest.raises(AdsConnectionRequired) as exc_info:
             _run(resolve_ads_page_for_launch(db, None, "brnd_1", require_whatsapp=False))
     assert exc_info.value.state == ConnectionState.EXPIRED
+
+
+def test_connects_the_page_the_person_has_full_control_of():
+    from app.agents.jane_ads.ads_connection import page_to_connect
+
+    pages = [
+        {"id": "1", "name": "Partial", "tasks": ["CREATE_CONTENT", "MODERATE"]},
+        {"id": "2", "name": "Full", "tasks": ["MANAGE", "ADVERTISE", "ANALYZE"]},
+    ]
+    assert page_to_connect(pages)["id"] == "2"
+
+
+def test_falls_back_to_the_first_page_when_none_reports_full_control():
+    from app.agents.jane_ads.ads_connection import page_to_connect
+
+    assert page_to_connect([{"id": "1"}, {"id": "2"}])["id"] == "1"
