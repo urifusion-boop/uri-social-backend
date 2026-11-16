@@ -2294,6 +2294,123 @@ async def facebook_ads_initiate(
     return RedirectResponse(auth_url)
 
 
+async def _connect_ads_page(db, page: dict, long_token: str) -> dict:
+    """Ask Meta for Uri's two grants on the chosen Page and store the pending ads connection.
+
+    1. Share the Page with Uri's Business Manager (ADVERTISE), from the Page side.
+    2. Give Uri's ads system user ADVERTISE on it (works once 1 holds).
+    When Meta refuses both — typically because the Page belongs to a Business portfolio, where
+    only the portfolio can add a partner, so even the Page's owner gets "(#200) Permissions
+    error" — Uri's Business Manager sends the Page a partner request instead, which the owner
+    approves in Meta Business Suite. The launch check retries 2 until that approval lands."""
+    from datetime import timezone
+    from app.services.MetaAdsService import (
+        BusinessManagerNotConfigured,
+        SystemUserNotConfigured,
+        assign_page_to_system_user,
+        request_page_access,
+        share_page_with_business_manager,
+    )
+
+    page_id = page["id"]
+    page_name = page["name"]
+    page_token = page["access_token"]
+    pic = page.get("picture")
+    profile_pic = (pic.get("data") or {}).get("url", "") if isinstance(pic, dict) else (pic or "")
+
+    business_manager_shared = False
+    system_user_assigned = False
+    business_manager_error = None
+    try:
+        await share_page_with_business_manager(page_id, page_token)
+        business_manager_shared = True
+        print(f"[FBAdsOAuth] ✅ Granted URI Business Manager ADVERTISE access to page {page_id}")
+
+        # Sharing with the business is not enough on its own: a system user
+        # does NOT inherit Page access from the business it belongs to, so
+        # ad-creative creation fails with "Missing Page permission ...
+        # Advertiser role or higher" even though the business holds
+        # PROFILE_PLUS_ADVERTISE. Live-confirmed 2026-08-31. Without this the
+        # only alternative is an admin assigning every client Page by hand.
+    except BusinessManagerNotConfigured:
+        print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
+    except Exception as e:
+        business_manager_error = str(e)
+        print(f"[FBAdsOAuth] ❌ Business Manager share failed for page {page_id}: {e}")
+
+    # Attempted whether or not the share above succeeded. The two grants are
+    # independent — a system user does NOT inherit Page access from the
+    # business it belongs to — and nesting this inside the success branch meant
+    # a Page whose share Meta refused ("(#200) Permissions error", seen in prod
+    # on repeat attempts) never even tried the grant that ad creatives actually
+    # need. Trying costs one call and can only improve the outcome.
+    try:
+        await assign_page_to_system_user(page_id, page_token)
+        system_user_assigned = True
+        print(f"[FBAdsOAuth] ✅ Assigned ads system user to page {page_id}")
+    except SystemUserNotConfigured:
+        business_manager_error = business_manager_error or (
+            "META_ADS_SYSTEM_USER_ID not set — ads cannot run from this Page yet."
+        )
+        print(f"[FBAdsOAuth] ⚠️ system user not configured — page {page_id} not assignable")
+    except Exception as e:
+        # Recorded, never swallowed: a launch from this Page fails until it is
+        # resolved, and the stored error is what the client is finally shown.
+        business_manager_error = business_manager_error or f"system-user assignment: {e}"
+        print(f"[FBAdsOAuth] ⚠️ system-user assignment failed for {page_id}: {e}")
+
+    access_request_status = None
+    access_request_error = None
+    if (not business_manager_shared and not system_user_assigned
+            and "duplicated asset" not in (business_manager_error or "")):
+        try:
+            res = await request_page_access(page_id)
+            access_request_status = str(res.get("access_status") or "PENDING").upper()
+            print(f"[FBAdsOAuth] 📨 Partner request sent to page {page_id}: {access_request_status}")
+        except Exception as e:
+            access_request_error = str(e)[:300]
+            print(f"[FBAdsOAuth] ⚠️ partner request to page {page_id} failed: {e}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn_doc = {
+        "id": f"fbads_{page_id}",
+        "user_id": None,               # set by finalize
+        "platform": "facebook_ads",
+        "connected_via": "facebook_ads_oauth",
+        "page_id": page_id,
+        "page_access_token": page_token,
+        # The USER-level long-lived token, kept separately from page_access_token —
+        # GET /me/permissions (the only way to read back which scopes were actually
+        # granted) only returns meaningful data for a user token; a Page token there
+        # comes back empty every time, which is exactly what silently broke the
+        # daily health check and the live pre-flight check before this was added.
+        "user_access_token": long_token,
+        "account_name": page_name,
+        "profile_picture_url": profile_pic,
+        "connection_status": "pending_user_match",
+        "business_manager_shared": business_manager_shared,
+        # Recorded separately: the system-user grant is what ad-creative
+        # creation actually needs, and it can succeed on a Page whose
+        # Business-Manager share Meta refused.
+        "system_user_assigned": system_user_assigned,
+        "business_manager_error": business_manager_error,
+        # Uri's partner request to the Page, approved by the owner in Meta Business Suite:
+        # PENDING until they do; None when it wasn't needed.
+        "access_request_status": access_request_status,
+        "access_request_error": access_request_error,
+        "access_request_at": now if access_request_status else None,
+        "connected_at": now,
+        "updated_at": now,
+    }
+    await db["social_connections"].update_one(
+        {"id": f"fbads_{page_id}"},
+        {"$set": conn_doc},
+        upsert=True,
+    )
+    print(f"[FBAdsOAuth] ✅ Stored ads-scoped page '{page_name}' (page_id={page_id}) pending user match")
+    return {"page_id": page_id, "page_name": page_name}
+
+
 @router.get("/connect/facebook-ads/callback")
 async def facebook_ads_callback(
     code: Optional[str] = Query(None),
@@ -2307,13 +2424,6 @@ async def facebook_ads_callback(
     ADVERTISE-only access to the page for it."""
     import urllib.parse
     import httpx
-    from datetime import timezone
-    from app.services.MetaAdsService import (
-        BusinessManagerNotConfigured,
-        SystemUserNotConfigured,
-        assign_page_to_system_user,
-        share_page_with_business_manager,
-    )
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
     base_redirect = f"{web_app_url}/workspace/?tab=connections"
@@ -2410,86 +2520,26 @@ async def facebook_ads_callback(
                 err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
-            from app.agents.jane_ads.ads_connection import page_to_connect
-            page = page_to_connect(pages)
-            page_id = page["id"]
-            page_name = page["name"]
-            page_token = page["access_token"]
-            profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
+            # Prefer the Pages the person has full control of (MANAGE + ADVERTISE): taking the
+            # first one Facebook listed connected Pages they couldn't advertise from. One such
+            # Page is connected straight away; several (or none reported) and they choose.
+            from app.agents.jane_ads.ads_connection import page_choices
+            candidates = page_choices(pages)
+            if len(candidates) > 1:
+                import secrets
+                token = secrets.token_urlsafe(24)
+                await db["pending_fb_ads_pages"].insert_one({
+                    "token": token,
+                    "pages": [{"id": p["id"], "name": p.get("name", ""), "access_token": p.get("access_token", ""),
+                               "picture": ((p.get("picture") or {}).get("data") or {}).get("url", "")
+                               if isinstance(p.get("picture"), dict) else ""} for p in candidates],
+                    "long_token": long_token,
+                    "created_at": datetime.utcnow(),
+                })
+                return RedirectResponse(f"{base_redirect}&connected=facebook_ads_pick&token={urllib.parse.quote(token)}")
 
-            business_manager_shared = False
-            system_user_assigned = False
-            business_manager_error = None
-            try:
-                await share_page_with_business_manager(page_id, page_token)
-                business_manager_shared = True
-                print(f"[FBAdsOAuth] ✅ Granted URI Business Manager ADVERTISE access to page {page_id}")
-
-                # Sharing with the business is not enough on its own: a system user
-                # does NOT inherit Page access from the business it belongs to, so
-                # ad-creative creation fails with "Missing Page permission ...
-                # Advertiser role or higher" even though the business holds
-                # PROFILE_PLUS_ADVERTISE. Live-confirmed 2026-08-31. Without this the
-                # only alternative is an admin assigning every client Page by hand.
-            except BusinessManagerNotConfigured:
-                print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
-            except Exception as e:
-                business_manager_error = str(e)
-                print(f"[FBAdsOAuth] ❌ Business Manager share failed for page {page_id}: {e}")
-
-            # Attempted whether or not the share above succeeded. The two grants are
-            # independent — a system user does NOT inherit Page access from the
-            # business it belongs to — and nesting this inside the success branch meant
-            # a Page whose share Meta refused ("(#200) Permissions error", seen in prod
-            # on repeat attempts) never even tried the grant that ad creatives actually
-            # need. Trying costs one call and can only improve the outcome.
-            try:
-                await assign_page_to_system_user(page_id, page_token)
-                system_user_assigned = True
-                print(f"[FBAdsOAuth] ✅ Assigned ads system user to page {page_id}")
-            except SystemUserNotConfigured:
-                business_manager_error = business_manager_error or (
-                    "META_ADS_SYSTEM_USER_ID not set — ads cannot run from this Page yet."
-                )
-                print(f"[FBAdsOAuth] ⚠️ system user not configured — page {page_id} not assignable")
-            except Exception as e:
-                # Recorded, never swallowed: a launch from this Page fails until it is
-                # resolved, and the stored error is what the client is finally shown.
-                business_manager_error = business_manager_error or f"system-user assignment: {e}"
-                print(f"[FBAdsOAuth] ⚠️ system-user assignment failed for {page_id}: {e}")
-
-            now = datetime.now(timezone.utc).isoformat()
-            conn_doc = {
-                "id": f"fbads_{page_id}",
-                "user_id": None,               # set by finalize
-                "platform": "facebook_ads",
-                "connected_via": "facebook_ads_oauth",
-                "page_id": page_id,
-                "page_access_token": page_token,
-                # The USER-level long-lived token, kept separately from page_access_token —
-                # GET /me/permissions (the only way to read back which scopes were actually
-                # granted) only returns meaningful data for a user token; a Page token there
-                # comes back empty every time, which is exactly what silently broke the
-                # daily health check and the live pre-flight check before this was added.
-                "user_access_token": long_token,
-                "account_name": page_name,
-                "profile_picture_url": profile_pic,
-                "connection_status": "pending_user_match",
-                "business_manager_shared": business_manager_shared,
-                # Recorded separately: the system-user grant is what ad-creative
-                # creation actually needs, and it can succeed on a Page whose
-                # Business-Manager share Meta refused.
-                "system_user_assigned": system_user_assigned,
-                "business_manager_error": business_manager_error,
-                "connected_at": now,
-                "updated_at": now,
-            }
-            await db["social_connections"].update_one(
-                {"id": f"fbads_{page_id}"},
-                {"$set": conn_doc},
-                upsert=True,
-            )
-            print(f"[FBAdsOAuth] ✅ Stored ads-scoped page '{page_name}' (page_id={page_id}) pending user match")
+            chosen = await _connect_ads_page(db, candidates[0], long_token)
+            page_id, page_name = chosen["page_id"], chosen["page_name"]
 
             params_out = (
                 f"connected=facebook_ads"
@@ -2503,6 +2553,48 @@ async def facebook_ads_callback(
         return RedirectResponse(
             f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
         )
+
+
+PENDING_ADS_PAGES_MAX_AGE_SECONDS = 3600
+
+
+async def _pending_ads_pages(db, token: str) -> dict:
+    pending = await db["pending_fb_ads_pages"].find_one({"token": token})
+    if not pending or (datetime.utcnow() - pending["created_at"]).total_seconds() > PENDING_ADS_PAGES_MAX_AGE_SECONDS:
+        raise HTTPException(status_code=404, detail="That Facebook sign-in has expired. Please connect again.")
+    return pending
+
+
+@router.get("/connect/facebook-ads/pending/{token}")
+async def facebook_ads_pending_pages(
+    token: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """The Pages to choose from after signing in with Facebook for ads (never their tokens)."""
+    pending = await _pending_ads_pages(db, token)
+    return {"pages": [{"id": p["id"], "name": p["name"], "picture": p.get("picture", "")} for p in pending["pages"]]}
+
+
+class FacebookAdsPickBody(BaseModel):
+    token: str
+    page_id: str
+
+
+@router.post("/connect/facebook-ads/pick")
+async def facebook_ads_pick_page(
+    body: FacebookAdsPickBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Connect the Page the person chose; the app then finalizes it like a single-Page connect."""
+    pending = await _pending_ads_pages(db, body.token)
+    page = next((p for p in pending["pages"] if p["id"] == body.page_id), None)
+    if not page:
+        raise HTTPException(status_code=400, detail="That Page wasn't one of the choices.")
+    chosen = await _connect_ads_page(db, page, pending["long_token"])
+    await db["pending_fb_ads_pages"].delete_one({"token": body.token})
+    return {"fb_page_id": chosen["page_id"], "page_name": chosen["page_name"]}
 
 
 @router.post("/connect/facebook-ads/finalize")

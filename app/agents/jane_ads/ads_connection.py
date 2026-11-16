@@ -15,6 +15,7 @@ health check — and refusing to fall back to a shared page when it's absent.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
@@ -60,8 +61,53 @@ def page_to_connect(pages: list[dict]) -> dict:
     on, in no useful order, so taking the first connected a Page they could not
     advertise from and every launch then failed with "page not shared". Prefer one they
     hold full control of; fall back to the first when Meta reports no tasks at all."""
+    return page_choices(pages)[0]
+
+
+def page_choices(pages: list[dict]) -> list[dict]:
+    """The Pages worth offering for ads: those the person holds full control of, or every Page
+    when Meta reports no tasks at all."""
     full = [p for p in pages if {"MANAGE", "ADVERTISE"} <= set(p.get("tasks") or [])]
-    return (full or pages)[0]
+    return full or pages
+
+
+REGRANT_EVERY = timedelta(minutes=2)
+
+
+async def _granted_since(db, ads: dict) -> bool:
+    """Has the Page's owner approved Uri since connecting? When Meta refused both grants at connect
+    time, Uri's Business Manager sent the Page a partner request; once it's approved in Meta
+    Business Suite, the system-user grant goes through. Try it (at most every couple of minutes,
+    this runs on every launch check) and remember a success, so no reconnect is needed."""
+    from app.services.MetaAdsService import assign_page_to_system_user
+
+    now = datetime.now(timezone.utc)
+    last = ads.get("regrant_tried_at")
+    if isinstance(last, datetime):
+        last = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+        if now - last < REGRANT_EVERY:
+            return False
+    try:
+        await assign_page_to_system_user(ads["page_id"], "")
+    except Exception as e:
+        update = {"regrant_tried_at": now, "regrant_error": str(e)[:300]}
+        if not ads.get("access_request_status") and not ads.get("access_request_error"):
+            # Connected before Uri sent partner requests: send it now, once.
+            from app.services.MetaAdsService import request_page_access
+            try:
+                res = await request_page_access(ads["page_id"])
+                update.update({"access_request_status": str(res.get("access_status") or "PENDING").upper(),
+                               "access_request_at": now.isoformat()})
+            except Exception as req_err:
+                update["access_request_error"] = str(req_err)[:300]
+        await db[CONNECTIONS].update_one({"id": ads.get("id")}, {"$set": update})
+        ads.update(update)
+        return False
+    await db[CONNECTIONS].update_one({"id": ads.get("id")}, {"$set": {
+        "system_user_assigned": True, "access_request_status": "APPROVED", "regrant_tried_at": now,
+        "regrant_error": None, "updated_at": now.isoformat()}})
+    print(f"[ads_connection] ✅ page {ads['page_id']} approved Uri — system user assigned", flush=True)
+    return True
 
 
 def _bm_share_was_already_done(ads: dict) -> bool:
@@ -238,7 +284,8 @@ async def resolve_connection_state(
     # share alone would hold back a Page that can advertise perfectly well.
     if (ads.get("business_manager_shared") is False
             and not ads.get("system_user_assigned")
-            and not _bm_share_was_already_done(ads)):
+            and not _bm_share_was_already_done(ads)
+            and not (live_check and await _granted_since(db, ads))):
         ads = dict(ads)
         ads["_business_manager_error"] = ads.get("business_manager_error") or ""
         return ConnectionState.PAGE_NOT_SHARED, ads
