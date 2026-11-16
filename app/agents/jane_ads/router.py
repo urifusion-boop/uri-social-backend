@@ -1241,6 +1241,9 @@ async def jane_meta_connection_status(
         # (resolving the asset conflict in Meta Business Settings), not just
         # re-consenting to the same scopes.
         "business_manager_error": (ads or {}).get("_business_manager_error", ""),
+        # page_not_shared only: Uri's partner request to the Page — "PENDING" while it waits
+        # for the owner's approval in Meta Business Suite.
+        "access_request_status": (ads or {}).get("access_request_status") or "",
     }
 
 
