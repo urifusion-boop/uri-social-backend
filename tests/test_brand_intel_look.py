@@ -92,3 +92,53 @@ def test_a_failure_picking_the_look_never_fails_the_read():
 
 def test_the_font_library_matches_the_apps():
     assert len(look.FONTS) == 16 and all(f["prompt"] and f["name"] for f in look.FONTS.values())
+
+
+# ── editing any suggestion before Use (staging 2026-11-16: "couldn't edit brand colours, CTA, logo") ──
+
+def test_an_edited_list_colours_and_logo_are_the_owners():
+    fields = {"cta_styles": {"value": ["DM us", "Learn more"], "basis": "inferred", "page": "p"},
+              "brand_colors": {"value": ["#D81818", "#C01818"], "basis": "inferred", "page": "p"},
+              "logo_url": {"value": "https://s3/found.png", "basis": "inferred", "page": "p"}}
+    edits = {"cta_styles": ["DM us", " Donate  now ", "DM us", ""], "brand_colors": ["#8E1B5C"],
+             "logo_url": "https://s3/mine.png"}
+    upd = service.build_update(fields, list(fields), {}, edits=edits)
+    assert upd["cta_styles"] == ["DM us", "Donate now"]
+    assert upd["brand_colors"] == ["#8E1B5C"]
+    assert upd["logo_url"] == "https://s3/mine.png"
+    assert all(upd["field_sources"][k]["source"] == "you" for k in fields)
+
+
+def test_an_edit_of_the_wrong_shape_is_ignored():
+    fields = {"brand_colors": {"value": ["#D81818"], "basis": "inferred", "page": "p"},
+              "logo_url": {"value": "https://s3/found.png", "basis": "inferred", "page": "p"},
+              "cta_styles": {"value": ["DM us"], "basis": "inferred", "page": "p"}}
+    edits = {"brand_colors": ["red"], "logo_url": "javascript:alert(1)", "cta_styles": "DM us"}
+    upd = service.build_update(fields, list(fields), {}, edits=edits)
+    assert upd["brand_colors"] == ["#D81818"] and upd["logo_url"] == "https://s3/found.png"
+    assert upd["cta_styles"] == ["DM us"]
+    assert upd["field_sources"]["brand_colors"]["source"] == "website"
+
+
+def test_a_chosen_logo_is_stored_but_not_saved_to_the_playbook():
+    import io
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from PIL import Image
+
+    from app.agents.brand_intel import router as R
+    from app.dependencies import get_active_brand_context
+
+    app = FastAPI()
+    app.include_router(R.router)
+    app.dependency_overrides[get_active_brand_context] = lambda: {"user_id": "u1", "brand_id": "b1"}
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 200), (142, 27, 92)).save(buf, format="JPEG")
+    with patch("app.utils.s3_upload.upload_bytes", new=AsyncMock(return_value="https://s3/chosen.png")) as up:
+        client = TestClient(app)
+        ok = client.post("/brand-intel/logo", files={"file": ("logo.jpg", buf.getvalue(), "image/jpeg")})
+        bad = client.post("/brand-intel/logo", files={"file": ("x.txt", b"not an image", "text/plain")})
+    assert ok.status_code == 200 and ok.json() == {"logo_url": "https://s3/chosen.png"}
+    assert up.await_count == 1
+    assert bad.status_code == 400 and "isn't an image" in bad.json()["detail"]

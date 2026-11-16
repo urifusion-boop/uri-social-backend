@@ -11,6 +11,8 @@ reads a day, and the whole read is capped in pages, bytes and time.
 """
 from __future__ import annotations
 
+import re
+
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -422,7 +424,8 @@ def build_update(fields: dict, chosen: list[str], profile: dict, edits: Optional
     for key in chosen:
         if key not in fields:
             continue
-        value = edits.get(key, fields[key]["value"])
+        edited = key in edits and _edit_ok(key, edits[key], fields[key]["value"])
+        value = _clean_edit(edits[key]) if edited else fields[key]["value"]
         current = profile.get(key)
         if isinstance(value, list):
             existing = [x for x in (current or []) if x] if isinstance(current, list) else []
@@ -433,12 +436,39 @@ def build_update(fields: dict, chosen: list[str], profile: dict, edits: Optional
                 if isinstance(current, dict) else value
         data[key] = value
         data.update(look.companions(key, value, profile))
-        sources[key] = {"source": "you" if key in edits else "website",
-                        "basis": "stated" if key in edits else fields[key]["basis"],
+        sources[key] = {"source": "you" if edited else "website",
+                        "basis": "stated" if edited else fields[key]["basis"],
                         "page": fields[key].get("page", ""), "value": value, "at": now.isoformat()}
     if data:
         data["field_sources"] = sources
     return data
+
+
+_HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _edit_ok(key: str, value: Any, found: Any) -> bool:
+    """An owner's edit has the same shape as what was found: words for words, a list for a list,
+    colours as #RRGGBB, a logo as an https image address. Anything else is ignored."""
+    if isinstance(found, list):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return False
+        if key == "brand_colors":
+            return all(_HEX.match(v.strip()) for v in value)
+        return True
+    if isinstance(found, str):
+        if not isinstance(value, str) or not value.strip():
+            return False
+        if key == "logo_url":
+            return value.startswith("https://") and len(value) < 1000
+        return True
+    return False
+
+
+def _clean_edit(value: Any) -> Any:
+    if isinstance(value, list):
+        return list(dict.fromkeys(" ".join(v.split())[:200] for v in value if v.strip()))[:20]
+    return value.strip()[:4000]
 
 
 def source_of(profile: dict, key: str) -> str:
