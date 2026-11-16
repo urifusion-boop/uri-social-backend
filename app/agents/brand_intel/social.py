@@ -62,7 +62,7 @@ async def read_profile(conn: dict, source: str) -> dict:
         if source == "instagram":
             ig = conn["ig_user_id"]
             p = await _get(client, ig, token, "username,name,biography,website,profile_picture_url")
-            media = await _get(client, f"{ig}/media", token, "caption", limit=_POSTS)
+            media = await _get(client, f"{ig}/media", token, "caption,media_type,media_product_type", limit=_POSTS)
             username = p.get("username") or conn.get("username") or ""
             url = f"https://instagram.com/{username}" if username else "https://instagram.com/"
             captions = [m.get("caption", "") for m in media.get("data") or [] if m.get("caption")]
@@ -75,6 +75,7 @@ async def read_profile(conn: dict, source: str) -> dict:
             website = p.get("website") or ""
             picture = p.get("profile_picture_url") or ""
             name = p.get("name") or username
+            formats = _formats(media.get("data") or [])
         else:
             page_id = conn["page_id"]
             p = await _get(client, page_id, token,
@@ -93,9 +94,22 @@ async def read_profile(conn: dict, source: str) -> dict:
             website = (p.get("website") or "").split()[0] if p.get("website") else ""
             picture = (((p.get("picture") or {}).get("data") or {}).get("url")) or ""
             name = p.get("name") or ""
+            formats = []
     if len(text) < 80:
         raise FetchError("That account doesn't say enough about the business yet to fill your Playbook.", "thin")
     return {"url": url, "requested": url, "text": text, "pages": [url], "page_list": [{"kind": source, "url": url,
                                                                                          "title": name}],
             "socials": socials, "colors": [], "logo_candidates": [picture] if picture else [],
-            "jsonld": [{"name": name}] if name else [], "lang": "", "website_found": website}
+            "jsonld": [{"name": name}] if name else [], "lang": "", "website_found": website,
+            "formats": formats}
+
+
+# Instagram's media types, as the Playbook names its formats.
+_FORMAT_OF = {"CAROUSEL_ALBUM": "Carousel", "IMAGE": "Single Image", "VIDEO": "Short Video / Reel"}
+
+
+def _formats(media: list[dict]) -> list[str]:
+    """The formats the account actually posts, most used first (what it does, not a guess)."""
+    from collections import Counter
+    counts = Counter(_FORMAT_OF[m["media_type"]] for m in media if m.get("media_type") in _FORMAT_OF)
+    return [f for f, _ in counts.most_common()]

@@ -44,14 +44,40 @@ FIELDS: dict[str, tuple[str, str]] = {
     "region": ("text", "the country or region they operate in"),
     "customer_location": ("text", "the cities or areas they serve, e.g. 'Lekki, Victoria Island and Ikoyi'"),
     "languages": ("list", "languages the site is written in"),
+    # The rest of the Playbook, so a read (above all an Instagram or Facebook read, which has no
+    # About or FAQ pages) fills it as far as the business's own words allow.
+    "voice_sample": ("text", "one real post caption or paragraph, copied word for word, that best shows how the business writes; 80-400 characters; never written by you"),
+    "content_pillars": ("list", "the 2-5 topics the business posts or writes about, chosen ONLY from the options"),
+    "cta_styles": ("list", "what the business asks people to do, chosen ONLY from the options"),
+    "primary_goal": ("text", "what its marketing is mainly trying to achieve, ONE of the options"),
+    "audience_age_range": ("list", "the age groups its customers are in, chosen ONLY from the options"),
+    "business_stage": ("text", "how established the business is, ONE of the options; only if the pages give a sign (founding year, size, years of service)"),
+    "customer_objections": ("list", "doubts or hesitations a customer might have before buying, up to 4"),
+}
+
+# Fields the Playbook offers as fixed choices: the value must be one of these, spelled exactly so,
+# or the Playbook can't show it as chosen. (Setup's own options, brand-setup/page.tsx.)
+CHOICES: dict[str, list[str]] = {
+    "content_pillars": ["Behind the Scenes", "Product Highlights", "Tips & Education", "Customer Stories",
+                        "Promotions", "Team & Culture", "Industry News", "Trending & Seasonal"],
+    "cta_styles": ["Link in bio", "Shop now", "DM us", "Book a call", "Learn more", "Sign up", "Download",
+                   "Visit our website"],
+    "primary_goal": ["Brand Awareness", "Drive Sales", "Grow Following", "Build Community", "Lead Generation",
+                     "Website Traffic"],
+    "audience_age_range": ["Gen Z (18-24)", "Millennials (25-40)", "Gen X (41-56)", "Boomers (57+)", "Everyone"],
+    "business_stage": ["new", "growing", "established", "market_leader"],
 }
 
 
 def _prompt(site: dict) -> str:
-    field_lines = "\n".join(f'- "{k}" ({kind}): {desc}' for k, (kind, desc) in FIELDS.items())
+    field_lines = "\n".join(
+        f'- "{k}" ({kind}): {desc}' + (f" — options: {json.dumps(CHOICES[k])}" if k in CHOICES else "")
+        for k, (kind, desc) in FIELDS.items())
     return (
-        "You are setting up a marketing playbook for a small business from its own website.\n"
-        "Read the pages below and fill the fields. Rules:\n"
+        "You are setting up a marketing playbook for a small business from its own website or social "
+        "media profile.\n"
+        "Read the pages below and fill the fields. Fill every field the pages support — a profile with "
+        "its recent posts usually supports nearly all of them as a reading (basis inferred). Rules:\n"
         "- Use only what the pages say or clearly imply. If a field isn't supported, leave value empty.\n"
         "- basis is \"stated\" when the pages say it outright, \"inferred\" when it's your reading.\n"
         "- Prices, testimonials, awards and numbers: copy them exactly, mark them stated, never invent.\n"
@@ -114,13 +140,21 @@ def clean(raw: dict, site: dict) -> dict[str, dict[str, Any]]:
             if not value:
                 continue
         else:
+            if isinstance(value, list):  # one answer asked for, several given: the first
+                value = next((v for v in value if str(v).strip()), "")
             value = " ".join(str(value or "").split())[:400]
             if not value:
                 continue
         if key == "key_products_services":
             value = [_unshout(v) for v in value]
+        if key in CHOICES:
+            value = _choose(key, value)
+            if not value:
+                continue
         basis = "stated" if item.get("basis") == "stated" else "inferred"
         page = item.get("page") if item.get("page") in pages else site.get("url", "")
+        if key == "voice_sample" and (len(value) < 40 or not _appears(value, text)):
+            continue  # a sample of their writing must be their writing
         if key in ("proof_points", "tagline", "price_range"):
             # Words that must be the site's own: keep only what can be found in it.
             if kind == "list":
@@ -134,6 +168,19 @@ def clean(raw: dict, site: dict) -> dict[str, dict[str, Any]]:
                     continue
         out[key] = {"value": value, "basis": basis, "page": page}
     return out
+
+
+def _choose(key: str, value: Any) -> Any:
+    """Only the Playbook's own options, spelled its way. A one-choice field keeps a string; a
+    multi-choice list stays a list, except the age range, which the Playbook keeps as one string."""
+    options = {o.lower(): o for o in CHOICES[key]}
+    picked = list(dict.fromkeys(options[v.strip().lower()] for v in ([value] if isinstance(value, str) else value)
+                                if isinstance(v, str) and v.strip().lower() in options))
+    if FIELDS[key][0] == "text":
+        return picked[0] if picked else ""
+    if key == "audience_age_range":
+        return ", ".join(picked)
+    return picked[:5]
 
 
 def _unshout(v: str) -> str:

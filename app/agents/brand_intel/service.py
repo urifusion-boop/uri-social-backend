@@ -112,7 +112,10 @@ async def read_site_job(db, job: dict, ctx) -> dict:
     fields.update(_deterministic_fields(site, fields))
     logo = await find_logo(site.get("logo_candidates") or [], site["url"])
     if logo:
+        colors = logo.pop("colors", None)
         fields["logo_url"] = logo
+        if colors and "brand_colors" not in fields:
+            fields["brand_colors"] = {"value": colors, "basis": "inferred", "page": site["url"]}
     await ctx.step("understand", "Understanding your business", "done", f"Found {len(fields)} things")
     await ctx.found(_found_preview(fields))
 
@@ -149,7 +152,10 @@ async def _read_social_job(db, job: dict, ctx, source: str) -> dict:
         fields["website"] = {"value": site["website_found"], "basis": "stated", "page": site["url"]}
     logo = await find_logo(site.get("logo_candidates") or [], site["url"])
     if logo:
+        colors = logo.pop("colors", None)
         fields["logo_url"] = logo
+        if colors and "brand_colors" not in fields:
+            fields["brand_colors"] = {"value": colors, "basis": "inferred", "page": site["url"]}
     await ctx.step("understand", "Understanding your business", "done", f"Found {len(fields)} things")
     await ctx.found(_found_preview(fields))
     doc = {"site": site["url"].replace("https://", ""), "url": site["url"], "fetched_at": datetime.now(timezone.utc),
@@ -181,10 +187,24 @@ async def find_logo(candidates: list[str], page: str) -> Optional[dict]:
             buf = io.BytesIO()
             img.convert("RGBA").save(buf, format="PNG")
             stored = await upload_bytes(buf.getvalue(), folder="uri-social/brand-logos", resource_type="image")
-            return {"value": stored, "basis": "inferred", "page": page}
+            return {"value": stored, "basis": "inferred", "page": page, "colors": logo_colors(img)}
         except Exception:
             continue
     return None
+
+
+def logo_colors(img, n: int = 3) -> list[str]:
+    """The logo's main colours as hex, leaving out near-white, near-black and grey (backgrounds and
+    text). Used only where the business has no website colours to go on."""
+    small = img.convert("RGBA").resize((64, 64), resample=0)  # nearest: no blended edge colours
+    counts: dict[tuple, int] = {}
+    for r, g, b, a in small.getdata():
+        if a < 128 or max(r, g, b) - min(r, g, b) < 30 or max(r, g, b) < 40 or min(r, g, b) > 225:
+            continue
+        key = (r // 24 * 24, g // 24 * 24, b // 24 * 24)
+        counts[key] = counts.get(key, 0) + 1
+    picked = [c for c, k in sorted(counts.items(), key=lambda kv: -kv[1]) if k >= 40][:n]
+    return ["#%02X%02X%02X" % c for c in picked]
 
 
 async def _tell_owner(db, job: dict, site: str, count: int) -> None:
@@ -280,7 +300,11 @@ def _compose(requested: str, final_url: str, reads: list, colors_counter, home) 
 
 def _deterministic_fields(site: dict, fields: dict) -> dict:
     """Facts read straight off the page, not from the model."""
-    out: dict[str, dict[str, Any]] = {"website": {"value": site["url"], "basis": "stated", "page": site["url"]}}
+    out: dict[str, dict[str, Any]] = {"website": {"value": site["url"], "basis": "stated", "page": site["url"]},
+                                      "default_link": {"value": site.get("website_found") or site["url"],
+                                                       "basis": "inferred", "page": site["url"]}}
+    if site.get("formats"):
+        out["preferred_formats"] = {"value": site["formats"], "basis": "stated", "page": site["url"]}
     if site.get("socials"):
         out["social_links"] = {"value": dict(site["socials"]), "basis": "stated", "page": site["url"]}
     if site.get("colors"):
