@@ -13,7 +13,7 @@ from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pymongo import ReturnDocument
+from pymongo import ReadPreference, ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     UserCreditWallet,
@@ -56,8 +56,13 @@ class CreditService:
         """
         Get user credit wallet
         Returns None if user has no wallet (never subscribed)
+
+        Read from the primary: prod reads from replicas by default (secondaryPreferred), and a
+        balance is read straight after it's written (grant a plan, spend a credit). A replica
+        that hadn't caught up returned no wallet at all for a user whose first wallet had just
+        been created, and the admin "Assign plan" crashed on it (prod 2026-11-16).
         """
-        wallet_doc = await self.user_credits_collection.find_one({"user_id": user_id})
+        wallet_doc = await _primary(self.user_credits_collection).find_one({"user_id": user_id})
         if not wallet_doc:
             return None
 
@@ -954,6 +959,15 @@ class CreditService:
         )
 
         return await self.get_user_wallet(user_id)
+
+
+def _primary(collection):
+    """The same collection, read from the primary (where the write just went). Kept as it is
+    where that isn't offered as the same kind of collection (in-memory test databases)."""
+    if not hasattr(collection, "with_options"):
+        return collection
+    primary = collection.with_options(read_preference=ReadPreference.PRIMARY)
+    return primary if type(primary) is type(collection) else collection
 
 
 # Singleton instance

@@ -164,3 +164,27 @@ def test_clear_subscription_reverts_to_free_and_keeps_bonus_credits(fake_db):
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_the_wallet_is_read_from_the_primary_so_a_just_created_one_is_found():
+    """Prod 2026-11-16: assigning a plan to a user with no wallet crashed ("Failed to assign plan").
+    Prod reads from replicas by default; the read straight after the upsert hit one that hadn't
+    caught up and found no wallet. Wallet reads now go to the primary."""
+    from pymongo import ReadPreference
+
+    from app.services import CreditService as module
+
+    seen = {}
+
+    class Coll:
+        def with_options(self, read_preference=None):
+            seen["read_preference"] = read_preference
+            return self
+
+        async def find_one(self, query, *a, **k):
+            return {"_id": "w", "user_id": query["user_id"], "bonus_credits": 0, "subscription_credits": 400,
+                    "subscription_tier": "starter"}
+
+    assert module._primary(Coll()).find_one  # passes through to the collection
+    module._primary(Coll())
+    assert seen["read_preference"] == ReadPreference.PRIMARY
