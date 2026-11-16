@@ -1625,7 +1625,9 @@ class ApprovalWorkflowService:
                     slides=validated_slides,
                     page_id=page_id,
                 )
-            elif post_type == "reel":
+            elif post_type == "reel" or (draft.get("video_url") and not draft.get("image_url") and post_type != "story"):
+                # An uploaded video keeps post_type "feed" (the upload form has no "reel" option), and Instagram's
+                # feed endpoint takes only images — so a video draft publishes as a Reel, music included.
                 video_url = draft.get("video_url") or ""
                 if not video_url:
                     return {"success": False, "error": "Reel draft has no video_url. Re-generate the video before publishing."}
