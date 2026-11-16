@@ -107,3 +107,32 @@ async def assign_page_to_system_user(page_id: str, page_access_token: str) -> di
                 f"System-user page assignment failed: {data['error'].get('message')}"
             )
         return data
+
+
+async def request_page_access(page_id: str) -> dict:
+    """Ask, from Uri's own Business Manager, for ADVERTISE access to a client's Page.
+
+    The Page-side share above (share_page_with_business_manager) is refused with
+    "(#200) Permissions error" when the Page belongs to a Business portfolio: only the
+    portfolio can add a partner, so even the Page's owner can't do it with a Page token.
+    This sends the partner request from Uri's side instead; the Page's owner approves it in
+    Meta Business Suite (Settings → Requests). Returns Meta's answer, normally
+    {"access_status": "PENDING"} — or "CONFIRMED" when no approval was needed."""
+    if not settings.META_BUSINESS_MANAGER_ID:
+        raise BusinessManagerNotConfigured("META_BUSINESS_MANAGER_ID is not set.")
+    if not settings.META_ADS_ACCESS_TOKEN:
+        raise SystemUserNotConfigured("META_ADS_ACCESS_TOKEN is not set.")
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{graph_base}/{settings.META_BUSINESS_MANAGER_ID}/client_pages",
+            params={
+                "page_id": page_id,
+                "permitted_tasks": json.dumps(["ADVERTISE"]),
+                "access_token": settings.META_ADS_ACCESS_TOKEN,
+            },
+        )
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(f"Partner request failed: {data['error'].get('message')}")
+        return data
