@@ -111,8 +111,14 @@ def test_search_asks_for_music_for_this_account_and_normalises_the_tracks(http):
     assert params == {"audio_type": "music", "user_id": "178414", "access_token": "TOKEN", "search_query": "birthday"}
     assert [t["audio_id"] for t in tracks] == ["1", "2"]
     assert tracks[0] == {"audio_id": "1", "title": "Birthday Wish", "artist": "Shuba", "duration_seconds": 154,
-                         "cover_url": "https://c/1.jpg", "preview_url": "https://p/1.mp3"}
-    assert tracks[1]["preview_url"] == "https://instagram/prev"
+                         "cover_url": "https://c/1.jpg", "preview_url": "https://p/1.mp3", "instagram_url": None}
+
+
+def test_a_track_with_only_an_instagram_page_has_no_playable_preview(http):
+    # on_platform_audio_preview_link is a web page; handing it to an <audio> element fails every time.
+    http.answers = [(SEARCH_ANSWER,)]
+    track = _run(IA.search_music("178414", "TOKEN"))[1]
+    assert track["preview_url"] is None and track["instagram_url"] == "https://instagram/prev"
 
 
 def test_search_with_no_query_asks_for_trending(http):

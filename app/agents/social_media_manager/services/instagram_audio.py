@@ -76,8 +76,10 @@ def _track(raw: Dict[str, Any]) -> Dict[str, Any]:
         "artist": raw.get("display_artist") or "",
         "duration_seconds": round((raw.get("duration_in_ms") or 0) / 1000),
         "cover_url": raw.get("cover_artwork_thumbnail_uri") or raw.get("cover_artwork_thumbnail_url"),
-        # A temporary link (about 1.5 days) to a preview of the track.
-        "preview_url": raw.get("download_url") or raw.get("on_platform_audio_preview_link"),
+        # A temporary link (about 1.5 days) to an audio file, when Instagram supplies one. Many tracks have none.
+        "preview_url": raw.get("download_url"),
+        # The track's page on instagram.com: a web page, not audio, so it can only be opened, never played in place.
+        "instagram_url": raw.get("on_platform_audio_preview_link"),
     }
 
 
