@@ -10,29 +10,21 @@ actually does at render time.
 """
 from typing import Callable, List, Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import ImageFont
 
-_DUMMY_DRAW = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-
-
-def load_measuring_font(font_size: int, font_weight: int) -> ImageFont.ImageFont:
-    """Mirrors DocumentRendererService._load_font's exact path/fallback so
-    text is measured against the same font that will actually draw it at
-    render time — measuring against the wrong font is worse than not
-    measuring at all."""
-    try:
-        path = (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            if font_weight >= 700
-            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        )
-        return ImageFont.truetype(path, font_size)
-    except Exception:
-        return ImageFont.load_default()
+from app.utils.fonts import load_font, text_width as fonts_text_width
 
 
-def text_width(text: str, font_size: int, font_weight: int = 400) -> int:
-    return int(_DUMMY_DRAW.textlength(text, font=load_measuring_font(font_size, font_weight)))
+def load_measuring_font(font_size: int, font_weight: int, font_family: Optional[str] = None) -> ImageFont.ImageFont:
+    """The same font DocumentRendererService draws with (both go through app/utils/fonts.py),
+    so text is measured against what will actually draw it — measuring against the wrong
+    font is worse than not measuring at all."""
+    return load_font(font_family, font_size, font_weight)
+
+
+def text_width(text: str, font_size: int, font_weight: int = 400, font_family: Optional[str] = None) -> int:
+    """Width as drawn, including any characters drawn in the fallback font (e.g. ₦)."""
+    return int(fonts_text_width(text, font_family, font_size, font_weight))
 
 
 def wrap_text(
@@ -41,6 +33,7 @@ def wrap_text(
     font_size: int,
     font_weight: int = 400,
     measure: Optional[Callable[[str], int]] = None,
+    font_family: Optional[str] = None,
 ) -> List[str]:
     """Greedy word-wrap against a measured width.
 
@@ -53,7 +46,7 @@ def wrap_text(
     uses the real default; injection exists only so the wrap *algorithm*
     can be tested independently of which fonts happen to be installed.
     """
-    measure = measure or (lambda s: text_width(s, font_size, font_weight))
+    measure = measure or (lambda s: text_width(s, font_size, font_weight, font_family))
     words = text.split()
     if not words:
         return [text]
