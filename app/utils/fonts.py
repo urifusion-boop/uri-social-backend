@@ -144,6 +144,14 @@ def draw_text(
     if len(runs) == 1:
         draw.text(xy, text, font=_truetype(runs[0][1], int(size)), fill=fill, anchor=anchor)
         return
+    if "\n" in text:
+        # Same line pitch Pillow's own multiline_text uses (height of "A" plus 4px).
+        primary = _truetype(font_path(family, weight), int(size))
+        pitch = draw.textbbox((0, 0), "A", font=primary)[3] + 4
+        x, y = xy
+        for i, line in enumerate(text.split("\n")):
+            draw_text(draw, (x, y + i * pitch), line, family, size, weight, fill=fill, anchor=anchor)
+        return
 
     anchor = anchor or "la"
     horizontal, vertical = anchor[0], anchor[1]
@@ -165,3 +173,54 @@ def draw_text(
         font = _truetype(path, int(size))
         draw.text((x, y), run, font=font, fill=fill, anchor="ls")
         x += font.getlength(run)
+
+
+def spans_width(spans: List[dict], family: Optional[str], size: int, weight: int = 400) -> float:
+    """Width of one line made of differently coloured pieces (see draw_spans)."""
+    return sum(text_width(sp.get("text", ""), sp.get("font_family", family), size,
+                          sp.get("font_weight", weight)) for sp in spans)
+
+
+def draw_spans(
+    draw: ImageDraw.ImageDraw,
+    xy: Tuple[float, float],
+    spans: List[dict],
+    family: Optional[str],
+    size: int,
+    weight: int = 400,
+    fill=None,
+    anchor: Optional[str] = None,
+    highlight_pad: Tuple[int, int] = (14, 6),
+) -> None:
+    """One line of text in pieces: [{"text": "Get "}, {"text": "50%", "color": (r,g,b,a)},
+    {"text": "is not", "highlight": (r,g,b,a)}]. Pieces share the line's baseline; a piece may
+    override color, font_family and font_weight, and a highlight draws a solid block behind
+    it (the "is not" bar on the billboard sample). The anchor works as for draw_text."""
+    anchor = anchor or "la"
+    horizontal, vertical = anchor[0], anchor[1]
+    primary = _truetype(font_path(family, weight), int(size))
+    ascent, descent = primary.getmetrics()
+    x, y = xy
+    total = spans_width(spans, family, size, weight)
+    if horizontal == "m":
+        x -= total / 2
+    elif horizontal == "r":
+        x -= total
+    if vertical in ("a", "t"):
+        y += ascent
+    elif vertical in ("d", "b"):
+        y -= descent
+    elif vertical == "m":
+        y += (ascent - descent) / 2
+    pad_x, pad_y = highlight_pad
+    for sp in spans:
+        text = sp.get("text", "")
+        fam = sp.get("font_family", family)
+        wt = sp.get("font_weight", weight)
+        width = text_width(text, fam, size, wt)
+        if sp.get("highlight") is not None and text.strip():
+            cap = draw.textbbox((0, 0), "H", font=_truetype(font_path(fam, wt), int(size)), anchor="ls")
+            draw.rectangle([x - pad_x, y + cap[1] - pad_y, x + width + pad_x, y + descent * 0.35 + pad_y],
+                           fill=sp["highlight"])
+        draw_text(draw, (x, y), text, fam, size, wt, fill=sp.get("color", fill), anchor="ls")
+        x += width
