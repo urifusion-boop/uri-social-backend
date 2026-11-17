@@ -177,8 +177,13 @@ NO_PHOTO_FORMAT_IDS = frozenset({
     # resolves to None and falls through, never actually auto-firing without
     # real human review (see that builder's own docstring).
     "SEED-089",
+    # Poster formats. Event Promo without a photo is a type-and-date poster; Offer Spotlight
+    # generates a situation photo; Problems vs Solution without a product lists outcomes.
+    "SEED-099", "SEED-100", "SEED-101",
 })
 UPLOAD_PHOTO_FORMAT_IDS = frozenset({
+    # Event Promo with the host's own photo; Problems vs Solution with the real product.
+    "SEED-099", "SEED-101",
     "SEED-093", "SEED-082", "SEED-074", "SEED-096",
     # Censored Item / Day 1 -> Day 30 — same completeness/readiness note as
     # News Headline above: both are also pooled_account_safe=REQUIRES_ISOLATION,
@@ -222,6 +227,17 @@ _CANVAS_SIZE = (1080, 1080)
 # announcement ("we're opening a new branch in Yaba on 1 October, tell
 # people about it") still fell through to Problem/Solution's default.
 _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
+    "SEED-099": (
+        "webinar", "workshop", "masterclass", "master class", "class on", "challenge", "bootcamp",
+        "training", "seminar", "register", "sign up", "join us on", "live session", "meetup",
+    ),
+    "SEED-100": (
+        "% off", "percent off", "discount", "promo", "sale", "anniversary", "deal", "slashed",
+        "half price", "buy one", "free delivery",
+    ),
+    "SEED-101": (
+        "tired of", "struggling", "frustrat", "stress of", "no more", "problem", "hassle",
+    ),
     # Us vs Them — the brief itself frames a comparison.
     "SEED-075": (
         "vs ", "vs.", "versus", "unlike other", "unlike most", "compared to",
@@ -1920,6 +1936,287 @@ async def _build_day1_day30(business_name: str, category: str, description: str,
     return document
 
 
+# ── Poster formats: SEED-099 Event Promo, SEED-100 Offer Spotlight, SEED-101 Problems vs Solution ──
+# Same contract as every format above: copy comes from the business's own words, any figure not
+# in them is removed, and a builder returns None (falls through to the next format) rather than
+# shipping something it can't stand behind.
+
+def _figures_in(text: str) -> list:
+    return re.findall(r"₦\s?[\d,.]+[kKmM]?|\d[\d,.]*\s?%|\d[\d,.]*", text or "")
+
+
+def _drop_invented_figures(text: str, source: str) -> str:
+    """Remove any ₦ amount, percentage or number that isn't in the business's own text."""
+    src_digits = re.sub(r"[^\d]", "", source or "")
+    for tok in _figures_in(text):
+        digits = re.sub(r"[^\d]", "", tok)
+        if digits and digits not in src_digits:
+            text = re.sub(r"\s{2,}", " ", text.replace(tok, "")).strip(" ,.-")
+    return text
+
+
+def _brand_source(description: str, brand_context: Optional[dict]) -> str:
+    """Everything the business itself has told us — what copy may be grounded in."""
+    bc = brand_context or {}
+    bits = [description or ""]
+    for key in ("key_products_services", "unique_selling_proposition", "website", "tagline",
+                "customer_pain_points", "customer_frustrations", "proof_points", "price_range"):
+        v = bc.get(key)
+        if isinstance(v, list):
+            bits.extend(str(x) for x in v)
+        elif v:
+            bits.append(str(v))
+    return "\n".join(bits)
+
+
+async def _cutout(photo_url: str) -> Optional[str]:
+    """The real photo with its background removed — remove.bg, then the local model. Never the
+    image-model method, which redraws the picture (a real person's face or a real product must
+    stay exactly as photographed)."""
+    from app.utils.background_removal import remove_background
+    for method in ("removebg", "rembg"):
+        try:
+            url = await remove_background(photo_url, method=method)
+            if url:
+                return url
+        except Exception as e:
+            print(f"[VSG01] cutout via {method} failed: {e}", flush=True)
+    return None
+
+
+def _poster_style(brand_context: Optional[dict], tokens: dict, default_font: str) -> dict:
+    from .ad_formats._type import brand_block_color, headline_family
+    return {
+        "headline_font": headline_family(brand_context, default_font),
+        "brand_color": brand_block_color((brand_context or {}).get("brand_colors"), tokens),
+    }
+
+
+async def _content_event_promo(business_name: str, category: str, description: str,
+                               brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}:\n"
+        "Does the text announce a REAL upcoming event with a stated date — a webinar, class, "
+        "workshop, challenge, masterclass, training, launch, meetup or similar? If not, return "
+        "{\"is_event\": false}.\n"
+        "If it does, return JSON with:\n"
+        "- is_event: true\n"
+        "- title: the event's own name if the text gives one, otherwise a short punchy name (<=6 "
+        "words) built only from what the event is about\n"
+        "- event_kind: what kind of event it is, <=5 words, using only details in the text "
+        "(e.g. '5-Day WhatsApp Challenge', 'Free live webinar on Zoom')\n"
+        "- date_text: the date EXACTLY as written in the text\n"
+        "- time_text: the time exactly as written, or \"\"\n"
+        "- host_name: the host's name only if the text names one, else \"\"\n"
+        "- host_role: the host's title only if the text states it, else \"\"\n"
+        "- action_line: <=3 words, e.g. 'Register now', 'Book your seat'. Say 'free' ONLY if the "
+        "text says the event is free.\n"
+        "- contact_line: a website, @handle or phone number ONLY if it appears in the text, else \"\"\n"
+        "Never invent a date, price, speaker or link. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not d.get("is_event"):
+        return None
+    source = _brand_source(description, brand_context)
+    date_text = str(d.get("date_text", "")).strip()
+    if not date_text or not _appears_in(date_text, description):
+        return None
+    time_text = str(d.get("time_text", "")).strip()
+    if time_text and _appears_in(time_text, description):
+        date_text = f"{date_text}, {time_text}"
+    host_name = str(d.get("host_name", "")).strip()
+    if host_name and not _appears_in(host_name, description):
+        host_name = ""
+    host_role = str(d.get("host_role", "")).strip() if host_name else ""
+    if host_role and not _appears_in(host_role, description):
+        host_role = ""
+    action = str(d.get("action_line", "")).strip()
+    if "free" in action.lower() and "free" not in (description or "").lower():
+        action = "Register now"
+    contact = str(d.get("contact_line", "")).strip()
+    if contact and not _appears_in(contact, source):
+        contact = ""
+    title = _drop_invented_figures(str(d.get("title", "")).strip(), description)
+    kind = _drop_invented_figures(str(d.get("event_kind", "")).strip(), description)
+    if not title or not kind:
+        return None
+    return {"title": title, "event_kind": kind, "date_text": date_text, "host_name": host_name or None,
+            "host_role": host_role or None, "action_line": action or "Register now",
+            "contact_line": contact or None}
+
+
+async def _build_event_promo(business_name: str, category: str, description: str, tokens: dict,
+                             photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                             brand_context: Optional[dict] = None):
+    from .ad_formats import event_promo
+    content = await _content_event_promo(business_name, category, description, brand_context)
+    if not content:
+        return None
+    # photo_url here is always the owner's own attested photo — a customer photo or a product
+    # photo never reaches this format (see _FORMATS_NOT_FOR_PHOTO).
+    cutout = await _cutout(photo_url) if photo_url else None
+    try:
+        return event_promo.build_document(
+            content["title"], content["event_kind"], content["date_text"],
+            canvas_size=_CANVAS_SIZE, tokens=tokens,
+            host_cutout_url=cutout, host_photo_url=None if cutout else photo_url,
+            host_name=content["host_name"], host_role=content["host_role"],
+            action_line=content["action_line"], contact_line=content["contact_line"],
+            brand_logo_url=brand_logo_url, **_poster_style(brand_context, tokens, event_promo.DEFAULT_FAMILY),
+        )
+    except Exception as e:
+        print(f"[VSG01] Event Promo build failed: {e}", flush=True)
+        return None
+
+
+async def _content_offer_spotlight(business_name: str, category: str, description: str,
+                                   brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip():
+        return None
+    services_hint = (brand_context or {}).get("key_products_services") or []
+    if isinstance(services_hint, str):
+        services_hint = [services_hint]
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}"
+        f"{(' — services: ' + '; '.join(map(str, services_hint))) if services_hint else ''}:\n"
+        "Does the text state a REAL offer — a discount, a price cut, a free extra, a bundle deal? "
+        "If not, return {\"has_offer\": false}.\n"
+        "If it does, return JSON with:\n"
+        "- has_offer: true\n"
+        "- headline: <=9 words leading with the offer, e.g. 'Get 50% off all of our creative services'\n"
+        "- emphasis: the offer's key figure or phrase copied EXACTLY from your headline, <=3 words "
+        "(e.g. '50%', 'Free delivery')\n"
+        "- ticket: <=5 words restating the offer for a small tag, e.g. '50% off all services'\n"
+        "- services: up to 5 of the business's own services or products, each <=3 words, ONLY ones "
+        "named above\n"
+        "- scene: a short visual scene of ONE person relaxed and pleased, in a setting that suits "
+        "this business (no brand names, no readable screens)\n"
+        "Never invent a figure: any number must appear in the text above. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not d.get("has_offer"):
+        return None
+    headline = _drop_invented_figures(str(d.get("headline", "")).strip(), description)
+    emphasis = str(d.get("emphasis", "")).strip()
+    ticket = _drop_invented_figures(str(d.get("ticket", "")).strip(), description)
+    scene = str(d.get("scene", "")).strip()
+    if not headline or not scene:
+        return None
+    # The offer itself must be real: its figure is in the business's words, or it's a stated
+    # non-numeric offer ("free delivery") that also appears there.
+    if not emphasis or emphasis.lower() not in headline.lower():
+        return None
+    figure_digits = re.sub(r"[^\d]", "", emphasis)
+    if figure_digits:
+        if figure_digits not in re.sub(r"[^\d]", "", description):
+            return None
+    elif not _appears_in(emphasis, description):
+        return None
+    source = _brand_source(description, brand_context).lower()
+    services = [str(x).strip() for x in (d.get("services") or []) if str(x).strip()]
+    services = [x for x in services if all(w.lower() in source for w in x.split()[:2])][:5]
+    return {"headline": headline, "emphasis": emphasis, "ticket": ticket or None,
+            "services": services, "scene": scene}
+
+
+async def _gen_scene_skin_checked(prompt: str, size: str, brand_context: Optional[dict]) -> Optional[str]:
+    """§1.7 — the same generate / check skin rendering / one corrected retry used by
+    Problem / Solution."""
+    current = prompt
+    for attempt in (1, 2):
+        url = await generate_scene(current, size=size, brand_context=brand_context)
+        result = await verify_skin_rendering(url)
+        if not result["contains_person"] or result["matches_target_range"]:
+            return url
+        observed = result.get("skin_tone_observed") or "too light"
+        print(f"[VSG01] scene failed skin-tone check (attempt {attempt}/2): {result['notes']}", flush=True)
+        current = f"CRITICAL: skin must be deep brown to dark brown, NOT {observed} as last time. {prompt}"
+    return None
+
+
+async def _build_offer_spotlight(business_name: str, category: str, description: str, tokens: dict,
+                                 photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                 brand_context: Optional[dict] = None):
+    from .ad_formats import offer_spotlight
+    content = await _content_offer_spotlight(business_name, category, description, brand_context)
+    if not content:
+        return None
+    width, height = _CANVAS_SIZE
+    try:
+        scene_url = await _gen_scene_skin_checked(
+            offer_spotlight.scene_prompt(content["scene"]), f"{width}x{height}", brand_context,
+        )
+    except SceneGenerationFailed as e:
+        print(f"[VSG01] Offer Spotlight scene generation failed: {e}", flush=True)
+        return None
+    if not scene_url:
+        return None
+    try:
+        return offer_spotlight.build_document(
+            scene_url, content["headline"], content["emphasis"], content["ticket"], content["services"],
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+            **_poster_style(brand_context, tokens, offer_spotlight.DEFAULT_FAMILY),
+        )
+    except Exception as e:
+        print(f"[VSG01] Offer Spotlight build failed: {e}", flush=True)
+        return None
+
+
+async def _content_problems_vs_solution(business_name: str, category: str, description: str,
+                                        brand_context: Optional[dict] = None) -> Optional[dict]:
+    bc = brand_context or {}
+    pains = bc.get("customer_pain_points") or bc.get("customer_frustrations") or []
+    if isinstance(pains, str):
+        pains = [pains]
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}"
+        f"{(' — known customer frustrations: ' + '; '.join(map(str, pains))) if pains else ''}:\n"
+        "Write a 'your problems | our solution' split ad.\n"
+        "- problems: 3 or 4 everyday frustrations this business's customers have, each <=5 words, "
+        "in the customer's own plain words (e.g. 'Dry, dull skin by noon', 'Counting stock by hand')\n"
+        "- solutions: 3 concrete RESULTS the customer gets, each <=5 words, matching the problems "
+        "(e.g. 'Know what's selling'). No slogans like 'Elevate your brand'.\n"
+        "No numbers, prices or percentages unless that exact figure appears above. "
+        "Return ONLY JSON: {\"problems\": [...], \"solutions\": [...]}."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    source = _brand_source(description, brand_context)
+    problems = [_drop_invented_figures(str(x).strip(), source) for x in (d.get("problems") or [])]
+    solutions = [_drop_invented_figures(str(x).strip(), source) for x in (d.get("solutions") or [])]
+    problems = [p for p in problems if p][:4]
+    solutions = [s for s in solutions if s][:3]
+    if len(problems) < 3 or len(solutions) < 2:
+        return None
+    return {"problems": problems, "solutions": solutions}
+
+
+async def _build_problems_vs_solution(business_name: str, category: str, description: str, tokens: dict,
+                                      photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                      brand_context: Optional[dict] = None):
+    from .ad_formats import problems_vs_solution
+    content = await _content_problems_vs_solution(business_name, category, description, brand_context)
+    if not content:
+        return None
+    # photo_url here is always an attested product photo (see _FORMATS_NOT_FOR_PHOTO). Without a
+    # clean cut-out the product isn't shown — the outcomes version is used instead.
+    cutout = await _cutout(photo_url) if photo_url else None
+    if photo_url and not cutout:
+        return None
+    try:
+        return problems_vs_solution.build_document(
+            content["problems"], solutions=content["solutions"], product_cutout_url=cutout,
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+            **_poster_style(brand_context, tokens, problems_vs_solution.DEFAULT_FAMILY),
+        )
+    except Exception as e:
+        print(f"[VSG01] Problems vs Solution build failed: {e}", flush=True)
+        return None
+
+
 _BUILDERS = {
     "SEED-075": _build_us_vs_them,
     "SEED-087": _build_borrowed_interface,
@@ -1936,6 +2233,9 @@ _BUILDERS = {
     "SEED-089": _build_humour_cartoon,
     "SEED-083": _build_censored_item,
     "SEED-078": _build_day1_day30,
+    "SEED-099": _build_event_promo,
+    "SEED-100": _build_offer_spotlight,
+    "SEED-101": _build_problems_vs_solution,
 }
 
 
@@ -2028,8 +2328,12 @@ PHOTO_ATTESTATIONS = ("product_photo", "real_customer_photo", "owner_photo")
 # put invented words in a real customer's mouth; Testimonial + Offer presents the
 # person as a customer, which the owner or their staff are not.
 _FORMATS_NOT_FOR_PERSON = {
-    "real_customer_photo": frozenset({"SEED-082"}),
-    "owner_photo": frozenset({"SEED-074"}),
+    # Event Promo presents the person as the event's host and Problems vs Solution presents
+    # the photo as the product, so neither may take a customer's photo.
+    "real_customer_photo": frozenset({"SEED-082", "SEED-099", "SEED-101"}),
+    "owner_photo": frozenset({"SEED-074", "SEED-101"}),
+    # A product photo is not a host.
+    "product_photo": frozenset({"SEED-099"}),
 }
 
 

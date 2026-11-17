@@ -89,6 +89,15 @@ def _covers_point(layer: Dict, x: float, y: float) -> bool:
     return lx <= x <= lx + lw and ly <= y <= ly + lh
 
 
+_GRADIENT_SCRIM_MIN_ALPHA = 204  # 80% opaque
+
+
+def _gradient_alpha_at(layer: Dict, y: float) -> float:
+    top, height = layer.get("y", 0), max(1, layer.get("height", 1))
+    a0, a1 = layer.get("from_alpha", 0), layer.get("to_alpha", 220)
+    return a0 + (a1 - a0) * min(1.0, max(0.0, (y - top) / height))
+
+
 def _effective_background(document: Dict, text_layer: Dict, all_layers: List[Dict]):
     """Returns (kind, value): ("solid", hex), ("photo", layer_type), or
     ("canvas", hex) — whichever layer is actually topmost beneath the text
@@ -101,6 +110,12 @@ def _effective_background(document: Dict, text_layer: Dict, all_layers: List[Dic
         if layer is text_layer or layer.get("z_index", 0) >= z:
             continue
         if layer.get("type") not in _BACKGROUND_CANDIDATE_TYPES:
+            continue
+        if layer.get("type") == "shape" and layer.get("shape") == "vgradient":
+            # §1.6 allows "a gradient scrim": it counts as a backing only where it is at
+            # least 80% opaque at the text's own height — a thin wash is not enough.
+            if _covers_point(layer, x, y) and _gradient_alpha_at(layer, y) >= _GRADIENT_SCRIM_MIN_ALPHA:
+                candidates.append({**layer, "fill_color": layer.get("color", "#000000")})
             continue
         if layer.get("type") == "shape" and (
             layer.get("shape") not in _FILL_SHAPE_TYPES or not layer.get("fill_color")

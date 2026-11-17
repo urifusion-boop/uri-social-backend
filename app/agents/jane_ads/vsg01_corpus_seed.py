@@ -82,6 +82,9 @@ assumed to work.
 from typing import List
 
 from .ad_formats import (
+    event_promo,
+    offer_spotlight,
+    problems_vs_solution,
     borrowed_interface,
     censored_item,
     day1_day30,
@@ -311,6 +314,44 @@ _RECORDS = [
                                "safety-violating depiction (no unprotected work at "
                                "height, no exposed live electrical work).",
         funnel_stages=["consideration"],
+    ),
+    dict(
+        format_module=event_promo,
+        claim="Use for a dated event — a webinar, class, workshop, challenge, masterclass or launch.",
+        mechanism="A poster reads at a glance: a huge title, what kind of event it is, the date on its "
+                  "own pill and one action — the viewer knows what, when and how to join in one look, "
+                  "and a real host's face makes it a person they're showing up for.",
+        business_types=["Coaches, trainers, schools, consultants, communities and any business "
+                        "running a dated event"],
+        modification_required="The date, host and any price must be the business's own; a host is "
+                               "only shown from the owner's own photo, never generated; say 'free' "
+                               "only when the event is free.",
+        funnel_stages=["conversion", "consideration"],
+    ),
+    dict(
+        format_module=offer_spotlight,
+        claim="Use for a real discount, price cut or deal — especially a service business with several offerings.",
+        mechanism="A warm everyday photo stops the scroll, the services sit as bright tags, and the "
+                  "offer appears twice — on a tilted ticket and in colour inside the headline — so it "
+                  "can't be missed.",
+        business_types=["Service businesses, agencies, salons, studios, shops running a promotion"],
+        modification_required="The offer and every figure must be the business's own and currently "
+                               "honoured; the photo shows a situation, never a fake customer or the "
+                               "product.",
+        funnel_stages=["conversion"],
+    ),
+    dict(
+        format_module=problems_vs_solution,
+        claim="Use when the customer's everyday frustrations are the clearest way in.",
+        mechanism="The viewer recognises their own complaints in the chat bubbles on the left, and "
+                  "the right side answers them — the real product, or what changes for them — so "
+                  "the business reads as the obvious fix.",
+        business_types=["Any business solving a recognisable everyday frustration — skincare, "
+                        "software, cleaning, logistics, food"],
+        modification_required="Frustrations in the customer's plain words, outcomes stated as "
+                               "results, no invented figures; the product is only ever the real, "
+                               "photographed product.",
+        funnel_stages=["awareness", "consideration"],
     ),
 ]
 

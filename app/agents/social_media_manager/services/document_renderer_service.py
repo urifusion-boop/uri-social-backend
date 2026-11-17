@@ -8,12 +8,12 @@ WYSIWYG Guarantee: Client preview and server render must be identical.
 """
 
 from typing import Dict, Any, Optional
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 import io
 import httpx
 from datetime import datetime
 
-from app.utils.fonts import draw_text, load_font
+from app.utils.fonts import draw_spans, draw_text, load_font, text_width as fonts_text_width
 
 
 class DocumentRendererService:
@@ -73,6 +73,9 @@ class DocumentRendererService:
                 elif layer_type == "shape":
                     await DocumentRendererService._render_shape(canvas, layer)
 
+                elif layer_type == "badge":
+                    await DocumentRendererService._render_badge(canvas, layer)
+
             except Exception as e:
                 print(f"⚠️ Error rendering layer {layer.get('id')}: {e}")
                 # Continue rendering other layers even if one fails
@@ -124,8 +127,14 @@ class DocumentRendererService:
         width = layer.get("width", canvas_width)
         height = layer.get("height", canvas_height)
 
-        # Resize to the layer's own dimensions
-        bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
+        # Resize to the layer's own dimensions. fit="cover" crops to fill instead of
+        # stretching, for a photo whose shape doesn't match its box; without it the
+        # image is stretched exactly as before.
+        if layer.get("fit") == "cover":
+            bg_image = ImageOps.fit(bg_image, (width, height), Image.Resampling.LANCZOS,
+                                    centering=tuple(layer.get("focus", (0.5, 0.5))))
+        else:
+            bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
 
         # Paste at the layer's own position
         canvas.paste(bg_image, (x, y))
@@ -148,8 +157,15 @@ class DocumentRendererService:
         width = layer.get("width")
         height = layer.get("height")
 
-        # Resize if dimensions specified
-        if width and height:
+        # Resize if dimensions specified. fit="contain" keeps the image's proportions
+        # inside the box, standing on its bottom edge, centred (a product or a cut-out
+        # person); without it the image is resized to the box exactly as before.
+        if width and height and layer.get("fit") == "contain":
+            product_image = product_image.convert("RGBA")
+            product_image.thumbnail((width, height), Image.Resampling.LANCZOS)
+            x += (width - product_image.width) // 2
+            y += height - product_image.height
+        elif width and height:
             product_image = product_image.resize((width, height), Image.Resampling.LANCZOS)
 
         # Apply rotation if specified
@@ -168,8 +184,9 @@ class DocumentRendererService:
     @staticmethod
     async def _render_text(canvas: Image.Image, layer: Dict[str, Any]):
         """Render text layer"""
+        spans = layer.get("spans")
         content = layer.get("content", "")
-        if not content:
+        if not content and not spans:
             return
 
         draw = ImageDraw.Draw(canvas)
@@ -195,7 +212,52 @@ class DocumentRendererService:
         # (often ₦) are drawn in Inter instead of as empty boxes.
         rgba_color = DocumentRendererService._hex_to_rgba(color)
         anchor = layer.get("text_align")
+        if spans:
+            # One line in differently coloured pieces, e.g. "Get " + "50%" (accent) + " off".
+            pieces = []
+            for sp in spans:
+                piece = {k: v for k, v in sp.items() if k in ("text", "font_family", "font_weight")}
+                if sp.get("color"):
+                    piece["color"] = DocumentRendererService._hex_to_rgba(sp["color"])
+                if sp.get("highlight"):
+                    piece["highlight"] = DocumentRendererService._hex_to_rgba(sp["highlight"])
+                pieces.append(piece)
+            draw_spans(draw, (x, y), pieces, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor)
+            return
         draw_text(draw, (x, y), content, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor)
+
+    @staticmethod
+    async def _render_badge(canvas: Image.Image, layer: Dict[str, Any]):
+        """A pill or tag with text, optionally tilted — the "50% Off All Services" ticket.
+
+        {cx, cy (centre on the canvas), text, font_family, font_size, font_weight, text_color,
+        fill_color, padding_x, padding_y, corner_radius, rotation (degrees, positive = anticlockwise),
+        border_color, border_width}. Drawn on its own transparent tile, rotated, then laid on the
+        canvas, so the text tilts with the tag."""
+        text = layer.get("text", "")
+        if not text:
+            return
+        family = layer.get("font_family")
+        size = int(layer.get("font_size", 36))
+        weight = layer.get("font_weight", 700)
+        pad_x, pad_y = int(layer.get("padding_x", 28)), int(layer.get("padding_y", 16))
+        font = load_font(family, size, weight)
+        ascent, descent = font.getmetrics()
+        w = int(fonts_text_width(text, family, size, weight)) + 2 * pad_x
+        h = ascent + descent + 2 * pad_y
+        tile = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        tile_draw = ImageDraw.Draw(tile)
+        fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
+        outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
+        tile_draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=int(layer.get("corner_radius", h // 2)),
+                                    fill=fill, outline=outline, width=int(layer.get("border_width", 0) or 0))
+        draw_text(tile_draw, (w / 2, h / 2), text, family, size, weight,
+                  fill=DocumentRendererService._hex_to_rgba(layer.get("text_color", "#FFFFFF")), anchor="mm")
+        rotation = float(layer.get("rotation", 0) or 0)
+        if rotation:
+            tile = tile.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
+        cx, cy = layer.get("cx", 0), layer.get("cy", 0)
+        canvas.alpha_composite(tile, (int(cx - tile.width / 2), int(cy - tile.height / 2)))
 
     @staticmethod
     async def _render_asset(canvas: Image.Image, layer: Dict[str, Any]):
@@ -284,6 +346,34 @@ class DocumentRendererService:
                 draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=border_width)
             else:
                 draw.rectangle(box, fill=fill, outline=outline, width=border_width)
+
+        elif shape == "vgradient":
+            # A colour fading in over the box from top to bottom (or the reverse), laid
+            # over what's beneath it — the dark wash that lets white text sit on a photo.
+            # {x, y, width, height, color, from_alpha (0-255, top), to_alpha (bottom)}
+            x, y = int(layer.get("x", 0)), int(layer.get("y", 0))
+            width, height = int(layer.get("width", 0)), int(layer.get("height", 0))
+            if width <= 0 or height <= 0:
+                return
+            r, g, b, _ = DocumentRendererService._hex_to_rgba(layer.get("color", "#000000"))
+            a0, a1 = int(layer.get("from_alpha", 0)), int(layer.get("to_alpha", 220))
+            column = Image.new("L", (1, height))
+            column.putdata([int(a0 + (a1 - a0) * (i / max(1, height - 1))) for i in range(height)])
+            wash = Image.new("RGBA", (width, height), (r, g, b, 255))
+            wash.putalpha(column.resize((width, height)))
+            canvas.alpha_composite(wash, (x, y))
+
+        elif shape == "ellipse":
+            # {x, y, width, height, fill_color, border_color, border_width} — e.g. the
+            # hand-drawn-style ring around "solution".
+            x, y = layer.get("x", 0), layer.get("y", 0)
+            width, height = layer.get("width", 0), layer.get("height", 0)
+            if width <= 0 or height <= 0:
+                return
+            fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
+            outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
+            draw.ellipse([x, y, x + width, y + height], fill=fill, outline=outline,
+                         width=int(layer.get("border_width", 4)))
 
         elif shape == "line":
             x1, y1 = layer.get("x1", 0), layer.get("y1", 0)
