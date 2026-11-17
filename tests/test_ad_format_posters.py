@@ -220,3 +220,29 @@ def test_badge_gradient_ellipse_and_spans_render():
     assert (r, g, b) != (255, 255, 255)                    # badge drawn
     greens = [img.getpixel((x, y)) for x in range(20, 400) for y in range(300, 350)]
     assert any(p[1] > 150 and p[0] < 80 for p in greens)   # the "50%" span is green
+
+
+def test_date_card_fits_a_long_month_and_puts_the_time_on_its_own_line():
+    doc = event_promo.build_document("Instagram growth challenge", "Free 3-day WhatsApp challenge",
+                                     "2nd – 4th December, 7pm", tokens=GREEN, action_line="Join now")
+    from app.utils.fonts import text_width
+    card = [l for l in doc["layers"] if l.get("shape") == "rounded_rect" and l["y"] < 400][0]
+    lines = [l for l in doc["layers"] if l.get("type") == "text" and l["x"] == card["x"] + card["width"] // 2]
+    assert [l["content"] for l in lines][-1] == "7PM"
+    assert all(text_width(l["content"], l.get("font_family"), l["font_size"], 900) <= card["width"] - 56 for l in lines)
+
+
+def test_offer_ticket_sits_above_the_headline_not_mid_frame():
+    doc = offer_spotlight.build_document(PHOTO, "Get 30% off all our services", "30%", "30% off all services",
+                                         ["Video editing"], tokens=GREEN)
+    ticket = _types(doc, "badge")[0]
+    first_line = min(l["y"] for l in _types(doc, "text") if l.get("spans"))
+    assert ticket["cy"] < first_line and ticket["cy"] > 1080 * 0.5
+
+
+def test_offer_services_must_be_named_word_for_word(monkeypatch):
+    _stub_model(monkeypatch, {"has_offer": True, "headline": "Get 30% off all our services", "emphasis": "30%",
+                              "ticket": "30% off", "services": ["Content creation", "Content management"],
+                              "scene": "a woman on a sofa"})
+    out = asyncio.run(orch._content_offer_spotlight("B", "c", "30% off social media management and content creation"))
+    assert out["services"] == ["Content creation"]

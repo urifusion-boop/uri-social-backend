@@ -100,16 +100,17 @@ def _build(
     else:
         card_x, card_y = int(width * 0.60), int(height * 0.16)
         card_w = width - card_x - PAD + 20
-        date_lines = wrap_words(date_text.upper(), headline_font, 64, 900, card_w - 56)[:4]
-        card_h = 120 + len(date_lines) * 80
+        date_size, date_lines = _fit_date_card(date_text, headline_font, card_w - 56)
+        date_pitch = int(date_size * 1.22)
+        card_h = 120 + len(date_lines) * date_pitch
         z += 1
         layers.append({"type": "shape", "z_index": z, "shape": "rounded_rect", "x": card_x, "y": card_y,
                        "width": card_w, "height": card_h, "corner_radius": 36, "fill_color": panel})
         for i, line in enumerate(date_lines):
             z += 1
             layers.append({"type": "text", "z_index": z, "content": line, "font_family": headline_font,
-                           "font_size": 64, "font_weight": 900, "color": panel_text,
-                           "x": card_x + card_w // 2, "y": card_y + 60 + i * 80, "text_align": "ma"})
+                           "font_size": date_size, "font_weight": 900, "color": panel_text,
+                           "x": card_x + card_w // 2, "y": card_y + 60 + i * date_pitch, "text_align": "ma"})
 
     # Left column: title, kind of event, date pill, host, action.
     title_size, title_lines = fit_headline(title.upper(), headline_font, 900, col_w, 4, title_cap, 52)
@@ -183,6 +184,19 @@ def _build(
     _check_vertical_fit(layers, height)
     assert_legible(document, {**t, "surface": surface})
     return document
+
+
+def _fit_date_card(date_text: str, family: str, max_width: int) -> Tuple[int, List[str]]:
+    """The date on the card: the time (after the last comma) on its own line, and the largest
+    size at which every line — including a single long word like 'DECEMBER' — fits the card."""
+    from app.utils.fonts import text_width
+    head, _, tail = date_text.rpartition(",")
+    parts = [head.strip(), tail.strip()] if head and tail.strip() else [date_text.strip()]
+    for size in range(64, 43, -4):
+        lines = [l for part in parts for l in wrap_words(part.upper(), family, size, 900, max_width)]
+        if len(lines) <= 5 and all(text_width(l, family, size, 900) <= max_width for l in lines):
+            return size, lines
+    raise EventPromoOverflow("the date doesn't fit its card")
 
 
 def _width(text: str, size: int, weight: int) -> float:

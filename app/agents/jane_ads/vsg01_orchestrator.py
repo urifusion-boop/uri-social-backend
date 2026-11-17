@@ -2116,7 +2116,7 @@ async def _content_offer_spotlight(business_name: str, category: str, descriptio
         return None
     source = _brand_source(description, brand_context).lower()
     services = [str(x).strip() for x in (d.get("services") or []) if str(x).strip()]
-    services = [x for x in services if all(w.lower() in source for w in x.split()[:2])][:5]
+    services = [x for x in services if x.lower() in source][:5]  # named by the business, word for word
     return {"headline": headline, "emphasis": emphasis, "ticket": ticket or None,
             "services": services, "scene": scene}
 

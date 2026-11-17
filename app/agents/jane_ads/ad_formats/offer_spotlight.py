@@ -133,7 +133,10 @@ def build_document(
         layers.append({"type": "badge", "z_index": z, "text": ticket_text, "font_family": headline_font,
                        "font_size": 48, "font_weight": 800, "fill_color": panel, "text_color": panel_text,
                        "padding_x": 34, "padding_y": 18, "corner_radius": 14, "rotation": 16,
-                       "cx": int(width * 0.72), "cy": int(height * 0.30)})
+                       # Right side, just above the headline: the scene prompt keeps the
+                       # person's face in the upper middle, so the ticket lands on their lap or
+                       # the sofa, never across a face.
+                       "cx": int(width * 0.74), "cy": head_top - 90})
 
     if brand_logo_url:
         z += 1
