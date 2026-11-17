@@ -1,8 +1,8 @@
 """
-Public (no-login) forms on the marketing site: the Contact page's "Send message"
-and the API Docs page's "Join the API waitlist".
+Public (no-login) forms on the marketing site: the Contact page's "Send message",
+the API Docs page's "Join the API waitlist" and the /ads page's "Free ad audit".
 
-Both store what they receive (so nothing is lost if SMTP is down or unset) and
+Each stores what it receives (so nothing is lost if SMTP is down or unset) and
 email the team inbox so a human sees it.
 """
 import time
@@ -23,6 +23,9 @@ router = APIRouter(prefix="/public", tags=["Public forms"])
 # hello@urisocial.com bounces ("550 5.1.1 User does not exist"); this is the inbox the team reads.
 INBOX = "urisocialinsight@gmail.com"
 
+# Free ad audit leads from the /ads landing page go straight to the person who follows them up.
+ADS_LEAD_INBOX = "precious.zino@urisocial.com"
+
 # Must match the <select> on the Contact page.
 CONTACT_SUBJECTS = {
     "General Inquiry",
@@ -38,6 +41,9 @@ CONTACT_SUBJECTS = {
 # across workers — it stops a casual script, not a determined one.
 _RATE_LIMIT = 5
 _RATE_WINDOW_SECONDS = 3600
+# Paid-ad traffic arrives in bursts, and many Nigerian mobile users share one carrier IP, so the
+# ad audit form gets a roomier limit than the contact form.
+_ADS_RATE_LIMIT = 20
 _hits: Dict[str, Deque[float]] = defaultdict(deque)
 
 
@@ -48,22 +54,22 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _throttle(request: Request, bucket: str) -> None:
+def _throttle(request: Request, bucket: str, limit: int = _RATE_LIMIT) -> None:
     key = f"{bucket}:{_client_ip(request)}"
     now = time.monotonic()
     hits = _hits[key]
     while hits and now - hits[0] > _RATE_WINDOW_SECONDS:
         hits.popleft()
-    if len(hits) >= _RATE_LIMIT:
+    if len(hits) >= limit:
         raise HTTPException(status_code=429, detail="Too many submissions. Please try again in a bit.")
     hits.append(now)
 
 
-async def _notify_team(**mail) -> None:
+async def _notify_team(*, to: str = INBOX, **mail) -> None:
     """Send the notification and log the outcome, so a missing email can be traced
     (send_raw_email only logs failures, and only says "not configured" if SMTP is unset)."""
-    ok = await email_service.send_raw_email(to_email=INBOX, **mail)
-    print(f"{'📧 Public form notification sent' if ok else '⚠️ Public form notification NOT sent'}: {mail['subject']!r} -> {INBOX}")
+    ok = await email_service.send_raw_email(to_email=to, **mail)
+    print(f"{'📧 Public form notification sent' if ok else '⚠️ Public form notification NOT sent'}: {mail['subject']!r} -> {to}")
 
 
 def _email_html(title: str, rows: Dict[str, str], body: Optional[str] = None) -> str:
@@ -97,6 +103,33 @@ class WaitlistRequest(BaseModel):
     email: EmailStr
     name: Optional[str] = Field(None, max_length=100)
     website: Optional[str] = Field(None, max_length=200)
+
+
+class AdsLeadRequest(BaseModel):
+    business: str = Field(..., min_length=1, max_length=150)
+    whatsapp: str = Field(..., min_length=1, max_length=30)
+    sells: str = Field(..., min_length=1, max_length=200)
+    budget: str = Field(..., min_length=1, max_length=60)
+    goal: str = Field(..., min_length=1, max_length=60)
+    # Which ad produced the lead (UTM tags from the ad link).
+    utm_source: Optional[str] = Field(None, max_length=100)
+    utm_medium: Optional[str] = Field(None, max_length=100)
+    utm_campaign: Optional[str] = Field(None, max_length=100)
+    utm_content: Optional[str] = Field(None, max_length=100)
+    page: Optional[str] = Field(None, max_length=100)
+    # Honeypot: hidden from people, filled in by bots.
+    website: Optional[str] = Field(None, max_length=200)
+
+
+def _whatsapp_digits(raw: str) -> str:
+    return "".join(ch for ch in raw if ch.isdigit())
+
+
+def _whatsapp_link(digits: str) -> str:
+    """wa.me link for the follow-up. A Nigerian local number (0801 234 5678) gets the 234 prefix."""
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = "234" + digits[1:]
+    return f"https://wa.me/{digits}"
 
 
 @router.post("/contact")
@@ -189,4 +222,68 @@ async def join_api_waitlist(
         "status": True,
         "responseCode": 200,
         "responseMessage": "You're on the list. We'll email you when API access opens.",
+    }
+
+
+@router.post("/ads-lead")
+async def submit_ads_lead(
+    body: AdsLeadRequest,
+    request: Request,
+    background: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    if body.website:
+        return {"status": True, "responseCode": 200, "responseMessage": "Received."}
+
+    digits = _whatsapp_digits(body.whatsapp)
+    if not 10 <= len(digits) <= 14:
+        raise HTTPException(status_code=422, detail="Enter a valid WhatsApp number.")
+
+    _throttle(request, "ads-lead", _ADS_RATE_LIMIT)
+
+    lead = {
+        "business": body.business.strip(),
+        "whatsapp": body.whatsapp.strip(),
+        "whatsapp_digits": digits,
+        "sells": body.sells.strip(),
+        "budget": body.budget.strip(),
+        "goal": body.goal.strip(),
+        "utm_source": body.utm_source,
+        "utm_medium": body.utm_medium,
+        "utm_campaign": body.utm_campaign,
+        "utm_content": body.utm_content,
+        "page": body.page,
+    }
+    await db["ads_leads"].insert_one(
+        {**lead, "ip": _client_ip(request), "status": "new", "created_at": datetime.utcnow()}
+    )
+
+    rows = {
+        "Business": lead["business"],
+        "WhatsApp": lead["whatsapp"],
+        "WhatsApp link": _whatsapp_link(digits),
+        "Sells": lead["sells"],
+        "Monthly ad budget": lead["budget"],
+        "Main goal": lead["goal"],
+    }
+    for label, key in (
+        ("Source", "utm_source"),
+        ("Medium", "utm_medium"),
+        ("Campaign", "utm_campaign"),
+        ("Ad", "utm_content"),
+    ):
+        if lead[key]:
+            rows[label] = lead[key]
+
+    background.add_task(
+        _notify_team,
+        to=ADS_LEAD_INBOX,
+        subject=f"[Ad audit] {lead['business']} — {lead['budget']}"[:150].replace("\r", " ").replace("\n", " "),
+        html_body=_email_html("New free ad audit request from the /ads page", rows),
+    )
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseMessage": "Received. We'll message you on WhatsApp shortly.",
     }

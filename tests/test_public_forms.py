@@ -130,3 +130,85 @@ def test_waitlist_rejects_bad_email(env):
     client, db, _ = env
     assert client.post("/public/api-waitlist", json={"email": "nope"}).status_code == 422
     assert not db["api_waitlist"].docs
+
+
+ADS_LEAD = {
+    "business": "Mama Put Kitchen",
+    "whatsapp": "0801 234 5678",
+    "sells": "jollof catering",
+    "budget": "₦50,000 – ₦200,000",
+    "goal": "More sales",
+    "utm_source": "facebook",
+    "utm_campaign": "december",
+    "page": "/ads",
+}
+
+
+def test_ads_lead_stores_and_emails_precious(env):
+    client, db, sent = env
+    r = client.post("/public/ads-lead", json=ADS_LEAD)
+    assert r.status_code == 200 and r.json()["status"] is True
+
+    (doc,) = db["ads_leads"].docs
+    assert doc["business"] == "Mama Put Kitchen" and doc["whatsapp_digits"] == "08012345678"
+    assert doc["utm_source"] == "facebook" and doc["status"] == "new"
+
+    (mail,) = sent
+    assert mail["to_email"] == "precious.zino@urisocial.com"
+    assert "Mama Put Kitchen" in mail["subject"]
+    body = mail["html_body"]
+    assert "jollof catering" in body and "More sales" in body and "december" in body
+    # A Nigerian local number becomes a ready-to-tap WhatsApp link.
+    assert "https://wa.me/2348012345678" in body
+
+
+def test_ads_lead_only_lists_the_utm_tags_it_has(env):
+    client, _, sent = env
+    client.post("/public/ads-lead", json={k: v for k, v in ADS_LEAD.items() if not k.startswith("utm_")})
+    assert "Campaign" not in sent[0]["html_body"] and "Source" not in sent[0]["html_body"]
+
+
+def test_ads_lead_escapes_html_in_notification(env):
+    client, _, sent = env
+    client.post("/public/ads-lead", json={**ADS_LEAD, "sells": "<script>alert(1)</script>"})
+    assert "<script>" not in sent[0]["html_body"]
+    assert "&lt;script&gt;" in sent[0]["html_body"]
+
+
+def test_ads_lead_subject_header_cannot_be_split(env):
+    client, _, sent = env
+    client.post("/public/ads-lead", json={**ADS_LEAD, "business": "Bob\r\nBcc: evil@example.com"})
+    assert "\r" not in sent[0]["subject"] and "\n" not in sent[0]["subject"]
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"business": ""},
+        {"whatsapp": "123"},
+        {"whatsapp": "call me maybe"},
+        {"whatsapp": "1" * 15},
+        {"sells": ""},
+        {"budget": ""},
+        {"goal": ""},
+    ],
+)
+def test_ads_lead_rejects_bad_input(env, patch):
+    client, db, sent = env
+    assert client.post("/public/ads-lead", json={**ADS_LEAD, **patch}).status_code == 422
+    assert not db["ads_leads"].docs and not sent
+
+
+def test_ads_lead_honeypot_is_silently_dropped(env):
+    client, db, sent = env
+    r = client.post("/public/ads-lead", json={**ADS_LEAD, "website": "http://spam"})
+    assert r.status_code == 200
+    assert not db["ads_leads"].docs and not sent
+
+
+def test_ads_lead_has_its_own_roomier_rate_limit(env):
+    client, _, _ = env
+    codes = [client.post("/public/ads-lead", json=ADS_LEAD).status_code for _ in range(mod._ADS_RATE_LIMIT + 1)]
+    assert codes == [200] * mod._ADS_RATE_LIMIT + [429]
+    # The contact form's own bucket is untouched.
+    assert client.post("/public/contact", json=GOOD).status_code == 200
