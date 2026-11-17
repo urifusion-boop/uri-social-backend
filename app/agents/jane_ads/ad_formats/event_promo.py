@@ -158,7 +158,9 @@ def _build(
 
     if action_line:
         btn_w = min(col_w, int(_width(action_line, 44, 800)) + 96)
-        btn_y = max(y + 20, height - PAD - 92 - (60 if contact_line else 0))
+        # With a photo the button anchors the bottom; without one the details are short, so the
+        # button follows them and the whole poster is centred below (no empty band mid-canvas).
+        btn_y = (y + 36) if not has_photo else max(y + 20, height - PAD - 92 - (60 if contact_line else 0))
         if btn_y + 92 > height - PAD - (60 if contact_line else 0) + 4:
             raise EventPromoOverflow("the action button doesn't fit under the event details")
         z += 1
@@ -173,8 +175,10 @@ def _build(
         layers.append({"type": "text", "z_index": z, "content": contact_line, "font_family": BODY_FAMILY,
                        "font_size": 42, "font_weight": 600,
                        "color": adjust_to_contrast(t["ink-quiet"], surface, 7.0),
-                       "x": PAD, "y": height - PAD - 46})
+                       "x": PAD, "y": (btn_y + 92 + 28) if (action_line and not has_photo) else height - PAD - 46})
 
+    if not has_photo:
+        _centre_vertically(layers, top=PAD + (70 if brand_logo_url else 0), bottom=height - PAD)
     if brand_logo_url:
         z += 1
         layers.append({"type": "brand_asset", "z_index": z, "url": brand_logo_url,
@@ -184,6 +188,19 @@ def _build(
     _check_vertical_fit(layers, height)
     assert_legible(document, {**t, "surface": surface})
     return document
+
+
+def _centre_vertically(layers: List[Dict], top: int, bottom: int) -> None:
+    """Move the whole poster down so its content sits centred between `top` and `bottom`."""
+    def extent(l):
+        return l["y"] + (l.get("height") or l.get("font_size", 48))
+    used_top = min(l["y"] for l in layers if "y" in l)
+    used_bottom = max(extent(l) for l in layers if "y" in l)
+    shift = int(((bottom - top) - (used_bottom - used_top)) / 2 + top - used_top)
+    if shift > 0:
+        for l in layers:
+            if "y" in l:
+                l["y"] += shift
 
 
 def _fit_date_card(date_text: str, family: str, max_width: int) -> Tuple[int, List[str]]:

@@ -246,3 +246,13 @@ def test_offer_services_must_be_named_word_for_word(monkeypatch):
                               "scene": "a woman on a sofa"})
     out = asyncio.run(orch._content_offer_spotlight("B", "c", "30% off social media management and content creation"))
     assert out["services"] == ["Content creation"]
+
+
+def test_event_without_photo_is_centred_not_bottom_heavy():
+    doc = event_promo.build_document("Cut patient paperwork time", "Free live webinar on Zoom",
+                                     "Thursday 4th December, 2pm", tokens=GREEN, host_name="Dr Ada Obi",
+                                     action_line="Register now", contact_line="docerity.com/webinar")
+    ys = [l["y"] for l in doc["layers"] if "y" in l]
+    ends = [l["y"] + (l.get("height") or l.get("font_size", 48)) for l in doc["layers"] if "y" in l]
+    top_gap, bottom_gap = min(ys) - event_promo.PAD, 1080 - event_promo.PAD - max(ends)
+    assert abs(top_gap - bottom_gap) <= 4
