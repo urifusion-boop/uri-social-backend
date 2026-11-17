@@ -256,3 +256,8 @@ def test_event_without_photo_is_centred_not_bottom_heavy():
     ends = [l["y"] + (l.get("height") or l.get("font_size", 48)) for l in doc["layers"] if "y" in l]
     top_gap, bottom_gap = min(ys) - event_promo.PAD, 1080 - event_promo.PAD - max(ends)
     assert abs(top_gap - bottom_gap) <= 4
+
+
+def test_offer_scene_prompt_carries_the_representation_block():
+    from app.agents.jane_ads.layer2_generation import REPRESENTATION_BLOCK
+    assert REPRESENTATION_BLOCK in offer_spotlight.scene_prompt("a clinic owner on a sofa")

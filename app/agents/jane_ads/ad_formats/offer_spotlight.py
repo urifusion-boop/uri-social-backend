@@ -17,6 +17,7 @@ from ._type import adjust_to_contrast, block_with_text, emphasis_spans, fit_head
 from .brand_tokens import contrast_ratio, darken_to_contrast
 from .legibility import assert_legible
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
+from ..layer2_generation import REPRESENTATION_BLOCK
 
 FORMAT = AdFormatDef(
     format_id="SEED-100",
@@ -38,8 +39,12 @@ _TAG_COLOURS = ["#D81B60", "#1E40AF", "#C2410C", "#047857", "#B91C1C", "#6D28D9"
 
 
 def scene_prompt(scene: str) -> str:
+    # REPRESENTATION_BLOCK is the same §1.7 representation instruction every other format's
+    # photo prompt carries; without it the model drew lighter skin and the skin-tone check
+    # rejected both attempts (seen on the first staging run).
     return (
-        f"A warm, natural lifestyle photograph: {scene}. One person, relaxed and genuinely "
+        f"A warm, natural lifestyle photograph of a real Nigerian scene: {scene}. "
+        f"{REPRESENTATION_BLOCK}. One person, relaxed and genuinely "
         "smiling, sitting comfortably indoors in soft daylight — think a living room with a "
         "plant and a sofa. The person sits in the centre-right of the frame, from the knees up. "
         "Keep the left third of the frame and the bottom third calm and uncluttered (text and "
