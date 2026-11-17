@@ -169,10 +169,10 @@ def test_offer_with_an_invented_discount_is_refused(monkeypatch):
 
 def test_offer_with_a_stated_discount_is_kept(monkeypatch):
     _stub_model(monkeypatch, {"has_offer": True, "headline": "Get 20% off all braids", "emphasis": "20%",
-                              "ticket": "20% off braids", "services": ["Braids", "Spaceships"],
+                              "ticket": "20% off braids", "services": ["Braids", "Wigs", "Spaceships"],
                               "scene": "a woman on a sofa"})
-    out = asyncio.run(orch._content_offer_spotlight("B", "c", "20% off braids this week. We also do wigs."))
-    assert out["emphasis"] == "20%" and out["services"] == ["Braids"]
+    out = asyncio.run(orch._content_offer_spotlight("B", "c", "20% off braids and wigs this week."))
+    assert out["emphasis"] == "20%" and out["services"] == ["Braids", "Wigs"] and out["ticket"] == "20% off braids"
 
 
 # ── Which photos reach which format ──────────────────────────────────────────
@@ -245,7 +245,7 @@ def test_offer_services_must_be_named_word_for_word(monkeypatch):
                               "ticket": "30% off", "services": ["Content creation", "Content management"],
                               "scene": "a woman on a sofa"})
     out = asyncio.run(orch._content_offer_spotlight("B", "c", "30% off social media management and content creation"))
-    assert out["services"] == ["Content creation"]
+    assert out["services"] == []  # only one real service named — no tag stack for a single item
 
 
 def test_event_without_photo_is_centred_not_bottom_heavy():
@@ -261,3 +261,15 @@ def test_event_without_photo_is_centred_not_bottom_heavy():
 def test_offer_scene_prompt_carries_the_representation_block():
     from app.agents.jane_ads.layer2_generation import REPRESENTATION_BLOCK
     assert REPRESENTATION_BLOCK in offer_spotlight.scene_prompt("a clinic owner on a sofa")
+
+
+def test_offer_ticket_and_tags_never_widen_the_deal(monkeypatch):
+    _stub_model(monkeypatch, {"has_offer": True, "headline": "25% off patient records setup", "emphasis": "25%",
+                              "ticket": "25% off all services",
+                              "services": ["Patient records setup", "Staff training", "Data engineering"],
+                              "scene": "a clinic owner"})
+    brief = "25% off our patient records setup and staff training this December."
+    out = asyncio.run(orch._content_offer_spotlight("B", "c", brief,
+                                                    {"key_products_services": ["Data engineering"]}))
+    assert out["ticket"] == "25% off"
+    assert out["services"] == ["Patient records setup", "Staff training"]

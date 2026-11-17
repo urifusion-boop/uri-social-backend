@@ -2114,9 +2114,17 @@ async def _content_offer_spotlight(business_name: str, category: str, descriptio
             return None
     elif not _appears_in(emphasis, description):
         return None
-    source = _brand_source(description, brand_context).lower()
+    # Tags sit beside the offer, so they list only what the brief itself puts on offer — a
+    # service from the brand profile that isn't in the deal would read as discounted too.
+    brief = (description or "").lower()
     services = [str(x).strip() for x in (d.get("services") or []) if str(x).strip()]
-    services = [x for x in services if x.lower() in source][:5]  # named by the business, word for word
+    services = [x for x in services if x.lower() in brief][:5]
+    if len(services) < 2:
+        services = []
+    # The ticket restates the offer; it may not widen it ("25% off all services" when only
+    # three services are discounted). Every word in it must come from the brief.
+    if ticket and not all(w in brief or w in ("off", "on") for w in re.findall(r"[a-z]{3,}", ticket.lower())):
+        ticket = f"{emphasis} off" if "off" in headline.lower() and "off" not in emphasis.lower() else emphasis
     return {"headline": headline, "emphasis": emphasis, "ticket": ticket or None,
             "services": services, "scene": scene}
 
