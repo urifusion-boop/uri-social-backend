@@ -85,6 +85,33 @@ def visible_rows(conn: dict, workspace_id: str = "") -> list[dict]:
     return [r for r in channel_rows(conn, workspace_id) if r["platform"] not in hidden]
 
 
+def _connected_at(conn: dict) -> datetime:
+    for k in ("connected_at", "updated_at"):
+        t = _naive_utc(conn.get(k))
+        if t is not None:
+            return t
+    return datetime.min
+
+
+def inbox_rows(conns: list[dict], workspace_id: str) -> list[tuple[dict, dict]]:
+    """(connection, channel row) for the ONE account per platform the inbox shows.
+
+    A workspace can end up with several connected Instagram accounts or Pages (earlier
+    ones, ones connected for publishing or ads). The inbox shows the most recently
+    connected one per platform, so a person who connects another account never sees
+    the old one left beside it. The others stay connected for everything else."""
+    best: dict[str, tuple[tuple, dict, dict]] = {}
+    for conn in conns:
+        if _workspace_of(conn) != workspace_id:
+            continue
+        rank = (_connected_at(conn), str(conn.get("_id") or ""))
+        for row in visible_rows(conn, workspace_id):
+            held = best.get(row["platform"])
+            if held is None or rank > held[0]:
+                best[row["platform"]] = (rank, conn, row)
+    return [(c, r) for _, c, r in best.values()]
+
+
 async def release_channels(db, workspace_id: str, platform: str = "",
                            external_account_id: str = "") -> int:
     """Give up this workspace's claim on channel accounts. Returns rows removed.
@@ -164,36 +191,36 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
     # Why a link found nothing matters: no connections at all is a different
     # problem from connections that belong to another workspace, and without
     # this the caller cannot tell them apart.
-    skipped: list[str] = []
-    for conn in conns:
-        if _workspace_of(conn) != workspace_id:
-            skipped.append(_workspace_of(conn))
-            continue
-        for row in visible_rows(conn, workspace_id):
-            key = {"workspace_id": row["workspace_id"],
-                   "platform": row["platform"],
-                   "external_account_id": row["external_account_id"]}
-            # Before claiming, clear any abandoned claim on the same account:
-            # an account moved between workspaces (support hand-over, a review
-            # test account) is otherwise claimed twice and routes nowhere.
-            await prune_stale_claims(db, workspace_id, row["external_account_id"])
-            await db[CHANNEL_ACCOUNTS].update_one(
-                key,
-                {"$set": {**row, "updated_at": now()},
-                 "$setOnInsert": {"connected_at": now()}},
-                upsert=True,
-            )
-            linked.append(key)
+    skipped: list[str] = [_workspace_of(c) for c in conns if _workspace_of(c) != workspace_id]
+    selected = inbox_rows(conns, workspace_id)
+    for _conn, row in selected:
+        key = {"workspace_id": row["workspace_id"],
+               "platform": row["platform"],
+               "external_account_id": row["external_account_id"]}
+        # Before claiming, clear any abandoned claim on the same account:
+        # an account moved between workspaces (support hand-over, a review
+        # test account) is otherwise claimed twice and routes nowhere.
+        await prune_stale_claims(db, workspace_id, row["external_account_id"])
+        await db[CHANNEL_ACCOUNTS].update_one(
+            key,
+            {"$set": {**row, "updated_at": now()},
+             "$setOnInsert": {"connected_at": now()}},
+            upsert=True,
+        )
+        linked.append(key)
 
     # Subscribe each distinct Page once, after the rows are stored. A Page can be backed
     # by several connections (Facebook through one provider, Instagram through another)
     # and only some of their tokens carry the messaging permissions, so every token is
     # tried and the first one Meta accepts is the one the channel keeps.
     tokens_by_page: dict[str, list[str]] = {}
+    shown_pages = {str(row.get("page_id") or "") for _c, row in selected}
     for conn in conns:
         if _workspace_of(conn) != workspace_id or not visible_rows(conn, workspace_id):
             continue
         page_id = str(conn.get("page_id") or "")
+        if page_id not in shown_pages:
+            continue
         token = conn.get("page_access_token") or ""
         if page_id and token and token not in tokens_by_page.setdefault(page_id, []):
             tokens_by_page[page_id].append(token)
@@ -252,9 +279,7 @@ async def in_sync_with_connections(db, workspace_id: str) -> bool:
     it can run on every inbox load and trigger a full link only when they differ."""
     conns = await db[SOCIAL_CONNECTIONS].find(
         {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}}).to_list(200)
-    expected = {(r["platform"], r["external_account_id"])
-                for c in conns if _workspace_of(c) == workspace_id
-                for r in visible_rows(c, workspace_id)}
+    expected = {(r["platform"], r["external_account_id"]) for _c, r in inbox_rows(conns, workspace_id)}
     have = {(r.get("platform"), r.get("external_account_id"))
             for r in await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(200)
             if r.get("platform") in ("instagram", "facebook")}

@@ -9,7 +9,7 @@ import copy
 import pytest
 
 from app.agents.inbox.channels import (account_for_event, begin_replace, channel_rows,
-                                       finish_replace, link_workspace_channels,
+                                       finish_replace, in_sync_with_connections, link_workspace_channels,
                                        prune_stale_claims, release_channels, visible_rows)
 from app.agents.inbox.entities import CHANNEL_ACCOUNTS
 from tests.test_inbox_ingest import FakeDB, _run
@@ -537,3 +537,54 @@ def test_reconnecting_a_swapped_out_account_shows_it_again(monkeypatch):
     assert out["replaced"] == ["preciouszino_"]
     old = next(c for c in db["social_connections"].docs if c["_id"] == "c1")
     assert "instagram" not in old["inbox_hidden"]
+
+
+# ── One account per platform ─────────────────────────────────────────────────
+
+OLDER = {**IG_CONN, "_id": "a", "connected_at": "2026-01-01T00:00:00",
+         "ig_user_id": "IG_OLD", "page_id": "PAGE_OLD", "username": "old"}
+NEWER = {**IG_CONN, "_id": "b", "connected_at": "2026-06-01T00:00:00",
+         "ig_user_id": "IG_NEW", "page_id": "PAGE_NEW", "username": "new"}
+
+
+def test_the_inbox_shows_only_the_newest_account_per_platform():
+    db = _seeded_db([OLDER, NEWER])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    ids = {(d["platform"], d["external_account_id"]) for d in db[CHANNEL_ACCOUNTS].docs}
+    assert ids == {("instagram", "IG_NEW"), ("facebook", "PAGE_NEW")}
+
+
+def test_connection_order_in_the_list_does_not_decide_which_wins():
+    db = _seeded_db([NEWER, OLDER])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert {d["external_account_id"] for d in db[CHANNEL_ACCOUNTS].docs} == {"IG_NEW", "PAGE_NEW"}
+
+
+def test_an_older_account_already_in_the_inbox_is_removed_when_a_newer_one_exists():
+    db = _seeded_db([OLDER])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    db["social_connections"].docs.append(copy.deepcopy(NEWER))
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert {d["external_account_id"] for d in db[CHANNEL_ACCOUNTS].docs} == {"IG_NEW", "PAGE_NEW"}
+
+
+def test_the_older_connection_stays_active_for_everything_else():
+    db = _seeded_db([OLDER, NEWER])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert all(c["connection_status"] == "active" for c in db["social_connections"].docs)
+
+
+def test_the_inbox_counts_as_in_sync_when_it_shows_only_the_newest():
+    db = _seeded_db([OLDER, NEWER])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert _run(in_sync_with_connections(db, "ws_1")) is True
+
+
+def test_instagram_and_facebook_each_keep_their_own_newest():
+    page_only = {"user_id": "u1", "brand_id": "ws_1", "platform": "facebook", "_id": "c",
+                 "connection_status": "active", "page_id": "PAGE_FB", "page_access_token": "t",
+                 "page_name": "A Page", "connected_at": "2026-09-01T00:00:00"}
+    db = _seeded_db([NEWER, page_only])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    ids = {(d["platform"], d["external_account_id"]) for d in db[CHANNEL_ACCOUNTS].docs}
+    assert ids == {("instagram", "IG_NEW"), ("facebook", "PAGE_FB")}
