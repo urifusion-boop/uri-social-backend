@@ -1977,7 +1977,9 @@ async def _cutout(photo_url: str) -> Optional[str]:
     for method in ("removebg", "rembg"):
         try:
             url = await remove_background(photo_url, method=method)
-            if url:
+            # remove_background hands back the original photo when it couldn't remove
+            # anything — that is not a cut-out, and pasting it as one shows a rectangle.
+            if url and url != photo_url:
                 return url
         except Exception as e:
             print(f"[VSG01] cutout via {method} failed: {e}", flush=True)
@@ -2057,18 +2059,52 @@ async def _build_event_promo(business_name: str, category: str, description: str
     # photo_url here is always the owner's own attested photo — a customer photo or a product
     # photo never reaches this format (see _FORMATS_NOT_FOR_PHOTO).
     cutout = await _cutout(photo_url) if photo_url else None
-    try:
-        return event_promo.build_document(
-            content["title"], content["event_kind"], content["date_text"],
-            canvas_size=_CANVAS_SIZE, tokens=tokens,
-            host_cutout_url=cutout, host_photo_url=None if cutout else photo_url,
-            host_name=content["host_name"], host_role=content["host_role"],
-            action_line=content["action_line"], contact_line=content["contact_line"],
-            brand_logo_url=brand_logo_url, **_poster_style(brand_context, tokens, event_promo.DEFAULT_FAMILY),
-        )
-    except Exception as e:
-        print(f"[VSG01] Event Promo build failed: {e}", flush=True)
-        return None
+    style = _poster_style(brand_context, tokens, event_promo.DEFAULT_FAMILY)
+    scene_url = scene_surface = None
+    if not photo_url:
+        # No host photo: generated artwork about the event's topic fills the right side.
+        # If it can't be made, the date-card version is used instead.
+        try:
+            scene_url = await generate_scene(
+                event_promo.scene_prompt(content["title"], content["event_kind"], style["brand_color"]),
+                size=f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}", brand_context=brand_context,
+            )
+            scene_surface = await _left_edge_colour(scene_url)
+        except Exception as e:
+            print(f"[VSG01] Event Promo artwork failed, using the date card: {e}", flush=True)
+            scene_url = scene_surface = None
+    builds = [scene_url, None] if scene_url else [None]
+    for scene in builds:
+        try:
+            return event_promo.build_document(
+                content["title"], content["event_kind"], content["date_text"],
+                canvas_size=_CANVAS_SIZE, tokens=tokens,
+                host_cutout_url=cutout, host_photo_url=None if cutout else photo_url,
+                scene_url=scene, scene_surface=scene_surface if scene else None,
+                host_name=content["host_name"], host_role=content["host_role"],
+                action_line=content["action_line"], contact_line=content["contact_line"],
+                brand_logo_url=brand_logo_url, **style,
+            )
+        except Exception as e:
+            print(f"[VSG01] Event Promo build failed{' with artwork' if scene else ''}: {e}", flush=True)
+    return None
+
+
+async def _left_edge_colour(url: str) -> Optional[str]:
+    """The artwork's own background colour (the median of its calm left strip), so the text
+    side and the picture read as one image. Hex light enough for dark text, else None."""
+    import io as _io
+    import httpx
+    from PIL import Image, ImageStat
+    from .ad_formats.brand_tokens import contrast_ratio
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    im = Image.open(_io.BytesIO(resp.content)).convert("RGB")
+    w, h = im.size
+    r, g, b = (int(v) for v in ImageStat.Stat(im.crop((0, int(h * 0.15), int(w * 0.08), int(h * 0.85)))).median)
+    hexc = "#{:02X}{:02X}{:02X}".format(r, g, b)
+    return hexc if contrast_ratio("#141014", hexc) >= 12 else None
 
 
 async def _content_offer_spotlight(business_name: str, category: str, description: str,

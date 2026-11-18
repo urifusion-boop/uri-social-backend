@@ -45,6 +45,9 @@ from .brand_tokens import contrast_ratio
 from .tokens import PLACEHOLDER_TOKENS
 
 MIN_BODY_FONT_SIZE = 42
+# Supporting text (a host's role, a link, a small label) — marked "secondary": True on the layer.
+# The ad's message itself still has to clear MIN_BODY_FONT_SIZE.
+MIN_SECONDARY_FONT_SIZE = 28
 MIN_HAIRLINE_STROKE = 2
 MIN_FONT_WEIGHT = 400  # see module docstring — the renderer's real floor, not true Medium (500)
 
@@ -111,6 +114,14 @@ def _effective_background(document: Dict, text_layer: Dict, all_layers: List[Dic
             continue
         if layer.get("type") not in _BACKGROUND_CANDIDATE_TYPES:
             continue
+        if layer.get("type") == "shape" and layer.get("shape") == "hgradient":
+            if _covers_point(layer, x, y):
+                lx, lw = layer.get("x", 0), max(1, layer.get("width", 1))
+                a0, a1 = layer.get("from_alpha", 255), layer.get("to_alpha", 0)
+                alpha = a0 + (a1 - a0) * min(1.0, max(0.0, (x - lx) / lw))
+                if alpha >= _GRADIENT_SCRIM_MIN_ALPHA:
+                    candidates.append({**layer, "fill_color": layer.get("color", "#FFFFFF")})
+            continue
         if layer.get("type") == "shape" and layer.get("shape") == "vgradient":
             # §1.6 allows "a gradient scrim": it counts as a backing only where it is at
             # least 80% opaque at the text's own height — a thin wash is not enough.
@@ -143,12 +154,15 @@ def check_legibility(document: Dict, tokens: Optional[Dict[str, str]] = None) ->
             content = layer.get("content", "")
             if not content:
                 continue  # matches _render_text's own early-return-on-empty-content
+            if layer.get("decorative"):
+                continue  # ornament (e.g. a faint oversized background word), not text to be read
 
             font_size = layer.get("font_size", 48)
-            if font_size < MIN_BODY_FONT_SIZE:
+            floor = MIN_SECONDARY_FONT_SIZE if layer.get("secondary") else MIN_BODY_FONT_SIZE
+            if font_size < floor:
                 issues.append(LegibilityIssue(
                     idx, "font_too_small",
-                    f"font_size={font_size} is below the §1.6 floor of {MIN_BODY_FONT_SIZE}px",
+                    f"font_size={font_size} is below the §1.6 floor of {floor}px",
                 ))
 
             font_weight = layer.get("font_weight", 400)
