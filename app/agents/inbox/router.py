@@ -21,7 +21,8 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
-    in_sync_with_connections, link_workspace_channels, release_channels, subscription_issue,
+    begin_replace, finish_replace, in_sync_with_connections, link_workspace_channels,
+    release_channels, subscription_issue,
 )
 from . import agent
 from .meta_transport import meta_transport
@@ -290,6 +291,34 @@ async def reply_to_conversation(
         "provider_message_id": record.get("provider_message_id", ""),
         "failure_reason": record.get("failure_reason", ""),
     }
+
+
+@router.post("/channels/replace/begin")
+async def replace_begin(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Called before the person connects another account from the inbox, so that the
+    accounts the inbox shows for that platform can be swapped for the new one."""
+    platform = str(payload.get("platform") or "")
+    if platform not in ("instagram", "facebook"):
+        raise HTTPException(status_code=400, detail="Platform must be instagram or facebook.")
+    return {"replacing": await begin_replace(db, brand_ctx.get("brand_id"), platform)}
+
+
+@router.post("/channels/replace/finish")
+async def replace_finish(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Called once the new account is connected. The inbox then shows it instead of the
+    accounts it showed before; Connected Accounts and publishing are untouched."""
+    platform = str(payload.get("platform") or "")
+    if platform not in ("instagram", "facebook"):
+        raise HTTPException(status_code=400, detail="Platform must be instagram or facebook.")
+    return await finish_replace(db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"), platform)
 
 
 @router.post("/channels/link")

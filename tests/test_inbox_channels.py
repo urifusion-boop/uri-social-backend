@@ -8,9 +8,9 @@ import copy
 
 import pytest
 
-from app.agents.inbox.channels import (account_for_event, channel_rows,
-                                       link_workspace_channels, prune_stale_claims,
-                                       release_channels)
+from app.agents.inbox.channels import (account_for_event, begin_replace, channel_rows,
+                                       finish_replace, link_workspace_channels,
+                                       prune_stale_claims, release_channels, visible_rows)
 from app.agents.inbox.entities import CHANNEL_ACCOUNTS
 from tests.test_inbox_ingest import FakeDB, _run
 from tests.test_inbox_send import Db
@@ -401,3 +401,139 @@ def test_missing_metadata_permission_says_uri_will_ask_again():
     out = subscription_issue("(#200) To subscribe to the feed field, one of these permissions is needed: "
                              "pages_manage_metadata", "Nayo's creation")
     assert out["code"] == "missing_permission" and "ask Meta for it again" in out["message"]
+
+
+# ── Replacing an inbox account ───────────────────────────────────────────────
+
+def test_a_connection_the_inbox_swapped_out_provides_no_rows_for_that_platform():
+    rows = visible_rows({**IG_CONN, "inbox_hidden": ["instagram"]}, "ws_1")
+    assert [r["platform"] for r in rows] == ["facebook"]
+
+
+def test_linking_skips_what_the_inbox_swapped_out():
+    db = _seeded_db([{**IG_CONN, "inbox_hidden": ["instagram"]}])
+    _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert [d["platform"] for d in db[CHANNEL_ACCOUNTS].docs] == ["facebook"]
+
+
+class _Coll:
+    def __init__(self, docs=None): self.docs = docs or []
+
+    def find(self, q, *a, **k):
+        docs = [d for d in self.docs if all(d.get(x) == y for x, y in q.items()
+                                            if not isinstance(y, dict))]
+        return _All(docs)
+
+    async def find_one_and_delete(self, q):
+        for d in self.docs:
+            if all(d.get(x) == y for x, y in q.items()):
+                self.docs.remove(d)
+                return d
+        return None
+
+    async def update_one(self, q, update, upsert=False):
+        doc = next((d for d in self.docs if all(d.get(x) == y for x, y in q.items())), None)
+        if doc is None:
+            if not upsert:
+                return
+            doc = dict(q)
+            self.docs.append(doc)
+        doc.update(update.get("$set", {}))
+        for k, v in update.get("$addToSet", {}).items():
+            if v not in doc.setdefault(k, []):
+                doc[k].append(v)
+        for k, v in update.get("$pull", {}).items():
+            doc[k] = [x for x in doc.get(k, []) if x != v]
+
+
+class _ReplaceDb(dict):
+    def __missing__(self, name):
+        self[name] = _Coll()
+        return self[name]
+
+
+def _replace_db(conns, shown):
+    db = _ReplaceDb()
+    db["social_connections"].docs.extend(copy.deepcopy(c) for c in conns)
+    db[CHANNEL_ACCOUNTS].docs.extend({"workspace_id": "ws_1", "platform": "instagram",
+                                      "external_account_id": i, "name": n} for i, n in shown)
+    return db
+
+
+NEW_CONN = {**IG_CONN, "ig_user_id": "IG2", "page_id": "PAGE2", "username": "preciouszino_",
+            "_id": "c2", "updated_at": "2999-01-01T00:00:00"}
+OLD_CONN = {**IG_CONN, "_id": "c1", "updated_at": "2020-01-01T00:00:00"}
+
+
+def _swap(monkeypatch, db, platform="instagram"):
+    import app.agents.inbox.channels as ch
+
+    async def no_link(*a, **k): return {}
+    monkeypatch.setattr(ch, "link_workspace_channels", no_link)
+    _run(begin_replace(db, "ws_1", platform))
+    return _run(finish_replace(db, "u1", "ws_1", platform))
+
+
+def test_connecting_another_account_swaps_out_the_one_the_inbox_showed(monkeypatch):
+    db = _replace_db([OLD_CONN], [("IG99", "urisocial")])
+    _run(begin_replace(db, "ws_1", "instagram"))
+    db["social_connections"].docs.append(copy.deepcopy(NEW_CONN))
+    import app.agents.inbox.channels as ch
+
+    async def no_link(*a, **k): return {}
+    monkeypatch.setattr(ch, "link_workspace_channels", no_link)
+    out = _run(finish_replace(db, "u1", "ws_1", "instagram"))
+    assert out["replaced"] == ["urisocial"]
+    old = next(c for c in db["social_connections"].docs if c["_id"] == "c1")
+    new = next(c for c in db["social_connections"].docs if c["_id"] == "c2")
+    assert old["inbox_hidden"] == ["instagram"]
+    assert "inbox_hidden" not in new
+    assert old["connection_status"] == "active"       # publishing still has it
+
+
+def test_reconnecting_the_same_account_replaces_nothing(monkeypatch):
+    db = _replace_db([OLD_CONN], [("IG99", "urisocial")])
+    assert _swap(monkeypatch, db) == {"replaced": []}
+    assert "inbox_hidden" not in db["social_connections"].docs[0]
+
+
+def test_a_finish_with_no_begin_replaces_nothing(monkeypatch):
+    db = _replace_db([OLD_CONN, NEW_CONN], [("IG99", "urisocial")])
+    import app.agents.inbox.channels as ch
+
+    async def no_link(*a, **k): return {}
+    monkeypatch.setattr(ch, "link_workspace_channels", no_link)
+    assert _run(finish_replace(db, "u1", "ws_1", "instagram")) == {"replaced": []}
+
+
+def test_a_stale_begin_is_ignored(monkeypatch):
+    from datetime import timedelta
+    db = _replace_db([OLD_CONN, NEW_CONN], [("IG99", "urisocial")])
+    _run(begin_replace(db, "ws_1", "instagram"))
+    db["inbox_replace_pending"].docs[0]["at"] -= timedelta(hours=2)
+    import app.agents.inbox.channels as ch
+
+    async def no_link(*a, **k): return {}
+    monkeypatch.setattr(ch, "link_workspace_channels", no_link)
+    assert _run(finish_replace(db, "u1", "ws_1", "instagram")) == {"replaced": []}
+    assert "inbox_hidden" not in db["social_connections"].docs[0]
+
+
+def test_a_begin_for_another_platform_does_not_swap_this_one(monkeypatch):
+    db = _replace_db([OLD_CONN, NEW_CONN], [("IG99", "urisocial")])
+    _run(begin_replace(db, "ws_1", "facebook"))
+    import app.agents.inbox.channels as ch
+
+    async def no_link(*a, **k): return {}
+    monkeypatch.setattr(ch, "link_workspace_channels", no_link)
+    assert _run(finish_replace(db, "u1", "ws_1", "instagram")) == {"replaced": []}
+
+
+def test_reconnecting_a_swapped_out_account_shows_it_again(monkeypatch):
+    hidden = {**OLD_CONN, "inbox_hidden": ["instagram"], "updated_at": "2999-01-01T00:00:00"}
+    db = _replace_db([hidden, {**NEW_CONN, "updated_at": "2020-01-01T00:00:00"}],
+                     [("IG2", "preciouszino_")])
+    out = _swap(monkeypatch, db)
+    assert out["replaced"] == ["preciouszino_"]
+    old = next(c for c in db["social_connections"].docs if c["_id"] == "c1")
+    assert "instagram" not in old["inbox_hidden"]
