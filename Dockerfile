@@ -60,6 +60,13 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
     curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 RUN pip install uvicorn
+# Background-removal model for cut-outs (app/utils/cutout_model.py) — baked in so a new
+# container never downloads it at request time. Its own layer, before the app code, so
+# it's cached between builds.
+ENV CUTOUT_MODEL=isnet-general-use \
+    CUTOUT_MODEL_DIR=/app/models
+RUN mkdir -p /app/models && curl -fsSL --retry 5 -o /app/models/isnet-general-use.onnx \
+    https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx
 COPY --from=build /usr/local/lib/python3.13 /usr/local/lib/python3.13
 COPY --from=build /app /app
 
