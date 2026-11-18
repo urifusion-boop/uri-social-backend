@@ -20,6 +20,8 @@ REQUIRED = {
     # The Unified Inbox webhook handshake. Without it Meta cannot subscribe, so
     # no message or comment ever arrives.
     "META_WEBHOOK_VERIFY_TOKEN": f"{SSM_PREFIX}/META_WEBHOOK_VERIFY_TOKEN",
+    # The "Connect WhatsApp" popup (Embedded Signup) is switched off while this is empty.
+    "WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID": f"{SSM_PREFIX}/WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID",
     # AI video creation (storyboard writing on Gemini 3.5 Flash-Lite, scene
     # animation on Veo 3.1) — confirmed missing/invalid live 2026-09-30:
     # generate-storyboard returned Google's own "API key not valid" error the
