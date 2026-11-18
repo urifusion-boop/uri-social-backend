@@ -105,12 +105,12 @@ async def remove_background_rembg(image_url: str) -> Optional[bytes]:
         PNG bytes with transparent background, or None if failed
     """
     try:
-        # Check if rembg is installed
-        try:
-            from rembg import remove
-            from PIL import Image
-        except ImportError:
-            print("⚠️ rembg not installed. Install with: pip install rembg[gpu] or pip install rembg")
+        # The model bundled with the server (app/utils/cutout_model.py) — the rembg
+        # project's own segmentation model, run directly with onnxruntime.
+        from PIL import Image
+        from app.utils import cutout_model
+        if not cutout_model.available():
+            print(f"⚠️ Cut-out model {cutout_model.MODEL_NAME} not available on this server")
             return None
 
         # Load the image — data: URI or real URL, see _load_image_bytes
@@ -118,17 +118,17 @@ async def remove_background_rembg(image_url: str) -> Optional[bytes]:
         input_image = Image.open(io.BytesIO(image_bytes))
 
         # Remove background (CPU-intensive, run in executor)
-        def _remove_bg():
-            return remove(input_image)
-
-        output_image = await asyncio.get_event_loop().run_in_executor(None, _remove_bg)
+        output_image = await asyncio.get_event_loop().run_in_executor(None, cutout_model.cut_out, input_image)
+        if output_image is None:
+            print("⚠️ Cut-out model found no clear subject")
+            return None
 
         # Convert to PNG bytes
         output_buffer = io.BytesIO()
         output_image.save(output_buffer, format="PNG")
         output_buffer.seek(0)
 
-        print(f"✂️ Background removed via rembg (local)")
+        print(f"✂️ Background removed via {cutout_model.MODEL_NAME} (local)")
         return output_buffer.read()
 
     except Exception as e:
