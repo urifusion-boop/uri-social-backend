@@ -1501,13 +1501,14 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
 
             if _d_ids:
                 # Attach uploaded images to drafts so they can be published.
-                # TikTok gets its own center-cropped-to-9:16 copies of any IMAGE
-                # uploads (see ImageContentService.crop_and_reupload_for_tiktok)
-                # — TikTok's own client auto-crops/letterboxes anything off-ratio
-                # when it actually posts, so this makes the draft preview match
-                # what goes live instead of a surprise crop later. Video uploads
-                # pass through untouched (PIL can't crop a video file). Every
-                # other platform keeps the original upload byte-for-byte.
+                # TikTok gets its own 9:16 copies of any IMAGE uploads, the whole
+                # picture fitted on a blurred backdrop, never cropped (see
+                # ImageContentService.crop_and_reupload_for_tiktok) — TikTok's own
+                # client auto-crops anything off-ratio when it actually posts and
+                # cuts text off at the sides, so this makes the draft preview match
+                # what goes live. Video uploads pass through untouched (PIL can't
+                # reshape a video file). Every other platform keeps the original
+                # upload byte-for-byte.
                 drafts_list = _rd.get("drafts", [])
                 tiktok_media_urls = None
                 if any(d.get("platform") == "tiktok" for d in drafts_list):
@@ -1525,8 +1526,8 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                     is_tiktok_cropped = d.get("platform") == "tiktok" and tiktok_media_urls
                     urls_for_platform = tiktok_media_urls if is_tiktok_cropped else media_urls
                     # item_logo_backgrounds was captured against the ORIGINAL
-                    # (pre-crop) images, indexed to media_urls — TikTok's own
-                    # center-cropped copies have different dimensions, so a
+                    # (pre-fit) images, indexed to media_urls — TikTok's own
+                    # 9:16 copies have different dimensions, so a
                     # saved pixel box wouldn't line up with them. Move Logo
                     # just isn't offered on a TikTok draft from this flow; every
                     # other platform's slides/image are byte-for-byte the
