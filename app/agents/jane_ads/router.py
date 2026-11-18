@@ -2502,6 +2502,11 @@ class MetaLaunchFromMessageBody(BaseModel):
     # entirely for a Meta-bound plan; ignored here too unless there are 2+ URLs (see the
     # tiktok_needs_video gate in _build_campaign_plan).
     carousel_image_urls: list[str] = []
+    # Meta-only, additive: more of the client's own photos (uploaded with
+    # reference_image_url, which stays the first ad). Each becomes another ad in the same
+    # campaign — Meta shows people the one that works best, as with "Make several ads".
+    # Ignored for every other platform and for a video upload.
+    extra_image_urls: list[str] = []
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
     reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
                                           # regenerating (a targeting/budget tweak shouldn't burn a
@@ -3612,6 +3617,35 @@ async def _build_campaign_plan(
             vsg01_format_id=body.vsg01_format_id, day30_photo_url=body.reference_image_url_2 or None,
             platform=copy_platform,
         )
+        extra_urls = [u for u in dict.fromkeys(body.extra_image_urls) if u and u != body.reference_image_url]
+        if extra_urls and not body.is_video and creative_platform == Platform.META.value and creative.image_url:
+            # Each extra photo gets the same treatment as the first (copy written to match
+            # it, and the same style), then runs as another ad beside it. A photo that
+            # fails is left out rather than failing the whole plan.
+            import asyncio
+            from . import concepts as concepts_mod
+            from .models import AdCreative
+            extra_urls = extra_urls[:concepts_mod.MAX_ADS - 1]
+            results = await asyncio.gather(*[
+                creative_from_upload(
+                    business_name, category, url, req.goal.value, creative_brief,
+                    user_id=user_id, db=db, brand_id=brand_id, is_video=False,
+                    city=parsed.city, service_area=service_area,
+                    audience_segment=variant_segment, who_its_for=variant_who_its_for,
+                    geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+                    destination_cta=destination_cta, asset_attestation=body.asset_attestation,
+                    vsg01_format_id=body.vsg01_format_id, platform=copy_platform,
+                ) for url in extra_urls
+            ], return_exceptions=True)
+            extras = [r for r in results if isinstance(r, AdCreative) and r.image_url and not r.is_video]
+            for i, r in enumerate(results):
+                if not isinstance(r, AdCreative):
+                    print(f"[upload] extra photo {i + 2} skipped for {business_id}: {r}", flush=True)
+            if extras:
+                creative.concept = creative.concept or "photo-1"
+                for i, ad in enumerate(extras, start=2):
+                    ad.concept = f"photo-{i}"
+                plan.concepts = extras
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
             business_name, category, body.reference_image_url, req.goal.value, creative_brief,
