@@ -10,6 +10,7 @@ WYSIWYG Guarantee: Client preview and server render must be identical.
 from typing import Dict, Any, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 import io
+import os
 import httpx
 from datetime import datetime
 
@@ -75,6 +76,9 @@ class DocumentRendererService:
 
                 elif layer_type == "badge":
                     await DocumentRendererService._render_badge(canvas, layer)
+
+                elif layer_type == "icon":
+                    DocumentRendererService._render_icon(canvas, layer)
 
             except Exception as e:
                 print(f"⚠️ Error rendering layer {layer.get('id')}: {e}")
@@ -160,11 +164,18 @@ class DocumentRendererService:
         # Resize if dimensions specified. fit="contain" keeps the image's proportions
         # inside the box, standing on its bottom edge, centred (a product or a cut-out
         # person); without it the image is resized to the box exactly as before.
+        if layer.get("trim"):
+            # Crop away a cut-out's transparent margins so the person, not the empty
+            # canvas around them, is what gets fitted into the box.
+            product_image = product_image.convert("RGBA")
+            bbox = product_image.split()[3].getbbox()
+            if bbox:
+                product_image = product_image.crop(bbox)
         if width and height and layer.get("fit") == "contain":
             product_image = product_image.convert("RGBA")
             product_image.thumbnail((width, height), Image.Resampling.LANCZOS)
-            x += (width - product_image.width) // 2
-            y += height - product_image.height
+            x += int((width - product_image.width) * layer.get("align_x", 0.5))
+            y += int((height - product_image.height) * layer.get("align_y", 1.0))
         elif width and height:
             product_image = product_image.resize((width, height), Image.Resampling.LANCZOS)
 
@@ -180,6 +191,21 @@ class DocumentRendererService:
 
         # Paste onto canvas
         canvas.paste(product_image, (x, y), product_image if product_image.mode == 'RGBA' else None)
+
+    ICONS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "icons"))
+
+    @staticmethod
+    def _render_icon(canvas: Image.Image, layer: Dict[str, Any]):
+        """A bundled glyph (app/assets/icons/<name>.png — WhatsApp, Instagram, …) drawn in
+        one colour at (x, y), `size` pixels square."""
+        name = os.path.basename(str(layer.get("name", "")))
+        path = os.path.join(DocumentRendererService.ICONS_DIR, f"{name}.png")
+        if not name or not os.path.exists(path):
+            return
+        size = int(layer.get("size", 32))
+        mask = Image.open(path).convert("RGBA").split()[3].resize((size, size), Image.Resampling.LANCZOS)
+        fill = Image.new("RGBA", (size, size), DocumentRendererService._hex_to_rgba(layer.get("color", "#000000")))
+        canvas.paste(fill, (int(layer.get("x", 0)), int(layer.get("y", 0))), mask)
 
     @staticmethod
     async def _render_text(canvas: Image.Image, layer: Dict[str, Any]):
@@ -216,7 +242,7 @@ class DocumentRendererService:
             # One line in differently coloured pieces, e.g. "Get " + "50%" (accent) + " off".
             pieces = []
             for sp in spans:
-                piece = {k: v for k, v in sp.items() if k in ("text", "font_family", "font_weight")}
+                piece = {k: v for k, v in sp.items() if k in ("text", "font_family", "font_weight", "font_size")}
                 if sp.get("color"):
                     piece["color"] = DocumentRendererService._hex_to_rgba(sp["color"])
                 if sp.get("highlight"):
@@ -361,6 +387,30 @@ class DocumentRendererService:
             column.putdata([int(a0 + (a1 - a0) * (i / max(1, height - 1))) for i in range(height)])
             wash = Image.new("RGBA", (width, height), (r, g, b, 255))
             wash.putalpha(column.resize((width, height)))
+            canvas.alpha_composite(wash, (x, y))
+
+        elif shape == "triangle":
+            # {x, y, width, height, fill_color} — pointing right, like a ▸ marker.
+            x, y = layer.get("x", 0), layer.get("y", 0)
+            width, height = layer.get("width", 0), layer.get("height", 0)
+            if width <= 0 or height <= 0 or not layer.get("fill_color"):
+                return
+            draw.polygon([(x, y), (x + width, y + height / 2), (x, y + height)],
+                         fill=DocumentRendererService._hex_to_rgba(layer["fill_color"]))
+
+        elif shape == "hgradient":
+            # {x, y, width, height, color, from_alpha (left), to_alpha (right)} — keeps the text side of
+            # a full-bleed image calm and clean.
+            x, y = int(layer.get("x", 0)), int(layer.get("y", 0))
+            width, height = int(layer.get("width", 0)), int(layer.get("height", 0))
+            if width <= 0 or height <= 0:
+                return
+            r, g, b, _ = DocumentRendererService._hex_to_rgba(layer.get("color", "#FFFFFF"))
+            a0, a1 = int(layer.get("from_alpha", 255)), int(layer.get("to_alpha", 0))
+            row = Image.new("L", (width, 1))
+            row.putdata([int(a0 + (a1 - a0) * (i / max(1, width - 1))) for i in range(width)])
+            wash = Image.new("RGBA", (width, height), (r, g, b, 255))
+            wash.putalpha(row.resize((width, height)))
             canvas.alpha_composite(wash, (x, y))
 
         elif shape == "ellipse":

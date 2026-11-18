@@ -177,7 +177,7 @@ def draw_text(
 
 def spans_width(spans: List[dict], family: Optional[str], size: int, weight: int = 400) -> float:
     """Width of one line made of differently coloured pieces (see draw_spans)."""
-    return sum(text_width(sp.get("text", ""), sp.get("font_family", family), size,
+    return sum(text_width(sp.get("text", ""), sp.get("font_family", family), sp.get("font_size", size),
                           sp.get("font_weight", weight)) for sp in spans)
 
 
@@ -217,10 +217,11 @@ def draw_spans(
         text = sp.get("text", "")
         fam = sp.get("font_family", family)
         wt = sp.get("font_weight", weight)
-        width = text_width(text, fam, size, wt)
+        sz = sp.get("font_size", size)  # a piece may be smaller (e.g. "your" in "MASTER your MONEY")
+        width = text_width(text, fam, sz, wt)
         if sp.get("highlight") is not None and text.strip():
-            cap = draw.textbbox((0, 0), "H", font=_truetype(font_path(fam, wt), int(size)), anchor="ls")
+            cap = draw.textbbox((0, 0), "H", font=_truetype(font_path(fam, wt), int(sz)), anchor="ls")
             draw.rectangle([x - pad_x, y + cap[1] - pad_y, x + width + pad_x, y + descent * 0.35 + pad_y],
                            fill=sp["highlight"])
-        draw_text(draw, (x, y), text, fam, size, wt, fill=sp.get("color", fill), anchor="ls")
+        draw_text(draw, (x, y), text, fam, sz, wt, fill=sp.get("color", fill), anchor="ls")
         x += width

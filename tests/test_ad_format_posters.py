@@ -3,6 +3,8 @@ import asyncio
 import io
 
 import pytest
+
+from app.utils.fonts import text_width
 from PIL import Image
 
 from app.agents.jane_ads import vsg01_orchestrator as orch
@@ -32,8 +34,11 @@ def test_event_with_host_photo_has_date_pill_host_and_button():
         host_role="Money mindset coach", action_line="Join free", contact_line="@brandco",
     )
     texts = [l["content"] for l in _types(doc, "text")]
-    assert "19th – 23rd February" in texts and "Patience Ade" in texts and "Join free" in texts
-    assert _types(doc, "composited_product")[0]["fit"] == "contain"
+    # The date is the business's own words, only split (days over month) and capitalised.
+    assert "19TH – 23RD" in texts and "FEBRUARY" in texts
+    assert "Patience Ade" in texts and "Join free  →" in texts
+    person = _types(doc, "composited_product")[0]
+    assert person["fit"] == "contain" and person["trim"]
     assert check_legibility(doc, {**YELLOW, "surface": "#FFFFFF"}) == []
 
 
@@ -56,8 +61,10 @@ def test_long_event_title_shrinks_instead_of_failing():
         host_cutout_url=PHOTO, host_name="Ada Obi", host_role="Chartered accountant",
         action_line="Book your seat", contact_line="brandco.ng",
     )
-    sizes = {l["font_size"] for l in _types(doc, "text") if l.get("font_weight") == 900}
-    assert max(sizes) < 120
+    title = [l for l in _types(doc, "text") if l.get("spans")]
+    assert max(l["font_size"] for l in title) < 120
+    assert all(l["x"] + text_width(l["content"], l["font_family"], l["font_size"], 900) <= 1080 * 0.545
+               for l in title if not any(sp["font_size"] != l["font_size"] for sp in l["spans"]))
 
 
 def test_title_that_cannot_fit_is_refused_so_another_format_is_used():
@@ -229,7 +236,8 @@ def test_date_card_fits_a_long_month_and_puts_the_time_on_its_own_line():
     card = [l for l in doc["layers"] if l.get("shape") == "rounded_rect" and l["y"] < 400][0]
     lines = [l for l in doc["layers"] if l.get("type") == "text" and l["x"] == card["x"] + card["width"] // 2]
     assert [l["content"] for l in lines][-1] == "7PM"
-    assert all(text_width(l["content"], l.get("font_family"), l["font_size"], 900) <= card["width"] - 56 for l in lines)
+    assert all(text_width(l["content"], l.get("font_family"), l["font_size"], l["font_weight"]) <= card["width"] - 56
+               for l in lines)
 
 
 def test_offer_ticket_sits_above_the_headline_not_mid_frame():
@@ -252,8 +260,11 @@ def test_event_without_photo_is_centred_not_bottom_heavy():
     doc = event_promo.build_document("Cut patient paperwork time", "Free live webinar on Zoom",
                                      "Thursday 4th December, 2pm", tokens=GREEN, host_name="Dr Ada Obi",
                                      action_line="Register now", contact_line="docerity.com/webinar")
-    ys = [l["y"] for l in doc["layers"] if "y" in l]
-    ends = [l["y"] + (l.get("height") or l.get("font_size", 48)) for l in doc["layers"] if "y" in l]
+    # The left column (the arc, date card and the faint background word are ornament on the right/bottom).
+    column = [l for l in doc["layers"] if "y" in l and l["y"] >= 0 and 0 <= l.get("x", -1) < 500
+              and not l.get("decorative")]
+    ys = [l["y"] for l in column]
+    ends = [l["y"] + (l.get("height") or l.get("font_size", 48)) for l in column]
     top_gap, bottom_gap = min(ys) - event_promo.PAD, 1080 - event_promo.PAD - max(ends)
     assert abs(top_gap - bottom_gap) <= 4
 
@@ -273,3 +284,48 @@ def test_offer_ticket_and_tags_never_widen_the_deal(monkeypatch):
                                                     {"key_products_services": ["Data engineering"]}))
     assert out["ticket"] == "25% off"
     assert out["services"] == ["Patient records setup", "Staff training"]
+
+
+def test_cutout_that_returns_the_original_photo_is_no_cutout(monkeypatch):
+    import app.utils.background_removal as br
+
+    async def unchanged(url, method="auto"):
+        return url  # what remove_background does when every method failed
+    monkeypatch.setattr(br, "remove_background", unchanged)
+    assert asyncio.run(orch._cutout(PHOTO)) is None
+
+
+_EVENT = {"is_event": True, "title": "Cut patient paperwork time", "event_kind": "Free live webinar",
+          "date_text": "4th December", "action_line": "Register now"}
+
+
+def test_event_without_photo_uses_generated_artwork(monkeypatch):
+    _stub_model(monkeypatch, _EVENT)
+    prompts = []
+
+    async def scene(prompt, size="1080x1080", brand_context=None):
+        prompts.append(prompt)
+        return "https://example.com/art.png"
+
+    async def edge(url):
+        return "#F6F3EE"
+    monkeypatch.setattr(orch, "generate_scene", scene)
+    monkeypatch.setattr(orch, "_left_edge_colour", edge)
+    doc = asyncio.run(orch._build_event_promo("Docerity", "health", "Free live webinar on 4th December",
+                                              GREEN))
+    art = _types(doc, "ai_generated_background")
+    assert art and art[0]["url"] == "https://example.com/art.png"
+    assert doc["canvas"]["background_color"] == "#F6F3EE"
+    assert "No people" in prompts[0] and "no text" in prompts[0].lower()
+
+
+def test_event_artwork_failure_falls_back_to_the_date_card(monkeypatch):
+    _stub_model(monkeypatch, _EVENT)
+
+    async def boom(prompt, size="1080x1080", brand_context=None):
+        raise orch.SceneGenerationFailed("down")
+    monkeypatch.setattr(orch, "generate_scene", boom)
+    doc = asyncio.run(orch._build_event_promo("Docerity", "health", "Free live webinar on 4th December",
+                                              GREEN))
+    assert doc and not _types(doc, "ai_generated_background")
+    assert any(l.get("content") == "DECEMBER" for l in _types(doc, "text"))
