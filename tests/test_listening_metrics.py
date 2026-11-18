@@ -9,7 +9,7 @@ card's own opened thread). Both are still reported as explicitly unavailable
 exists yet. Uses an in-memory MongoDB; no network, no AI.
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -19,6 +19,9 @@ from app.agents.market_intelligence.listening import metrics
 from app.agents.market_intelligence.listening.router import product_metrics_endpoint
 
 NOW = datetime(2026, 10, 21, 12, 0)
+# Ad spend rows are read by jane_ads growth.metrics.load, which looks back from the real
+# current date (not NOW) — so they're dated yesterday, or they age out of its window.
+SPEND_DATE = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
 MARKET_KEY = "hair_wigs:NG"
 
 
@@ -184,10 +187,10 @@ class TestAdTestCostPerQualifiedLead:
         run(db["jane_ads_meta_campaigns"].insert_one(
             {"brand_id": "b1", "thread_id": "thr_1", "campaign_id": "camp_1"}))
         run(db["jane_ads_metric_snapshots"].insert_one(
-            {"campaign_id": "camp_1", "level": "campaign", "date": "2026-10-20", "spend_ngn": 20000.0,
+            {"campaign_id": "camp_1", "level": "campaign", "date": SPEND_DATE, "spend_ngn": 20000.0,
              "impressions": 1000, "reach": 900, "clicks": 50, "conversations": 5}))
         run(db["jane_ads_metric_snapshots"].insert_one(
-            {"campaign_id": "camp_1", "level": "ad", "ad_id": "ad_1", "date": "2026-10-20", "spend_ngn": 20000.0,
+            {"campaign_id": "camp_1", "level": "ad", "ad_id": "ad_1", "date": SPEND_DATE, "spend_ngn": 20000.0,
              "impressions": 1000, "reach": 900, "clicks": 50, "conversations": 5}))
         run(db["inbox_conversations"].insert_one(
             {"workspace_id": "b1", "source_ad_id": "ad_1", "lead_stage": "qualified"}))
@@ -210,9 +213,9 @@ class TestAdTestCostPerQualifiedLead:
         run(db["jane_ads_meta_campaigns"].insert_one(
             {"brand_id": "b1", "thread_id": "thr_1", "campaign_id": "camp_1"}))
         run(db["jane_ads_metric_snapshots"].insert_one(
-            {"campaign_id": "camp_1", "level": "campaign", "date": "2026-10-20", "spend_ngn": 5000.0}))
+            {"campaign_id": "camp_1", "level": "campaign", "date": SPEND_DATE, "spend_ngn": 5000.0}))
         run(db["jane_ads_metric_snapshots"].insert_one(
-            {"campaign_id": "camp_1", "level": "ad", "ad_id": "ad_1", "date": "2026-10-20", "spend_ngn": 5000.0}))
+            {"campaign_id": "camp_1", "level": "ad", "ad_id": "ad_1", "date": SPEND_DATE, "spend_ngn": 5000.0}))
         run(db["inbox_conversations"].insert_one({"workspace_id": "b1", "source_ad_id": "ad_1"}))
 
         result = run(metrics.product_metrics(db, now=NOW))
