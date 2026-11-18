@@ -3261,19 +3261,35 @@ Answer with exactly one word: "yes" or "no"."""
             return fn(size=fallback_size, **kwargs)
 
     @staticmethod
+    def _fit_with_blurred_backdrop(img: Any, tw: int, th: int) -> Any:
+        """The whole picture, scaled to fit inside a tw x th frame, on a blurred, enlarged copy of itself.
+
+        Nothing is cut off: a centre crop of a 4:5 post to TikTok's 9:16 keeps only ~70% of the width and
+        slices text and logos at the sides. The blur fills the bars above and below the way TikTok's own
+        editor does, so it doesn't read as a letterbox."""
+        from PIL import Image, ImageFilter
+
+        img = img.convert("RGB")
+        cover = max(tw / img.width, th / img.height)
+        backdrop = img.resize((max(tw, round(img.width * cover)), max(th, round(img.height * cover))), Image.LANCZOS)
+        left, top = (backdrop.width - tw) // 2, (backdrop.height - th) // 2
+        backdrop = backdrop.crop((left, top, left + tw, top + th)).filter(ImageFilter.GaussianBlur(40))
+
+        contain = min(tw / img.width, th / img.height)
+        fg_w, fg_h = max(1, round(img.width * contain)), max(1, round(img.height * contain))
+        backdrop.paste(img.resize((fg_w, fg_h), Image.LANCZOS), ((tw - fg_w) // 2, (th - fg_h) // 2))
+        return backdrop
+
+    @staticmethod
     async def crop_and_reupload_for_tiktok(image_url: str, user_id: str) -> str:
-        """Center-crop a user-uploaded image to TikTok's Photo Mode spec
-        (1080x1920, 9:16) and re-upload it, returning the new URL. Used only
-        for TikTok drafts in the Upload Content flow — every other platform
-        keeps the user's original upload untouched, matching how AI-generated
-        images already get a platform-specific size (see IMAGE_SPECS) while
-        raw uploads otherwise pass through as-is. TikTok's own client
-        auto-crops/letterboxes anything off-ratio when it actually posts, so
-        this makes what the user approves in the draft preview match what
-        actually goes live, instead of a surprise crop TikTok applies later.
-        Falls back to the original URL on any failure — a bad crop should
-        never block the upload flow."""
-        import base64 as _b64
+        """Fit a user-uploaded image into TikTok's Photo Mode frame (1080x1920, 9:16) and re-upload it,
+        returning the new URL. Used only for TikTok drafts in the Upload Content flow — every other
+        platform keeps the user's original upload untouched.
+
+        The picture is fitted whole, never cropped (see _fit_with_blurred_backdrop). The old centre crop
+        cut the sides off any post that wasn't already tall and thin. It also makes what the user
+        approves in the draft preview match what goes live. Falls back to the original URL on any
+        failure — a bad conversion should never block the upload flow."""
         import io
         import httpx
         from PIL import Image
@@ -3284,27 +3300,20 @@ Answer with exactly one word: "yes" or "no"."""
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(image_url)
             resp.raise_for_status()
-            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            img = Image.open(io.BytesIO(resp.content))
 
-            buf = io.BytesIO()
-            img.save(buf, format="WEBP", quality=97)
-            b64 = _b64.b64encode(buf.getvalue()).decode()
-
-            cropped_b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
-            cropped_img = Image.open(io.BytesIO(_b64.b64decode(cropped_b64))).convert("RGB")
-            if cropped_img.size != (target_w, target_h):
-                cropped_img = cropped_img.resize((target_w, target_h), Image.LANCZOS)
+            fitted = ImageContentService._fit_with_blurred_backdrop(img, target_w, target_h)
 
             out_buf = io.BytesIO()
-            cropped_img.save(out_buf, format="WEBP", quality=97, method=6)
+            fitted.save(out_buf, format="WEBP", quality=97, method=6)
 
             url = await upload_bytes(
                 out_buf.getvalue(), folder=f"uri-social/tiktok-crop/{user_id}", resource_type="image",
             )
-            print(f"✅ Cropped upload to TikTok 9:16 ({target_w}x{target_h}): {url[:100]}...", flush=True)
+            print(f"✅ Fitted upload to TikTok 9:16 ({target_w}x{target_h}): {url[:100]}...", flush=True)
             return url
         except Exception as e:
-            print(f"⚠️ TikTok crop failed for {image_url[:80]}: {e} — using original upload as-is", flush=True)
+            print(f"⚠️ TikTok fit failed for {image_url[:80]}: {e} — using original upload as-is", flush=True)
             return image_url
 
     @staticmethod
