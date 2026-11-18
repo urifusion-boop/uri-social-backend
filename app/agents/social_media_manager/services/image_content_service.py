@@ -3302,6 +3302,11 @@ Answer with exactly one word: "yes" or "no"."""
             resp.raise_for_status()
             img = Image.open(io.BytesIO(resp.content))
 
+            # Already tall-ish (9:16 up to square, e.g. a 4:5 post): TikTok takes it as is, so keep the
+            # user's picture exactly as uploaded, with no bars. Only wider pictures need fitting.
+            if 9 / 16 - 0.01 <= img.width / img.height <= 1.0:
+                return image_url
+
             fitted = ImageContentService._fit_with_blurred_backdrop(img, target_w, target_h)
 
             out_buf = io.BytesIO()

@@ -105,6 +105,8 @@ def stubbed(monkeypatch):
         async def get(self, url):
             if url == "https://cdn/broken":
                 raise httpx.ConnectError("down")
+            if url == "https://cdn/landscape.png":
+                return _Resp(_png(_post(1600, 900)))
             return _Resp(_png(_post()))
 
     async def fake_upload(data, folder, resource_type):
@@ -116,8 +118,13 @@ def stubbed(monkeypatch):
     return uploaded
 
 
-def test_the_reupload_is_a_9_16_webp_with_nothing_cut_off(stubbed):
+def test_a_4_5_post_is_sent_to_tiktok_exactly_as_uploaded(stubbed):
     url = asyncio.get_event_loop().run_until_complete(ICS.crop_and_reupload_for_tiktok("https://cdn/post.png", "u1"))
+    assert url == "https://cdn/post.png" and not stubbed   # no bars, no re-upload
+
+
+def test_a_landscape_picture_is_reuploaded_fitted_to_9_16_with_nothing_cut_off(stubbed):
+    url = asyncio.get_event_loop().run_until_complete(ICS.crop_and_reupload_for_tiktok("https://cdn/landscape.png", "u1"))
     assert url == "https://cdn/fitted.webp" and stubbed["folder"].endswith("/u1")
     out = Image.open(io.BytesIO(stubbed["data"])).convert("RGB")
     assert out.size == (1080, 1920)
