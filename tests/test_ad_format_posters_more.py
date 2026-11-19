@@ -368,3 +368,23 @@ def test_a_long_host_title_is_shown_in_full_not_cut_at_two_lines():
     doc = _event_with_host("Patience Carew", "Certified money mindset coach and author of Rich Habits")
     shown = " ".join(l["content"] for l in doc["layers"] if l.get("type") == "text" and l.get("font_size") == 28)
     assert "Rich Habits" in shown
+
+
+def test_portrait_headline_description_always_ends_clear_of_the_pill():
+    # Found live on staging: a four-line description ran down to within a few pixels of the CTA pill.
+    from app.agents.jane_ads.ad_formats import portrait_headline
+    from app.utils.fonts import load_font
+    doc = portrait_headline.build_document(
+        "https://example.com/p.png", "Secure Digital Patient Records", "Secure",
+        "Docerity keeps every patient record digital, searchable, and secure for private clinics in Lagos.",
+        "Book a demo at:", "docerity.com", tokens=resolve_brand_tokens(["#18F04F"]), brand_color="#18F04F",
+        second_color="#A3145C")
+    texts = [l for l in doc["layers"] if l.get("type") == "text"]
+    sentence = "Docerity keeps every patient record digital, searchable, and secure for private clinics in Lagos."
+    desc = [l for l in texts if l.get("secondary") and l["content"].strip() and l["content"].strip() in sentence]
+    pill = min(l["y"] for l in doc["layers"] if l.get("shape") == "rounded_rect" and l.get("height", 0) == 112)
+    assert desc, "the description should still be shown"
+    last = desc[-1]
+    ink_bottom = last["y"] + load_font(last["font_family"], last["font_size"], last["font_weight"]).getbbox(
+        last["content"], anchor="la")[3]
+    assert ink_bottom <= pill - 12
