@@ -121,6 +121,12 @@ def _check_label_one_line(label: str, cell_width: int, font_family: Optional[str
         )
 
 
+# One backdrop for every item (and the tile behind the cut-out product), so the grid reads as one flat lay.
+# Live on staging each item came back on its own colour (grey, green, red, dark) and the pack looked random.
+BACKDROP = "#ECE7E1"
+_BACKDROP_WORDS = "a plain, seamless, warm light-grey paper backdrop (hex #ECE7E1), the same for every item"
+
+
 def _item_prompt(item: str, nigerian_setting_hint: str = "", seasonal_context: Optional[str] = None) -> str:
     """Per-item variant of VSG-01-PROMPTS v3 §6.11's flat-lay prompt — see
     module docstring for why this is generated per item rather than as one
@@ -131,7 +137,7 @@ def _item_prompt(item: str, nigerian_setting_hint: str = "", seasonal_context: O
     recognisable at grid scale — applied to each item instead)."""
     seasonal = seasonal_context_clause(seasonal_context)
     return (
-        f"Overhead flat lay of {item} on a plain surface, even soft daylight "
+        f"Overhead flat lay of {item} on {_BACKDROP_WORDS}, edge to edge with no other colour, even soft daylight "
         "from above producing a subtle consistent shadow, true-to-life "
         "material rendering — genuine surface texture, sheen and colour "
         "fidelity for exactly what this object is — styled but not "
@@ -208,8 +214,17 @@ def build_document(
     z = 0
     logo_w = 200 if brand_logo_url else 0
     if title:
-        size, lines = fit_headline(title, font_family, 800, width - 2 * margin - logo_w - 24, 2,
-                                   _TITLE_MAX, _TITLE_MIN, -0.01)
+        title_w = width - 2 * margin - logo_w - 24
+        size, lines = fit_headline(title, font_family, 800, title_w, 2, _TITLE_MAX, _TITLE_MIN, -0.01)
+        # Never a single word left alone on the second line ("The Lagos clinic starter / pack"): narrow
+        # the measure until the break is balanced, at the same size.
+        narrow = title_w
+        while len(lines) == 2 and len(lines[1].split()) < 2 and narrow > title_w * 0.55:
+            narrow -= 20
+            try:
+                size, lines = fit_headline(title, font_family, 800, narrow, 2, size, size, -0.01)
+            except ValueError:
+                break
         pitch = int(size * 1.08)
         ty = margin + (_TITLE_BAND - 24 - pitch * len(lines)) // 2
         for i, line in enumerate(lines):
@@ -223,6 +238,11 @@ def build_document(
         cell_x = margin + col * (cell_w + gap)
         cell_y = top + row * (cell_h + label_height + gap)
 
+        if is_product:
+            # The cut-out product sits on the same backdrop tile as the photographed items.
+            z += 1
+            layers.append({"type": "shape", "shape": "rect", "z_index": z, "x": cell_x, "y": cell_y,
+                           "width": cell_w, "height": cell_h, "fill_color": BACKDROP})
         z += 1
         layers.append({
             "type": "composited_product", "z_index": z,
