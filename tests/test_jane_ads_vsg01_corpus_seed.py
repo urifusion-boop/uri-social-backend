@@ -1,5 +1,5 @@
 """
-vsg01_corpus_seed.py (VSG-01 v3 §6, step 9) — the 18 ad formats as real
+vsg01_corpus_seed.py (VSG-01 v3 §6, step 9) — the 23 ad formats as real
 corpus records (the original 12, plus 3 added in a later session: text_only,
 price_led_offer, work_in_progress — see FORMAT_MODULES in
 vsg01_corpus_seed.py itself, the actual source of truth this list mirrors),
@@ -22,6 +22,7 @@ from app.agents.jane_ads.ad_formats import (
     problem_solution, testimonial_offer, text_on_a_face, news_headline,
     censored_item, starter_pack, humour_cartoon, text_only, price_led_offer,
     work_in_progress, event_promo, offer_spotlight, problems_vs_solution,
+    portrait_headline, floating_cards, enrol_signup, billboard_statement, ai_answer,
 )
 
 ALL_FORMAT_MODULES = [
@@ -29,6 +30,7 @@ ALL_FORMAT_MODULES = [
     problem_solution, testimonial_offer, text_on_a_face, news_headline,
     censored_item, starter_pack, humour_cartoon, text_only, price_led_offer,
     work_in_progress, event_promo, offer_spotlight, problems_vs_solution,
+    portrait_headline, floating_cards, enrol_signup, billboard_statement, ai_answer,
 ]
 
 
@@ -37,13 +39,13 @@ def _run(coro):
 
 
 class TestBuildVsg01Strategies:
-    def test_produces_exactly_eighteen_valid_records(self):
+    def test_produces_exactly_twenty_three_valid_records(self):
         """Pydantic validation passing at construction IS a real test here
         — any record missing modification_required (mandatory whenever
         transfer_verdict is applies_with_modification) or a negative
         budget floor would raise before this assertion ever runs."""
         strategies = build_vsg01_strategies()
-        assert len(strategies) == 18
+        assert len(strategies) == 23
         assert {s.strategy_id for s in strategies} == {m.FORMAT.format_id for m in ALL_FORMAT_MODULES}
 
     def test_all_records_are_draft_never_pre_approved(self):
@@ -94,11 +96,11 @@ class TestSeedAndRetrieveEndToEnd:
     per business profile — against the actual InMemoryStrategyStore and
     retrieval.retrieve(), no stand-ins."""
 
-    def test_seeding_ingests_all_eighteen_as_draft(self):
+    def test_seeding_ingests_all_twenty_three_as_draft(self):
         store = InMemoryStrategyStore()
         count = _run(seed_vsg01_corpus(store))
-        assert count == 18
-        assert _run(store.count(status=StrategyStatus.DRAFT)) == 18
+        assert count == 23
+        assert _run(store.count(status=StrategyStatus.DRAFT)) == 23
         assert _run(store.count(status=StrategyStatus.APPROVED)) == 0
 
     def test_nothing_retrieves_before_human_approval(self):
