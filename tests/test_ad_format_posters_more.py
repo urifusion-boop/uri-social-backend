@@ -316,3 +316,55 @@ def test_recolor_shifts_only_the_face_colour():
     assert out.getpixel((30, 30))[:3] == (0x12, 0x3A, 0x9E)
     assert out.getpixel((50, 50))[:3] == (0x22, 0x22, 0x22)             # the arm keeps its colour
     assert out.getpixel((5, 5))[:3] == (0x5A, 0xA0, 0xE6)               # sky untouched
+
+
+# ── layout fixes found when testing every format end to end (19 Nov) ─────────
+
+def test_floating_cards_subline_clears_the_headlines_descenders():
+    from app.agents.jane_ads.ad_formats import floating_cards
+    from app.utils.fonts import load_font
+    doc = floating_cards.build_document(
+        "https://example.com/scene.png", "Running out of stock shouldn't surprise you.",
+        "Know what's selling, know what's left.", ("Items out of stock", "Restock today"),
+        ("Low in stock!", "Asymmetric gold ring"), "Track your inventory with daash.", "daashapp.co",
+        tokens=resolve_brand_tokens(["#1155CC"]), brand_color="#1155CC", second_color="#F28C38")
+    texts = [l for l in doc["layers"] if l.get("type") == "text"]
+    head = [l for l in texts if not l.get("secondary") and l["content"].strip() and l["font_size"] >= 60]
+    sub = next(l for l in texts if l["content"].startswith("Know what"))
+    last = head[-1]
+    ink_bottom = last["y"] + load_font(last["font_family"], last["font_size"], last["font_weight"]).getbbox(
+        last["content"], anchor="la")[3]
+    sub_ink_top = sub["y"] + load_font(sub["font_family"], sub["font_size"], sub["font_weight"]).getbbox(
+        sub["content"], anchor="la")[1]
+    assert sub_ink_top - ink_bottom >= 12
+
+
+def _event_with_host(name, role):
+    from app.agents.jane_ads.ad_formats import event_promo
+    return event_promo.build_document(
+        "Master your money mindset", "5-Day WhatsApp Challenge", "19th – 23rd February, 7pm",
+        tokens=resolve_brand_tokens(["#F5C400"]), brand_color="#F5C400",
+        host_cutout_url="https://example.com/host.png", host_name=name, host_role=role,
+        action_line="Join free", contact_line="@brandco")
+
+
+def _host_photo(doc):
+    return next(l for l in doc["layers"] if l.get("type") == "composited_product")
+
+
+def test_a_short_host_name_keeps_the_photo_where_it_was():
+    photo = _host_photo(_event_with_host("Ada Obi", "Money coach"))
+    assert photo["x"] == int(1080 * 0.525)
+
+
+def test_a_long_host_name_moves_the_photo_clear_of_it_and_keeps_its_right_edge():
+    short = _host_photo(_event_with_host("Ada Obi", "Money coach"))
+    long_ = _host_photo(_event_with_host("Patience Carew", "Certified money mindset coach"))
+    assert long_["x"] > short["x"]
+    assert long_["x"] + long_["width"] == short["x"] + short["width"]
+
+
+def test_a_long_host_title_is_shown_in_full_not_cut_at_two_lines():
+    doc = _event_with_host("Patience Carew", "Certified money mindset coach and author of Rich Habits")
+    shown = " ".join(l["content"] for l in doc["layers"] if l.get("type") == "text" and l.get("font_size") == 28)
+    assert "Rich Habits" in shown

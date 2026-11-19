@@ -15,7 +15,7 @@ does in the business's own words; no figure appears on them unless the business 
 import math
 from typing import Dict, List, Optional, Tuple
 
-from app.utils.fonts import text_width
+from app.utils.fonts import load_font, text_width
 from ._type import fit_headline, vivid_block, wrap_words
 from .legibility import assert_legible
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
@@ -114,7 +114,13 @@ def build_document(
     head_top = PAD + 8
     sub_lines = wrap_words(subline, BODY_FAMILY, 34, 600, max_w) if subline else []
     sub_lines = sub_lines[:2]
+    # Placed from where the headline's ink really ends: the last line's descenders (the p and y of
+    # "surprise you.") hang well below its line pitch and used to cut into the subline.
     sub_top = head_top + pitch * len(lines) + 22
+    if sub_lines:
+        head_ink_bottom = load_font(headline_font, size, hw).getbbox(lines[-1], anchor="la")[3]
+        sub_ink_top = load_font(BODY_FAMILY, 34, 600).getbbox(sub_lines[0], anchor="la")[1]
+        sub_top = max(sub_top, head_top + pitch * (len(lines) - 1) + head_ink_bottom + 18 - sub_ink_top)
     text_bottom = sub_top + (len(sub_lines) * 42 if sub_lines else 0)
     # A deep wash from the top through the type, then fading out — §1.6's scrim, tinted dark.
     layers.append({"type": "shape", "shape": "vgradient", "x": 0, "y": 0, "width": width,

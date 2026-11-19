@@ -480,6 +480,18 @@ def _date_two_lines(date_text: str) -> List[str]:
     return [date_text.upper()]
 
 
+def _role_lines(host_role: Optional[str], max_w: int) -> Tuple[int, List[str]]:
+    """The host's title, at the 28px legibility floor, in up to four lines (it used to stop at two and drop
+    the rest without a sign). A title longer still ends with an ellipsis so it reads as shortened."""
+    if not host_role:
+        return 28, []
+    lines = wrap_words(host_role, BODY_FAMILY, 28, 700, max_w)
+    if len(lines) > 4:
+        lines = lines[:4]
+        lines[-1] = lines[-1].rstrip(".,;:") + "…"
+    return 28, lines
+
+
 def _build_portrait(title, event_kind, date_text, canvas_size, t, host_cutout_url, host_name, host_role,
                     action_line, contact_line, brand_logo_url, headline_font, brand, title_cap,
                     social_platforms) -> Dict:
@@ -510,10 +522,19 @@ def _build_portrait(title, event_kind, date_text, canvas_size, t, host_cutout_ur
     wx, wy, wr = int(1477 * s), int(-1400 * s), int(1713 * s)
     back.append({"type": "shape", "shape": "ellipse", "x": wx - wr, "y": wy - wr, "width": 2 * wr,
                  "height": 2 * wr, "fill_color": surface})
-    # The host: on the right, standing on the bottom edge, clear of the name beside them.
+    # The host: on the right, standing on the bottom edge, clear of the name beside them. The name and
+    # title sit over the photo's empty top-left, as in the reference; when they run long enough to reach
+    # the host's head (about 0.655 of the width), the photo moves right by just that much.
+    photo_x, photo_right = int(width * 0.525), int(width * 0.525) + int(width * 0.495)
+    if host_name:
+        tx = int(width * 0.418) + int(30 * s)
+        role_size, role_lines = _role_lines(host_role, int(width * 0.22))
+        text_right = tx + max([text_width(host_name, BODY_FAMILY, int(34 * s), 800)]
+                              + [text_width(rl, BODY_FAMILY, role_size, 700) for rl in role_lines])
+        photo_x += max(0, int(text_right - width * 0.655))
     back.append({"type": "composited_product", "url": host_cutout_url, "trim": True, "fit": "contain",
-                 "align_x": 1.0, "align_y": 1.0, "x": int(width * 0.525), "y": int(height * 0.15),
-                 "width": int(width * 0.495), "height": int(height * 0.87)})
+                 "align_x": 1.0, "align_y": 1.0, "x": photo_x, "y": int(height * 0.15),
+                 "width": photo_right - photo_x, "height": int(height * 0.87)})
 
     col: List[Dict] = []
     y = 0
@@ -661,10 +682,11 @@ def _build_portrait(title, event_kind, date_text, canvas_size, t, host_cutout_ur
         col.append({"type": "text", "content": host_name, "font_family": BODY_FAMILY, "font_size": int(34 * s),
                     "font_weight": 800, "color": INK, "x": hx + int(30 * s), "y": host_y, "secondary": True})
         ry = host_y + int(44 * s)
-        for rl in (wrap_words(host_role, BODY_FAMILY, 28, 700, hw) if host_role else [])[:2]:
-            col.append({"type": "text", "content": rl, "font_family": BODY_FAMILY, "font_size": 28,
+        role_size, role_lines = _role_lines(host_role, hw)
+        for rl in role_lines:
+            col.append({"type": "text", "content": rl, "font_family": BODY_FAMILY, "font_size": role_size,
                         "font_weight": 700, "color": QUIET, "x": hx + int(30 * s), "y": ry, "secondary": True})
-            ry += 34
+            ry += role_size + 6
 
     layers = back + col
     if brand_logo_url:
