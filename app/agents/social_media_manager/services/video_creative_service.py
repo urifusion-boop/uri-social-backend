@@ -128,6 +128,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
   "total_duration_seconds": <int>,
   "target_platform": "<string>",
   "aspect_ratio": "9:16",
+  "people_look": "<who anyone on screen is, even a hand: from the brief, see WHO APPEARS>",
   "scenes": [
     {
       "scene_number": <int>,
@@ -177,6 +178,11 @@ def validated_outcome(storyboard: Dict[str, Any], has_reference_images: bool) ->
         storyboard["outcome_reason"] = reason[:300]
     else:
         storyboard.pop("outcome_reason", None)
+
+
+def brand_brief_scene_people(scene: dict, brand_context: Optional[Dict[str, Any]]) -> str:
+    from . import brand_brief
+    return brand_brief.scene_people_line(scene, brand_context)
 
 
 class VideoCreativeService:
@@ -306,6 +312,9 @@ class VideoCreativeService:
             preamble_lines.append(_brief)
         preamble_lines.append("")
         preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+        _people = brand_brief.people_look_rule(brand_context)
+        if _people:
+            preamble_lines.append(_people)
         _visual = brand_brief.video_visual_rules(brand_context, _platform)
         if _visual:
             preamble_lines.append("")
@@ -384,6 +393,8 @@ class VideoCreativeService:
         # The Playbook's word rules, guaranteed on what viewers read and hear. Before the owner's own
         # edited direction is put back below, so their wording is never rewritten.
         brand_brief.enforce_video_script(storyboard, brand_context)
+        # Who the people are, on every scene, so the pictures and clips follow the brief, not a default.
+        brand_brief.apply_people_look(storyboard, brand_context)
 
         # Forced style: trust our own value over whatever the model echoed.
         # Inferred style: trust the model's pick only if it's a real slug —
@@ -568,6 +579,8 @@ class VideoCreativeService:
                 + "Photorealistic, dramatic lighting. Vertical 9:16 composition. "
                 # The picture model draws only what it is told: without this it invents a brand on every box.
                 + VideoCreativeService._frame_branding(brand_context, "")
+                # Who any person or hand in the shot is: the brief's people, never the picture model's default.
+                + brand_brief_scene_people(scene, brand_context)
             )
 
             loop = asyncio.get_running_loop()

@@ -673,6 +673,68 @@ def video_visual_rules(bc: Optional[Dict[str, Any]], platform: str = "") -> str:
     )
 
 
+# Markets whose people are Black Africans, so a picture model's default (a white person) is wrong for them.
+_BLACK_AFRICAN_MARKETS = (
+    "nigeria", "lagos", "abuja", "ghana", "accra", "kenya", "nairobi", "west africa", "east africa",
+    "sub-saharan", "cameroon", "senegal", "uganda", "tanzania", "rwanda", "ethiopia", "zambia", "zimbabwe",
+    "ivory coast", "cote d'ivoire", "côte d'ivoire", "sierra leone", "liberia", "benin", "togo", "malawi",
+    "botswana", "africa",
+)
+
+
+def market_people(bc: Optional[Dict[str, Any]]) -> str:
+    """Who people are by default for this brand: locals of its market (Black African for an African market).
+    Only a fallback: what the brief says about the people always comes first."""
+    region = str((bc or {}).get("region") or "").strip()
+    if not region:
+        return ""
+    if any(m in region.lower() for m in _BLACK_AFRICAN_MARKETS):
+        return (f"Black African people from the brand's market ({region}), with natural dark skin tones and "
+                "local features, hairstyles and clothing")
+    return f"people who look like the locals of the brand's market ({region})"
+
+
+def people_look_rule(bc: Optional[Dict[str, Any]]) -> str:
+    """For the script writer: how to decide who the people on screen are. Skin tone used to be left to chance:
+    with no PERSON line (a product video, or a Playbook that avoids people) nobody was described, and the picture
+    model drew its default, a white person or a white hand, for a Lagos brand."""
+    fallback = market_people(bc)
+    return (
+        "WHO APPEARS (people_look): decide who anyone on screen is, even a single hand holding the product. Take it "
+        "from the brief: the PERSON line first; with no PERSON line, any other cue anywhere in the brief (a "
+        "\"Nigerian voiceover\" in SOUND, a Lagos SETTING, the audience) means the people are that too"
+        + (f"; when the brief gives no cue at all, they are {fallback}" if fallback else "")
+        + ". Write it in people_look, and put that description into every video_prompt that shows a person, face "
+        "or hand. This decides only WHO they are, not whether people appear: the brief and the owner's instructions "
+        "still decide that."
+    )
+
+
+def apply_people_look(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Every scene carries who its people are (scene["people_look"]), so the scene image and the clip draw the
+    people the brief asked for, never the models' default. The script writer's people_look is kept; without one,
+    the brand's market is used."""
+    if not isinstance(storyboard, dict):
+        return storyboard
+    look = str(storyboard.get("people_look") or "").strip() or market_people(bc)
+    if not look:
+        return storyboard
+    storyboard["people_look"] = look
+    for scene in storyboard.get("scenes") or []:
+        if isinstance(scene, dict) and not str(scene.get("people_look") or "").strip():
+            scene["people_look"] = look
+    return storyboard
+
+
+def scene_people_line(scene: Optional[Dict[str, Any]], bc: Optional[Dict[str, Any]] = None) -> str:
+    """For the picture and video models: who any person, face or hand in this scene is."""
+    look = str((scene or {}).get("people_look") or "").strip() or market_people(bc)
+    if not look:
+        return ""
+    return (f" Any person, face, hand or body part that appears in this shot is one of the {look}" if look == market_people(bc)
+            else f" Any person, face, hand or body part that appears in this shot: {look}") + "."
+
+
 def frame_owner_rules(bc: Optional[Dict[str, Any]], platform: str = "") -> str:
     """For the picture model, appended to every scene image prompt: the owner's own Playbook instructions for
     video, so the frames follow them even where the script did not spell them out."""
