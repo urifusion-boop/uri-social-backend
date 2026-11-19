@@ -1210,12 +1210,15 @@ async def _content_starter_pack(business_name: str, category: str, description: 
         "Pack format — never build this on an ethnic, regional, or religious stereotype; the "
         "identity must be one the audience would claim willingly, e.g. 'a Lagos gym-goer's kit', "
         "not a group label).\n"
+        "- title: the identity this pack is for, as the meme says it, e.g. 'The Lagos gym-goer starter pack' "
+        "(<=7 words, ends with 'starter pack')\n"
         "- product_label: a short label for the business's own product (from its name/category)\n"
         "- items: 3-6 objects, each {\"description\": \"a short scene description for generating a "
         "flat-lay photo of it, e.g. 'a pair of running shoes'\", \"label\": \"short caption\"}\n"
-        f"Every label (product_label included) sits under its photo on ONE line: 1-2 words, at most "
-        f"{_STARTER_LABEL_CHARS} characters, e.g. 'Gym shoes', 'Zobo drink', 'Health app'.\n"
-        "Return ONLY the JSON with exactly these 2 keys."
+        f"Every label (product_label included) sits under its photo on ONE line: 1-2 whole words, at most "
+        f"{_STARTER_LABEL_CHARS} characters, e.g. 'Gym shoes', 'Zobo drink', 'Health app'. Never abbreviate "
+        "or cut a word short ('Appt Cal' is wrong; 'Calendar' is right).\n"
+        "Return ONLY the JSON with exactly these 3 keys."
     )
     d = await _call_content_model(prompt)
     if not d or not isinstance(d.get("items"), list):
@@ -1228,7 +1231,16 @@ async def _content_starter_pack(business_name: str, category: str, description: 
     if len(items) < 3:
         return None
     product_label = str(d.get("product_label", "")).strip() or business_name or category or "Our product"
-    return await _fit_starter_labels(business_name, category, product_label, items)
+    fitted = await _fit_starter_labels(business_name, category, product_label, items,
+                                       _brand_font(brand_context))
+    if fitted:
+        fitted["title"] = str(d.get("title", "")).strip() or None
+    return fitted
+
+
+def _brand_font(brand_context: Optional[dict]) -> str:
+    from .ad_formats._type import headline_family
+    return headline_family(brand_context, "Inter")
 
 
 # Grid cells at the most items (7 → 3 columns) leave ~300px: about this many characters at the 42px floor.
@@ -1236,7 +1248,7 @@ _STARTER_LABEL_CHARS = 12
 
 
 async def _fit_starter_labels(business_name: str, category: str, product_label: str,
-                              items: list) -> Optional[dict]:
+                              items: list, font_family: Optional[str] = None) -> Optional[dict]:
     """Every label must sit on one line under its photo (starter_pack's grid has room for one).
     A label that doesn't fit gets one shorter rewrite; an extra item whose label still won't fit is
     left out (3 must remain), and the product's own label falls back to the business name."""
@@ -1244,11 +1256,12 @@ async def _fit_starter_labels(business_name: str, category: str, product_label: 
 
     cell_w = starter_pack.cell_width_for(len(items) + 1)
     labels = [product_label] + [label for _, label in items]
-    too_long = [l for l in labels if not starter_pack.label_fits(l, cell_w)]
+    too_long = [l for l in labels if not starter_pack.label_fits(l, cell_w, font_family)]
     if too_long:
         d = await _call_content_model(
-            "Shorten each of these image captions to 1-2 words, at most "
-            f"{_STARTER_LABEL_CHARS} characters, keeping the meaning: "
+            "Shorten each of these image captions to 1-2 whole words, at most "
+            f"{_STARTER_LABEL_CHARS} characters, keeping the meaning. Never abbreviate or cut a word "
+            "short; pick a shorter word instead: "
             + json.dumps(too_long)
             + '. Return ONLY JSON: {"labels": ["...", ...]} in the same order.'
         )
@@ -1257,13 +1270,13 @@ async def _fit_starter_labels(business_name: str, category: str, product_label: 
             swap = {old: str(new).strip() for old, new in zip(too_long, short) if str(new).strip()}
             product_label = swap.get(product_label, product_label)
             items = [(desc, swap.get(label, label)) for desc, label in items]
-    items = [(desc, label) for desc, label in items if starter_pack.label_fits(label, cell_w)]
+    items = [(desc, label) for desc, label in items if starter_pack.label_fits(label, cell_w, font_family)]
     if len(items) < 3:
         return None
     cell_w = starter_pack.cell_width_for(len(items) + 1)
-    if not starter_pack.label_fits(product_label, cell_w):
+    if not starter_pack.label_fits(product_label, cell_w, font_family):
         product_label = next(
-            (c for c in (business_name, category) if c and starter_pack.label_fits(c, cell_w)), None
+            (c for c in (business_name, category) if c and starter_pack.label_fits(c, cell_w, font_family)), None
         )
         if not product_label:
             return None
@@ -1305,10 +1318,15 @@ async def _build_starter_pack(business_name: str, category: str, description: st
         print(f"[VSG01] Starter Pack item generation failed: {e}", flush=True)
         return None
 
+    # The owner's real product, cut out so it sits flush among the flat-lay items (the format's spec);
+    # the photo as it is only when the cut-out can't be made.
+    product_url = await _cutout(photo_url) or photo_url
+    font = _brand_font(brand_context)
     try:
         document = starter_pack.build_document(
-            item_urls, item_labels, photo_url, content["product_label"],
+            item_urls, item_labels, product_url, content["product_label"],
             canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+            title=content.get("title"), font_family=font,
         )
     except Exception as e:
         print(f"[VSG01] Starter Pack build failed: {e}", flush=True)

@@ -62,6 +62,7 @@ from ..layer2_generation import generate_scene, seasonal_context_clause
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
+from ._type import fit_headline
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
 FORMAT = AdFormatDef(
@@ -77,6 +78,11 @@ _MIN_ITEMS = 4
 _MAX_ITEMS = 9
 _FONT_LABEL = 42  # §1.6 floor
 _SHADOW = {"opacity": 0.25, "blur": 12, "offset_x": 0, "offset_y": 6}
+_LABEL_WEIGHT = 600
+# The identity title across the top ("The Lagos clinic owner starter pack"), as the format is known;
+# its band is also where the brand's logo goes (the grid leaves no clear corner).
+_TITLE_BAND = 150
+_TITLE_MAX, _TITLE_MIN = 58, 44
 
 
 class InvalidItemCount(ValueError):
@@ -102,12 +108,12 @@ def cell_width_for(total_items: int, canvas_size=(1080, 1080)) -> int:
     return (canvas_size[0] - 2 * 56 - (cols - 1) * 32) // cols
 
 
-def label_fits(label: str, cell_width: int) -> bool:
-    return len(wrap_text(label, cell_width, _FONT_LABEL)) == 1
+def label_fits(label: str, cell_width: int, font_family: Optional[str] = None) -> bool:
+    return len(wrap_text(label, cell_width, _FONT_LABEL, _LABEL_WEIGHT, font_family=font_family)) == 1
 
 
-def _check_label_one_line(label: str, cell_width: int) -> None:
-    lines = wrap_text(label, cell_width, _FONT_LABEL)
+def _check_label_one_line(label: str, cell_width: int, font_family: Optional[str] = None) -> None:
+    lines = wrap_text(label, cell_width, _FONT_LABEL, _LABEL_WEIGHT, font_family=font_family)
     if len(lines) != 1:
         raise LabelNotOneLine(
             f"label {label!r} wraps to {len(lines)} lines at this grid cell's width "
@@ -150,8 +156,12 @@ def build_document(
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
     brand_logo_url: str = None,
+    title: Optional[str] = None,
+    font_family: Optional[str] = None,
 ) -> Dict:
     """
+    title: the identity the pack is for, e.g. "The Lagos clinic owner starter pack" (top band).
+    font_family: the brand's typeface for the title and labels.
     item_image_urls / item_labels: the surrounding items — real Layer 2
     generated photos (via render()) or any other already-resolved photo
     URLs, one label per image, same length.
@@ -180,8 +190,9 @@ def build_document(
     margin = 56
     gap = 32
     label_height = int(_FONT_LABEL * 1.3) + 16
+    top = margin + (_TITLE_BAND if title else 0)
     cell_w = (width - 2 * margin - (cols - 1) * gap) // cols
-    cell_h = (height - 2 * margin - (rows - 1) * gap) // rows - label_height
+    cell_h = (height - top - margin - (rows - 1) * gap) // rows - label_height
 
     if product_index is None:
         product_index = total_items // 2
@@ -191,15 +202,26 @@ def build_document(
     entries.insert(product_index, (product_image_url, product_label, True))
 
     for _, label, _is_product in entries:
-        _check_label_one_line(label, cell_w)
+        _check_label_one_line(label, cell_w, font_family)
 
     layers = []
     z = 0
+    logo_w = 200 if brand_logo_url else 0
+    if title:
+        size, lines = fit_headline(title, font_family, 800, width - 2 * margin - logo_w - 24, 2,
+                                   _TITLE_MAX, _TITLE_MIN, -0.01)
+        pitch = int(size * 1.08)
+        ty = margin + (_TITLE_BAND - 24 - pitch * len(lines)) // 2
+        for i, line in enumerate(lines):
+            z += 1
+            layers.append({"type": "text", "z_index": z, "content": line, "font_family": font_family,
+                           "font_size": size, "font_weight": 800, "tracking": -0.01, "color": t["ink"],
+                           "x": margin, "y": ty + i * pitch})
 
     for i, (url, label, is_product) in enumerate(entries):
         row, col = divmod(i, cols)
         cell_x = margin + col * (cell_w + gap)
-        cell_y = margin + row * (cell_h + label_height + gap)
+        cell_y = top + row * (cell_h + label_height + gap)
 
         z += 1
         layers.append({
@@ -212,11 +234,19 @@ def build_document(
         layers.append({
             "type": "text", "z_index": z, "content": label,
             "x": cell_x + cell_w // 2, "y": cell_y + cell_h + 8,
-            "font_size": _FONT_LABEL, "color": t["ink-quiet"], "text_align": "ma",
+            "font_size": _FONT_LABEL, "font_weight": _LABEL_WEIGHT, "font_family": font_family,
+            "color": t["ink-quiet"], "text_align": "ma", "secondary": True,
         })
 
-    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
-    layers.extend(badge_layers)
+    if brand_logo_url and title:
+        # In the title band by default; place_brand_logo moves it to the brand's own Playbook position
+        # wherever that is clear of the grid.
+        z += 1
+        layers.append({"type": "brand_asset", "role": "brand_logo", "z_index": z, "url": brand_logo_url,
+                       "x": width - margin - logo_w, "y": margin + 10, "width": logo_w, "height": 80})
+    else:
+        badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+        layers.extend(badge_layers)
 
     document = {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},
