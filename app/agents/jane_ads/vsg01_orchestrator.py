@@ -1212,7 +1212,9 @@ async def _content_starter_pack(business_name: str, category: str, description: 
         "not a group label).\n"
         "- product_label: a short label for the business's own product (from its name/category)\n"
         "- items: 3-6 objects, each {\"description\": \"a short scene description for generating a "
-        "flat-lay photo of it, e.g. 'a pair of running shoes'\", \"label\": \"short caption, one line\"}\n"
+        "flat-lay photo of it, e.g. 'a pair of running shoes'\", \"label\": \"short caption\"}\n"
+        f"Every label (product_label included) sits under its photo on ONE line: 1-2 words, at most "
+        f"{_STARTER_LABEL_CHARS} characters, e.g. 'Gym shoes', 'Zobo drink', 'Health app'.\n"
         "Return ONLY the JSON with exactly these 2 keys."
     )
     d = await _call_content_model(prompt)
@@ -1226,6 +1228,45 @@ async def _content_starter_pack(business_name: str, category: str, description: 
     if len(items) < 3:
         return None
     product_label = str(d.get("product_label", "")).strip() or business_name or category or "Our product"
+    return await _fit_starter_labels(business_name, category, product_label, items)
+
+
+# Grid cells at the most items (7 → 3 columns) leave ~300px: about this many characters at the 42px floor.
+_STARTER_LABEL_CHARS = 12
+
+
+async def _fit_starter_labels(business_name: str, category: str, product_label: str,
+                              items: list) -> Optional[dict]:
+    """Every label must sit on one line under its photo (starter_pack's grid has room for one).
+    A label that doesn't fit gets one shorter rewrite; an extra item whose label still won't fit is
+    left out (3 must remain), and the product's own label falls back to the business name."""
+    from .ad_formats import starter_pack
+
+    cell_w = starter_pack.cell_width_for(len(items) + 1)
+    labels = [product_label] + [label for _, label in items]
+    too_long = [l for l in labels if not starter_pack.label_fits(l, cell_w)]
+    if too_long:
+        d = await _call_content_model(
+            "Shorten each of these image captions to 1-2 words, at most "
+            f"{_STARTER_LABEL_CHARS} characters, keeping the meaning: "
+            + json.dumps(too_long)
+            + '. Return ONLY JSON: {"labels": ["...", ...]} in the same order.'
+        )
+        short = (d or {}).get("labels") if isinstance(d, dict) else None
+        if isinstance(short, list) and len(short) == len(too_long):
+            swap = {old: str(new).strip() for old, new in zip(too_long, short) if str(new).strip()}
+            product_label = swap.get(product_label, product_label)
+            items = [(desc, swap.get(label, label)) for desc, label in items]
+    items = [(desc, label) for desc, label in items if starter_pack.label_fits(label, cell_w)]
+    if len(items) < 3:
+        return None
+    cell_w = starter_pack.cell_width_for(len(items) + 1)
+    if not starter_pack.label_fits(product_label, cell_w):
+        product_label = next(
+            (c for c in (business_name, category) if c and starter_pack.label_fits(c, cell_w)), None
+        )
+        if not product_label:
+            return None
     return {"product_label": product_label, "items": items}
 
 
