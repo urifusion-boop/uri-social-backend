@@ -92,7 +92,7 @@ def test_quick_replies_and_tag_presets_persist_per_brand():
         assert first["tag_presets"] == wd.DEFAULT_TAG_PRESETS and first["quick_replies"] == []
         saved = await wd.put_prefs({"quick_replies": [
             {"title": "Welcome", "text": "Hi {first_name}!", "shortcut": "hi", "category": "Greetings",
-             "buttons": [{"label": "Create Ad Now", "kind": "create_ad"},
+             "buttons": [{"label": "Book a demo", "kind": "book", "url": "https://uri.ng/demo"},
                          {"label": "Our site", "kind": "link", "url": "https://uri.ng"}]}],
             "tag_presets": ["VIP", "Wholesale"]}, db, ME)
         reply = saved["quick_replies"][0]
@@ -111,6 +111,7 @@ def test_quick_replies_and_tag_presets_persist_per_brand():
     {"title": "", "text": "x"},
     {"title": "A", "text": "x", "shortcut": "/has space"},
     {"title": "A", "text": "x", "buttons": [{"label": "Go", "kind": "link", "url": "not a url"}]},
+    {"title": "A", "text": "x", "buttons": [{"label": "Book", "kind": "book", "url": ""}]},
 ])
 def test_bad_quick_replies_are_refused(reply):
     async def go():

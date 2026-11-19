@@ -42,9 +42,10 @@ MAX_NOTES = 200
 MAX_REPLIES = 200
 MAX_REPLY_LEN = 2000
 MAX_BUTTONS = 3
-# What a button under a quick reply may do. A link opens a URL the business gave;
-# the others open a screen in URI for the customer's next step.
-BUTTON_KINDS = ("link", "create_ad", "schedule_demo", "learn_more")
+# A button under a quick reply is a link to the business's own page (booking, store,
+# website) — DMs carry text, so it goes out as a tap-able "Label: address" line under the
+# reply. The kind only picks the icon the team sees.
+BUTTON_KINDS = ("link", "book", "buy", "learn_more")
 DEFAULT_TAG_PRESETS = ["VIP", "Repeat customer", "Refund", "Spam review", "Urgent"]
 DEFAULT_CATEGORIES = ["Greetings", "Pricing", "Delivery", "Ads & promos", "Support"]
 
@@ -239,9 +240,9 @@ def _clean_replies(replies: Any, categories: list[str]) -> list[dict]:
             url = str((b or {}).get("url") or "").strip()
             if not label or kind not in BUTTON_KINDS:
                 continue
-            if kind == "link" and not re.match(r"^https?://\S+$", url):
+            if not re.match(r"^https?://\S+$", url):
                 raise HTTPException(status_code=400, detail=f"The button {label!r} needs a full web address.")
-            buttons.append({"label": label, "kind": kind, "url": url if kind == "link" else ""})
+            buttons.append({"label": label, "kind": kind, "url": url})
         out.append({"id": str(r.get("id") or uuid.uuid4().hex), "title": title, "text": text,
                     "shortcut": shortcut, "category": category, "buttons": buttons,
                     "uses": int(r.get("uses") or 0)})
