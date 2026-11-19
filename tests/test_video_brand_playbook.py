@@ -537,14 +537,65 @@ def test_without_owner_instructions_the_prompts_are_unchanged(monkeypatch):
     assert "FOR THE PICTURES" not in _user_prompt(fake)
 
 
-# ── the people on screen look like the brand's market ─────────────────────────
-# Skin tone was left to chance: on prod (a Playbook that avoids people, so the script described nobody) the
-# picture model drew its default, a white person, for a Lagos brand. Staging only looked right by luck.
+# ── the people on screen are the people the brief asked for ────────────────
+# Skin tone was left to chance. On prod (a Playbook that avoids people, and a brief with no PERSON line but a
+# "Warm female Nigerian voiceover") the script described nobody, and the picture model drew its default, a white
+# person, for a Lagos brand. Now: the brief's own cues first, the brand's market only when the brief is silent,
+# and every scene carries it to the scene image and the clip.
 
-def test_a_nigerian_brand_gets_black_african_people_in_the_script(monkeypatch):
+HANDBAG_BRIEF = (
+    "CONCEPT: A plain handbag sits on a simple table.\nSTYLE: Before / After.\n"
+    "SCENE 1 (0-5s): An ordinary handbag on a simple table. Says exactly: \"Your product might not be the problem.\"\n"
+    "SOUND: Warm female Nigerian voiceover, gentle background music.\n"
+)
+
+
+def test_the_script_writer_is_told_to_take_the_people_from_the_brief_first(monkeypatch):
     _, fake = _describe_it(monkeypatch, _visual_bc(), target_platform="instagram_reels")
     prompt = _user_prompt(fake)
-    assert "WHO APPEARS" in prompt and "Black African people" in prompt and "Lagos" in prompt
+    assert "WHO APPEARS (people_look)" in prompt
+    rule = prompt.split("WHO APPEARS (people_look)", 1)[1]
+    assert "PERSON line first" in rule and "Nigerian voiceover" in rule and "even a single hand" in rule
+    assert "Black African people" in rule                                  # only as the fallback
+    assert "not whether people appear" in rule                             # "no people" in the Playbook still wins
+    assert '"people_look"' in fake.calls[0]["messages"][0]["content"]      # asked for in the JSON
+
+
+def test_the_script_writers_own_people_look_is_kept_and_put_on_every_scene():
+    sb = {"people_look": "a warm Nigerian woman in her 30s", "scenes": [{"scene_number": 1}, {"scene_number": 2}]}
+    bb.apply_people_look(sb, _bc())
+    assert [s["people_look"] for s in sb["scenes"]] == ["a warm Nigerian woman in her 30s"] * 2
+
+
+def test_without_a_people_look_every_scene_gets_the_brands_market():
+    sb = {"scenes": [{"scene_number": 1}]}
+    bb.apply_people_look(sb, _bc())
+    assert "Black African people" in sb["people_look"] and "Lagos" in sb["scenes"][0]["people_look"]
+
+
+def test_the_describe_it_storyboard_comes_back_with_people_on_every_scene(monkeypatch):
+    result, _ = _describe_it(monkeypatch, _visual_bc(), target_platform="instagram_reels")
+    scenes = result["storyboard"]["scenes"]
+    assert scenes and all("Black African people" in s["people_look"] for s in scenes)
+
+
+def test_every_scene_image_draws_the_scenes_people_first_and_chained(monkeypatch):
+    for prev in (None, "https://cdn.test/prev.png"):
+        scene = {"scene_number": 1, "shot_type": "product_hero", "video_prompt": "A handbag on a table",
+                 "motion": "push in", "people_look": "a warm Nigerian woman in her 30s"}
+        _, prompt = _frame(monkeypatch, _visual_bc(), prev=prev, scene=scene)
+        assert "Any person, face, hand or body part that appears in this shot: a warm Nigerian woman" in prompt
+
+
+def test_a_scene_image_without_people_look_falls_back_to_the_brands_market(monkeypatch):
+    _, prompt = _frame(monkeypatch, _bc())
+    assert "hand or body part that appears in this shot is one of the Black African people" in prompt
+
+
+def test_the_photo_storyboard_frame_carries_the_scenes_people():
+    from app.agents.social_media_manager.services.video_storyboard_service import _scene_people
+    assert "a warm Nigerian woman" in _scene_people({"people_look": "a warm Nigerian woman"})
+    assert _scene_people({}) == ""
 
 
 def test_the_photo_storyboard_script_gets_the_same_people_rule(monkeypatch):
@@ -571,27 +622,21 @@ def test_the_photo_storyboard_script_gets_the_same_people_rule(monkeypatch):
                         raising=False)
     monkeypatch.setattr(vss, "_gemini_client", SimpleNamespace(models=FakeModels()))
     image = "data:image/png;base64," + base64.b64encode(b"x" * 16).decode()
-    _run(vss.VideoStoryboardService.generate_storyboard(
+    result = _run(vss.VideoStoryboardService.generate_storyboard(
         brand_images=[image], optional_text="lunch combo", brand_context=_bc(), target_platform="tiktok"))
-    assert "WHO APPEARS" in captured["text"] and "Black African people" in captured["text"]
-
-
-def test_every_scene_image_is_told_who_the_people_are_even_with_no_owner_rules(monkeypatch):
-    bc = _bc()
-    bc["playbook_instructions"] = []
-    for prev in (None, "https://cdn.test/prev.png"):
-        _, prompt = _frame(monkeypatch, bc, prev=prev)
-        assert "WHO APPEARS" in prompt and "Black African people" in prompt and "hands" in prompt
+    assert "WHO APPEARS (people_look)" in captured["text"]
+    assert all("Black African people" in s["people_look"] for s in result["storyboard"]["scenes"])
 
 
 @pytest.mark.parametrize("region", ["West Africa, Nigeria", "Lagos", "Accra, Ghana", "Nairobi"])
-def test_african_markets_get_black_african_people(region):
-    assert "Black African people" in bb.people_look_rule({"region": region})
+def test_african_markets_fall_back_to_black_african_people(region):
+    assert "Black African people" in bb.market_people({"region": region})
 
 
-def test_another_market_gets_its_own_locals_and_no_region_changes_nothing(monkeypatch):
-    rule = bb.people_look_rule({"region": "London, UK"})
-    assert "locals of the brand's market (London, UK)" in rule and "Black African" not in rule
-    assert bb.people_look_rule({}) == "" and bb.people_look_rule(None) == ""
+def test_another_market_falls_back_to_its_own_locals_and_no_region_changes_nothing(monkeypatch):
+    assert "locals of the brand's market (London, UK)" in bb.market_people({"region": "London, UK"})
+    assert bb.market_people({}) == "" and bb.scene_people_line({}, None) == ""
+    sb = {"scenes": [{"scene_number": 1}]}
+    assert "people_look" not in bb.apply_people_look(sb, {})["scenes"][0]
     _, prompt = _frame(monkeypatch, None)
-    assert "WHO APPEARS" not in prompt
+    assert "hand or body part" not in prompt
