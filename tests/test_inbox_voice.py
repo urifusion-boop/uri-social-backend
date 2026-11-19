@@ -39,24 +39,24 @@ def test_eight_templates_each_scored_on_every_trait():
         assert set(t["traits"]) == set(TRAITS)
 
 
-def test_the_assessment_has_42_core_questions_in_eight_sections():
-    assert len(QUESTIONS) == 42
-    assert {q["section"] for q in QUESTIONS} == set("ABCDEFGH")
+def test_the_assessment_asks_only_the_core_questions():
+    assert len(QUESTIONS) == 12
+    assert {q["section"] for q in QUESTIONS} == set("ABCEG")
+    assert all(q["id"] in ("q3", "q6", "q7", "q9", "q13") for q in QUESTIONS if q["required"])
 
 
 def test_answers_keep_only_known_questions_and_valid_values():
     clean = voice.clean_answers({"q3": "premium_adviser", "q6": "250", "q9": "sometimes",
                                  "q1": ["friendly", "evil", "calm", "bold", "caring", "playful",
                                         "professional"], "admin": True})
-    assert clean == {"q3": "premium_adviser", "q6": 100,
-                     "q1": ["friendly", "calm", "bold", "caring", "playful"]}
+    assert clean == {"q3": "premium_adviser", "q6": 100}
 
 
 def test_answers_unlock_the_matching_follow_ups():
     ids = lambda a, ind="": [q["id"] for q in follow_ups_for(a, ind)]
-    assert "fu_premium_discounts" in ids({"q3": "premium_adviser"})
+    assert ids({"q3": "premium_adviser"}) == []
     assert "fu_pidgin_degree" in ids({"q13": ["en", "pidgin"]})
-    assert "fu_sales_never" in ids({"q26": 85})
+    assert ids({"q26": 85}) == []
     assert "fu_regulated_rules" in ids({}, "Healthcare clinic")
     assert ids({"q3": "calm_problem_solver"}) == []
 
