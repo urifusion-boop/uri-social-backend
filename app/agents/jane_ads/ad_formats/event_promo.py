@@ -42,6 +42,9 @@ INK = "#141014"
 QUIET = "#4A4245"
 
 # Words drawn smaller and lighter inside the title, as in "MASTER your MONEY MINDSET".
+# Title sizes tried, largest first (build_document); the last is the floor.
+TITLE_CAPS = tuple(range(120, 51, -6))
+
 SMALL_WORDS = {
     "a", "an", "and", "at", "by", "for", "from", "in", "into", "of", "on", "or", "our", "the", "to",
     "with", "your", "my", "is", "it", "its", "you", "we",
@@ -60,7 +63,7 @@ class EventPromoOverflow(ValueError):
 def build_document(*args, **kwargs) -> Dict:
     """Lays the poster out at the largest title size whose column still fits the canvas."""
     last: Optional[Exception] = None
-    for cap in range(120, 51, -6):
+    for cap in TITLE_CAPS:
         try:
             return _build(*args, title_cap=cap, **kwargs)
         except (EventPromoOverflow, ValueError) as e:
@@ -118,6 +121,19 @@ def _title_lines(title: str, family: str, size: int, max_width: int) -> List[Lis
             line = trial
     if line:
         lines.append(line)
+    # A small word never stands on a line of its own ("GET MORE / CUSTOMERS / on / INSTAGRAM"): a
+    # smaller size is tried, where it fits at the end of the line before. At the smallest size it
+    # joins that line anyway rather than lose the poster.
+    if any(all(sp["font_weight"] == 600 for sp in ln) for ln in lines[1:]):
+        if size > min(TITLE_CAPS):
+            raise ValueError("a small word would stand alone")
+        merged: List[List[Dict]] = []
+        for ln in lines:
+            if merged and all(sp["font_weight"] == 600 for sp in ln):
+                merged[-1] = merged[-1] + [{"text": " ", "font_size": int(size * 0.6), "font_weight": 900}] + ln
+            else:
+                merged.append(ln)
+        return merged
     for ln in lines:
         if spans_width(ln, family, size, 900) > max_width:
             raise ValueError("a word is wider than the column")

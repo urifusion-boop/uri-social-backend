@@ -66,3 +66,16 @@ def test_a_logo_inside_a_design_element_is_never_moved():
     before = [dict(l) for l in doc["layers"] if l.get("type") == "brand_asset"]
     after = [l for l in place_brand_logo(doc, {"logo_position": "top_left"})["layers"] if l.get("type") == "brand_asset"]
     assert before == after
+
+
+def test_a_small_word_never_stands_alone_on_a_title_line():
+    # Live on staging: "GET MORE / CUSTOMERS / on / INSTAGRAM" beside generated artwork.
+    col = int(1080 * 0.46) - event_promo.PAD
+    for cap in event_promo.TITLE_CAPS:
+        try:
+            lines = event_promo._title_lines("Get more customers on Instagram", event_promo.DEFAULT_FAMILY, cap, col)
+            break
+        except ValueError:
+            continue
+    texts = ["".join(sp["text"] for sp in ln) for ln in lines]
+    assert "on" not in texts and any(t.endswith("on") for t in texts)
