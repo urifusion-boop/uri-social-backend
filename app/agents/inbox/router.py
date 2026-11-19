@@ -177,6 +177,9 @@ async def list_conversations(
             "source_ad_id": r.get("source_ad_id", ""),
             "lead_stage": r.get("lead_stage", ""),
             "lead_value": r.get("lead_value"),
+            "lead_interest": r.get("lead_interest", ""),
+            "starred": bool(r.get("starred")),
+            "notes_count": len(r.get("notes") or []),
             "last_direction": (last[0].get("direction") if last else ""),
             **_agent_view(r),
         })
