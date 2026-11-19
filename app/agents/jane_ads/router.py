@@ -3071,8 +3071,8 @@ async def _build_campaign_plan(
     # unrelated "sporteinstein.com" left over from an earlier campaign.
     if req.goal != Goal.FOLLOWERS and requested_destination not in ("", "ask"):
         from .destination import (
-            VALUE_FIELD_FOR_TYPE, cta_choice_list, options_for_platform, selected_for_objective,
-            set_brand_destination,
+            VALUE_FIELD_FOR_TYPE, cta_choice_list, get_brand_destination, options_for_platform,
+            selected_for_objective, set_brand_destination,
         )
         # The goal the client has picked so far (None until they have): a destination
         # their goal cannot use is never offered, so a Traffic campaign has no WhatsApp.
@@ -3103,6 +3103,12 @@ async def _build_campaign_plan(
 
         value = (body.destination_value or "").strip()
         field = VALUE_FIELD_FOR_TYPE[destination_type.value]
+        if not value and destination_type == DestinationType.WEBSITE and _typed_website:
+            # Website chosen with the box left blank: the address already saved wins (it may be the one
+            # just typed into the picker); the address written in the brief only when none is saved.
+            _saved = await get_brand_destination(db, brand_ctx.get("brand_id"))
+            if not (_saved.get("website_url") or "").strip():
+                value = _typed_website
         if destination_type == DestinationType.WHATSAPP and value:
             # The number lives in TWO places by existing design: the ads connection
             # (which the launch gate reads) and the brand settings (which the
@@ -3126,9 +3132,14 @@ async def _build_campaign_plan(
                 **({field: value} if value and field != "whatsapp_number" else {}),
             )
         except ValueError as e:
-            return _early_destination_error(str(e))
-        from .threads import mark_destination_answered
-        await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
+            if value:
+                return _early_destination_error(str(e))
+            # Nothing typed and nothing saved yet: not an error the client made. Leave it unsaved and
+            # unanswered; the destination question below asks for the address, pre-filled where we can.
+            brand_destination = await get_brand_destination(db, brand_ctx.get("brand_id"))
+        else:
+            from .threads import mark_destination_answered
+            await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
 
     # A budget that can't run is said before the client picks an audience, not after.
     budget_check = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)

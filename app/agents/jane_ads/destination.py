@@ -473,6 +473,14 @@ async def set_brand_destination(
     number, and ignores destination_cta (that button is Meta's native one)."""
     update: dict = {"destination_type": destination_type.value,
                     "updated_at": datetime.now(timezone.utc)}
+    # A blank value means "the one I've already saved" (the wizard says so under the box). It used
+    # to be validated as the address itself, so choosing Website with the saved address left blank
+    # always failed with "That website address doesn't look right".
+    if not (website_url or "").strip() or not (custom_url or "").strip() or not (instagram_username or "").strip():
+        saved = await get_brand_destination(db, brand_id)
+        website_url = (website_url or "").strip() or saved.get("website_url", "")
+        custom_url = (custom_url or "").strip() or saved.get("custom_url", "")
+        instagram_username = (instagram_username or "").strip() or saved.get("instagram_username", "")
     if destination_type == DestinationType.CUSTOM:
         url = normalize_website_url(custom_url)
         if not url:
