@@ -134,6 +134,22 @@ def build_document(
     if desc_lines:
         last_top = head_top + (len(lines) - 1) * pitch
         dy = last_top + int(size * 0.2)
+        # It must end clear of the pill below. A long description first steps down to the 28px floor; if it
+        # still reaches the pill it moves up, but only beside a headline line short enough not to touch it;
+        # otherwise it's left out, as when there's no room beside the headline at all.
+        limit = pill_y - 18
+        bottom = lambda top, n, sz: top + (n - 1) * int(sz * 1.08) + int(sz * 1.2)
+        if bottom(dy, len(desc_lines), desc_size) > limit:
+            smaller = wrap_words(description, BODY_FAMILY, 28, 500, desc_w)
+            if len(smaller) <= len(desc_lines):
+                desc_size, desc_lines = 28, smaller
+        over = bottom(dy, len(desc_lines), desc_size) - limit
+        if over > 0:
+            above_clear = len(lines) < 2 or pad + text_width(lines[-2], headline_font, size, hw, tr) + 24 <= desc_x
+            if above_clear or over <= int(size * 0.2):
+                dy -= over
+            else:
+                desc_lines = []
         for j, dl in enumerate(desc_lines):
             layers.append({"type": "text", "content": dl, "font_family": BODY_FAMILY, "font_size": desc_size,
                            "font_weight": 500, "color": "#FFFFFF", "x": desc_x, "y": dy + j * int(desc_size * 1.08),
