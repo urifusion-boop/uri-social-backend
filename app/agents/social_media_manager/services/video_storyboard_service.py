@@ -484,6 +484,10 @@ class VideoStoryboardService:
                 preamble_lines.append(_brief)
             preamble_lines.append("")
             preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+            _visual = brand_brief.video_visual_rules(brand_context, _platform)
+            if _visual:
+                preamble_lines.append("")
+                preamble_lines.append(_visual)
             contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
 
             for i, img_data in enumerate(brand_images):
