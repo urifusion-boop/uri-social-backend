@@ -488,3 +488,50 @@ def test_a_saved_destination_the_goal_allows_stays_selected():
 def test_whatsapp_under_traffic_is_the_pairing_launch_refuses():
     assert not allowed_for_objective(DestinationType.WHATSAPP, CampaignObjective.TRAFFIC)
     assert validate(CampaignObjective.TRAFFIC, destination_type="whatsapp", require_action=False)
+
+
+# ── A blank website means "the one already saved" (the wizard says so under the box) ──
+# Live on staging: choosing Website on the Goal step with the box blank failed with "That website
+# address doesn't look right", and the blank was resent on every later call, so it kept failing.
+
+from app.agents.jane_ads import destination as d  # noqa: E402
+
+
+class _Col:
+    def __init__(self, doc=None):
+        self.doc = doc
+
+    async def find_one(self, q, proj=None):
+        return dict(self.doc) if self.doc else None
+
+    async def find_one_and_update(self, q, upd, upsert=False, return_document=None):
+        self.doc = {**(self.doc or {}), **q, **upd["$set"]}
+        return dict(self.doc)
+
+
+class _Db(dict):
+    def __init__(self, doc=None):
+        super().__init__()
+        self[d.SETTINGS_COLLECTION] = _Col(doc)
+
+
+def _run(coro):
+    import asyncio
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def test_a_blank_website_keeps_the_one_already_saved():
+    db = _Db({"brand_id": "b1", "destination_type": "website", "website_url": "https://urisocial.com"})
+    out = _run(d.set_brand_destination(db, "b1", d.DestinationType.WEBSITE, destination_cta="learn_more"))
+    assert out["website_url"] == "https://urisocial.com"
+
+
+def test_a_typed_website_still_replaces_the_saved_one():
+    db = _Db({"brand_id": "b1", "website_url": "https://old.com"})
+    out = _run(d.set_brand_destination(db, "b1", d.DestinationType.WEBSITE, website_url="urisocial.com"))
+    assert out["website_url"] == "https://urisocial.com"
+
+
+def test_a_blank_website_with_nothing_saved_is_still_refused():
+    with pytest.raises(ValueError):
+        _run(d.set_brand_destination(_Db(), "b1", d.DestinationType.WEBSITE))
