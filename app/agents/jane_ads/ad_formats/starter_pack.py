@@ -248,6 +248,11 @@ def build_document(
             "type": "composited_product", "z_index": z,
             "url": url, "x": cell_x, "y": cell_y, "width": cell_w, "height": cell_h,
             "shadow": dict(_SHADOW),
+            # The cut-out product: its empty margins trimmed and the object centred in its tile at the
+            # items' scale (it came out small in a corner, with the original photo's space around it).
+            **({"trim": True, "fit": "contain", "grow": True, "align_x": 0.5, "align_y": 0.5,
+                "x": cell_x + int(cell_w * 0.12), "y": cell_y + int(cell_h * 0.12),
+                "width": int(cell_w * 0.76), "height": int(cell_h * 0.76)} if is_product else {}),
         })
 
         z += 1

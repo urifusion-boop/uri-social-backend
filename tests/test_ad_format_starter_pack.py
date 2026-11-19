@@ -109,9 +109,14 @@ class TestBuildDocument:
         """§2.11: 'consistent scale' — the product must not read as
         elevated above the pack."""
         doc = self._doc()
-        products = [l for l in doc["layers"] if l["type"] == "composited_product"]
-        sizes = {(l["width"], l["height"]) for l in products}
+        items = [l for l in doc["layers"] if l["type"] == "composited_product" and not l.get("grow")]
+        product = next(l for l in doc["layers"] if l["type"] == "composited_product" and l.get("grow"))
+        tile = next(l for l in doc["layers"] if l.get("type") == "shape" and l.get("fill_color") == "#ECE7E1")
+        # Every cell is the same size: each photographed item fills its cell; the cut-out product's cell is
+        # its backdrop tile, with the product centred inside it at the items' scale, never larger.
+        sizes = {(l["width"], l["height"]) for l in items} | {(tile["width"], tile["height"])}
         assert len(sizes) == 1
+        assert product["width"] < tile["width"] and product["height"] < tile["height"]
 
     def test_every_item_including_product_gets_the_same_shadow(self):
         doc = self._doc()

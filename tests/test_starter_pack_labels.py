@@ -85,4 +85,6 @@ def test_every_item_is_shot_on_the_same_backdrop_and_the_product_gets_the_same_t
     doc = starter_pack.build_document(["a", "b", "c", "d"], ["Planner", "Pens", "Phone", "Laptop"], "p", "Health app")
     tiles = [l for l in doc["layers"] if l.get("type") == "shape" and l.get("fill_color") == starter_pack.BACKDROP]
     product = next(l for l in doc["layers"] if l.get("type") == "composited_product" and l["url"] == "p")
-    assert len(tiles) == 1 and (tiles[0]["x"], tiles[0]["y"]) == (product["x"], product["y"])
+    t = tiles[0]
+    assert len(tiles) == 1 and product["grow"] and product["trim"]
+    assert t["x"] < product["x"] and product["x"] + product["width"] < t["x"] + t["width"]   # centred inside its tile
