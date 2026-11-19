@@ -239,6 +239,10 @@ def _build(
     surface = (scene_surface or SURFACE) if use_scene else SURFACE
     col_x = PAD
     col_w = int(width * (0.46 if use_scene else 0.50)) - PAD
+    # Generated artwork brings its own background colour (often a warm beige): the muted text and small
+    # accents are darkened just enough to stay legible on it, instead of failing the check and losing the art.
+    quiet = adjust_to_contrast(QUIET, surface, 7.0)
+    accent = adjust_to_contrast(brand, surface, 4.5)
 
     back: List[Dict] = []  # behind the column, absolute positions
     if use_scene:
@@ -382,7 +386,7 @@ def _build(
         y += 44
         if host_role:
             col.append({"type": "text", "content": host_role, "font_family": BODY_FAMILY, "font_size": 28,
-                        "font_weight": 600, "color": QUIET, "x": col_x + 28, "y": y, "secondary": True})
+                        "font_weight": 600, "color": quiet, "x": col_x + 28, "y": y, "secondary": True})
             y += 38
         y += 20
 
@@ -402,15 +406,15 @@ def _build(
     if contact_line:
         if contact_line.strip().startswith("@"):
             col.append({"type": "shape", "shape": "ellipse", "x": col_x, "y": y + 6, "width": 26, "height": 26,
-                        "border_color": QUIET, "border_width": 2})
+                        "border_color": quiet, "border_width": 2})
             col.append({"type": "text", "content": "@", "font_family": BODY_FAMILY, "font_size": 28,
-                        "font_weight": 800, "color": QUIET, "x": col_x + 13, "y": y + 19, "text_align": "mm",
+                        "font_weight": 800, "color": quiet, "x": col_x + 13, "y": y + 19, "text_align": "mm",
                         "decorative": True})
             contact_line = contact_line.strip()[1:]
         else:
-            col.extend(_globe_mark(col_x, y + 6, 26, QUIET))
+            col.extend(_globe_mark(col_x, y + 6, 26, quiet))
         col.append({"type": "text", "content": contact_line, "font_family": BODY_FAMILY, "font_size": 30,
-                    "font_weight": 700, "color": QUIET, "x": col_x + 38, "y": y, "secondary": True})
+                    "font_weight": 700, "color": quiet, "x": col_x + 38, "y": y, "secondary": True})
         y += 40
 
     top = PAD + (100 if brand_logo_url else 10)
@@ -422,7 +426,7 @@ def _build(
 
     layers = back + col
     if brand_logo_url:
-        layers.append({"type": "brand_asset", "url": brand_logo_url, "x": PAD, "y": PAD - 16, "width": 220,
+        layers.append({"type": "brand_asset", "role": "brand_logo", "url": brand_logo_url, "x": PAD, "y": PAD - 16, "width": 220,
                        "height": 84})
     for i, layer in enumerate(layers, start=1):
         layer["z_index"] = i
@@ -690,7 +694,7 @@ def _build_portrait(title, event_kind, date_text, canvas_size, t, host_cutout_ur
 
     layers = back + col
     if brand_logo_url:
-        layers.append({"type": "brand_asset", "url": brand_logo_url, "x": pad, "y": int(60 * s),
+        layers.append({"type": "brand_asset", "role": "brand_logo", "url": brand_logo_url, "x": pad, "y": int(60 * s),
                        "width": int(300 * s), "height": int(110 * s)})
     for i, layer in enumerate(layers, start=1):
         layer["z_index"] = i

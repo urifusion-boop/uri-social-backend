@@ -422,14 +422,22 @@ class DocumentRendererService:
         # Fixed once at this single render choke point rather than in each
         # of the 4 callers, since none of them can know a specific
         # business's real logo shape in advance anyway.
+        # trim: drop a logo file's transparent margins first, so the mark itself (not its padding)
+        # lines up with the type beside it.
+        if layer.get("trim") and asset_image.mode == "RGBA":
+            bbox = asset_image.getchannel("A").getbbox()
+            if bbox:
+                asset_image = asset_image.crop(bbox)
         if width and height:
             orig_w, orig_h = asset_image.size
             if orig_w and orig_h:
                 scale = min(width / orig_w, height / orig_h)
                 fit_w, fit_h = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
                 asset_image = asset_image.resize((fit_w, fit_h), Image.Resampling.LANCZOS)
-                x += (width - fit_w) // 2
-                y += (height - fit_h) // 2
+                # align_x / align_y: where the fitted logo sits in its box (0 = left/top, 0.5 = centre,
+                # the default every existing caller relies on).
+                x += int((width - fit_w) * layer.get("align_x", 0.5))
+                y += int((height - fit_h) * layer.get("align_y", 0.5))
 
         # tint: the logo drawn in one colour (white on a brand-colour pill). Only for a logo
         # with a real transparent background — tinting an opaque logo would paint a solid

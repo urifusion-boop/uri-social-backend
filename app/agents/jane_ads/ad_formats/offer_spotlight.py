@@ -211,7 +211,7 @@ def build_document(
     layers.append(_sparkle(min(int(width * 0.5), stack_right + 46), max(110, stack_top - 34), 18, "#FFFFFF"))
 
     if brand_logo_url:
-        layers.append({"type": "brand_asset", "url": brand_logo_url, "x": PAD, "y": PAD - 14,
+        layers.append({"type": "brand_asset", "role": "brand_logo", "url": brand_logo_url, "x": PAD, "y": PAD - 14,
                        "width": 190, "height": 76})
 
     for z, layer in enumerate(layers, start=1):

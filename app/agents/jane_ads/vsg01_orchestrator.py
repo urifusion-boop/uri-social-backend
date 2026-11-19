@@ -2824,6 +2824,9 @@ async def render_vsg01_creative(
     )
     if document is None:
         return None
+    # The poster's standalone logo goes where the brand chose (Brand Playbook logo position/size).
+    from .ad_formats.brand_logo import place_brand_logo
+    document = place_brand_logo(document, brand_context)
 
     try:
         from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService

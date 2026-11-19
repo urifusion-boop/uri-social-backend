@@ -179,7 +179,7 @@ def build_document(
                        "font_weight": 600, "color": "#FFFFFF", "x": width - PAD, "y": PAD + 18, "text_align": "ra",
                        "secondary": True})
     if brand_logo_url:
-        layers.append({"type": "brand_asset", "url": brand_logo_url, "x": PAD, "y": PAD - 6, "width": 220,
+        layers.append({"type": "brand_asset", "role": "brand_logo", "url": brand_logo_url, "x": PAD, "y": PAD - 6, "width": 220,
                        "height": 84, "tint": "#FFFFFF"})
 
     for z, layer in enumerate(layers, start=1):
