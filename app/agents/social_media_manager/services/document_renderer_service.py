@@ -202,7 +202,15 @@ class DocumentRendererService:
                 product_image = product_image.crop(bbox)
         if width and height and layer.get("fit") == "contain":
             product_image = product_image.convert("RGBA")
-            product_image.thumbnail((width, height), Image.Resampling.LANCZOS)
+            if layer.get("grow"):
+                # Scaled up as well as down to fill the box (opt-in: a small cut-out shown at the scale
+                # of the photos beside it).
+                k = min(width / product_image.width, height / product_image.height)
+                product_image = product_image.resize(
+                    (max(1, round(product_image.width * k)), max(1, round(product_image.height * k))),
+                    Image.Resampling.LANCZOS)
+            else:
+                product_image.thumbnail((width, height), Image.Resampling.LANCZOS)
             x += int((width - product_image.width) * layer.get("align_x", 0.5))
             y += int((height - product_image.height) * layer.get("align_y", 1.0))
         elif width and height:
