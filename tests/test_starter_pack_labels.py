@@ -50,3 +50,24 @@ def test_when_the_rewrite_fails_the_product_label_falls_back_to_the_business_nam
 def test_the_prompt_states_the_real_label_limit():
     import inspect
     assert "_STARTER_LABEL_CHARS" in inspect.getsource(orch._content_starter_pack)
+
+
+def test_the_pack_has_its_identity_title_and_the_logo_sits_in_the_title_band():
+    doc = starter_pack.build_document(
+        ["https://e.com/1.png", "https://e.com/2.png", "https://e.com/3.png", "https://e.com/4.png"],
+        ["Stethoscope", "Planner", "Coffee", "Calendar"], "https://e.com/product.png", "Health app",
+        brand_logo_url="https://e.com/logo.png", title="The Lagos clinic owner starter pack", font_family="Poppins")
+    texts = [l for l in doc["layers"] if l.get("type") == "text"]
+    assert any("starter pack" in l["content"] or "starter" in l["content"] for l in texts)
+    logo = next(l for l in doc["layers"] if l.get("role") == "brand_logo")
+    cells = [l for l in doc["layers"] if l.get("type") == "composited_product"]
+    assert logo["y"] + logo["height"] <= min(c["y"] for c in cells)          # above the grid
+    assert all(l.get("font_family") == "Poppins" for l in texts)
+
+
+def test_the_recompose_flow_gives_styles_the_real_product_photo():
+    import inspect
+    from app.agents.jane_ads import creative
+    src = inspect.getsource(creative)
+    i = src.index("photo_url=reference_image_url, photo_attestation=asset_attestation, recomposite=True")
+    assert i > 0

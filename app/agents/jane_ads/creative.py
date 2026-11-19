@@ -1312,20 +1312,19 @@ async def creative_from_recomposite(
     write_ad_copy's docstring."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     content_for_image = f"{business_name or category} — {description or category}"
-    image_url = await generate_ad_image(
-        content_for_image, brand_context, seed=description, reference_image=reference_image_url,
-        platform=platform,
-    )
-    final_image = image_url or reference_image_url
 
     vsg01_result = None
+    final_image = None
     # VSG-01's format library is Meta-shaped with zero TikTok awareness — see
     # generate_ad_creative's matching guard above.
     if db is not None and asset_attestation and platform != "tiktok":
         from .vsg01_orchestrator import select_and_render_vsg01_creative
+        # A style gets the owner's REAL product photo (each one cuts it out / frames it itself). It used
+        # to get the recomposited ad below, a whole ad with its own words, which then showed up as the
+        # "product" inside Starter Pack's grid.
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
-            photo_url=final_image, photo_attestation=asset_attestation, recomposite=True,
+            photo_url=reference_image_url, photo_attestation=asset_attestation, recomposite=True,
             forced_format_id=vsg01_format_id,
         )
         if vsg01_result is not None:
@@ -1338,6 +1337,13 @@ async def creative_from_recomposite(
                 vsg01_result = None
             else:
                 final_image = uploaded
+    if final_image is None:
+        # No style used: the recomposited photo (background cleaned/replaced, product preserved) is the ad.
+        image_url = await generate_ad_image(
+            content_for_image, brand_context, seed=description, reference_image=reference_image_url,
+            platform=platform,
+        )
+        final_image = image_url or reference_image_url
 
     summary = "" if vsg01_result is not None else await describe_ad_image(final_image)
     if summary:
