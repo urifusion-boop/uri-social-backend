@@ -673,13 +673,43 @@ def video_visual_rules(bc: Optional[Dict[str, Any]], platform: str = "") -> str:
     )
 
 
+# Markets whose people are Black Africans, so a picture model's default (a white person) is wrong for them.
+_BLACK_AFRICAN_MARKETS = (
+    "nigeria", "lagos", "abuja", "ghana", "accra", "kenya", "nairobi", "west africa", "east africa",
+    "sub-saharan", "cameroon", "senegal", "uganda", "tanzania", "rwanda", "ethiopia", "zambia", "zimbabwe",
+    "ivory coast", "cote d'ivoire", "côte d'ivoire", "sierra leone", "liberia", "benin", "togo", "malawi",
+    "botswana", "africa",
+)
+
+
+def people_look_rule(bc: Optional[Dict[str, Any]]) -> str:
+    """Who the people on screen are. Without it skin tone was left to chance: the script writer only saw
+    "Market/region: Nigeria", and wherever it did not describe a person (a product video, or a Playbook that
+    says to avoid people) the picture and video models drew their default, a white person, for a Lagos brand.
+    Applies to anyone at all who appears: presenters, customers, hands, background figures."""
+    region = str((bc or {}).get("region") or "").strip()
+    if not region:
+        return ""
+    low = region.lower()
+    if any(m in low for m in _BLACK_AFRICAN_MARKETS):
+        who = (f"Black African people from the brand's market ({region}), with natural dark skin tones and "
+               "local features, hairstyles and clothing")
+    else:
+        who = f"people who look like the locals of the brand's market ({region})"
+    return (f"WHO APPEARS: every person who appears at all — presenters, customers, staff, hands, background "
+            f"figures — is one of the {who}, unless the brief or the owner's own photos clearly show someone else.")
+
+
 def frame_owner_rules(bc: Optional[Dict[str, Any]], platform: str = "") -> str:
-    """For the picture model, appended to every scene image prompt: the owner's own Playbook instructions for
-    video, so the frames follow them even where the script did not spell them out."""
+    """For the picture model, appended to every scene image prompt: who the people are (people_look_rule) and the
+    owner's own Playbook instructions for video, so the frames follow them even where the script did not spell
+    them out."""
+    look = people_look_rule(bc)
+    look = f" {look}" if look else ""
     owner = owner_instructions(bc, kind="video", platform=platform)
     if not owner:
-        return ""
-    return (
+        return look
+    return look + (
         " The brand owner's own rules for these images — follow every one that is about what the picture shows, "
         "they override the style above; ignore any that are only about wording, and draw no text for them: "
         + " | ".join(owner) + "."

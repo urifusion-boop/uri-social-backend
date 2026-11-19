@@ -306,6 +306,9 @@ class VideoCreativeService:
             preamble_lines.append(_brief)
         preamble_lines.append("")
         preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+        _people = brand_brief.people_look_rule(brand_context)
+        if _people:
+            preamble_lines.append(_people)
         _visual = brand_brief.video_visual_rules(brand_context, _platform)
         if _visual:
             preamble_lines.append("")

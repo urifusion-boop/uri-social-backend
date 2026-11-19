@@ -535,3 +535,63 @@ def test_without_owner_instructions_the_prompts_are_unchanged(monkeypatch):
     assert "brand owner's own rules" not in prompt
     _, fake = _describe_it(monkeypatch, {})
     assert "FOR THE PICTURES" not in _user_prompt(fake)
+
+
+# ── the people on screen look like the brand's market ─────────────────────────
+# Skin tone was left to chance: on prod (a Playbook that avoids people, so the script described nobody) the
+# picture model drew its default, a white person, for a Lagos brand. Staging only looked right by luck.
+
+def test_a_nigerian_brand_gets_black_african_people_in_the_script(monkeypatch):
+    _, fake = _describe_it(monkeypatch, _visual_bc(), target_platform="instagram_reels")
+    prompt = _user_prompt(fake)
+    assert "WHO APPEARS" in prompt and "Black African people" in prompt and "Lagos" in prompt
+
+
+def test_the_photo_storyboard_script_gets_the_same_people_rule(monkeypatch):
+    captured = {}
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            captured["text"] = contents[0].text
+            return SimpleNamespace(text=json.dumps(SCRIPT))
+
+    class _Part:
+        def __init__(self, text=None):
+            self.text = text
+
+        @staticmethod
+        def from_text(text):
+            return _Part(text)
+
+        @staticmethod
+        def from_bytes(data, mime_type):
+            return _Part()
+
+    monkeypatch.setattr(vss, "genai_types", SimpleNamespace(Part=_Part, GenerateContentConfig=lambda **kw: kw),
+                        raising=False)
+    monkeypatch.setattr(vss, "_gemini_client", SimpleNamespace(models=FakeModels()))
+    image = "data:image/png;base64," + base64.b64encode(b"x" * 16).decode()
+    _run(vss.VideoStoryboardService.generate_storyboard(
+        brand_images=[image], optional_text="lunch combo", brand_context=_bc(), target_platform="tiktok"))
+    assert "WHO APPEARS" in captured["text"] and "Black African people" in captured["text"]
+
+
+def test_every_scene_image_is_told_who_the_people_are_even_with_no_owner_rules(monkeypatch):
+    bc = _bc()
+    bc["playbook_instructions"] = []
+    for prev in (None, "https://cdn.test/prev.png"):
+        _, prompt = _frame(monkeypatch, bc, prev=prev)
+        assert "WHO APPEARS" in prompt and "Black African people" in prompt and "hands" in prompt
+
+
+@pytest.mark.parametrize("region", ["West Africa, Nigeria", "Lagos", "Accra, Ghana", "Nairobi"])
+def test_african_markets_get_black_african_people(region):
+    assert "Black African people" in bb.people_look_rule({"region": region})
+
+
+def test_another_market_gets_its_own_locals_and_no_region_changes_nothing(monkeypatch):
+    rule = bb.people_look_rule({"region": "London, UK"})
+    assert "locals of the brand's market (London, UK)" in rule and "Black African" not in rule
+    assert bb.people_look_rule({}) == "" and bb.people_look_rule(None) == ""
+    _, prompt = _frame(monkeypatch, None)
+    assert "WHO APPEARS" not in prompt
