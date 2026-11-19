@@ -318,7 +318,8 @@ def keyword_exclusions(text: str) -> list[str]:
 # The model called "i'm interested" Pidgin and the reply came back in Pidgin. A reply
 # only switches to Pidgin when the customer's own words are Pidgin.
 _PIDGIN_WORDS = (r"\b(dey|wetin|abeg|una|sabi|wahala|abi|sef|oya|comot|pikin|wan|na im|"
-                 r"how far|e don|no vex|shey|wey|dem|una|ehn|biko|jare|o\s*jare|kuku|nko)\b")
+                 r"how far|e don|no vex|shey|wey|dem|una|ehn|biko|jare|o\s*jare|kuku|nko|"
+                 r"i fit|we fit|you fit|fit get|nawa|e go|make i|no be|abeg|how i)\b")
 
 
 def _language(model_said: Any, text: str) -> str:

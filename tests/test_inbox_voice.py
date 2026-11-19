@@ -391,3 +391,10 @@ def test_a_pidgin_default_replies_in_pidgin_even_to_english():
                                               "pidgin_degree": "moderate"}})
     rule, pidgin = voice.language_rule(p, "en")
     assert pidgin and "Always reply in natural Nigerian Pidgin" in rule
+
+
+def test_everyday_pidgin_is_recognised_as_pidgin():
+    from app.agents.inbox import agent
+    for text in ("how i fit get art for my wife", "wetin una dey sell", "we fit meet tomorrow"):
+        assert agent._language("pcm", text) == "pcm"
+    assert agent._language("pcm", "i'm interested") == "en"
