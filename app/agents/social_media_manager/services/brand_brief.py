@@ -657,6 +657,35 @@ def _brand_name(bc: Optional[Dict[str, Any]]) -> str:
     return str((bc or {}).get("brand_name") or "").strip()
 
 
+def video_visual_rules(bc: Optional[Dict[str, Any]], platform: str = "") -> str:
+    """For the script writer: the owner's own Playbook instructions for video, applied to what is SHOWN.
+    The Brand Brief governs the words, and video_prompt must not quote rules, so without this an instruction
+    like "do not use images of people" or "never use a full pink background" never reached the pictures."""
+    owner = owner_instructions(bc, kind="video", platform=platform)
+    if not owner:
+        return ""
+    return (
+        "THE OWNER'S INSTRUCTIONS FOR THE PICTURES: wherever one of these is about what is shown (people, "
+        "backgrounds, colours, setting, style, the look of the graphics), every scene and every video_prompt must "
+        "obey it, overriding any default style. Describe scenes that follow it; do not quote the instruction in a "
+        "video_prompt. Instructions only about wording apply to the text, not the picture: "
+        + " | ".join(owner)
+    )
+
+
+def frame_owner_rules(bc: Optional[Dict[str, Any]], platform: str = "") -> str:
+    """For the picture model, appended to every scene image prompt: the owner's own Playbook instructions for
+    video, so the frames follow them even where the script did not spell them out."""
+    owner = owner_instructions(bc, kind="video", platform=platform)
+    if not owner:
+        return ""
+    return (
+        " The brand owner's own rules for these images — follow every one that is about what the picture shows, "
+        "they override the style above; ignore any that are only about wording, and draw no text for them: "
+        + " | ".join(owner) + "."
+    )
+
+
 def visual_branding_rule(bc: Optional[Dict[str, Any]]) -> str:
     """For the script writer: what may be written into a video_prompt about brands, logos and lettering.
     Without it the picture model invents one ("Lagos Luxe Beauty" on every box and uniform)."""
