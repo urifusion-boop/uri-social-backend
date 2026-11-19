@@ -119,3 +119,23 @@ def test_per_day_hours_and_cleaning():
     # Defaults keep both automations off.
     d = agent.normalize_settings({})
     assert not d["away_message"]["enabled"] and not d["ad_lead_welcome"]["enabled"]
+
+
+def test_saving_without_the_new_fields_keeps_them():
+    async def go():
+        db = AsyncMongoMockClient()["t"]
+        await agent.save_settings(db, "ws", {
+            "away_message": {"enabled": True, "text": "Closed!"},
+            "ad_lead_welcome": {"enabled": True, "text": "Welcome!"},
+            "alert_emails": ["a@b.co"],
+            "business_hours": {"day_hours": {"Sat": {"open": "10:00", "close": "14:00"}}}}, "u1")
+        # An older screen saves only the hours and the policy.
+        out = await agent.save_settings(db, "ws", {"auto_reply_enabled": True,
+                                                   "business_hours": {"open": "08:00", "close": "17:00"}}, "u1")
+        assert out["away_message"] == {"enabled": True, "text": "Closed!"}
+        assert out["ad_lead_welcome"]["text"] == "Welcome!" and out["alert_emails"] == ["a@b.co"]
+        assert out["business_hours"]["day_hours"] == {"Sat": {"open": "10:00", "close": "14:00"}}
+        again = await agent.load_settings(db, "ws")
+        assert again["away_message"]["enabled"] and again["business_hours"]["open"] == "08:00"
+        assert again["business_hours"]["day_hours"]["Sat"]["open"] == "10:00"
+    run(go())

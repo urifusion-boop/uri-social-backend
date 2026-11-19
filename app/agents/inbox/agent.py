@@ -239,10 +239,19 @@ async def load_settings(db, workspace_id: str) -> dict:
 async def save_settings(db, workspace_id: str, raw: dict, actor_id: str) -> dict:
     clean = normalize_settings(raw)
     fields = dict(clean)
-    # A screen that doesn't show the alert emails mustn't wipe them by saving.
-    if "alert_emails" not in (raw or {}):
-        fields.pop("alert_emails")
-        clean["alert_emails"] = (await load_settings(db, workspace_id))["alert_emails"]
+    raw = raw or {}
+    stored = None
+    # A screen that doesn't show a setting mustn't wipe it by saving: the alert emails,
+    # the two fixed messages and the per-day hours keep their stored values when absent.
+    for key in ("alert_emails", "away_message", "ad_lead_welcome"):
+        if key not in raw:
+            stored = stored or await load_settings(db, workspace_id)
+            fields.pop(key)
+            clean[key] = stored[key]
+    if "day_hours" not in (raw.get("business_hours") or {}):
+        stored = stored or await load_settings(db, workspace_id)
+        clean["business_hours"]["day_hours"] = stored["business_hours"]["day_hours"]
+        fields["business_hours"] = clean["business_hours"]
     await db[SETTINGS].update_one(
         {"workspace_id": workspace_id},
         {"$set": {**fields, "updated_at": now(), "updated_by": actor_id},
