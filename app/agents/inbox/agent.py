@@ -32,7 +32,7 @@ from bson import ObjectId
 
 from . import situation as sit
 from . import voice
-from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, Direction, Kind, now
+from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, Direction, Kind, now
 from . import onebox
 from .send import SendRefused, check_eligibility
 
@@ -103,8 +103,23 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                  "Sat": True, "Sun": False},
         "open": "09:00",
         "close": "18:00",
+        # Optional per-day hours, e.g. {"Sat": {"open": "10:00", "close": "14:00"}}; a day
+        # without its own entry uses open/close above.
+        "day_hours": {},
+    },
+    # Fixed messages the owner writes — no AI, nothing billed. Both off until turned on.
+    "away_message": {
+        "enabled": False,
+        "text": "Hi {first_name}, thanks for your message! We're closed right now, "
+                "but we'll reply as soon as we open.",
+    },
+    "ad_lead_welcome": {
+        "enabled": False,
+        "text": "Hi {first_name}, thanks for reaching out from our ad! How can we help you today?",
     },
 }
+
+MAX_FIXED_REPLY_LEN = 600
 
 _DAY_KEYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -178,9 +193,28 @@ def normalize_settings(raw: Optional[dict]) -> dict:
                      for d in _DAY_KEYS},
             "open": _clean_time(hours_in.get("open"), base["business_hours"]["open"]),
             "close": _clean_time(hours_in.get("close"), base["business_hours"]["close"]),
+            "day_hours": _clean_day_hours(hours_in.get("day_hours")),
         },
         "alert_emails": _clean_emails(raw.get("alert_emails")),
+        "away_message": _clean_fixed(raw.get("away_message"), base["away_message"]),
+        "ad_lead_welcome": _clean_fixed(raw.get("ad_lead_welcome"), base["ad_lead_welcome"]),
     }
+
+
+def _clean_day_hours(value: Any) -> dict:
+    out: dict[str, dict] = {}
+    for d, h in (value.items() if isinstance(value, dict) else []):
+        if d in _DAY_KEYS and isinstance(h, dict):
+            o, c = _clean_time(h.get("open"), ""), _clean_time(h.get("close"), "")
+            if o and c:
+                out[d] = {"open": o, "close": c}
+    return out
+
+
+def _clean_fixed(value: Any, default: dict) -> dict:
+    value = value if isinstance(value, dict) else {}
+    text = str(value.get("text") or "").strip()[:MAX_FIXED_REPLY_LEN] or default["text"]
+    return {"enabled": bool(value.get("enabled", default["enabled"])), "text": text}
 
 
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
@@ -220,10 +254,12 @@ async def save_settings(db, workspace_id: str, raw: dict, actor_id: str) -> dict
 
 def within_business_hours(hours: dict, at: Optional[datetime] = None) -> bool:
     local = (at or now()).astimezone(ZoneInfo(hours["timezone"]))
-    if not hours["days"].get(_DAY_KEYS[local.weekday()]):
+    day = _DAY_KEYS[local.weekday()]
+    if not hours["days"].get(day):
         return False
-    open_t = dtime.fromisoformat(hours["open"])
-    close_t = dtime.fromisoformat(hours["close"])
+    own = (hours.get("day_hours") or {}).get(day) or {}
+    open_t = dtime.fromisoformat(own.get("open") or hours["open"])
+    close_t = dtime.fromisoformat(own.get("close") or hours["close"])
     t = local.time()
     if open_t <= close_t:
         return open_t <= t < close_t
@@ -756,6 +792,10 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
                           llm: Llm = openai_json, transport=None) -> dict:
     """After a message is stored: label it, draft a reply, and auto-send if allowed."""
     settings = await load_settings(db, workspace_id)
+    try:
+        await send_fixed_replies(db, workspace_id, conversation_id, settings, transport)
+    except Exception as e:                      # a fixed reply must never stop the inbox
+        print(f"[Inbox] fixed reply failed for {conversation_id}: {e}", flush=True)
     # The Onebox gate runs BEFORE the model is called: a conversation past its message
     # cap, or a workspace out of allowance, must not cost anything to be told no.
     if settings["auto_reply_enabled"] and onebox.ENFORCE and ObjectId.is_valid(conversation_id):
@@ -772,6 +812,75 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
         return await _process_inbound(db, workspace_id, conversation_id, message_id, llm, transport, settings)
     finally:
         await onebox.record_cost(db, workspace_id, conversation_id, usage_token)
+
+
+def _first_name(display_name: str) -> str:
+    parts = (display_name or "").strip().split()
+    return parts[0] if parts else "there"
+
+
+def _closed_period(hours: dict, at: datetime) -> str:
+    """Which closed stretch `at` falls in (the local date it began), so the away message
+    goes once per night or day off, not once per message."""
+    local = at.astimezone(ZoneInfo(hours["timezone"]))
+    day = _DAY_KEYS[local.weekday()]
+    own = (hours.get("day_hours") or {}).get(day) or {}
+    open_t = dtime.fromisoformat(own.get("open") or hours["open"])
+    start = local.date() - timedelta(days=1) if local.time() < open_t else local.date()
+    return start.isoformat()
+
+
+async def send_fixed_replies(db, workspace_id: str, conversation_id: str, settings: dict,
+                             transport=None, at: Optional[datetime] = None) -> list[str]:
+    """The owner's own fixed messages, sent as soon as a DM arrives (no AI, not billed):
+    - the ad lead welcome, once, on the first message of a conversation that came from an ad;
+    - the away message, once per closed stretch, when a DM arrives outside business hours.
+    Never on public comments, never when a team member is handling the conversation, and
+    only inside Meta's 24-hour reply window (send_reply refuses otherwise)."""
+    welcome, away = settings.get("ad_lead_welcome") or {}, settings.get("away_message") or {}
+    if not (welcome.get("enabled") or away.get("enabled")) or not ObjectId.is_valid(conversation_id):
+        return []
+    at = at or now()
+    conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id), "workspace_id": workspace_id})
+    if not conv or (conv.get("kind") or Kind.DM.value) != Kind.DM.value or conv.get("assignee_id"):
+        return []
+    outbound = await db[MESSAGES].find(
+        {"conversation_id": conversation_id, "direction": Direction.OUTBOUND.value}
+    ).to_list(500)
+    if any(m.get("actor_id") not in (AGENT_ACTOR, None, "") and not m.get("approved_draft") and
+           (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF for m in outbound):
+        return []
+    ident = await db[IDENTITIES].find_one({"_id": ObjectId(conv["contact_identity_id"])}) \
+        if ObjectId.is_valid(conv.get("contact_identity_id", "")) else None
+    name = _first_name((ident or {}).get("display_name", ""))
+
+    from .meta_transport import meta_transport
+    from .send import send_reply
+    account = await db[CHANNEL_ACCOUNTS].find_one({"_id": ObjectId(conv["channel_account_id"])}) \
+        if ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+
+    sent: list[str] = []
+
+    async def _send(kind: str, text: str, key: str) -> None:
+        # Already sent under this key (this ad welcome, this closed stretch): send_reply
+        # would hand back the earlier record, which is not a new message.
+        if await db[OUTBOX].find_one({"workspace_id": workspace_id, "idempotency_key": key}):
+            return
+        try:
+            record = await send_reply(db, workspace_id, conversation_id, text.replace("{first_name}", name),
+                                      idempotency_key=key, actor_id=AGENT_ACTOR,
+                                      transport=transport or meta_transport, account=account or {})
+        except SendRefused:
+            return
+        if record.get("delivery") == "accepted":
+            sent.append(kind)
+
+    if welcome.get("enabled") and conv.get("source_ad_id") and not outbound:
+        await _send("ad_lead_welcome", welcome["text"], f"adwelcome:{conversation_id}")
+    if away.get("enabled") and not sent and not within_business_hours(settings["business_hours"], at):
+        await _send("away_message", away["text"],
+                    f"away:{conversation_id}:{_closed_period(settings['business_hours'], at)}")
+    return sent
 
 
 async def _notify_onebox_blocked(db, workspace_id: str, conv: dict, decision) -> None:
