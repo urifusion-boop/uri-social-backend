@@ -96,6 +96,16 @@ class LabelNotOneLine(ValueError):
     pass
 
 
+def cell_width_for(total_items: int, canvas_size=(1080, 1080)) -> int:
+    """The grid cell's width for this many items (product included) — the space a label has."""
+    cols = math.ceil(math.sqrt(total_items))
+    return (canvas_size[0] - 2 * 56 - (cols - 1) * 32) // cols
+
+
+def label_fits(label: str, cell_width: int) -> bool:
+    return len(wrap_text(label, cell_width, _FONT_LABEL)) == 1
+
+
 def _check_label_one_line(label: str, cell_width: int) -> None:
     lines = wrap_text(label, cell_width, _FONT_LABEL)
     if len(lines) != 1:
