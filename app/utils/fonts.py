@@ -119,9 +119,13 @@ def text_runs(text: str, family: Optional[str], weight: int = 400) -> List[Tuple
     return runs
 
 
-def text_width(text: str, family: Optional[str], size: int, weight: int = 400) -> float:
-    """Advance width of `text` as draw_text will draw it, fallback runs included."""
-    return sum(_truetype(path, int(size)).getlength(run) for run, path in text_runs(text, family, weight))
+def text_width(text: str, family: Optional[str], size: int, weight: int = 400, tracking: float = 0.0) -> float:
+    """Advance width of `text` as draw_text will draw it, fallback runs included. `tracking` is
+    extra space between letters as a fraction of the size (-0.03 = 3% tighter)."""
+    width = sum(_truetype(path, int(size)).getlength(run) for run, path in text_runs(text, family, weight))
+    if tracking and len(text or "") > 1:
+        width += tracking * size * (len(text) - 1)
+    return width
 
 
 def draw_text(
@@ -133,6 +137,7 @@ def draw_text(
     weight: int = 400,
     fill=None,
     anchor: Optional[str] = None,
+    tracking: float = 0.0,
 ) -> None:
     """ImageDraw.text with the font picked by family/weight and per-character fallback.
 
@@ -141,7 +146,7 @@ def draw_text(
     horizontal part of the anchor (l/m/r) and the vertical ascender/baseline/descender part.
     """
     runs = text_runs(text, family, weight)
-    if len(runs) == 1:
+    if len(runs) == 1 and not tracking:
         draw.text(xy, text, font=_truetype(runs[0][1], int(size)), fill=fill, anchor=anchor)
         return
     if "\n" in text:
@@ -150,7 +155,8 @@ def draw_text(
         pitch = draw.textbbox((0, 0), "A", font=primary)[3] + 4
         x, y = xy
         for i, line in enumerate(text.split("\n")):
-            draw_text(draw, (x, y + i * pitch), line, family, size, weight, fill=fill, anchor=anchor)
+            draw_text(draw, (x, y + i * pitch), line, family, size, weight, fill=fill, anchor=anchor,
+                      tracking=tracking)
         return
 
     anchor = anchor or "la"
@@ -158,7 +164,7 @@ def draw_text(
     primary = _truetype(font_path(family, weight), int(size))
     ascent, descent = primary.getmetrics()
     x, y = xy
-    total = sum(_truetype(path, int(size)).getlength(run) for run, path in runs)
+    total = text_width(text, family, size, weight, tracking)
     if horizontal == "m":
         x -= total / 2
     elif horizontal == "r":
@@ -169,16 +175,28 @@ def draw_text(
         y -= descent
     elif vertical == "m":
         y += (ascent - descent) / 2
+    step = tracking * size
     for run, path in runs:
         font = _truetype(path, int(size))
-        draw.text((x, y), run, font=font, fill=fill, anchor="ls")
-        x += font.getlength(run)
+        if not step:
+            draw.text((x, y), run, font=font, fill=fill, anchor="ls")
+            x += font.getlength(run)
+            continue
+        # Letter by letter, each at its place in the untracked run (so pair kerning holds)
+        # plus the extra spacing.
+        for i, ch in enumerate(run):
+            if not ch.isspace():
+                draw.text((x + font.getlength(run[:i]) + i * step, y), ch, font=font, fill=fill, anchor="ls")
+        x += font.getlength(run) + len(run) * step
 
 
-def spans_width(spans: List[dict], family: Optional[str], size: int, weight: int = 400) -> float:
+def spans_width(spans: List[dict], family: Optional[str], size: int, weight: int = 400,
+                tracking: float = 0.0) -> float:
     """Width of one line made of differently coloured pieces (see draw_spans)."""
-    return sum(text_width(sp.get("text", ""), sp.get("font_family", family), sp.get("font_size", size),
-                          sp.get("font_weight", weight)) for sp in spans)
+    total = sum(text_width(sp.get("text", ""), sp.get("font_family", family), sp.get("font_size", size),
+                           sp.get("font_weight", weight), tracking) for sp in spans)
+    # the letter spacing also falls between one piece and the next
+    return total + tracking * size * max(0, len([sp for sp in spans if sp.get("text")]) - 1)
 
 
 def draw_spans(
@@ -191,6 +209,7 @@ def draw_spans(
     fill=None,
     anchor: Optional[str] = None,
     highlight_pad: Tuple[int, int] = (14, 6),
+    tracking: float = 0.0,
 ) -> None:
     """One line of text in pieces: [{"text": "Get "}, {"text": "50%", "color": (r,g,b,a)},
     {"text": "is not", "highlight": (r,g,b,a)}]. Pieces share the line's baseline; a piece may
@@ -201,7 +220,7 @@ def draw_spans(
     primary = _truetype(font_path(family, weight), int(size))
     ascent, descent = primary.getmetrics()
     x, y = xy
-    total = spans_width(spans, family, size, weight)
+    total = spans_width(spans, family, size, weight, tracking)
     if horizontal == "m":
         x -= total / 2
     elif horizontal == "r":
@@ -218,10 +237,10 @@ def draw_spans(
         fam = sp.get("font_family", family)
         wt = sp.get("font_weight", weight)
         sz = sp.get("font_size", size)  # a piece may be smaller (e.g. "your" in "MASTER your MONEY")
-        width = text_width(text, fam, sz, wt)
+        width = text_width(text, fam, sz, wt, tracking)
         if sp.get("highlight") is not None and text.strip():
             cap = draw.textbbox((0, 0), "H", font=_truetype(font_path(fam, wt), int(sz)), anchor="ls")
             draw.rectangle([x - pad_x, y + cap[1] - pad_y, x + width + pad_x, y + descent * 0.35 + pad_y],
                            fill=sp["highlight"])
-        draw_text(draw, (x, y), text, fam, sz, wt, fill=sp.get("color", fill), anchor="ls")
-        x += width
+        draw_text(draw, (x, y), text, fam, sz, wt, fill=sp.get("color", fill), anchor="ls", tracking=tracking)
+        x += width + (tracking * size if text else 0)

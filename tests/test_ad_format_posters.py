@@ -83,15 +83,21 @@ def test_offer_puts_the_offer_in_colour_on_a_ticket_and_over_a_dense_wash():
     emph = [sp for sp in spans if sp["text"] == "50%"]
     assert emph and emph[0]["color"] != "#FFFFFF"
     assert contrast_ratio(emph[0]["color"], offer_spotlight.WASH) >= 4.5
-    assert _types(doc, "badge")[0]["text"] == "50% off all services"
+    # The ticket carries the offer word for word, set in two lines as on the reference.
+    assert _types(doc, "badge")[0]["text"].replace("\n", " ") == "50% off all services"
     assert check_legibility(doc, GREEN) == []
 
 
-def test_offer_tags_all_carry_white_text_at_7_to_1():
+def test_offer_tags_all_read_at_7_to_1_and_stay_bright():
     doc = offer_spotlight.build_document(PHOTO, "Half price braids this week", "Half price", None,
                                          ["Braids", "Wigs", "Nails", "Lashes", "Pedicure"], tokens=GREEN)
     tags = [l for l in doc["layers"] if l.get("shape") == "rect"]
-    assert len(tags) == 5 and all(contrast_ratio("#FFFFFF", t["fill_color"]) >= 7.0 for t in tags)
+    labels = [l for l in _types(doc, "text") if l["content"].startswith("•")]
+    assert len(tags) == 5 and len(labels) == 5
+    for tag, label in zip(tags, labels):
+        assert contrast_ratio(label["color"], tag["fill_color"]) >= 7.0
+    # bright tags carry dark text rather than being deepened to dull colours
+    assert any(label["color"] != "#FFFFFF" for label in labels)
 
 
 def test_emphasis_split_across_lines():
@@ -108,25 +114,54 @@ def test_problems_with_product_shows_product_and_ringed_solution():
         ["Dry skin by noon", "Clogged pores", "Too many steps"], product_cutout_url=PHOTO,
         tokens=resolve_brand_tokens(["#D7261E"]), brand_color="#D7261E",
     )
-    assert _types(doc, "ellipse") and _types(doc, "composited_product")
+    assert _types(doc, "path") and _types(doc, "composited_product")  # the hand-drawn ring
     texts = [l["content"] for l in _types(doc, "text")]
     assert "problems" in texts and "solution" in texts and "Clogged pores" in texts
 
 
-def test_problems_without_product_lists_outcomes_with_ticks():
+def test_problems_without_product_answers_in_brand_colour_reply_bubbles():
     doc = problems_vs_solution.build_document(
         ["Running out of stock", "Counting by hand", "Not knowing what sells"],
-        solutions=["Know what's selling", "Low-stock alerts"], tokens=YELLOW, brand_color="#E8B10C",
+        solutions=["Know what's selling", "Low-stock alerts", "Restock in time"], tokens=YELLOW,
+        brand_color="#E8B10C",
     )
     assert not _types(doc, "composited_product")
-    assert any(l["content"].startswith("✓") for l in _types(doc, "text"))
+    texts = [l["content"] for l in _types(doc, "text")]
+    assert "Know what's selling" in texts and "Restock in time" in texts
+    fills = {l["fill_color"] for l in _types(doc, "rounded_rect")}
+    assert block_with_text("#E8B10C", problems_vs_solution.INK)[0] in fills
+
+
+def test_five_problems_with_a_logo_fit_instead_of_failing():
+    # Staging regression: four points plus a logo raised "the bubbles don't fit" every time, so
+    # Jane always fell back to another format.
+    doc = problems_vs_solution.build_document(
+        ["Lost patient files everywhere", "Long queues at reception desk", "Staff wasting hours on paperwork",
+         "Missed follow-up appointments", "No time for patients"],
+        solutions=["Records in seconds", "Shorter waits", "Reminders sent for you", "Time back for care",
+                   "Calmer front desk"],
+        tokens=GREEN, brand_color="#12C98B", brand_logo_url=PHOTO,
+    )
+    bubbles = [l for l in _types(doc, "rounded_rect")]
+    assert len(bubbles) >= 6
+    assert all(b["y"] + b["height"] < 1080 - 100 for b in bubbles)  # clear of the logo
+
+
+def test_long_points_shrink_then_drop_the_last_rather_than_fail():
+    doc = problems_vs_solution.build_document(
+        ["Counting stock by hand every evening after closing", "Customers asking for items you ran out of",
+         "Not knowing which products sell", "Money tied up in slow stock", "Orders lost in chats"],
+        solutions=["Know what's selling", "Restock in time", "See profit daily"], tokens=GREEN,
+    )
+    sizes = {l["font_size"] for l in _types(doc, "text") if l.get("secondary")}
+    assert sizes and max(sizes) <= problems_vs_solution.BUBBLE_SIZES[0]
 
 
 def test_too_many_long_problems_refuse_rather_than_overlap():
     with pytest.raises(problems_vs_solution.TooMuchCopy):
         problems_vs_solution.build_document(
             ["A very long frustration that keeps going and going for many words"] * 4,
-            solutions=["x", "y"], tokens=YELLOW,
+            solutions=["x", "y", "z"], tokens=YELLOW,
         )
 
 

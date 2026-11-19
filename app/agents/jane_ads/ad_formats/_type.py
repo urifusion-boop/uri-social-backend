@@ -67,14 +67,15 @@ def adjust_to_contrast(hex_color: str, against: str, min_ratio: float) -> str:
     return "#FFFFFF" if bg_light < 0.5 else "#000000"
 
 
-def wrap_words(text: str, family: str, size: int, weight: int, max_width: int) -> List[str]:
+def wrap_words(text: str, family: str, size: int, weight: int, max_width: int,
+               tracking: float = 0.0) -> List[str]:
     words = (text or "").split()
     if not words:
         return []
     lines, current = [], words[0]
     for word in words[1:]:
         candidate = f"{current} {word}"
-        if text_width(candidate, family, size, weight) <= max_width:
+        if text_width(candidate, family, size, weight, tracking) <= max_width:
             current = candidate
         else:
             lines.append(current)
@@ -84,13 +85,13 @@ def wrap_words(text: str, family: str, size: int, weight: int, max_width: int) -
 
 
 def fit_headline(text: str, family: str, weight: int, max_width: int, max_lines: int,
-                 largest: int, smallest: int) -> Tuple[int, List[str]]:
+                 largest: int, smallest: int, tracking: float = 0.0) -> Tuple[int, List[str]]:
     """The largest size (stepping down by 4) at which `text` wraps into max_lines and no
     single word is wider than the column. Raises ValueError if even `smallest` won't fit."""
     size = largest
     while size >= smallest:
-        lines = wrap_words(text, family, size, weight, max_width)
-        if len(lines) <= max_lines and all(text_width(l, family, size, weight) <= max_width for l in lines):
+        lines = wrap_words(text, family, size, weight, max_width, tracking)
+        if len(lines) <= max_lines and all(text_width(l, family, size, weight, tracking) <= max_width for l in lines):
             return size, lines
         size -= 4
     raise ValueError(f"headline doesn't fit {max_lines} lines at {smallest}px: {text!r}")
@@ -165,3 +166,72 @@ def block_with_text(fill: str, ink: str = "#1A1A1A", min_ratio: float = 7.0) -> 
     if max(white, dark) >= min_ratio:
         return fill, ("#FFFFFF" if white >= dark else ink)
     return darken_to_contrast(fill, "#FFFFFF", min_ratio), "#FFFFFF"
+
+
+def _hue_light(hex_color: str) -> Tuple[float, float]:
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    hue, light, _ = colorsys.rgb_to_hls(r, g, b)
+    return hue, light
+
+
+def tint(hex_color: str, amount: float) -> str:
+    """`hex_color` mixed toward white by `amount` (0..1) — a soft fill in the same hue."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    mix = [round(c + (255 - c) * amount) for c in (r, g, b)]
+    return "#{:02X}{:02X}{:02X}".format(*mix)
+
+
+def brand_pair(brand_colors: Optional[List[str]], tokens: Dict[str, str]) -> Tuple[str, str]:
+    """(main, second) brand colours for two-tone pieces — the green and yellow halves of the
+    "Fresh Crops" pill. The second is the brand's next colour that clearly differs from the
+    main one (another hue, or much lighter/darker); a one-colour brand gets a light tint of
+    its own colour instead of a colour it doesn't own."""
+    # The brand's own first colour leads (the order the Playbook lists them in), not the most
+    # saturated one — a green-and-yellow farm brand's pill is green with a yellow half.
+    valid = [c.strip().upper() for c in (brand_colors or [])
+             if isinstance(c, str) and len(c.strip()) == 7 and c.strip().startswith("#")]
+    main = valid[0] if valid else brand_block_color(brand_colors, tokens)
+    try:
+        mh, ml = _hue_light(main)
+    except ValueError:
+        main = tokens["accent"]
+        mh, ml = _hue_light(main)
+    for c in brand_colors or []:
+        if not (isinstance(c, str) and len(c.strip()) == 7 and c.strip().startswith("#")):
+            continue
+        c = c.strip().upper()
+        if c == main.upper():
+            continue
+        try:
+            ch, cl = _hue_light(c)
+        except ValueError:
+            continue
+        hue_gap = min(abs(ch - mh), 1 - abs(ch - mh))
+        if (hue_gap > 0.08 or abs(cl - ml) > 0.3) and _saturation(c) > 0.25:
+            return main, c
+    return main, tint(main, 0.78)
+
+
+def vivid_block(fill: str, ink: str = "#1A1A1A", min_ratio: float = 7.0) -> Tuple[str, str]:
+    """(fill, text colour) like block_with_text, but when neither white nor ink reads on `fill`
+    it picks the gentler of two fixes: deepen it for white text, or lighten it toward white for
+    dark text. A bright orange stays a light orange with dark text instead of turning brown; a
+    mid blue stays blue, a little deeper, with white text."""
+    from .brand_tokens import darken_to_contrast
+    white, dark = contrast_ratio("#FFFFFF", fill), contrast_ratio(ink, fill)
+    if max(white, dark) >= min_ratio:
+        return fill, ("#FFFFFF" if white >= dark else ink)
+    deep = darken_to_contrast(fill, "#FFFFFF", min_ratio)
+    light = None
+    for step in range(1, 20):
+        candidate = tint(fill, step * 0.05)
+        if contrast_ratio(ink, candidate) >= min_ratio:
+            light = candidate
+            break
+    # A colour white already nearly reads on (a mid blue, a brand green) is deepened for white
+    # text; a light, warm one (orange, yellow, mint) is lifted for dark text instead of browning.
+    if light and white < 3.0:
+        return light, ink
+    return deep, "#FFFFFF"
