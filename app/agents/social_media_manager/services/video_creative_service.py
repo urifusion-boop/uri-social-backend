@@ -306,6 +306,10 @@ class VideoCreativeService:
             preamble_lines.append(_brief)
         preamble_lines.append("")
         preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+        _visual = brand_brief.video_visual_rules(brand_context, _platform)
+        if _visual:
+            preamble_lines.append("")
+            preamble_lines.append(_visual)
         content: List[Dict[str, Any]] = [{"type": "text", "text": "\n".join(preamble_lines)}]
         for img in reference_images:
             content.append({"type": "image_url", "image_url": {"url": img}})
@@ -515,7 +519,7 @@ class VideoCreativeService:
     @staticmethod
     def _frame_branding(brand_context: Optional[Dict[str, Any]], on_screen_text: str = "") -> str:
         from . import brand_brief
-        return brand_brief.frame_branding_rules(brand_context, on_screen_text)
+        return brand_brief.frame_branding_rules(brand_context, on_screen_text) + brand_brief.frame_owner_rules(brand_context)
 
     # What the picture model is told to do with the owner's photos. A frame need not show the product, so this
     # only governs where it does appear.

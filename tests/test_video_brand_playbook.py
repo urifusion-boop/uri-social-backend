@@ -450,3 +450,88 @@ def test_the_brands_own_words_are_removed_without_the_caption_swap_table():
     assert bb.strip_banned_words("one simple transformation story", ["transform"], universal=False) == "one simple story"
     # the built-in list still swaps for captions
     assert bb.strip_banned_words("one simple transformation story") == "one simple improve story"
+
+
+# ── the owner's instructions reach the PICTURES, not only the words ────────────
+# Prod's Playbook rules were all about what is shown ("do not use images of people", "never use a full pink
+# background"), saved with applies_to ["all"]. The script writer was told the brief covers only the words and
+# the scene images got only colours, so those rules never reached a single frame.
+
+VISUAL_RULES = [
+    {"text": "Do not use images of people in design.", "applies_to": ["all"], "platforms": []},
+    {"text": "Never use a full pink background in content.", "applies_to": ["all"], "platforms": []},
+    {"text": "Open captions with a hook", "applies_to": ["posts"], "platforms": []},
+]
+
+
+def _visual_bc():
+    bc = _bc()
+    bc["playbook_instructions"] = [dict(r) for r in VISUAL_RULES]
+    return bc
+
+
+def test_the_describe_it_script_writer_applies_owner_rules_to_every_video_prompt(monkeypatch):
+    _, fake = _describe_it(monkeypatch, _visual_bc(), target_platform="instagram_reels")
+    prompt = _user_prompt(fake)
+    assert "THE OWNER'S INSTRUCTIONS FOR THE PICTURES" in prompt
+    visual = prompt.split("THE OWNER'S INSTRUCTIONS FOR THE PICTURES", 1)[1]
+    assert "Do not use images of people" in visual and "full pink background" in visual
+    assert "Open captions with a hook" not in visual                       # a posts-only rule stays out
+
+
+def test_the_upload_script_writer_applies_owner_rules_to_the_pictures_too(monkeypatch):
+    captured = {}
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            captured["text"] = contents[0].text
+            return SimpleNamespace(text=json.dumps(SCRIPT))
+
+    class _Part:
+        def __init__(self, text=None):
+            self.text = text
+
+        @staticmethod
+        def from_text(text):
+            return _Part(text)
+
+        @staticmethod
+        def from_bytes(data, mime_type):
+            return _Part()
+
+    monkeypatch.setattr(vss, "genai_types", SimpleNamespace(Part=_Part, GenerateContentConfig=lambda **kw: kw),
+                        raising=False)
+    monkeypatch.setattr(vss, "_gemini_client", SimpleNamespace(models=FakeModels()))
+    image = "data:image/png;base64," + base64.b64encode(b"x" * 16).decode()
+    _run(vss.VideoStoryboardService.generate_storyboard(
+        brand_images=[image], optional_text="lunch combo", brand_context=_visual_bc(), target_platform="tiktok"))
+    assert "THE OWNER'S INSTRUCTIONS FOR THE PICTURES" in captured["text"]
+    assert "Do not use images of people" in captured["text"].split("FOR THE PICTURES", 1)[1]
+
+
+def test_every_scene_image_carries_the_owners_rules_first_and_chained(monkeypatch):
+    for prev in (None, "https://cdn.test/prev.png"):
+        _, prompt = _frame(monkeypatch, _visual_bc(), prev=prev)
+        assert "brand owner's own rules for these images" in prompt
+        assert "Do not use images of people" in prompt and "full pink background" in prompt
+        assert "Open captions with a hook" not in prompt
+        assert "Do NOT invent or show any brand" in prompt                 # the existing rules are kept
+
+
+def test_video_scoped_rules_reach_the_pictures_and_other_scopes_do_not():
+    bc = _bc()
+    bc["playbook_instructions"] = [
+        {"text": "Show the shop front", "applies_to": ["video"], "platforms": []},
+        {"text": "Ads use red", "applies_to": ["ads"], "platforms": []},
+    ]
+    assert "Show the shop front" in bb.frame_owner_rules(bc)
+    assert "Ads use red" not in bb.frame_owner_rules(bc)
+    assert "Ads use red" not in bb.video_visual_rules(bc)
+
+
+def test_without_owner_instructions_the_prompts_are_unchanged(monkeypatch):
+    assert bb.video_visual_rules({}) == "" and bb.frame_owner_rules(None) == ""
+    _, prompt = _frame(monkeypatch, None)
+    assert "brand owner's own rules" not in prompt
+    _, fake = _describe_it(monkeypatch, {})
+    assert "FOR THE PICTURES" not in _user_prompt(fake)
