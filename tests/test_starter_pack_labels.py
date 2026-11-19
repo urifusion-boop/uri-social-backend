@@ -71,3 +71,18 @@ def test_the_recompose_flow_gives_styles_the_real_product_photo():
     src = inspect.getsource(creative)
     i = src.index("photo_url=reference_image_url, photo_attestation=asset_attestation, recomposite=True")
     assert i > 0
+
+
+def test_the_title_never_leaves_one_word_alone_on_its_second_line():
+    doc = starter_pack.build_document(["a", "b", "c", "d"], ["Planner", "Pens", "Phone", "Laptop"], "p", "Health app",
+                                      brand_logo_url="l", title="The Lagos clinic starter pack", font_family="Poppins")
+    lines = [l["content"] for l in doc["layers"] if l.get("type") == "text" and l.get("font_weight") == 800]
+    assert len(lines) == 1 or len(lines[-1].split()) >= 2
+
+
+def test_every_item_is_shot_on_the_same_backdrop_and_the_product_gets_the_same_tile():
+    assert starter_pack.BACKDROP in starter_pack._item_prompt("a laptop")
+    doc = starter_pack.build_document(["a", "b", "c", "d"], ["Planner", "Pens", "Phone", "Laptop"], "p", "Health app")
+    tiles = [l for l in doc["layers"] if l.get("type") == "shape" and l.get("fill_color") == starter_pack.BACKDROP]
+    product = next(l for l in doc["layers"] if l.get("type") == "composited_product" and l["url"] == "p")
+    assert len(tiles) == 1 and (tiles[0]["x"], tiles[0]["y"]) == (product["x"], product["y"])
