@@ -683,11 +683,13 @@ _BLACK_AFRICAN_MARKETS = (
 
 
 def market_people(bc: Optional[Dict[str, Any]]) -> str:
-    """Who people are by default for this brand: locals of its market (Black African for an African market).
-    Only a fallback: what the brief says about the people always comes first."""
+    """Who people are by default for this brand: locals of its market (Black African for an African market, and
+    for a brand with no market set, since Uri is built for African businesses). Only a fallback: what the brief
+    says about the people always comes first."""
     region = str((bc or {}).get("region") or "").strip()
     if not region:
-        return ""
+        return ("Black African people (Nigerian unless the brief says otherwise), with natural dark skin tones and "
+                "local features, hairstyles and clothing")
     if any(m in region.lower() for m in _BLACK_AFRICAN_MARKETS):
         return (f"Black African people from the brand's market ({region}), with natural dark skin tones and "
                 "local features, hairstyles and clothing")
@@ -727,8 +729,9 @@ def apply_people_look(storyboard: Dict[str, Any], bc: Optional[Dict[str, Any]]) 
 
 
 def scene_people_line(scene: Optional[Dict[str, Any]], bc: Optional[Dict[str, Any]] = None) -> str:
-    """For the picture and video models: who any person, face or hand in this scene is."""
-    look = str((scene or {}).get("people_look") or "").strip() or market_people(bc)
+    """For the picture and video models: who any person, face or hand in this scene is. The script step puts
+    people_look on every scene; the brand's market is used only when the brand is known (bc given)."""
+    look = str((scene or {}).get("people_look") or "").strip() or (market_people(bc) if bc is not None else "")
     if not look:
         return ""
     return (f" Any person, face, hand or body part that appears in this shot is one of the {look}" if look == market_people(bc)

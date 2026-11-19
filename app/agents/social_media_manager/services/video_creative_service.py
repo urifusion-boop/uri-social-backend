@@ -182,7 +182,7 @@ def validated_outcome(storyboard: Dict[str, Any], has_reference_images: bool) ->
 
 def brand_brief_scene_people(scene: dict, brand_context: Optional[Dict[str, Any]]) -> str:
     from . import brand_brief
-    return brand_brief.scene_people_line(scene, brand_context)
+    return brand_brief.scene_people_line(scene, brand_context or {})   # a Describe It frame always knows its brand
 
 
 class VideoCreativeService:

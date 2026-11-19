@@ -633,10 +633,20 @@ def test_african_markets_fall_back_to_black_african_people(region):
     assert "Black African people" in bb.market_people({"region": region})
 
 
-def test_another_market_falls_back_to_its_own_locals_and_no_region_changes_nothing(monkeypatch):
-    assert "locals of the brand's market (London, UK)" in bb.market_people({"region": "London, UK"})
-    assert bb.market_people({}) == "" and bb.scene_people_line({}, None) == ""
+def test_another_market_falls_back_to_its_own_locals():
+    rule = bb.market_people({"region": "London, UK"})
+    assert "locals of the brand's market (London, UK)" in rule and "Black African" not in rule
+
+
+def test_a_brand_with_no_market_falls_back_to_black_african_people(monkeypatch):
+    for bc in ({}, None, {"region": "  "}):
+        assert "Black African people (Nigerian unless the brief says otherwise)" in bb.market_people(bc)
     sb = {"scenes": [{"scene_number": 1}]}
-    assert "people_look" not in bb.apply_people_look(sb, {})["scenes"][0]
+    assert "Black African people" in bb.apply_people_look(sb, {})["scenes"][0]["people_look"]
     _, prompt = _frame(monkeypatch, None)
-    assert "hand or body part" not in prompt
+    assert "hand or body part that appears in this shot is one of the Black African people" in prompt
+
+
+def test_the_brief_still_wins_over_the_default_when_there_is_no_market():
+    sb = {"people_look": "a white expat chef in his 50s", "scenes": [{"scene_number": 1}]}
+    assert bb.apply_people_look(sb, {})["scenes"][0]["people_look"] == "a white expat chef in his 50s"
