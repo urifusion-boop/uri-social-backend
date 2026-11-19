@@ -128,6 +128,15 @@ def _effective_background(document: Dict, text_layer: Dict, all_layers: List[Dic
             if _covers_point(layer, x, y) and _gradient_alpha_at(layer, y) >= _GRADIENT_SCRIM_MIN_ALPHA:
                 candidates.append({**layer, "fill_color": layer.get("color", "#000000")})
             continue
+        if layer.get("type") == "shape" and layer.get("shape") == "polygon":
+            # A filled polygon (an arrow-ended pill) backs text inside its bounding box.
+            pts = layer.get("points") or []
+            if layer.get("fill_color") and pts:
+                xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                box = {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)}
+                if _covers_point(box, x, y):
+                    candidates.append(layer)
+            continue
         if layer.get("type") == "shape" and (
             layer.get("shape") not in _FILL_SHAPE_TYPES or not layer.get("fill_color")
         ):

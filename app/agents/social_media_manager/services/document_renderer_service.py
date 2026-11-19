@@ -140,8 +140,37 @@ class DocumentRendererService:
         else:
             bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
 
+        # recolor: {from, to, box: [x0, y0, x1, y1], tolerance} — every pixel inside the box
+        # within `tolerance` of `from` becomes `to`, keeping its own light and shade. Repaints a
+        # billboard's blank face in exactly the colour its words were checked against, right
+        # up to (and behind) the railings and lamp arms, which keep their own colours.
+        recolor = layer.get("recolor")
+        if recolor:
+            bg_image = DocumentRendererService._recolor(bg_image, recolor)
+
         # Paste at the layer's own position
         canvas.paste(bg_image, (x, y))
+
+    @staticmethod
+    def _recolor(image: Image.Image, spec: Dict[str, Any]) -> Image.Image:
+        import numpy as np
+        src = np.array(DocumentRendererService._hex_to_rgba(spec["from"])[:3], dtype=np.float32)
+        dst = np.array(DocumentRendererService._hex_to_rgba(spec["to"])[:3], dtype=np.float32)
+        x0, y0, x1, y1 = (int(v) for v in spec.get("box", (0, 0, image.width, image.height)))
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(image.width, x1), min(image.height, y1)
+        if x1 <= x0 or y1 <= y0:
+            return image
+        arr = np.array(image.convert("RGBA"), dtype=np.float32)
+        region = arr[y0:y1, x0:x1, :3]
+        dist = np.sqrt(((region - src) ** 2).sum(axis=2))
+        tol = float(spec.get("tolerance", 60))
+        # Fully replaced near the colour, blending out toward the edge of the tolerance, so the
+        # face's edge stays soft. Shading is kept: each pixel keeps its offset from `from`.
+        weight = np.clip((tol - dist) / (tol * 0.35), 0.0, 1.0)[..., None]
+        shifted = np.clip(region + (dst - src), 0, 255)
+        arr[y0:y1, x0:x1, :3] = region * (1 - weight) + shifted * weight
+        return Image.fromarray(arr.astype(np.uint8), "RGBA")
 
     @staticmethod
     async def _render_product(canvas: Image.Image, layer: Dict[str, Any]):
@@ -248,9 +277,13 @@ class DocumentRendererService:
                 if sp.get("highlight"):
                     piece["highlight"] = DocumentRendererService._hex_to_rgba(sp["highlight"])
                 pieces.append(piece)
-            draw_spans(draw, (x, y), pieces, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor)
+            draw_spans(draw, (x, y), pieces, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor,
+                       tracking=float(layer.get("tracking", 0) or 0))
             return
-        draw_text(draw, (x, y), content, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor)
+        # `tracking`: letter spacing as a fraction of the size (-0.03 = 3% tighter), as the
+        # reference posters set their headlines; 0 draws exactly as before.
+        draw_text(draw, (x, y), content, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor,
+                  tracking=float(layer.get("tracking", 0) or 0))
 
     @staticmethod
     async def _render_badge(canvas: Image.Image, layer: Dict[str, Any]):
@@ -263,27 +296,103 @@ class DocumentRendererService:
         text = layer.get("text", "")
         if not text:
             return
-        family = layer.get("font_family")
-        size = int(layer.get("font_size", 36))
-        weight = layer.get("font_weight", 700)
-        pad_x, pad_y = int(layer.get("padding_x", 28)), int(layer.get("padding_y", 16))
-        font = load_font(family, size, weight)
-        ascent, descent = font.getmetrics()
-        w = int(fonts_text_width(text, family, size, weight)) + 2 * pad_x
-        h = ascent + descent + 2 * pad_y
-        tile = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        tile_draw = ImageDraw.Draw(tile)
-        fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
-        outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
-        tile_draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=int(layer.get("corner_radius", h // 2)),
-                                    fill=fill, outline=outline, width=int(layer.get("border_width", 0) or 0))
-        draw_text(tile_draw, (w / 2, h / 2), text, family, size, weight,
-                  fill=DocumentRendererService._hex_to_rgba(layer.get("text_color", "#FFFFFF")), anchor="mm")
+        if layer.get("style") == "ticket":
+            tile = DocumentRendererService._ticket_tile(layer)
+        else:
+            family = layer.get("font_family")
+            size = int(layer.get("font_size", 36))
+            weight = layer.get("font_weight", 700)
+            pad_x, pad_y = int(layer.get("padding_x", 28)), int(layer.get("padding_y", 16))
+            font = load_font(family, size, weight)
+            ascent, descent = font.getmetrics()
+            tracking = float(layer.get("tracking", 0) or 0)
+            # One line, or two split on "\n" (the "Anniversary / Discounted Offer" tag).
+            lines = [l for l in text.split("\n") if l.strip()][:2] or [text]
+            pitch = int(size * 1.02)
+            w = int(max(fonts_text_width(l, family, size, weight, tracking) for l in lines)) + 2 * pad_x
+            h = ascent + descent + pitch * (len(lines) - 1) + 2 * pad_y
+            tile = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            tile_draw = ImageDraw.Draw(tile)
+            fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
+            outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
+            tile_draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=int(layer.get("corner_radius", h // 2)),
+                                        fill=fill, outline=outline, width=int(layer.get("border_width", 0) or 0))
+            ink = DocumentRendererService._hex_to_rgba(layer.get("text_color", "#FFFFFF"))
+            if len(lines) == 1:
+                draw_text(tile_draw, (w / 2, h / 2), text, family, size, weight, fill=ink, anchor="mm",
+                          tracking=tracking)
+            else:
+                for i, line in enumerate(lines):
+                    draw_text(tile_draw, (pad_x, pad_y + i * pitch), line, family, size, weight, fill=ink,
+                              anchor="la", tracking=tracking)
         rotation = float(layer.get("rotation", 0) or 0)
         if rotation:
             tile = tile.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
         cx, cy = layer.get("cx", 0), layer.get("cy", 0)
-        canvas.alpha_composite(tile, (int(cx - tile.width / 2), int(cy - tile.height / 2)))
+        DocumentRendererService._composite_clipped(canvas, tile, int(cx - tile.width / 2), int(cy - tile.height / 2))
+
+    @staticmethod
+    def _ticket_tile(layer: Dict[str, Any]) -> Image.Image:
+        """style="ticket": a paper ticket — scalloped ends, a stub carrying five small stars
+        (star_color) behind a dashed tear line, then the text (one or two lines, split on
+        "\\n"). Same keys as a badge otherwise."""
+        k = DocumentRendererService._SMOOTH
+        family = layer.get("font_family")
+        size = int(layer.get("font_size", 36))
+        weight = layer.get("font_weight", 700)
+        tracking = float(layer.get("tracking", 0) or 0)
+        lines = [l for l in str(layer.get("text", "")).split("\n") if l.strip()][:2]
+        pad_x, pad_y = int(layer.get("padding_x", 26)), int(layer.get("padding_y", 16))
+        font = load_font(family, size, weight)
+        ascent, descent = font.getmetrics()
+        pitch = int(size * 1.02)
+        text_w = int(max(fonts_text_width(l, family, size, weight, tracking) for l in lines))
+        text_h = pitch * (len(lines) - 1) + ascent + descent
+        star_r = max(5, int(size * 0.16))
+        stub_w = 5 * star_r * 2 + 2 * pad_x // 2
+        notch = max(6, int(size * 0.2))
+        w = notch + stub_w + pad_x + text_w + pad_x + notch
+        h = text_h + 2 * pad_y
+        fill = DocumentRendererService._hex_to_rgba(layer.get("fill_color", "#0B6E4F"))
+        ink = DocumentRendererService._hex_to_rgba(layer.get("text_color", "#FFFFFF"))
+        star = DocumentRendererService._hex_to_rgba(layer.get("star_color", "#FFD23F"))
+        big = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
+        d = ImageDraw.Draw(big)
+        # Scalloped ends: little half-circles bitten out of the left and right edges.
+        d.rectangle([notch * k, 0, (w - notch) * k, h * k], fill=fill)
+        bites = max(3, h // (notch * 2))
+        step = h / bites
+        for i in range(bites):
+            cy = (i + 0.5) * step * k
+            r = step * k / 2
+            d.ellipse([notch * k - r, cy - r, notch * k + r, cy + r], fill=fill)
+            d.ellipse([(w - notch) * k - r, cy - r, (w - notch) * k + r, cy + r], fill=fill)
+        # Stars on the stub, then the dashed tear line.
+        sx = (notch + pad_x // 2 + star_r) * k
+        for i in range(5):
+            DocumentRendererService._star(d, sx + i * star_r * 2 * k, h * k * 0.62, star_r * k, star)
+        tear = (notch + stub_w) * k
+        y = int(h * k * 0.12)
+        while y < h * k * 0.88:
+            d.line([(tear, y), (tear, min(y + 5 * k, h * k * 0.88))], fill=ink, width=2 * k)
+            y += 10 * k
+        tile = big.resize((w, h), Image.Resampling.LANCZOS)
+        td = ImageDraw.Draw(tile)
+        tx = notch + stub_w + pad_x
+        ty = pad_y
+        for i, line in enumerate(lines):
+            draw_text(td, (tx, ty + i * pitch), line, family, size, weight, fill=ink, anchor="la", tracking=tracking)
+        return tile
+
+    @staticmethod
+    def _star(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float, fill):
+        import math
+        pts = []
+        for i in range(10):
+            a = -math.pi / 2 + i * math.pi / 5
+            rr = r if i % 2 == 0 else r * 0.45
+            pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+        d.polygon(pts, fill=fill)
 
     @staticmethod
     async def _render_asset(canvas: Image.Image, layer: Dict[str, Any]):
@@ -321,6 +430,30 @@ class DocumentRendererService:
                 asset_image = asset_image.resize((fit_w, fit_h), Image.Resampling.LANCZOS)
                 x += (width - fit_w) // 2
                 y += (height - fit_h) // 2
+
+        # tint: the logo drawn in one colour (white on a brand-colour pill). Only for a logo
+        # with a real transparent background — tinting an opaque logo would paint a solid
+        # block, so that one sits on a small white plate instead.
+        if layer.get("tint"):
+            asset_image = asset_image.convert("RGBA")
+            alpha = asset_image.split()[3]
+            clear = sum(alpha.histogram()[:16]) / max(1, asset_image.width * asset_image.height)
+            if clear > 0.08:
+                solid = Image.new("RGBA", asset_image.size, DocumentRendererService._hex_to_rgba(layer["tint"]))
+                solid.putalpha(alpha)
+                asset_image = solid
+            else:
+                plate_pad = max(6, asset_image.height // 8)
+                plate = Image.new("RGBA", (asset_image.width + 2 * plate_pad, asset_image.height + 2 * plate_pad),
+                                  (0, 0, 0, 0))
+                ImageDraw.Draw(plate).rounded_rectangle([0, 0, plate.width - 1, plate.height - 1],
+                                                        radius=plate_pad * 2, fill=(255, 255, 255, 255))
+                plate.alpha_composite(asset_image, (plate_pad, plate_pad))
+                scale = min(asset_image.width / plate.width, asset_image.height / plate.height)
+                x += (asset_image.width - round(plate.width * scale)) // 2
+                y += (asset_image.height - round(plate.height * scale)) // 2
+                asset_image = plate.resize((max(1, round(plate.width * scale)), max(1, round(plate.height * scale))),
+                                           Image.Resampling.LANCZOS)
 
         # Apply opacity if specified
         opacity = layer.get("opacity", 1.0)
@@ -465,6 +598,77 @@ class DocumentRendererService:
                     pos += step
             else:
                 draw.line([(x1, y1), (x2, y2)], fill=color, width=stroke_width)
+
+        elif shape in ("polygon", "path"):
+            DocumentRendererService._render_smooth_shape(canvas, layer, shape)
+
+    # Supersampling factor for polygons and paths: Pillow draws them without anti-aliasing,
+    # so they're drawn this many times larger and scaled down — smooth edges, like the rest.
+    _SMOOTH = 3
+
+    @staticmethod
+    def _catmull_rom(points: list, steps: int = 16) -> list:
+        """A smooth curve through every point (the swoosh, the hand-drawn ring)."""
+        if len(points) < 3:
+            return points
+        pts = [points[0]] + points + [points[-1]]
+        out = []
+        for i in range(1, len(pts) - 2):
+            p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+            for s in range(steps):
+                t = s / steps
+                t2, t3 = t * t, t * t * t
+                out.append(tuple(
+                    0.5 * ((2 * p1[k]) + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
+                           + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)
+                    for k in (0, 1)))
+        out.append(tuple(points[-1]))
+        return out
+
+    @staticmethod
+    def _render_smooth_shape(canvas: Image.Image, layer: Dict[str, Any], shape: str):
+        """polygon: {points: [[x, y], …], fill_color, border_color, border_width} — an arrow-ended
+        pill, a ticket. path: {points, color, stroke_width, smooth (curve through the points),
+        closed} — a hand-drawn ring, a swoosh."""
+        points = [(float(p[0]), float(p[1])) for p in (layer.get("points") or [])]
+        if len(points) < 2:
+            return
+        if shape == "path" and layer.get("smooth"):
+            points = DocumentRendererService._catmull_rom(points + ([points[0]] if layer.get("closed") else []))
+        k = DocumentRendererService._SMOOTH
+        pad = int(layer.get("stroke_width", layer.get("border_width", 0)) or 0) + 2
+        xs, ys = [p[0] for p in points], [p[1] for p in points]
+        x0, y0 = int(min(xs)) - pad, int(min(ys)) - pad
+        w, h = int(max(xs)) - x0 + pad + 1, int(max(ys)) - y0 + pad + 1
+        if w <= 0 or h <= 0:
+            return
+        tile = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
+        d = ImageDraw.Draw(tile)
+        scaled = [((x - x0) * k, (y - y0) * k) for x, y in points]
+        if shape == "polygon":
+            fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
+            outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
+            if fill is None and outline is None:
+                return
+            d.polygon(scaled, fill=fill, outline=outline, width=int(layer.get("border_width", 0) or 0) * k)
+        else:
+            color = DocumentRendererService._hex_to_rgba(layer.get("color", "#000000"))
+            sw = int(layer.get("stroke_width", 4)) * k
+            d.line(scaled, fill=color, width=sw, joint="curve")
+            r = sw / 2
+            for cx, cy in (scaled[0], scaled[-1]):  # round ends
+                d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+        tile = tile.resize((w, h), Image.Resampling.LANCZOS)
+        DocumentRendererService._composite_clipped(canvas, tile, x0, y0)
+
+    @staticmethod
+    def _composite_clipped(canvas: Image.Image, tile: Image.Image, x: int, y: int):
+        """alpha_composite for a tile that may run off any edge of the canvas (a swoosh, a
+        shape cut by the frame) — only the part on the canvas is drawn."""
+        cx, cy = max(0, -x), max(0, -y)
+        if cx >= tile.width or cy >= tile.height:
+            return
+        canvas.alpha_composite(tile.crop((cx, cy, tile.width, tile.height)), (max(0, x), max(0, y)))
 
     @staticmethod
     async def _fetch_image(url: str) -> Optional[Image.Image]:

@@ -180,10 +180,14 @@ NO_PHOTO_FORMAT_IDS = frozenset({
     # Poster formats. Event Promo without a photo is a type-and-date poster; Offer Spotlight
     # generates a situation photo; Problems vs Solution without a product lists outcomes.
     "SEED-099", "SEED-100", "SEED-101",
+    # Second poster set: three generate a situation photo, the billboard generates a blank
+    # billboard (our renderer sets the words), AI Answer is drawn.
+    "SEED-102", "SEED-103", "SEED-104", "SEED-105", "SEED-106",
 })
 UPLOAD_PHOTO_FORMAT_IDS = frozenset({
-    # Event Promo with the host's own photo; Problems vs Solution with the real product.
-    "SEED-099", "SEED-101",
+    # Event Promo with the host's own photo; Problems vs Solution with the real product;
+    # Portrait + Headline with the owner's own photo.
+    "SEED-099", "SEED-101", "SEED-102",
     "SEED-093", "SEED-082", "SEED-074", "SEED-096",
     # Censored Item / Day 1 -> Day 30 — same completeness/readiness note as
     # News Headline above: both are also pooled_account_safe=REQUIRES_ISOLATION,
@@ -237,6 +241,22 @@ _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
     ),
     "SEED-101": (
         "tired of", "struggling", "frustrat", "stress of", "no more", "problem", "hassle",
+    ),
+    "SEED-102": (
+        "fresh", "farm", "made by", "handmade", "meet our", "our team", "we deliver", "home-grown",
+    ),
+    "SEED-103": (
+        "app", "dashboard", "software", "track your", "inventory", "manage your", "platform", "automat",
+    ),
+    "SEED-104": (
+        "enrol", "enroll", "admission", "apply now", "applications", "cohort", "intake", "sign up",
+        "register now", "membership", "join our", "secure your seat", "course",
+    ),
+    "SEED-105": (
+        "bold statement", "truth", "myth", "is not", "isn't", "stop thinking", "billboard", "mindset",
+    ),
+    "SEED-106": (
+        "ask ai", "chatgpt", "people ask", "how do i", "what should i", "question", "advice", "guide",
     ),
     # Us vs Them — the brief itself frames a comparison.
     "SEED-075": (
@@ -2073,6 +2093,7 @@ async def _build_event_promo(business_name: str, category: str, description: str
         except Exception as e:
             print(f"[VSG01] Event Promo artwork failed, using the date card: {e}", flush=True)
             scene_url = scene_surface = None
+    contact, platforms = _event_contact(content["contact_line"], brand_context)
     builds = [scene_url, None] if scene_url else [None]
     for scene in builds:
         try:
@@ -2082,12 +2103,29 @@ async def _build_event_promo(business_name: str, category: str, description: str
                 host_cutout_url=cutout, host_photo_url=None if cutout else photo_url,
                 scene_url=scene, scene_surface=scene_surface if scene else None,
                 host_name=content["host_name"], host_role=content["host_role"],
-                action_line=content["action_line"], contact_line=content["contact_line"],
+                action_line=content["action_line"], contact_line=contact, social_platforms=platforms,
                 brand_logo_url=brand_logo_url, **style,
             )
         except Exception as e:
             print(f"[VSG01] Event Promo build failed{' with artwork' if scene else ''}: {e}", flush=True)
     return None
+
+
+def _event_contact(contact: Optional[str], brand_context: Optional[dict]) -> tuple:
+    """(contact line, networks to show icons for). The brief's own contact wins; an @handle in it
+    gets the icons of the connected networks that handle is really on. Without one, the brand's
+    own connected handle and its networks, then its website. An icon is never shown for a
+    network the handle isn't on."""
+    handles = (brand_context or {}).get("_social_handles") or []
+    if contact:
+        if contact.strip().startswith("@"):
+            name = contact.strip().lstrip("@").lower()
+            return contact, [h["platform"] for h in handles if str(h.get("username", "")).lstrip("@").lower() == name]
+        return contact, []
+    handle, platforms = _brand_handle(brand_context)
+    if handle:
+        return handle, platforms
+    return (_brand_website(brand_context) or None), []
 
 
 async def _left_edge_colour(url: str) -> Optional[str]:
@@ -2125,10 +2163,12 @@ async def _content_offer_spotlight(business_name: str, category: str, descriptio
         "- emphasis: the offer's key figure or phrase copied EXACTLY from your headline, <=3 words "
         "(e.g. '50%', 'Free delivery')\n"
         "- ticket: <=5 words restating the offer for a small tag, e.g. '50% off all services'\n"
-        "- services: up to 5 of the business's own services or products, each <=3 words, ONLY ones "
+        "- services: up to 6 of the business's own services or products, each <=3 words, ONLY ones "
         "named above\n"
         "- scene: a short visual scene of ONE person relaxed and pleased, in a setting that suits "
         "this business (no brand names, no readable screens)\n"
+        "- occasion: 2-4 words naming what the offer celebrates ONLY if the text says (e.g. "
+        "'Anniversary Discounted Offer', 'December Sale'), else \"\"\n"
         "Never invent a figure: any number must appear in the text above. Return ONLY the JSON."
     )
     d = await _call_content_model(prompt)
@@ -2154,15 +2194,20 @@ async def _content_offer_spotlight(business_name: str, category: str, descriptio
     # service from the brand profile that isn't in the deal would read as discounted too.
     brief = (description or "").lower()
     services = [str(x).strip() for x in (d.get("services") or []) if str(x).strip()]
-    services = [x for x in services if x.lower() in brief][:5]
+    services = [x for x in services if x.lower() in brief][:6]
     if len(services) < 2:
         services = []
     # The ticket restates the offer; it may not widen it ("25% off all services" when only
     # three services are discounted). Every word in it must come from the brief.
     if ticket and not all(w in brief or w in ("off", "on") for w in re.findall(r"[a-z]{3,}", ticket.lower())):
         ticket = f"{emphasis} off" if "off" in headline.lower() and "off" not in emphasis.lower() else emphasis
+    # The occasion tag only says what the brief says the offer is for.
+    occasion = str(d.get("occasion", "")).strip()
+    if occasion and not all(w in brief or w in ("offer", "discounted", "discount", "sale", "special")
+                            for w in re.findall(r"[a-z]{3,}", occasion.lower())):
+        occasion = ""
     return {"headline": headline, "emphasis": emphasis, "ticket": ticket or None,
-            "services": services, "scene": scene}
+            "services": services, "scene": scene, "occasion": occasion or None}
 
 
 async def _gen_scene_skin_checked(prompt: str, size: str, brand_context: Optional[dict]) -> Optional[str]:
@@ -2201,6 +2246,8 @@ async def _build_offer_spotlight(business_name: str, category: str, description:
         return offer_spotlight.build_document(
             scene_url, content["headline"], content["emphasis"], content["ticket"], content["services"],
             canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+            occasion=content.get("occasion"),
+            handle=_brand_handle(brand_context)[0] or _brand_website(brand_context) or None,
             **_poster_style(brand_context, tokens, offer_spotlight.DEFAULT_FAMILY),
         )
     except Exception as e:
@@ -2218,10 +2265,10 @@ async def _content_problems_vs_solution(business_name: str, category: str, descr
         f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}"
         f"{(' — known customer frustrations: ' + '; '.join(map(str, pains))) if pains else ''}:\n"
         "Write a 'your problems | our solution' split ad.\n"
-        "- problems: 3 or 4 everyday frustrations this business's customers have, each <=5 words, "
+        "- problems: 4 or 5 everyday frustrations this business's customers have, each <=5 words, "
         "in the customer's own plain words (e.g. 'Dry, dull skin by noon', 'Counting stock by hand')\n"
-        "- solutions: 3 concrete RESULTS the customer gets, each <=5 words, matching the problems "
-        "(e.g. 'Know what's selling'). No slogans like 'Elevate your brand'.\n"
+        "- solutions: one concrete RESULT the customer gets for each problem, in the same order, each "
+        "<=5 words (e.g. 'Know what's selling'). No slogans like 'Elevate your brand'.\n"
         "No numbers, prices or percentages unless that exact figure appears above. "
         "Return ONLY JSON: {\"problems\": [...], \"solutions\": [...]}."
     )
@@ -2231,9 +2278,9 @@ async def _content_problems_vs_solution(business_name: str, category: str, descr
     source = _brand_source(description, brand_context)
     problems = [_drop_invented_figures(str(x).strip(), source) for x in (d.get("problems") or [])]
     solutions = [_drop_invented_figures(str(x).strip(), source) for x in (d.get("solutions") or [])]
-    problems = [p for p in problems if p][:4]
-    solutions = [s for s in solutions if s][:3]
-    if len(problems) < 3 or len(solutions) < 2:
+    problems = [p for p in problems if p][:5]
+    solutions = [s for s in solutions if s][:5]
+    if len(problems) < 3 or len(solutions) < 3:
         return None
     return {"problems": problems, "solutions": solutions}
 
@@ -2261,6 +2308,423 @@ async def _build_problems_vs_solution(business_name: str, category: str, descrip
         return None
 
 
+# ── Poster formats, second set: SEED-102 Portrait + Headline, SEED-103 Floating Cards,
+# SEED-104 Enrol / Sign-up, SEED-105 Billboard Statement, SEED-106 AI Answer ──
+# Same contract: copy from the business's own words, no figure it didn't give, every contact
+# detail its own, and None (fall through) rather than an ad we can't stand behind.
+
+def _brand_website(brand_context: Optional[dict]) -> str:
+    bc = brand_context or {}
+    site = str(bc.get("website") or bc.get("default_link") or "").strip()
+    site = re.sub(r"^https?://", "", site).rstrip("/")
+    return re.sub(r"^www\.", "", site) if site else ""
+
+
+def _brand_handle(brand_context: Optional[dict]) -> tuple:
+    """("@handle", [platforms it's on]) from the brand's own connected accounts, or ("", [])."""
+    handles = (brand_context or {}).get("_social_handles") or []
+    by_name: dict = {}
+    for h in handles:
+        name = str(h.get("username") or "").strip().lstrip("@")
+        if name:
+            by_name.setdefault(name.lower(), (name, []))[1].append(h["platform"])
+    if not by_name:
+        return "", []
+    # The handle on the most networks; Instagram's breaks a tie (it's what people search).
+    name, platforms = max(by_name.values(), key=lambda v: (len(v[1]), "instagram" in v[1]))
+    return f"@{name}", platforms
+
+
+async def _load_social_handles(db, brand_context: Optional[dict]) -> list:
+    """[{platform, username}] for the brand's active connected accounts — read once per ad so
+    a poster can show the brand's real handle and the networks it's on."""
+    bc = brand_context or {}
+    if db is None:
+        return []
+    scope = {"brand_id": bc["brand_id"]} if bc.get("brand_id") else (
+        {"user_id": bc["user_id"], "brand_id": {"$exists": False}} if bc.get("user_id") else None)
+    if not scope:
+        return []
+    names = {"twitter": "x", "x": "x", "instagram": "instagram", "facebook": "facebook", "tiktok": "tiktok",
+             "linkedin": "linkedin", "youtube": "youtube"}
+    out = []
+    try:
+        async for doc in db["social_connections"].find(
+            {**scope, "connection_status": {"$in": ["active", None]}}, {"_id": 0, "platform": 1, "username": 1},
+        ).limit(20):
+            platform = names.get(str(doc.get("platform") or "").lower())
+            if platform and doc.get("username"):
+                out.append({"platform": platform, "username": str(doc["username"])})
+    except Exception as e:
+        print(f"[VSG01] social handles lookup failed: {e}", flush=True)
+    return out
+
+
+_PHONE_RE = re.compile(r"(?:\+?234|0)[\s-]?[789][01]\d(?:[\s-]?\d){7}")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def _contacts_in(description: str, brand_context: Optional[dict]) -> list:
+    """[(kind, value)] — a phone number and an email only if the business wrote them, else its
+    saved WhatsApp number. Never invented."""
+    text = description or ""
+    out = []
+    phone = _PHONE_RE.search(text)
+    if phone:
+        out.append(("phone", re.sub(r"\s+", " ", phone.group(0)).strip()))
+    else:
+        wa = str((brand_context or {}).get("_whatsapp_number") or "").strip()
+        if wa:
+            digits = re.sub(r"\D", "", wa)
+            if digits.startswith("234") and len(digits) == 13:
+                wa = f"+234 {digits[3:6]} {digits[6:9]} {digits[9:]}"
+            out.append(("phone", wa))
+    email = _EMAIL_RE.search(text)
+    if email:
+        out.append(("email", email.group(0).rstrip(".")))
+    return out
+
+
+async def _gen_person_scene(prompt: str, brand_context: Optional[dict]) -> Optional[str]:
+    try:
+        return await _gen_scene_skin_checked(prompt, f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}", brand_context)
+    except SceneGenerationFailed as e:
+        print(f"[VSG01] scene generation failed: {e}", flush=True)
+        return None
+
+
+def _clean(d: dict, key: str, source: str, limit: int = 120) -> str:
+    """A copy field with any figure the business didn't give removed."""
+    return _drop_invented_figures(str(d.get(key, "") or "").strip(), source)[:limit].strip()
+
+
+async def _content_portrait_headline(business_name: str, category: str, description: str,
+                                     brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}:\n"
+        "Write a portrait poster: one smiling person fills the photo with a big headline across them.\n"
+        "Return JSON with:\n"
+        "- headline: 3-6 words, the business's promise in plain words (e.g. 'Fresh Crops for Healthy "
+        "Living')\n"
+        "- emphasis: ONE word copied exactly from your headline, the word to colour\n"
+        "- description: one sentence, 10-18 words, saying what the business does for the customer, only "
+        "from the text above\n"
+        "- cta_lead: 2-4 words leading into the website, e.g. 'Shop from us at:', 'Book with us at:'\n"
+        "- person: who is in the photo, as a generic description that suits this business (e.g. 'a "
+        "Nigerian woman farmer in her thirties wearing a colourful head-wrap') — never a named person\n"
+        "- holding: what they hold or wear that shows the business (no brand names, no logos)\n"
+        "- setting: where they are, a few words\n"
+        "No numbers, prices or percentages unless that exact figure appears above. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    source = _brand_source(description, brand_context)
+    headline = _clean(d, "headline", source, 60)
+    emphasis = str(d.get("emphasis", "")).strip()
+    if not headline or len(headline.split()) > 7:
+        return None
+    if emphasis and emphasis.lower() not in headline.lower():
+        emphasis = ""
+    person, holding, setting = (str(d.get(k, "")).strip() for k in ("person", "holding", "setting"))
+    if not person or not setting:
+        return None
+    return {"headline": headline, "emphasis": emphasis or None,
+            "description": _clean(d, "description", source, 140) or None,
+            "cta_lead": str(d.get("cta_lead", "")).strip()[:30] or None,
+            "person": person, "holding": holding or "smiling warmly", "setting": setting}
+
+
+async def _build_portrait_headline(business_name: str, category: str, description: str, tokens: dict,
+                                   photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                   brand_context: Optional[dict] = None):
+    from .ad_formats import portrait_headline
+    from .ad_formats._type import brand_pair
+    content = await _content_portrait_headline(business_name, category, description, brand_context)
+    if not content:
+        return None
+    # photo_url here is only ever the owner's own attested photo (see _FORMATS_NOT_FOR_PERSON):
+    # their real photo is used whole. Otherwise a person is generated for the situation.
+    scene = photo_url or await _gen_person_scene(
+        portrait_headline.scene_prompt(content["person"], content["holding"], content["setting"]), brand_context)
+    if not scene:
+        return None
+    style = _poster_style(brand_context, tokens, portrait_headline.DEFAULT_FAMILY)
+    main, second = brand_pair((brand_context or {}).get("brand_colors"), tokens)
+    target = _brand_website(brand_context) or _brand_handle(brand_context)[0] or None
+    try:
+        return portrait_headline.build_document(
+            scene, content["headline"], content["emphasis"], content["description"],
+            content["cta_lead"] if target else None, target, canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url, brand_name=business_name, headline_font=style["headline_font"],
+            brand_color=main, second_color=second,
+        )
+    except Exception as e:
+        print(f"[VSG01] Portrait + Headline build failed: {e}", flush=True)
+        return None
+
+
+async def _content_floating_cards(business_name: str, category: str, description: str,
+                                  brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}:\n"
+        "Write a lifestyle ad where two small app-style cards float over a photo of someone using the "
+        "product or service, like pieces of its screen.\n"
+        "Return JSON with:\n"
+        "- headline: 4-8 words naming the customer's worry or the promise (e.g. 'Running out of stock "
+        "shouldn't surprise you.')\n"
+        "- subline: 3-8 words (e.g. 'Know what's selling, know what's left.')\n"
+        "- card_one: {\"label\": 2-4 words, \"value\": 1-3 words} — something the product shows or does "
+        "(e.g. {\"label\": \"Next appointment\", \"value\": \"Reminder sent\"})\n"
+        "- card_two: {\"text\": 2-4 words, \"status\": 1-3 words} — a row with a status tag (e.g. "
+        "{\"text\": \"Patient record saved\", \"status\": \"Synced\"})\n"
+        f"- cta_line: 3-7 words ending with the business name, e.g. 'Track your inventory with "
+        f"{business_name or 'us'}.'\n"
+        "- person: a generic description of who is in the photo, suiting this business — never named\n"
+        "- device: 'a laptop on her lap' or 'a phone in his hand' or similar\n"
+        "- setting: where they are, a few words\n"
+        "No numbers, prices or percentages anywhere unless that exact figure appears above. Return ONLY "
+        "the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    source = _brand_source(description, brand_context)
+    headline = _clean(d, "headline", source, 70)
+    cta = _clean(d, "cta_line", source, 50)
+    person, device, setting = (str(d.get(k, "")).strip() for k in ("person", "device", "setting"))
+    if not headline or not cta or not person or not setting:
+        return None
+    c1, c2 = d.get("card_one") or {}, d.get("card_two") or {}
+    card_one = (_clean(c1, "label", source, 28), _clean(c1, "value", source, 22)) if isinstance(c1, dict) else None
+    card_two = (_clean(c2, "text", source, 30), _clean(c2, "status", source, 18)) if isinstance(c2, dict) else None
+    return {"headline": headline, "subline": _clean(d, "subline", source, 60) or None,
+            "card_one": card_one if card_one and all(card_one) else None,
+            "card_two": card_two if card_two and card_two[0] else None,
+            "cta_line": cta, "person": person, "device": device or "a laptop", "setting": setting}
+
+
+async def _build_floating_cards(business_name: str, category: str, description: str, tokens: dict,
+                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                brand_context: Optional[dict] = None):
+    from .ad_formats import floating_cards
+    from .ad_formats._type import brand_pair
+    content = await _content_floating_cards(business_name, category, description, brand_context)
+    if not content:
+        return None
+    scene = await _gen_person_scene(
+        floating_cards.scene_prompt(content["person"], content["device"], content["setting"]), brand_context)
+    if not scene:
+        return None
+    style = _poster_style(brand_context, tokens, floating_cards.DEFAULT_FAMILY)
+    main, second = brand_pair((brand_context or {}).get("brand_colors"), tokens)
+    try:
+        return floating_cards.build_document(
+            scene, content["headline"], content["subline"], content["card_one"], content["card_two"],
+            content["cta_line"], _brand_website(brand_context) or None, canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url, headline_font=style["headline_font"], brand_color=main,
+            second_color=second,
+        )
+    except Exception as e:
+        print(f"[VSG01] Floating Cards build failed: {e}", flush=True)
+        return None
+
+
+async def _content_enrol_signup(business_name: str, category: str, description: str,
+                                brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}:\n"
+        "Is the text inviting people to ENROL, APPLY, REGISTER or SIGN UP — a school, course, programme, "
+        "admission, cohort, class intake, membership or similar? If not, return {\"is_signup\": false}.\n"
+        "If it is, return JSON with:\n"
+        "- is_signup: true\n"
+        "- kicker: 3-5 words above the headline (e.g. 'Your Future Begins Here')\n"
+        "- headline: 2-5 words, bold, set in capitals (e.g. 'Campus, Career & Beyond')\n"
+        "- side_line: 2-5 words beside the headline, or \"\"\n"
+        "- button: 2-4 words, e.g. 'Secure your seat', 'Apply now', 'Join the next cohort'\n"
+        "- person: a generic description of a happy learner or member who suits this business — never "
+        "named\n"
+        "- setting: where they are (e.g. 'a university campus', 'a bright training centre')\n"
+        "- doing: what they're doing (e.g. 'with a laptop on her lap')\n"
+        "Never invent a date, price, deadline or number. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not d.get("is_signup"):
+        return None
+    source = _brand_source(description, brand_context)
+    headline = _clean(d, "headline", source, 40)
+    button = _clean(d, "button", source, 28)
+    person, setting = str(d.get("person", "")).strip(), str(d.get("setting", "")).strip()
+    if not headline or not button or not person or not setting:
+        return None
+    return {"kicker": _clean(d, "kicker", source, 40) or None, "headline": headline,
+            "side_line": _clean(d, "side_line", source, 36) or None, "button": button, "person": person,
+            "setting": setting, "doing": str(d.get("doing", "")).strip() or "smiling"}
+
+
+async def _build_enrol_signup(business_name: str, category: str, description: str, tokens: dict,
+                              photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                              brand_context: Optional[dict] = None):
+    from .ad_formats import enrol_signup
+    content = await _content_enrol_signup(business_name, category, description, brand_context)
+    if not content:
+        return None
+    scene = await _gen_person_scene(
+        enrol_signup.scene_prompt(content["person"], content["setting"], content["doing"]), brand_context)
+    if not scene:
+        return None
+    style = _poster_style(brand_context, tokens, enrol_signup.DEFAULT_FAMILY)
+    try:
+        return enrol_signup.build_document(
+            scene, content["kicker"], content["headline"], content["side_line"], content["button"],
+            _contacts_in(description, brand_context), _brand_website(brand_context) or None,
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url, **style,
+        )
+    except Exception as e:
+        print(f"[VSG01] Enrol / Sign-up build failed: {e}", flush=True)
+        return None
+
+
+async def _content_billboard_statement(business_name: str, category: str, description: str,
+                                       brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}:\n"
+        "Write ONE bold billboard statement — a short, confident truth this business stands for, the "
+        "kind that stops people on the road (e.g. 'Posting is not Marketing').\n"
+        "Return JSON with:\n"
+        "- statement: 3-6 words\n"
+        "- highlight: 1-3 consecutive words copied exactly from the statement, the turn of the line "
+        "(e.g. 'is not')\n"
+        "- subline: 4-9 words that follow it up (e.g. 'Take your business to the next level.')\n"
+        "- sub_emphasis: the last 1-3 words of the subline, copied exactly\n"
+        "No numbers, prices, guarantees or claims about competitors, and nothing the text above doesn't "
+        "support. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    source = _brand_source(description, brand_context)
+    statement = _clean(d, "statement", source, 48)
+    if not statement or len(statement.split()) > 7:
+        return None
+    highlight = str(d.get("highlight", "")).strip()
+    if highlight and highlight.lower() not in statement.lower():
+        highlight = ""
+    subline = _clean(d, "subline", source, 70)
+    sub_emphasis = str(d.get("sub_emphasis", "")).strip()
+    if sub_emphasis and sub_emphasis.lower() not in subline.lower():
+        sub_emphasis = ""
+    return {"statement": statement, "highlight": highlight or None, "subline": subline or None,
+            "sub_emphasis": sub_emphasis or None}
+
+
+async def _billboard_scene(panel_hex: str, brand_context: Optional[dict]):
+    """(scene_url, panel box on the canvas, measured panel colour) — two tries, or None."""
+    import io as _io
+    import httpx
+    from PIL import Image
+    from .ad_formats import billboard_statement
+    for attempt in (1, 2):
+        try:
+            url = await generate_scene(billboard_statement.scene_prompt(panel_hex),
+                                       size=f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}", brand_context=None)
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            im = Image.open(_io.BytesIO(resp.content)).convert("RGB").resize(_CANVAS_SIZE)
+            found = billboard_statement.find_panel(im, panel_hex)
+            if found:
+                return url, found[0], found[1]
+            print(f"[VSG01] Billboard: no clean blank face found (attempt {attempt}/2)", flush=True)
+        except Exception as e:
+            print(f"[VSG01] Billboard scene failed (attempt {attempt}/2): {e}", flush=True)
+    return None
+
+
+async def _build_billboard_statement(business_name: str, category: str, description: str, tokens: dict,
+                                     photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                     brand_context: Optional[dict] = None):
+    from .ad_formats import billboard_statement
+    from .ad_formats._type import brand_pair
+    content = await _content_billboard_statement(business_name, category, description, brand_context)
+    if not content:
+        return None
+    main, second = brand_pair((brand_context or {}).get("brand_colors"), tokens)
+    found = await _billboard_scene(main, brand_context)
+    if not found:
+        return None
+    scene, box, panel = found
+    style = _poster_style(brand_context, tokens, billboard_statement.DEFAULT_FAMILY)
+    try:
+        return billboard_statement.build_document(
+            scene, box, panel, content["statement"], content["highlight"], content["subline"],
+            content["sub_emphasis"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+            website=_brand_website(brand_context) or None, headline_font=style["headline_font"],
+            second_color=second if second.upper() != main.upper() else None,
+        )
+    except Exception as e:
+        print(f"[VSG01] Billboard Statement build failed: {e}", flush=True)
+        return None
+
+
+async def _content_ai_answer(business_name: str, category: str, description: str,
+                             brand_context: Optional[dict] = None) -> Optional[dict]:
+    if not (description or "").strip() or not business_name:
+        return None
+    services = (brand_context or {}).get("key_products_services") or []
+    if isinstance(services, str):
+        services = [services]
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}"
+        f"{(' — services: ' + '; '.join(map(str, services))) if services else ''}:\n"
+        "The ad looks like a chat with an AI assistant: a customer asks a real question, and the "
+        "answer gives genuinely useful advice, then says what this business offers.\n"
+        "Return JSON with:\n"
+        "- question: the customer's question as they'd type it, casual and lowercase, 8-16 words "
+        "(e.g. 'i'm a nigerian student with my course picked. what do i sort out next?')\n"
+        "- advice: ONE sentence of real, general advice that answers it, 12-22 words, no business "
+        "named\n"
+        f"- offer: ONE plain sentence, 10-20 words, starting with '{business_name}', saying what it "
+        "offers — only services named above, no praise, no 'best', no numbers\n"
+        "Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    source = _brand_source(description, brand_context)
+    question = str(d.get("question", "")).strip()
+    advice = _clean(d, "advice", source, 170)
+    offer = _clean(d, "offer", source, 150)
+    if not question or not advice or not offer or business_name.lower() not in offer.lower():
+        return None
+    if re.search(r"\b(best|number one|no\.? ?1|#1|guarantee)", offer.lower()):
+        return None
+    return {"question": question[:110], "advice": advice, "offer": offer}
+
+
+async def _build_ai_answer(business_name: str, category: str, description: str, tokens: dict,
+                           photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                           brand_context: Optional[dict] = None):
+    from .ad_formats import ai_answer
+    content = await _content_ai_answer(business_name, category, description, brand_context)
+    if not content:
+        return None
+    try:
+        return ai_answer.build_document(content["question"], content["advice"], content["offer"],
+                                        canvas_size=_CANVAS_SIZE, tokens=tokens)
+    except Exception as e:
+        print(f"[VSG01] AI Answer build failed: {e}", flush=True)
+        return None
+
+
 _BUILDERS = {
     "SEED-075": _build_us_vs_them,
     "SEED-087": _build_borrowed_interface,
@@ -2280,6 +2744,11 @@ _BUILDERS = {
     "SEED-099": _build_event_promo,
     "SEED-100": _build_offer_spotlight,
     "SEED-101": _build_problems_vs_solution,
+    "SEED-102": _build_portrait_headline,
+    "SEED-103": _build_floating_cards,
+    "SEED-104": _build_enrol_signup,
+    "SEED-105": _build_billboard_statement,
+    "SEED-106": _build_ai_answer,
 }
 
 
@@ -2293,6 +2762,11 @@ _BUILDERS = {
 _PERSON_ATTRIBUTES_BY_FORMAT = {
     "SEED-082": (True, True),
     "SEED-074": (True, True),
+    # The second poster set shows a generated person (Portrait + Headline may also use the
+    # owner's own photo, which this static table can't tell apart).
+    "SEED-102": (True, False),
+    "SEED-103": (True, False),
+    "SEED-104": (True, False),
 }
 
 
@@ -2374,10 +2848,12 @@ PHOTO_ATTESTATIONS = ("product_photo", "real_customer_photo", "owner_photo")
 _FORMATS_NOT_FOR_PERSON = {
     # Event Promo presents the person as the event's host and Problems vs Solution presents
     # the photo as the product, so neither may take a customer's photo.
-    "real_customer_photo": frozenset({"SEED-082", "SEED-099", "SEED-101"}),
+    # Portrait + Headline lays the business's own headline across the person, so it takes the
+    # owner's photo but never a customer's (the words would read as theirs) or a product photo.
+    "real_customer_photo": frozenset({"SEED-082", "SEED-099", "SEED-101", "SEED-102"}),
     "owner_photo": frozenset({"SEED-074", "SEED-101"}),
-    # A product photo is not a host.
-    "product_photo": frozenset({"SEED-099"}),
+    # A product photo is not a host, nor a portrait.
+    "product_photo": frozenset({"SEED-099", "SEED-102"}),
 }
 
 
@@ -2502,6 +2978,21 @@ async def select_and_render_vsg01_creative(
             [s for s in ranked if s.strategy_id == effective_forced]
             + [s for s in ranked if s.strategy_id != effective_forced]
         )
+
+    # The poster formats show the brand's real handle (with the networks it's on) and its saved
+    # WhatsApp number — read once here, only when a ranked format can use them.
+    ranked_now = {s.strategy_id for s in ranked}
+    if db is not None and ranked_now & {"SEED-099", "SEED-100", "SEED-102", "SEED-104"}:
+        extra = {}
+        if "_social_handles" not in (brand_context or {}):
+            extra["_social_handles"] = await _load_social_handles(db, brand_context)
+        if "SEED-104" in ranked_now and "_whatsapp_number" not in (brand_context or {}):
+            try:
+                from .whatsapp import get_brand_whatsapp
+                extra["_whatsapp_number"] = await get_brand_whatsapp(db, (brand_context or {}).get("brand_id"))
+            except Exception as e:
+                print(f"[VSG01] WhatsApp number lookup failed: {e}", flush=True)
+        brand_context = {**(brand_context or {}), **extra}
 
     business_id = str((brand_context or {}).get("brand_id") or (brand_context or {}).get("user_id") or business_name)
     for strategy in ranked:

@@ -82,8 +82,13 @@ assumed to work.
 from typing import List
 
 from .ad_formats import (
+    ai_answer,
+    billboard_statement,
+    enrol_signup,
     event_promo,
+    floating_cards,
     offer_spotlight,
+    portrait_headline,
     problems_vs_solution,
     borrowed_interface,
     censored_item,
@@ -351,6 +356,68 @@ _RECORDS = [
         modification_required="Frustrations in the customer's plain words, outcomes stated as "
                                "results, no invented figures; the product is only ever the real, "
                                "photographed product.",
+        funnel_stages=["awareness", "consideration"],
+    ),
+    dict(
+        format_module=portrait_headline,
+        claim="Use when a warm, human face says what the business is about — farms, food, beauty, "
+              "care, any business whose promise is personal.",
+        mechanism="A smiling person fills the frame and the big headline runs across them, so the "
+                  "promise reads as a person's, not a company's; the two-tone pill makes the next "
+                  "step (where to buy) impossible to miss.",
+        business_types=["Food, farms, beauty, wellness, fashion, care and personal services"],
+        modification_required="The person is generated for the situation or is the owner's own "
+                               "photo, never a customer's; headline and description only from the "
+                               "business's own words; no invented figures.",
+        funnel_stages=["awareness", "consideration"],
+    ),
+    dict(
+        format_module=floating_cards,
+        claim="Use for an app, software or service whose value shows on a screen — tracking, "
+              "bookings, reminders, records, dashboards.",
+        mechanism="Someone at ease with the product, with pieces of its screen floating beside "
+                  "them, shows the result before anyone reads a word; the headline names the worry "
+                  "the product removes.",
+        business_types=["Apps, software, SaaS, fintech, booking and management tools"],
+        modification_required="Cards show what the product does in the business's own words, with no "
+                               "figure it didn't give; the person is generated, never a named customer.",
+        funnel_stages=["awareness", "consideration"],
+    ),
+    dict(
+        format_module=enrol_signup,
+        claim="Use for enrolment, admissions, registration, a course intake or a membership sign-up.",
+        mechanism="A happy learner or member makes the future feel near; the big capitals headline "
+                  "and the 'secure your seat' button make it one step, and the real phone number and "
+                  "email remove the last doubt.",
+        business_types=["Schools, colleges, training centres, academies, bootcamps, gyms and clubs"],
+        modification_required="Contact details are only the business's own; no invented dates, "
+                               "deadlines, prices or places left; the person is generated.",
+        funnel_stages=["conversion", "consideration"],
+    ),
+    dict(
+        format_module=billboard_statement,
+        claim="Use for one bold, confident statement the business stands for.",
+        mechanism="A real-looking roadside billboard gives a single line public weight; the "
+                  "highlighted turn of the phrase is what people remember.",
+        business_types=["Any business with a clear point of view — agencies, consultants, "
+                        "coaches, brands"],
+        modification_required="The statement is the business's own view, with no figures, "
+                               "guarantees or claims about competitors; every word is set by our "
+                               "renderer, never painted by the image model.",
+        funnel_stages=["awareness"],
+    ),
+    dict(
+        format_module=ai_answer,
+        claim="Use when customers have a real question the business answers — what to do next, how "
+              "to choose, where to start.",
+        mechanism="People already ask AI assistants these questions; seeing their own question "
+                  "answered with useful advice, then the business that does it, feels like a tip, "
+                  "not an ad.",
+        business_types=["Services people research first — education, travel, health, finance, "
+                        "consulting"],
+        modification_required="A generic chat look with no real AI product's name, logo or styling, "
+                               "so no third-party endorsement is implied; the answer only states "
+                               "what the business offers.",
         funnel_stages=["awareness", "consideration"],
     ),
 ]
