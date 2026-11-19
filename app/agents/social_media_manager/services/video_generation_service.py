@@ -994,6 +994,10 @@ class VideoGenerationService:
             # Faces melt and morph in image-to-video unless told to hold still; the talking models are driven by
             # the voice, not this prompt.
             prompt = with_face_stability(prompt)
+            # Who any person or hand in the clip is, from the brief (set on every scene by the script step), so a
+            # hand or face the video model adds is not its default.
+            from app.agents.social_media_manager.services.brand_brief import scene_people_line
+            prompt += scene_people_line(scene)
         spoken = (scene.get("dialogue") or "").strip()
         if spoken and model in _SPEECH_IN_PROMPT_MODELS:
             prompt = with_spoken_line(prompt, spoken)

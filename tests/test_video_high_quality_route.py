@@ -129,3 +129,13 @@ def test_other_outcomes_still_fall_back_when_the_first_model_fails(monkeypatch):
     col, used = _run_job(monkeypatch, "quick_video", failing={V._H3_TURBO})
     assert used == [V._H3_TURBO, V._H3_TURBO, V._PIXVERSE]      # the first model gets a second try before the fallback
     assert col.clips[0]["fallback_used"] is True and col.clips[0]["routed_model"] == V._PIXVERSE
+
+
+def test_a_clip_is_told_who_any_person_or_hand_in_it_is(sent):
+    # Set on every scene by the script step: a hand or face the video model adds follows the brief, not a default.
+    scene = {"scene_number": 1, "frame_image_url": "https://img/f.png", "duration_seconds": 5,
+             "video_prompt": "A handbag on a table", "people_look": "Black Nigerian people from Lagos"}
+    with pytest.raises(_Stop):
+        _run(V.VideoGenerationService._generate_scene_fal(scene, OMNI, V.DEFAULT_AVATAR_VOICE, "job1"))
+    assert sent[-1][1]["prompt"].startswith("A handbag on a table")
+    assert "Any person, face, hand or body part that appears in this shot: Black Nigerian people from Lagos." in sent[-1][1]["prompt"]

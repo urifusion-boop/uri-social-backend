@@ -535,3 +535,118 @@ def test_without_owner_instructions_the_prompts_are_unchanged(monkeypatch):
     assert "brand owner's own rules" not in prompt
     _, fake = _describe_it(monkeypatch, {})
     assert "FOR THE PICTURES" not in _user_prompt(fake)
+
+
+# ── the people on screen are the people the brief asked for ────────────────
+# Skin tone was left to chance. On prod (a Playbook that avoids people, and a brief with no PERSON line but a
+# "Warm female Nigerian voiceover") the script described nobody, and the picture model drew its default, a white
+# person, for a Lagos brand. Now: the brief's own cues first, the brand's market only when the brief is silent,
+# and every scene carries it to the scene image and the clip.
+
+HANDBAG_BRIEF = (
+    "CONCEPT: A plain handbag sits on a simple table.\nSTYLE: Before / After.\n"
+    "SCENE 1 (0-5s): An ordinary handbag on a simple table. Says exactly: \"Your product might not be the problem.\"\n"
+    "SOUND: Warm female Nigerian voiceover, gentle background music.\n"
+)
+
+
+def test_the_script_writer_is_told_to_take_the_people_from_the_brief_first(monkeypatch):
+    _, fake = _describe_it(monkeypatch, _visual_bc(), target_platform="instagram_reels")
+    prompt = _user_prompt(fake)
+    assert "WHO APPEARS (people_look)" in prompt
+    rule = prompt.split("WHO APPEARS (people_look)", 1)[1]
+    assert "PERSON line first" in rule and "Nigerian voiceover" in rule and "even a single hand" in rule
+    assert "Black African people" in rule                                  # only as the fallback
+    assert "not whether people appear" in rule                             # "no people" in the Playbook still wins
+    assert '"people_look"' in fake.calls[0]["messages"][0]["content"]      # asked for in the JSON
+
+
+def test_the_script_writers_own_people_look_is_kept_and_put_on_every_scene():
+    sb = {"people_look": "a warm Nigerian woman in her 30s", "scenes": [{"scene_number": 1}, {"scene_number": 2}]}
+    bb.apply_people_look(sb, _bc())
+    assert [s["people_look"] for s in sb["scenes"]] == ["a warm Nigerian woman in her 30s"] * 2
+
+
+def test_without_a_people_look_every_scene_gets_the_brands_market():
+    sb = {"scenes": [{"scene_number": 1}]}
+    bb.apply_people_look(sb, _bc())
+    assert "Black African people" in sb["people_look"] and "Lagos" in sb["scenes"][0]["people_look"]
+
+
+def test_the_describe_it_storyboard_comes_back_with_people_on_every_scene(monkeypatch):
+    result, _ = _describe_it(monkeypatch, _visual_bc(), target_platform="instagram_reels")
+    scenes = result["storyboard"]["scenes"]
+    assert scenes and all("Black African people" in s["people_look"] for s in scenes)
+
+
+def test_every_scene_image_draws_the_scenes_people_first_and_chained(monkeypatch):
+    for prev in (None, "https://cdn.test/prev.png"):
+        scene = {"scene_number": 1, "shot_type": "product_hero", "video_prompt": "A handbag on a table",
+                 "motion": "push in", "people_look": "a warm Nigerian woman in her 30s"}
+        _, prompt = _frame(monkeypatch, _visual_bc(), prev=prev, scene=scene)
+        assert "Any person, face, hand or body part that appears in this shot: a warm Nigerian woman" in prompt
+
+
+def test_a_scene_image_without_people_look_falls_back_to_the_brands_market(monkeypatch):
+    _, prompt = _frame(monkeypatch, _bc())
+    assert "hand or body part that appears in this shot is one of the Black African people" in prompt
+
+
+def test_the_photo_storyboard_frame_carries_the_scenes_people():
+    from app.agents.social_media_manager.services.video_storyboard_service import _scene_people
+    assert "a warm Nigerian woman" in _scene_people({"people_look": "a warm Nigerian woman"})
+    assert _scene_people({}) == ""
+
+
+def test_the_photo_storyboard_script_gets_the_same_people_rule(monkeypatch):
+    captured = {}
+
+    class FakeModels:
+        def generate_content(self, model, contents, config):
+            captured["text"] = contents[0].text
+            return SimpleNamespace(text=json.dumps(SCRIPT))
+
+    class _Part:
+        def __init__(self, text=None):
+            self.text = text
+
+        @staticmethod
+        def from_text(text):
+            return _Part(text)
+
+        @staticmethod
+        def from_bytes(data, mime_type):
+            return _Part()
+
+    monkeypatch.setattr(vss, "genai_types", SimpleNamespace(Part=_Part, GenerateContentConfig=lambda **kw: kw),
+                        raising=False)
+    monkeypatch.setattr(vss, "_gemini_client", SimpleNamespace(models=FakeModels()))
+    image = "data:image/png;base64," + base64.b64encode(b"x" * 16).decode()
+    result = _run(vss.VideoStoryboardService.generate_storyboard(
+        brand_images=[image], optional_text="lunch combo", brand_context=_bc(), target_platform="tiktok"))
+    assert "WHO APPEARS (people_look)" in captured["text"]
+    assert all("Black African people" in s["people_look"] for s in result["storyboard"]["scenes"])
+
+
+@pytest.mark.parametrize("region", ["West Africa, Nigeria", "Lagos", "Accra, Ghana", "Nairobi"])
+def test_african_markets_fall_back_to_black_african_people(region):
+    assert "Black African people" in bb.market_people({"region": region})
+
+
+def test_another_market_falls_back_to_its_own_locals():
+    rule = bb.market_people({"region": "London, UK"})
+    assert "locals of the brand's market (London, UK)" in rule and "Black African" not in rule
+
+
+def test_a_brand_with_no_market_falls_back_to_black_african_people(monkeypatch):
+    for bc in ({}, None, {"region": "  "}):
+        assert "Black African people (Nigerian unless the brief says otherwise)" in bb.market_people(bc)
+    sb = {"scenes": [{"scene_number": 1}]}
+    assert "Black African people" in bb.apply_people_look(sb, {})["scenes"][0]["people_look"]
+    _, prompt = _frame(monkeypatch, None)
+    assert "hand or body part that appears in this shot is one of the Black African people" in prompt
+
+
+def test_the_brief_still_wins_over_the_default_when_there_is_no_market():
+    sb = {"people_look": "a white expat chef in his 50s", "scenes": [{"scene_number": 1}]}
+    assert bb.apply_people_look(sb, {})["scenes"][0]["people_look"] == "a white expat chef in his 50s"

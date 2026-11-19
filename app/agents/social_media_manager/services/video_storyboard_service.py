@@ -87,6 +87,7 @@ Return ONLY valid JSON — no markdown fences, no explanation:
   "total_duration_seconds": <int>,
   "target_platform": "<string>",
   "aspect_ratio": "9:16",
+  "people_look": "<who anyone on screen is, even a hand: from the brief, see WHO APPEARS>",
   "scenes": [
     {
       "scene_number": <int>,
@@ -237,6 +238,11 @@ def _storyboard_jobs_collection():
     return get_db()["storyboard_jobs"]
 
 
+def _scene_people(scene: dict) -> str:
+    from . import brand_brief
+    return brand_brief.scene_people_line(scene)
+
+
 class VideoStoryboardService:
 
     @staticmethod
@@ -301,6 +307,8 @@ class VideoStoryboardService:
                 "picture, and keep the lower third of the frame calm and uncluttered. " if text else "")
                 + "Keep the brand product, colors, and visual identity exactly as shown. "
                 "Photorealistic, dramatic lighting. Vertical 9:16 composition."
+                # Who any person or hand in the shot is (set on every scene by the script step).
+                + _scene_people(scene)
             )
 
             img_file = BytesIO(img_bytes)
@@ -484,6 +492,9 @@ class VideoStoryboardService:
                 preamble_lines.append(_brief)
             preamble_lines.append("")
             preamble_lines.append(brand_brief.visual_branding_rule(brand_context))
+            _people = brand_brief.people_look_rule(brand_context)
+            if _people:
+                preamble_lines.append(_people)
             _visual = brand_brief.video_visual_rules(brand_context, _platform)
             if _visual:
                 preamble_lines.append("")
@@ -533,6 +544,8 @@ class VideoStoryboardService:
 
         # The Playbook's word rules, guaranteed on what viewers read and hear.
         brand_brief.enforce_video_script(storyboard, brand_context)
+        # Who the people are, on every scene, so the pictures and clips follow the brief, not a default.
+        brand_brief.apply_people_look(storyboard, brand_context)
 
         return {"status": True, "storyboard": storyboard}
 
