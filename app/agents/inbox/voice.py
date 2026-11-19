@@ -109,7 +109,7 @@ def normalize_profile(raw: Optional[dict]) -> dict:
     sales = raw.get("sales") or {}
     situ = raw.get("situational") or {}
     allowed = [a for a in (lang.get("allowed") or ["en"]) if a in ("en", "en-NG", "pcm")] or ["en"]
-    default = lang.get("default") if lang.get("default") in ("en", "en-NG") else "en"
+    default = lang.get("default") if lang.get("default") in ("en", "en-NG", "pcm") else "en"
     if default not in allowed:
         allowed = [default] + allowed
     pidgin = lang.get("pidgin") if lang.get("pidgin") in ("switch", "light", "english", "ask") \
@@ -471,6 +471,13 @@ def language_rule(p: Optional[dict], customer_language: str) -> tuple[str, bool]
     if not p:
         return ENGLISH_RULE, False
     lang = p["language"]
+    if lang["default"] == "pcm":
+        degree = {"light": "light, easy-to-read", "moderate": "natural",
+                  "full": "full"}[lang["pidgin_degree"]]
+        examples = "; ".join(f'"{e}"' for e in lang.get("pidgin_examples") or [])
+        sample = f" Examples of how the business writes Pidgin (style only): {examples}." if examples else ""
+        return (f"Always reply in {degree} Nigerian Pidgin, whatever language the customer writes in — "
+                f"respectful, natural, never a caricature. Keep every fact exact.{sample}"), True
     base = NIGERIAN_ENGLISH_RULE if lang["default"] == "en-NG" else ENGLISH_RULE
     if customer_language != "pcm" or "pcm" not in lang["allowed"]:
         return base, False

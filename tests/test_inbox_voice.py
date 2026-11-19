@@ -384,3 +384,10 @@ def test_without_a_voice_the_agent_behaves_as_before():
 def test_follow_up_ids_are_all_defined():
     for q in FOLLOW_UPS.values():
         assert q["id"] in FOLLOW_UPS
+
+
+def test_a_pidgin_default_replies_in_pidgin_even_to_english():
+    p = voice.normalize_profile({"language": {"default": "pcm", "allowed": ["pcm"],
+                                              "pidgin_degree": "moderate"}})
+    rule, pidgin = voice.language_rule(p, "en")
+    assert pidgin and "Always reply in natural Nigerian Pidgin" in rule
