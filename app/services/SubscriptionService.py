@@ -130,7 +130,9 @@ class SubscriptionService:
         ("agency", "Agency Plan", 120000, 220, ["AI Image Generation", "Multi-platform Formatting", "Dedicated Support",
                                                  "Advanced Analytics", "Team Collaboration", "White Label Options"]),
     ]
-    CUSTOM_PRICE_PER_CREDIT = 750
+    # A credit bought on its own costs what a credit costs on the entry plan (Starter: ₦30,000 ÷ 45 = ₦667), so
+    # it always lines up with the plans and a plan is never worse value than buying credits one by one.
+    CUSTOM_PRICE_PER_CREDIT = round(PLANS[0][2] / PLANS[0][3])
     # What a plan sync may change (never timestamps or anything else stored on the plan).
     _PLAN_FIELDS = ("name", "price_ngn_monthly", "price_ngn_3months", "price_ngn_6months", "price_ngn_12months",
                     "credits_monthly", "price_ngn", "credits", "price_per_credit", "features", "is_active")
@@ -160,7 +162,7 @@ class SubscriptionService:
             price_ngn_monthly=c, price_ngn_3months=c, price_ngn_6months=c, price_ngn_12months=c,
             credits_monthly=1,
             price_ngn=c, credits=1, price_per_credit=c,
-            features=["Pay Per Credit", f"₦{c:,} per credit", "All Features Included", "No Monthly Commitment"],
+            features=["Pay Per Credit", "Any amount", "All Features Included", "No Monthly Commitment"],
             is_active=True,
         ))
         return tiers
@@ -189,7 +191,7 @@ class SubscriptionService:
         Sections 5, 6, 7: Multi-duration subscription model with 5% discount
 
         Monthly pricing: see PLANS above (Starter ₦30,000 / 45 credits, Growth ₦45,000 / 75,
-        Pro ₦75,000 / 130, Agency ₦120,000 / 220; Custom ₦750 per credit).
+        Pro ₦75,000 / 130, Agency ₦120,000 / 220; Custom credits at the Starter rate).
 
         Multi-month pricing applies 5% discount on total (not on credits)
         """

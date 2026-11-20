@@ -74,18 +74,43 @@ def _sent(monkeypatch):
     return sent
 
 
-@pytest.mark.parametrize("before,after,expected", [
-    (5, 4, []),                       # still above the low level
-    (4, 3, ["credits_low"]),          # reaches the low level: told once
-    (3, 2, []),                       # already low: not told again on every deduction
-    (1, 0, ["credits_exhausted"]),    # runs out
-    (6, 0, ["credits_exhausted"]),    # a 6-credit video taking the last six: out, not "low"
+@pytest.mark.parametrize("tier,before,after,expected", [
+    ("starter", 6, 5, ["credits_low"]),       # Starter 45 → low at 5 (10%, rounded up)
+    ("starter", 7, 6, []),                    # still above 5
+    ("starter", 5, 4, []),                    # already low: not told again
+    ("agency", 23, 22, ["credits_low"]),      # Agency 220 → low at 22
+    ("growth", 9, 8, ["credits_low"]),        # Growth 75 → 8
+    ("pro", 14, 13, ["credits_low"]),         # Pro 130 → 13
+    ("starter", 1, 0, ["credits_exhausted"]), # runs out
+    ("starter", 9, 0, ["credits_exhausted"]), # a big charge taking the last credits: out, not "low"
 ])
-def test_customers_are_told_once_when_credits_run_low_and_when_they_run_out(monkeypatch, before, after, expected):
-    from app.services.CreditService import notify_balance_crossing
+def test_customers_are_told_once_at_10_percent_of_their_plan_and_when_they_run_out(monkeypatch, tier, before, after, expected):
+    from app.services.CreditService import monthly_credits_for, notify_balance_crossing
     sent = _sent(monkeypatch)
-    asyncio.get_event_loop().run_until_complete(notify_balance_crossing(None, "u1", before, after))
+    asyncio.get_event_loop().run_until_complete(
+        notify_balance_crossing(None, "u1", before, after, monthly_credits=monthly_credits_for(tier)))
     assert sent == expected
+
+
+def test_the_trial_is_told_when_its_last_credit_is_left():
+    from app.services.CreditService import low_balance_level
+    assert low_balance_level(10) == 1
+
+
+def test_custom_credits_cost_the_starter_rate_and_the_rate_is_not_shown():
+    from app.services.PaymentService import PaymentService
+    tiers = _tiers()
+    assert PaymentService.CUSTOM_CREDIT_PRICE_NGN == tiers["starter"].price_per_credit == 667
+    assert tiers["custom"].price_per_credit == 667
+    assert not any("₦" in f for f in tiers["custom"].features)
+
+
+def test_existing_subscribers_get_the_new_credits_at_renewal_not_before():
+    # The plan sync only edits the stored plans; renewal reads the plan as it is then.
+    import inspect
+    from app.services.SubscriptionService import SubscriptionService as S
+    assert "user_credits" not in inspect.getsource(S.sync_tiers_to_defaults)
+    assert "get_tier_by_id" in inspect.getsource(S.renew_subscription)
 
 
 def test_both_alerts_are_always_on():
