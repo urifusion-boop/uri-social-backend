@@ -3364,6 +3364,8 @@ Answer with exactly one word: "yes" or "no"."""
         supported by the API, just never exercised since every caller here used
         to pass exactly one image.
         """
+        from app.utils.image_usage import bump as _count_image_call
+        _count_image_call()
         import base64 as _b64
         import io
 

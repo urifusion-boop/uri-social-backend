@@ -354,6 +354,45 @@ def _keyword_content_fit_boost(description: str) -> dict[str, float]:
     return {fid: 1.0 for fid, phrases in _CONTENT_FIT_SIGNALS.items() if any(p in text for p in phrases)}
 
 
+# Styles that may only state facts the brief itself gives (they never invent a date, offer, price or
+# quote), each with the fact it needs and how that's said to the client.
+FACT_NEEDS: dict[str, tuple[str, str]] = {
+    "SEED-099": ("event_with_date", "Needs an event with a date in your brief"),
+    "SEED-100": ("offer", "Needs a real offer or discount in your brief"),
+    "SEED-104": ("signup", "Needs a course, intake or registration in your brief"),
+    "SEED-096": ("price", "Needs a price in your brief"),
+    "SEED-081": ("item_prices", "Needs items with their prices in your brief"),
+    "SEED-093": ("customer_quote", "Needs a real customer quote in your brief"),
+    "SEED-074": ("customer_quote", "Needs a real customer quote in your brief"),
+}
+
+
+async def brief_unmet_needs(description: str) -> dict[str, str]:
+    """{format_id: reason} for the fact-led styles this brief can't support, asked BEFORE generation
+    so the Style step can say so up front (each style's own content step refuses the same briefs,
+    and the client only found out afterwards: "Couldn't build Event Promo for this one").
+    One content-model call; any failure returns {} so nothing is ever blocked by an outage."""
+    text = (description or "").strip()
+    if not text:
+        return {fid: reason for fid, (_, reason) in FACT_NEEDS.items()}
+    d = await _call_content_model(
+        f"A business wrote this ad brief:\n\n{text}\n\n"
+        "Answer ONLY from what the text actually states (never infer or assume):\n"
+        "- event_with_date: does it announce a real upcoming event (webinar, class, launch, meetup...) "
+        "WITH a stated date?\n"
+        "- offer: does it state a real offer (a discount, a price cut, a free extra, a bundle)?\n"
+        "- signup: is it about enrolling or registering (a course, admission, intake, cohort, membership)?\n"
+        "- price: does it state a specific price?\n"
+        "- item_prices: does it list items each with its own price or cost?\n"
+        "- customer_quote: does it contain an actual customer quote or review?\n"
+        'Return JSON: {"event_with_date": true|false, "offer": ..., "signup": ..., "price": ..., '
+        '"item_prices": ..., "customer_quote": ...}. Return ONLY the JSON.'
+    )
+    if not isinstance(d, dict):
+        return {}
+    return {fid: reason for fid, (fact, reason) in FACT_NEEDS.items() if d.get(fact) is False}
+
+
 async def _content_fit_boost(description: str, eligible: list[Strategy]) -> dict[str, float]:
     """Real content-fit classification: asks the content model which ONE
     eligible format's actual, authored corpus claim best matches what the
