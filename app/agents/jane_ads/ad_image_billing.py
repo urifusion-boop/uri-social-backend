@@ -73,3 +73,17 @@ async def record(db, *, user_id: str, brand_id: Optional[str], campaign_id: str,
         })
     except Exception as e:
         print(f"[AdImageBilling] record failed: {e}", flush=True)
+
+
+def credits_needed(forced_format_id: Optional[str]) -> int:
+    """What the balance must cover before an ad is generated: the picked style's price when billing
+    is on, else the flat credit. When Jane chooses the style, see styles_costing_more_than."""
+    return price(forced_format_id) if (mode() == "on" and forced_format_id) else FLAT_CREDITS
+
+
+def styles_costing_more_than(balance: int) -> list[str]:
+    """With billing on and Jane choosing the style, the styles this balance can't pay for: left out of
+    her choice, so an ad never costs more than what's left."""
+    if mode() != "on":
+        return []
+    return [fid for fid in STYLE_IMAGES if price(fid) > balance]

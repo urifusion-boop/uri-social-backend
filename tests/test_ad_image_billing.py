@@ -70,3 +70,23 @@ def test_off_records_nothing(monkeypatch):
     _run(b.record({b.COLLECTION: col}, user_id="u", brand_id=None, campaign_id="c",
                   format_id="SEED-099", image_calls=1, charged=1))
     assert col.rows == []
+
+
+def test_shadow_needs_only_the_flat_credit_and_excludes_nothing(monkeypatch):
+    monkeypatch.setattr(settings, "AD_IMAGE_BILLING_MODE", "shadow", raising=False)
+    assert b.credits_needed("SEED-088") == 1
+    assert b.styles_costing_more_than(0) == []
+
+
+def test_on_a_picked_style_needs_its_price(monkeypatch):
+    monkeypatch.setattr(settings, "AD_IMAGE_BILLING_MODE", "on", raising=False)
+    assert b.credits_needed("SEED-088") == 3
+    assert b.credits_needed("SEED-099") == 1
+    assert b.credits_needed(None) == 1          # Jane chooses: see styles_costing_more_than
+
+
+def test_on_jane_never_picks_a_style_the_balance_cant_pay_for(monkeypatch):
+    monkeypatch.setattr(settings, "AD_IMAGE_BILLING_MODE", "on", raising=False)
+    left_out = b.styles_costing_more_than(1)
+    assert "SEED-088" in left_out and "SEED-080" in left_out and "SEED-099" not in left_out
+    assert b.styles_costing_more_than(3) == []
