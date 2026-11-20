@@ -117,18 +117,79 @@ class SubscriptionService:
 
     # ==================== PRD 5: Plan Structure ====================
 
+    # Plans per "URI Social Pricing Update" (Nov 2026): monthly price and monthly credits. Price per credit is
+    # the monthly price ÷ monthly credits, rounded to the nearest naira. Multi-month prices keep the existing
+    # 5% bulk discount, applied to the new monthly price.
+    PLANS = [
+        # tier_id, name, monthly price (₦), monthly credits, features
+        ("starter", "Starter Plan", 30000, 45, ["AI Image Generation", "Multi-platform Formatting", "Email Support"]),
+        ("growth", "Growth Plan", 45000, 75, ["AI Image Generation", "Multi-platform Formatting", "Priority Support",
+                                               "Advanced Analytics"]),
+        ("pro", "Pro Plan", 75000, 130, ["AI Image Generation", "Multi-platform Formatting", "Priority Support",
+                                          "Advanced Analytics", "Team Collaboration"]),
+        ("agency", "Agency Plan", 120000, 220, ["AI Image Generation", "Multi-platform Formatting", "Dedicated Support",
+                                                 "Advanced Analytics", "Team Collaboration", "White Label Options"]),
+    ]
+    CUSTOM_PRICE_PER_CREDIT = 750
+    # What a plan sync may change (never timestamps or anything else stored on the plan).
+    _PLAN_FIELDS = ("name", "price_ngn_monthly", "price_ngn_3months", "price_ngn_6months", "price_ngn_12months",
+                    "credits_monthly", "price_ngn", "credits", "price_per_credit", "features", "is_active")
+
+    def default_tiers(self) -> List[SubscriptionTier]:
+        """The plans as they should be. A plan's allowance is credits — never "campaigns" (one campaign can
+        use several credits)."""
+        tiers = []
+        for tier_id, name, monthly, credits, features in self.PLANS:
+            tiers.append(SubscriptionTier(
+                tier_id=tier_id, name=name,
+                price_ngn_monthly=monthly,
+                price_ngn_3months=int(monthly * 3 * self.DISCOUNT_RATE),
+                price_ngn_6months=int(monthly * 6 * self.DISCOUNT_RATE),
+                price_ngn_12months=int(monthly * 12 * self.DISCOUNT_RATE),
+                credits_monthly=credits,
+                # Legacy fields for backward compatibility
+                price_ngn=monthly, credits=credits,
+                price_per_credit=round(monthly / credits),
+                features=[f"{credits} credits/month"] + features,
+                is_active=True,
+            ))
+        c = self.CUSTOM_PRICE_PER_CREDIT
+        tiers.append(SubscriptionTier(
+            tier_id="custom", name="Custom Plan",
+            # Custom plan is pay-per-credit, no multi-duration pricing
+            price_ngn_monthly=c, price_ngn_3months=c, price_ngn_6months=c, price_ngn_12months=c,
+            credits_monthly=1,
+            price_ngn=c, credits=1, price_per_credit=c,
+            features=["Pay Per Credit", f"₦{c:,} per credit", "All Features Included", "No Monthly Commitment"],
+            is_active=True,
+        ))
+        return tiers
+
+    async def sync_tiers_to_defaults(self) -> List[dict]:
+        """Bring the stored plans in line with default_tiers() (the seed below only runs on an empty
+        collection, so a price change never reached a database that already had plans). Upserts each plan
+        by tier_id, setting only its name, prices, credits and features; returns what changed."""
+        changed = []
+        for tier in self.default_tiers():
+            new = tier.dict(exclude_none=True)
+            old = await self.subscription_tiers_collection.find_one({"tier_id": tier.tier_id}) or {}
+            fields = {k: v for k, v in new.items() if k in self._PLAN_FIELDS and old.get(k) != v}
+            if fields:
+                await self.subscription_tiers_collection.update_one(
+                    {"tier_id": tier.tier_id}, {"$set": fields}, upsert=True)
+                changed.append({"tier_id": tier.tier_id,
+                                "from": {k: old.get(k) for k in fields if k in ("price_ngn_monthly", "credits_monthly", "price_per_credit")},
+                                "to": {k: fields[k] for k in fields if k in ("price_ngn_monthly", "credits_monthly", "price_per_credit")}})
+        return changed
+
     async def initialize_default_tiers(self) -> None:
         """
         Seed database with default subscription tiers with multi-duration pricing
         PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
         Sections 5, 6, 7: Multi-duration subscription model with 5% discount
 
-        Monthly Pricing:
-        - Starter: ₦15,000 / 20 credits
-        - Growth: ₦25,000 / 35 credits
-        - Pro: ₦40,000 / 50 credits
-        - Agency: ₦80,000 / 100 credits
-        - Custom: ₦750 per credit
+        Monthly pricing: see PLANS above (Starter ₦30,000 / 45 credits, Growth ₦45,000 / 75,
+        Pro ₦75,000 / 130, Agency ₦120,000 / 220; Custom ₦750 per credit).
 
         Multi-month pricing applies 5% discount on total (not on credits)
         """
@@ -137,120 +198,7 @@ class SubscriptionService:
         if existing_count > 0:
             return  # Already initialized
 
-        tiers = [
-            SubscriptionTier(
-                tier_id="starter",
-                name="Starter Plan",
-                # Multi-duration pricing (PRD Section 6 & 7)
-                price_ngn_monthly=15000,
-                price_ngn_3months=int(15000 * 3 * self.DISCOUNT_RATE),  # ₦42,750 (save 5%)
-                price_ngn_6months=int(15000 * 6 * self.DISCOUNT_RATE),  # ₦85,500 (save 5%)
-                price_ngn_12months=int(15000 * 12 * self.DISCOUNT_RATE),  # ₦171,000 (save 5%)
-                credits_monthly=20,
-                # Legacy fields for backward compatibility
-                price_ngn=15000,
-                credits=20,
-                price_per_credit=750,
-                features=[
-                    "20 Campaigns/Month",
-                    "AI Image Generation",
-                    "Multi-platform Formatting",
-                    "Email Support"
-                ],
-                is_active=True
-            ),
-            SubscriptionTier(
-                tier_id="growth",
-                name="Growth Plan",
-                # Multi-duration pricing (PRD Section 6 & 7)
-                price_ngn_monthly=25000,
-                price_ngn_3months=int(25000 * 3 * self.DISCOUNT_RATE),  # ₦71,250 (save 5%)
-                price_ngn_6months=int(25000 * 6 * self.DISCOUNT_RATE),  # ₦142,500 (save 5%)
-                price_ngn_12months=int(25000 * 12 * self.DISCOUNT_RATE),  # ₦285,000 (save 5%)
-                credits_monthly=35,
-                # Legacy fields for backward compatibility
-                price_ngn=25000,
-                credits=35,
-                price_per_credit=714,
-                features=[
-                    "35 Campaigns/Month",
-                    "AI Image Generation",
-                    "Multi-platform Formatting",
-                    "Priority Support",
-                    "Advanced Analytics"
-                ],
-                is_active=True
-            ),
-            SubscriptionTier(
-                tier_id="pro",
-                name="Pro Plan",
-                # Multi-duration pricing (PRD Section 6 & 7)
-                price_ngn_monthly=40000,
-                price_ngn_3months=int(40000 * 3 * self.DISCOUNT_RATE),  # ₦114,000 (save 5%)
-                price_ngn_6months=int(40000 * 6 * self.DISCOUNT_RATE),  # ₦228,000 (save 5%)
-                price_ngn_12months=int(40000 * 12 * self.DISCOUNT_RATE),  # ₦456,000 (save 5%)
-                credits_monthly=50,
-                # Legacy fields for backward compatibility
-                price_ngn=40000,
-                credits=50,
-                price_per_credit=800,
-                features=[
-                    "50 Campaigns/Month",
-                    "AI Image Generation",
-                    "Multi-platform Formatting",
-                    "Priority Support",
-                    "Advanced Analytics",
-                    "Team Collaboration"
-                ],
-                is_active=True
-            ),
-            SubscriptionTier(
-                tier_id="agency",
-                name="Agency Plan",
-                # Multi-duration pricing (PRD Section 6 & 7)
-                price_ngn_monthly=80000,
-                price_ngn_3months=int(80000 * 3 * self.DISCOUNT_RATE),  # ₦228,000 (save 5%)
-                price_ngn_6months=int(80000 * 6 * self.DISCOUNT_RATE),  # ₦456,000 (save 5%)
-                price_ngn_12months=int(80000 * 12 * self.DISCOUNT_RATE),  # ₦912,000 (save 5%)
-                credits_monthly=100,
-                # Legacy fields for backward compatibility
-                price_ngn=80000,
-                credits=100,
-                price_per_credit=800,
-                features=[
-                    "100 Campaigns/Month",
-                    "AI Image Generation",
-                    "Multi-platform Formatting",
-                    "Dedicated Support",
-                    "Advanced Analytics",
-                    "Team Collaboration",
-                    "White Label Options"
-                ],
-                is_active=True
-            ),
-            SubscriptionTier(
-                tier_id="custom",
-                name="Custom Plan",
-                # Custom plan is pay-per-credit, no multi-duration pricing
-                price_ngn_monthly=750,
-                price_ngn_3months=750,
-                price_ngn_6months=750,
-                price_ngn_12months=750,
-                credits_monthly=1,
-                # Legacy fields for backward compatibility
-                price_ngn=750,  # Per credit
-                credits=1,  # Unit pricing
-                price_per_credit=750,
-                features=[
-                    "Pay Per Credit",
-                    "₦750 per Campaign",
-                    "All Features Included",
-                    "No Monthly Commitment"
-                ],
-                is_active=True
-            )
-        ]
-
+        tiers = self.default_tiers()
         # Insert all tiers
         await self.subscription_tiers_collection.insert_many(
             [tier.dict(exclude_none=True) for tier in tiers]

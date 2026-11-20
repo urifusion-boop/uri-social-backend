@@ -234,6 +234,8 @@ class TrialService:
             ).dict(exclude_none=True)
         )
 
+        from app.services.CreditService import notify_balance_crossing
+        await notify_balance_crossing(lambda: self.db, user_id, balance_before, balance_after)
         return True
 
     async def refund_trial_credit(
