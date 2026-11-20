@@ -667,7 +667,10 @@ async def list_wizard_drafts(
                 "payload": d.get("payload"),
                 "updated_at": d["updated_at"].isoformat() if d.get("updated_at") else None,
             }
-            for d in docs
+            # A draft saved by the old one-slot-per-brand version has no draft_id; it can't be resumed or
+            # deleted by id, and reading it crashed this whole list (500), so drafts from another device
+            # never loaded. It's skipped.
+            for d in docs if d.get("draft_id")
         ]
     }
 
