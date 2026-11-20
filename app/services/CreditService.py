@@ -492,7 +492,8 @@ class CreditService:
         if balance_after <= 0 and updated.get("subscription_source") == "access_code" and updated.get("subscription_tier"):
             await self._revoke_comp_grant(user_id, reason="credits_exhausted")
 
-        await notify_balance_crossing(lambda: self.db, user_id, balance_before, balance_after)
+        await notify_balance_crossing(lambda: self.db, user_id, balance_before, balance_after,
+                                      monthly_credits=monthly_credits_for(updated.get("subscription_tier")))
         return True
 
     async def _revoke_comp_grant(self, user_id: str, reason: str, code: Optional[str] = None) -> bool:
@@ -975,18 +976,30 @@ def _primary(collection):
 credit_service = CreditService()
 
 
-# The balance at or below which a customer is told credits are running low (the dashboard's existing
-# low-credit warning level, PRD 7.3).
-LOW_BALANCE_CREDITS = 3
+def monthly_credits_for(tier_id: Optional[str]) -> int:
+    """A plan's monthly credits (SubscriptionService.PLANS); the entry plan's for anything without one
+    (custom credits only, an unknown tier)."""
+    from app.services.SubscriptionService import SubscriptionService
+    plans = {p[0]: p[3] for p in SubscriptionService.PLANS}
+    return plans.get(tier_id or "", SubscriptionService.PLANS[0][3])
 
 
-async def notify_balance_crossing(db, user_id: str, before: float, after: float) -> None:
+def low_balance_level(monthly_credits: int) -> int:
+    """"Running low" = 10% of the plan's monthly credits, rounded up (Starter 45 → 5, Growth 75 → 8,
+    Pro 130 → 13, Agency 220 → 22, the 10-credit trial → 1)."""
+    import math
+    return max(1, math.ceil(monthly_credits * 0.10))
+
+
+async def notify_balance_crossing(db, user_id: str, before: float, after: float,
+                                  monthly_credits: Optional[int] = None) -> None:
     """`db` may be a callable returning the database, so even reaching it happens inside the guard below."""
     """Tell the customer, once, when a deduction takes their balance down to the low level or to zero
     ("Notify customers when their balance is running low and when credits are exhausted"). Only on the
     crossing itself, never on every deduction below it. Never raises: a notification must not undo a charge."""
     try:
-        if not (after <= 0 < before or after <= LOW_BALANCE_CREDITS < before):
+        low = low_balance_level(monthly_credits or monthly_credits_for(None))
+        if not (after <= 0 < before or after <= low < before):
             return
         if callable(db):
             db = db()
@@ -997,7 +1010,7 @@ async def notify_balance_crossing(db, user_id: str, before: float, after: float)
                 "Your credits are used up, so new content can't be generated until you top up or your plan "
                 "renews. Anything already scheduled still posts.",
                 link="/workspace/?tab=billing", dedupe_key="credits_exhausted", dedupe_hours=1)
-        elif after <= LOW_BALANCE_CREDITS < before:
+        elif after <= low < before:
             await brand_notifier.notify(
                 db, user_id, None, "credits_low", "Your credits are running low",
                 f"You have {int(after)} credit{'' if int(after) == 1 else 's'} left. Top up or upgrade so "

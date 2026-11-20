@@ -37,7 +37,9 @@ class PaymentService:
     # Fixed price for the "buy N custom credits" flow — a one-off bonus-credit
     # top-up, separate from the subscription tiers. NGN only (no USD pricing
     # requested for this flow).
-    CUSTOM_CREDIT_PRICE_NGN = 800
+    # The Starter plan's rate (see SubscriptionService.CUSTOM_PRICE_PER_CREDIT), never a separate number.
+    from app.services.SubscriptionService import SubscriptionService as _Sub
+    CUSTOM_CREDIT_PRICE_NGN = _Sub.CUSTOM_PRICE_PER_CREDIT
 
     def __init__(self):
         self._db: Optional[AsyncIOMotorDatabase] = None
