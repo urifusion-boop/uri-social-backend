@@ -686,8 +686,13 @@ async def save_wizard_draft(
     save. See wizard_draft.py and the frontend's campaign-wizard/
     wizardDraft.ts, which calls this as a backstop behind its own (faster,
     free) localStorage copy."""
-    from .wizard_draft import save_draft
-    await save_draft(db, _wizard_draft_key(brand_ctx), draft_id, body.payload)
+    from .wizard_draft import DraftOwnedElsewhere, save_draft
+    try:
+        await save_draft(db, _wizard_draft_key(brand_ctx), draft_id, body.payload,
+                         user_id=brand_ctx.get("user_id"))
+    except DraftOwnedElsewhere:
+        # 409, not 403: the frontend signs people out on most 403s.
+        raise HTTPException(status_code=409, detail="This unfinished ad belongs to another account.")
     return {"ok": True}
 
 
