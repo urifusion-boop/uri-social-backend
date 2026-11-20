@@ -56,7 +56,8 @@ _DEFAULT_EVENTS = {"post_ready", "post_published"}
 
 # Never optional: an owner must hear that a post didn't go out, or that a
 # customer is waiting on a person, whatever alerts they picked.
-_ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply", "ad_growth_alert", "inbox_quota"}
+_ALWAYS_EVENTS = {"post_failed", "inbox_needs_reply", "ad_growth_alert", "inbox_quota",
+                  "credits_low", "credits_exhausted"}
 
 # Sent here whatever channel the brand chose, on top of that channel. WhatsApp
 # only goes to owners who linked a number (see notify).

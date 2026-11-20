@@ -492,6 +492,7 @@ class CreditService:
         if balance_after <= 0 and updated.get("subscription_source") == "access_code" and updated.get("subscription_tier"):
             await self._revoke_comp_grant(user_id, reason="credits_exhausted")
 
+        await notify_balance_crossing(lambda: self.db, user_id, balance_before, balance_after)
         return True
 
     async def _revoke_comp_grant(self, user_id: str, reason: str, code: Optional[str] = None) -> bool:
@@ -972,3 +973,35 @@ def _primary(collection):
 
 # Singleton instance
 credit_service = CreditService()
+
+
+# The balance at or below which a customer is told credits are running low (the dashboard's existing
+# low-credit warning level, PRD 7.3).
+LOW_BALANCE_CREDITS = 3
+
+
+async def notify_balance_crossing(db, user_id: str, before: float, after: float) -> None:
+    """`db` may be a callable returning the database, so even reaching it happens inside the guard below."""
+    """Tell the customer, once, when a deduction takes their balance down to the low level or to zero
+    ("Notify customers when their balance is running low and when credits are exhausted"). Only on the
+    crossing itself, never on every deduction below it. Never raises: a notification must not undo a charge."""
+    try:
+        if not (after <= 0 < before or after <= LOW_BALANCE_CREDITS < before):
+            return
+        if callable(db):
+            db = db()
+        from app.services import brand_notifier
+        if after <= 0 < before:
+            await brand_notifier.notify(
+                db, user_id, None, "credits_exhausted", "You've used all your credits",
+                "Your credits are used up, so new content can't be generated until you top up or your plan "
+                "renews. Anything already scheduled still posts.",
+                link="/workspace/?tab=billing", dedupe_key="credits_exhausted", dedupe_hours=1)
+        elif after <= LOW_BALANCE_CREDITS < before:
+            await brand_notifier.notify(
+                db, user_id, None, "credits_low", "Your credits are running low",
+                f"You have {int(after)} credit{'' if int(after) == 1 else 's'} left. Top up or upgrade so "
+                "generating content isn't interrupted.",
+                link="/workspace/?tab=billing", dedupe_key="credits_low", dedupe_hours=1)
+    except Exception as e:
+        print(f"[Credits] balance notification failed for {user_id}: {e}", flush=True)
