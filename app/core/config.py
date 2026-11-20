@@ -294,6 +294,8 @@ class Settings(BaseSettings):
     # Credits for AI video generation (see video_generation_billing.py). off = free, as before;
     # shadow = record what would be charged without charging; on = charge. Prices: video_pricing.py.
     VIDEO_GENERATION_BILLING_MODE: str = "off"
+    # Credits for an ad's images by style: off | shadow | on (see jane_ads/ad_image_billing.py).
+    AD_IMAGE_BILLING_MODE: str = "shadow"
 
     # jane-whatsapp-reply — shared secret this backend presents (as
     # X-Internal-Service) when proxying support-team requests to jane's own

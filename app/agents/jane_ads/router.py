@@ -603,8 +603,23 @@ async def suggest_ad_format(
         for s in ranked if s.strategy_id in by_id
     ]
     if not serialized:
-        return {"suggested": None, "alternatives": []}
-    return {"suggested": serialized[0], "alternatives": serialized[1:]}
+        return {"suggested": None, "alternatives": [], "needs_in_brief": {}}
+    # Fact-led styles this brief can't support (no event date, no offer, no price...): still listed so
+    # the picker can show them greyed with the reason, never suggested.
+    from .vsg01_orchestrator import brief_unmet_needs
+    needs = await brief_unmet_needs(body.description or "")
+    ready = [f for f in serialized if f["format_id"] not in needs]
+    suggested = ready[0] if ready else None
+    from . import ad_image_billing
+    return {
+        "suggested": suggested,
+        "alternatives": [f for f in serialized if f is not suggested],
+        "needs_in_brief": needs,
+        # What each style costs, and whether that's what's charged yet ("on"); in "shadow" the flat
+        # 1 credit is still charged and the picker shows no price.
+        "credits": {f["format_id"]: ad_image_billing.price(f["format_id"]) for f in serialized},
+        "billing_mode": ad_image_billing.mode(),
+    }
 
 
 @router.get("/creative/drafts")
@@ -3679,18 +3694,27 @@ async def _build_campaign_plan(
                 vsg01_format_id=None if angle else body.vsg01_format_id, platform=copy_platform,
             )
 
-        if n_concepts > 1:
-            # The first ad now; the page adds the rest through POST /plan/{id}/ads.
-            first_angle = concepts_mod.ANGLES[0][0]
-            creative = await _one(first_angle)
-            creative.concept = first_angle
-            plan.concepts_wanted = n_concepts
-        else:
-            creative = await _one()
+        from app.utils.image_usage import counting as _counting_images
+        from . import ad_image_billing
+        with _counting_images() as _image_calls:
+            if n_concepts > 1:
+                # The first ad now; the page adds the rest through POST /plan/{id}/ads.
+                first_angle = concepts_mod.ANGLES[0][0]
+                creative = await _one(first_angle)
+                creative.concept = first_angle
+                plan.concepts_wanted = n_concepts
+            else:
+                creative = await _one()
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
-            # (the function's own default) is the closest existing match.
-            await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
+            # (the function's own default) is the closest existing match. The amount is the flat 1
+            # credit unless ad image billing is "on" (then the style's price — ad_image_billing.py).
+            _charged = ad_image_billing.credits_to_charge(creative.vsg01_format_id)
+            await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation",
+                                               amount=_charged)
+            await ad_image_billing.record(
+                db, user_id=user_id, brand_id=brand_ctx.get("brand_id"), campaign_id=business_id,
+                format_id=creative.vsg01_format_id, image_calls=_image_calls.n, charged=_charged)
     if (not creative.headline) if (creative_platform == Platform.GOOGLE.value and not google_visual) \
             else (not creative.image_url):
         # Empty creative almost always means the image/copy model failed (often the
@@ -4498,12 +4522,14 @@ async def meta_plan_add_ad(
         if not await credit_service.check_sufficient_credits(user_id, required=1):
             raise HTTPException(status_code=402, detail="You're out of content credits. Top up, or add your own photo or video.")
         angle = concepts_mod.next_angle([c.concept for c in [plan.creative, *plan.concepts]])
-        ad = await generate_ad_creative(
-            name, req.category, req.goal.value, concepts_mod.brief_for(clean_brief, angle),
-            behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn,
-            exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id],
-            image_layout=concepts_mod.layout_for(angle),
-            **shared)
+        from app.utils.image_usage import counting as _counting_images
+        with _counting_images() as _added_image_calls:
+            ad = await generate_ad_creative(
+                name, req.category, req.goal.value, concepts_mod.brief_for(clean_brief, angle),
+                behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn,
+                exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id],
+                image_layout=concepts_mod.layout_for(angle),
+                **shared)
         ad.concept = angle
     else:
         path_body = MetaLaunchFromMessageBody(
@@ -4527,7 +4553,13 @@ async def meta_plan_add_ad(
     if blocking:
         raise HTTPException(status_code=400, detail=f"Can't use this ad — {blocking[0].guidance}")
     if body.source == "generate":
-        await credit_service.deduct_credit(user_id, campaign_id=doc["business_id"], reason="campaign_generation")
+        from . import ad_image_billing
+        _charged = ad_image_billing.credits_to_charge(ad.vsg01_format_id)
+        await credit_service.deduct_credit(user_id, campaign_id=doc["business_id"], reason="campaign_generation",
+                                           amount=_charged)
+        await ad_image_billing.record(
+            db, user_id=user_id, brand_id=brand_ctx.get("brand_id"), campaign_id=doc["business_id"],
+            format_id=ad.vsg01_format_id, image_calls=_added_image_calls.n, charged=_charged)
     plan.concepts.append(ad)
     if 1 + len(plan.concepts) >= plan.concepts_wanted:
         plan.concepts_wanted = 0
