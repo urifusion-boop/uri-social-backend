@@ -3665,11 +3665,21 @@ async def _build_campaign_plan(
         # uploaded photo/video or a reused draft (PRD §5.1) doesn't touch this at all.
         from app.services.CreditService import credit_service
 
-        if not await credit_service.check_sufficient_credits(user_id, required=1):
+        from . import ad_image_billing
+        # The balance must cover the ad: the picked style's price once ad image billing is on (else the
+        # flat 1 credit). When Jane chooses, she leaves out styles the balance can't pay for.
+        _needed = ad_image_billing.credits_needed(body.vsg01_format_id)
+        if not await credit_service.check_sufficient_credits(user_id, required=_needed):
             raise HTTPException(
                 status_code=402,
-                detail="You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead.",
+                detail=(f"This style takes {_needed} content credits — top up, or pick another style."
+                        if _needed > 1 else
+                        "You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead."),
             )
+        _unaffordable: list[str] = []
+        if ad_image_billing.mode() == "on":  # also covers a fallback from a picked style
+            _wallet = await credit_service.get_user_wallet(user_id)
+            _unaffordable = ad_image_billing.styles_costing_more_than(_wallet.credits_remaining if _wallet else 0)
         n_concepts = min(max(1, body.concepts), _concepts_allowed(plan, creative_platform))
         if n_concepts > 1 and not await credit_service.check_sufficient_credits(user_id, required=n_concepts):
             raise HTTPException(
@@ -3692,6 +3702,7 @@ async def _build_campaign_plan(
                 # bails early, and the ad ships with corpus_coverage="none".
                 budget_ngn=float(parsed.budget_ngn or 0),
                 vsg01_format_id=None if angle else body.vsg01_format_id, platform=copy_platform,
+                exclude_format_ids=_unaffordable or None,
             )
 
         from app.utils.image_usage import counting as _counting_images
@@ -4521,13 +4532,18 @@ async def meta_plan_add_ad(
     if body.source == "generate":
         if not await credit_service.check_sufficient_credits(user_id, required=1):
             raise HTTPException(status_code=402, detail="You're out of content credits. Top up, or add your own photo or video.")
+        from . import ad_image_billing
+        _wallet = await credit_service.get_user_wallet(user_id)
+        # Billing on: a style this balance can't pay for is never picked for the extra ad.
+        _unaffordable = ad_image_billing.styles_costing_more_than(_wallet.credits_remaining if _wallet else 0)
         angle = concepts_mod.next_angle([c.concept for c in [plan.creative, *plan.concepts]])
         from app.utils.image_usage import counting as _counting_images
         with _counting_images() as _added_image_calls:
             ad = await generate_ad_creative(
                 name, req.category, req.goal.value, concepts_mod.brief_for(clean_brief, angle),
                 behaviour=plan.behaviour.value, budget_ngn=req.budget_ngn,
-                exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id],
+                exclude_format_ids=[c.vsg01_format_id for c in [plan.creative, *plan.concepts] if c.vsg01_format_id]
+                + _unaffordable,
                 image_layout=concepts_mod.layout_for(angle),
                 **shared)
         ad.concept = angle
