@@ -105,6 +105,18 @@ _AREAS = (
 )
 
 
+def primary(db):
+    """The same database, read from the primary. Prod reads from replicas by
+    default, and a replica can be a moment behind: the job record written just
+    before was not found ("Unknown deletion job"), and a sweep could miss a
+    record written moments earlier. Every read here goes to the primary."""
+    try:
+        from pymongo import ReadPreference
+        return db.client.get_database(db.name, read_preference=ReadPreference.PRIMARY)
+    except Exception:
+        return db
+
+
 def area_of(collection: str) -> str:
     c = collection.lower()
     for prefix, label in _AREAS:
@@ -324,7 +336,7 @@ async def reachable_databases() -> list:
             if n in _SYSTEM_DBS or (id(c), n) in seen:
                 continue
             seen.add((id(c), n))
-            dbs.append(c[n])
+            dbs.append(primary(c[n]))
     return dbs
 
 
@@ -385,6 +397,7 @@ async def blockers(db, ident: Identity, user: dict, forfeit_wallet_ngn: Optional
 # ── Preview ──────────────────────────────────────────────────────────────────
 
 async def preview(db, user: dict, databases: Optional[list] = None) -> dict:
+    db = primary(db)
     databases = databases if databases is not None else await reachable_databases()
     ident = await resolve_identity(db, user, databases)
     flt = owner_filter(ident)
@@ -459,6 +472,7 @@ class Deps:
 
 async def start_job(db, user: dict, mode: str, admin_user_id: str, forfeited_wallet_ngn: float = 0.0,
                     databases: Optional[list] = None) -> str:
+    db = primary(db)
     databases = databases if databases is not None else await reachable_databases()
     ident = await resolve_identity(db, user, databases)
     job_id = "del_" + uuid.uuid4().hex[:16]
@@ -466,7 +480,7 @@ async def start_job(db, user: dict, mode: str, admin_user_id: str, forfeited_wal
         "job_id": job_id, "user_hash": user_hash(ident.user_id), "mode": mode,
         "admin_user_id": admin_user_id, "status": "running", "progress": "Starting",
         "forfeited_wallet_ngn": round(float(forfeited_wallet_ngn or 0), 2),
-        "started_at": datetime.now(timezone.utc),
+        "started_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc),
         # Needed to finish (or resume) after the user record itself is gone;
         # removed the moment the job completes.
         "_identity": ident.to_doc(),
@@ -474,9 +488,30 @@ async def start_job(db, user: dict, mode: str, admin_user_id: str, forfeited_wal
     return job_id
 
 
-async def run_job(db, job_id: str, deps: Optional[Deps] = None) -> dict:
-    deps = deps or Deps()
-    job = await db[JOBS].find_one({"job_id": job_id})
+async def run_job(db, job_id: str, deps: Optional[Deps] = None) -> Optional[dict]:
+    """Runs the deletion. Never lets a failure go unrecorded: whatever goes wrong
+    is written on the job (status "failed", with the reason), so the admin sees
+    it and can finish the deletion, instead of a job stuck on "Starting"."""
+    db = primary(db)
+    try:
+        return await _run_job(db, job_id, deps or Deps())
+    except Exception as e:
+        print(f"[account_deletion] job {job_id} failed: {e!r}", flush=True)
+        try:
+            await db[JOBS].update_one({"job_id": job_id, "status": "running"}, {"$set": {
+                "status": "failed", "error": str(e)[:300], "updated_at": datetime.now(timezone.utc)}})
+        except Exception:
+            pass
+        return None
+
+
+async def _run_job(db, job_id: str, deps: Deps) -> dict:
+    job = None
+    for _ in range(5):
+        job = await db[JOBS].find_one({"job_id": job_id})
+        if job:
+            break
+        await asyncio.sleep(1)
     if not job or not job.get("_identity"):
         raise ValueError("Unknown or finished deletion job")
     ident = Identity.from_doc(job["_identity"])
@@ -486,7 +521,8 @@ async def run_job(db, job_id: str, deps: Optional[Deps] = None) -> dict:
     report: dict[str, Any] = {"deleted": {}, "scrubbed": {}, "anonymised": {}, "errors": []}
 
     async def progress(text: str):
-        await db[JOBS].update_one({"job_id": job_id}, {"$set": {"progress": text}})
+        await db[JOBS].update_one({"job_id": job_id}, {"$set": {"progress": text,
+                                                                "updated_at": datetime.now(timezone.utc)}})
 
     try:
         # Sessions still open are refused from now on (JWTBearer).
@@ -543,13 +579,13 @@ async def run_job(db, job_id: str, deps: Optional[Deps] = None) -> dict:
         status = "done" if not report["remaining"] else "done_with_leftovers"
         await db[JOBS].update_one({"job_id": job_id}, {
             "$set": {"status": status, "progress": "Finished", "finished_at": datetime.now(timezone.utc),
+                     "updated_at": datetime.now(timezone.utc),
                      "report": _report_for_storage(report)},
             "$unset": {"_identity": ""},
         })
         return report
-    except Exception as e:
-        await db[JOBS].update_one({"job_id": job_id}, {"$set": {
-            "status": "failed", "error": str(e)[:300], "report": _report_for_storage(report)}})
+    except Exception:
+        await db[JOBS].update_one({"job_id": job_id}, {"$set": {"report": _report_for_storage(report)}})
         raise
 
 
@@ -723,3 +759,19 @@ async def pause_live_campaigns(db, user: dict) -> dict:
         except Exception as e:
             failed.append({**item, "error": str(e)[:200]})
     return {"paused": paused, "failed": failed}
+
+
+STALLED_AFTER_SECONDS = 180
+
+
+def is_stalled(job: dict) -> bool:
+    """A running job that hasn't moved for a while: its server stopped (a deploy,
+    a restart). The admin can finish it; the deletion is safe to repeat."""
+    if job.get("status") != "running":
+        return False
+    last = job.get("updated_at") or job.get("started_at")
+    if not last:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last).total_seconds() > STALLED_AFTER_SECONDS
