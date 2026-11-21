@@ -1245,3 +1245,114 @@ async def sync_subscription_plans(admin_user: dict = Depends(verify_admin)):
     from app.services.SubscriptionService import subscription_service
     changed = await subscription_service.sync_tiers_to_defaults()
     return {"changed": changed}
+
+
+# ── Delete an account permanently ────────────────────────────────────────────
+# See app/services/account_deletion.py for what is deleted and how.
+
+_deletion_tasks: set = set()
+
+
+async def _user_for_admin(user_id: str, db) -> dict:
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    try:
+        user = await db["users"].find_one({"_id": ObjectId(user_id)})
+    except InvalidId:
+        user = None
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@router.get("/users/{user_id}/deletion-preview")
+async def account_deletion_preview(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Everything that would be deleted, by area and collection, and what has to
+    be settled first (running ads, ad wallet money, admin rights)."""
+    from app.services import account_deletion as AD
+    return await AD.preview(db, await _user_for_admin(user_id, db))
+
+
+@router.post("/users/{user_id}/pause-campaigns")
+async def account_deletion_pause_campaigns(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Pause every running ad campaign of this account's brands on Meta/TikTok/Google."""
+    from app.services import account_deletion as AD
+    return await AD.pause_live_campaigns(db, await _user_for_admin(user_id, db))
+
+
+class DeleteAccountRequest(BaseModel):
+    mode: str = Field(..., description="everything | keep_payments")
+    confirm_email: str
+    # The exact ad-wallet amount the admin confirms will be lost (refunded outside Uri, or given up).
+    forfeit_wallet_ngn: Optional[float] = None
+
+
+@router.post("/users/{user_id}/delete")
+async def delete_account_permanently(
+    user_id: str,
+    body: DeleteAccountRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Starts the permanent deletion and returns a job id to follow
+    (GET /admin/account-deletions/{job_id})."""
+    from app.services import account_deletion as AD
+
+    if body.mode not in AD.MODES:
+        raise HTTPException(status_code=400, detail="mode must be 'everything' or 'keep_payments'")
+    user = await _user_for_admin(user_id, db)
+    if (body.confirm_email or "").strip().lower() != (user.get("email") or "").strip().lower():
+        raise HTTPException(status_code=400, detail="Type the account's email exactly to confirm.")
+    admin_uid = (admin_user.get("claims") or {}).get("userId")
+    if admin_uid and admin_uid == (user.get("userId") or str(user["_id"])):
+        raise HTTPException(status_code=400, detail="You can't delete your own account here.")
+    ident = await AD.resolve_identity(db, user)
+    blocking = await AD.blockers(db, ident, user, forfeit_wallet_ngn=body.forfeit_wallet_ngn)
+    if blocking:
+        raise HTTPException(status_code=409, detail={"message": "Settle these first.", "blockers": blocking})
+    job_id = await AD.start_job(db, user, body.mode, admin_uid or "", forfeited_wallet_ngn=body.forfeit_wallet_ngn or 0)
+    task = asyncio.create_task(AD.run_job(db, job_id))
+    _deletion_tasks.add(task)
+    task.add_done_callback(_deletion_tasks.discard)
+    return {"job_id": job_id, "status": "running"}
+
+
+@router.get("/account-deletions/{job_id}")
+async def account_deletion_status(
+    job_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    from app.services import account_deletion as AD
+    job = await db[AD.JOBS].find_one({"job_id": job_id}, {"_id": 0, "_identity": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Deletion not found")
+    return job
+
+
+@router.post("/account-deletions/{job_id}/resume")
+async def account_deletion_resume(
+    job_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Finish a deletion that stopped part-way (a restart, an error). Safe to repeat."""
+    from app.services import account_deletion as AD
+    job = await db[AD.JOBS].find_one({"job_id": job_id}, {"_identity": 1, "status": 1})
+    if not job:
+        raise HTTPException(status_code=404, detail="Deletion not found")
+    if not job.get("_identity"):
+        raise HTTPException(status_code=400, detail="This deletion already finished.")
+    await db[AD.JOBS].update_one({"job_id": job_id}, {"$set": {"status": "running", "progress": "Resuming"}})
+    task = asyncio.create_task(AD.run_job(db, job_id))
+    _deletion_tasks.add(task)
+    task.add_done_callback(_deletion_tasks.discard)
+    return {"job_id": job_id, "status": "running"}

@@ -25,6 +25,11 @@ class JWTBearer(HTTPBearer):
                 raise HTTPException(
                     status_code=403, detail="Invalid token or expired token."
                 )
+            # A session left open on an account an admin has since deleted is
+            # refused, rather than re-creating the account's brand on its next request.
+            from app.services.account_deletion import is_deleted_user
+            if await is_deleted_user((payload.get("claims") or {}).get("userId")):
+                raise HTTPException(status_code=401, detail="This account has been deleted.")
             if self.validate_subscription_flag:
                 await self.validate_subscription(payload)
             return payload
