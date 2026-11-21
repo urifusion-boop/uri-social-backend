@@ -231,3 +231,42 @@ def test_open_sessions_of_a_deleted_account_are_refused(monkeypatch):
     assert run(AD.is_deleted_user(C)) is False
     # the marker holds a hash, not the id
     assert A not in str(run(db[AD.MARKERS].find_one({})))
+
+
+def test_a_failure_is_recorded_on_the_job_not_left_on_starting():
+    db, gw = seed()
+    user = run(db.users.find_one({"userId": A}))
+    job = run(AD.start_job(db, user, AD.MODE_EVERYTHING, "admin-1", databases=[db, gw]))
+
+    class Broken(AD.Deps):
+        async def databases(self):
+            raise RuntimeError("database unreachable")
+    assert run(AD.run_job(db, job, Broken(databases=[db, gw], bucket=BUCKET, s3=FakeS3([])))) is None
+    doc = run(db[AD.JOBS].find_one({"job_id": job}))
+    assert doc["status"] == "failed" and "database unreachable" in doc["error"]
+    assert doc.get("_identity")          # kept, so the deletion can be finished
+    # finishing it later works and completes the deletion
+    async def revoke(conn):
+        return "cancelled"
+    run(db[AD.JOBS].update_one({"job_id": job}, {"$set": {"status": "running"}}))
+    report = run(AD.run_job(db, job, AD.Deps(databases=[db, gw], bucket=BUCKET, s3=FakeS3([]), revoke=revoke)))
+    assert report["remaining"] == {}
+    assert run(db.users.count_documents({"userId": A})) == 0
+
+
+def test_a_job_that_stops_moving_is_shown_as_stalled():
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    assert AD.is_stalled({"status": "running", "updated_at": now - timedelta(minutes=10)})
+    assert not AD.is_stalled({"status": "running", "updated_at": now})
+    assert not AD.is_stalled({"status": "done", "updated_at": now - timedelta(hours=1)})
+    # naive datetimes, as Mongo returns them
+    assert AD.is_stalled({"status": "running", "updated_at": (now - timedelta(minutes=10)).replace(tzinfo=None)})
+
+
+def test_reads_go_to_the_primary():
+    from pymongo import ReadPreference
+    db, _ = seed()
+    p = AD.primary(db)
+    assert p.name == db.name
+    assert getattr(p, "read_preference", ReadPreference.PRIMARY) == ReadPreference.PRIMARY
