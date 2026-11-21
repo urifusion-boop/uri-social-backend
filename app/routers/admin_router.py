@@ -1332,9 +1332,10 @@ async def account_deletion_status(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     from app.services import account_deletion as AD
-    job = await db[AD.JOBS].find_one({"job_id": job_id}, {"_id": 0, "_identity": 0})
+    job = await AD.primary(db)[AD.JOBS].find_one({"job_id": job_id}, {"_id": 0, "_identity": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Deletion not found")
+    job["stalled"] = AD.is_stalled(job)
     return job
 
 
@@ -1346,12 +1347,13 @@ async def account_deletion_resume(
 ):
     """Finish a deletion that stopped part-way (a restart, an error). Safe to repeat."""
     from app.services import account_deletion as AD
-    job = await db[AD.JOBS].find_one({"job_id": job_id}, {"_identity": 1, "status": 1})
+    job = await AD.primary(db)[AD.JOBS].find_one({"job_id": job_id}, {"_identity": 1, "status": 1})
     if not job:
         raise HTTPException(status_code=404, detail="Deletion not found")
     if not job.get("_identity"):
         raise HTTPException(status_code=400, detail="This deletion already finished.")
-    await db[AD.JOBS].update_one({"job_id": job_id}, {"$set": {"status": "running", "progress": "Resuming"}})
+    await db[AD.JOBS].update_one({"job_id": job_id}, {"$set": {
+        "status": "running", "progress": "Resuming", "updated_at": datetime.utcnow()}})
     task = asyncio.create_task(AD.run_job(db, job_id))
     _deletion_tasks.add(task)
     task.add_done_callback(_deletion_tasks.discard)
