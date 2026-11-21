@@ -13,6 +13,8 @@ import io
 import httpx
 from datetime import datetime
 
+from app.utils.fonts import draw_text, load_font
+
 
 class DocumentRendererService:
     """Service for rendering layered documents to images"""
@@ -180,8 +182,6 @@ class DocumentRendererService:
         x = layer.get("x", 100)
         y = layer.get("y", 100)
 
-        # Load font
-        font = DocumentRendererService._load_font(font_family, font_size, font_weight)
 
         # Draw text. `text_align` maps straight onto Pillow's own anchor
         # strings (e.g. "ra" = right-ascender) — added for right-aligned
@@ -190,9 +190,12 @@ class DocumentRendererService:
         # ourselves in every format builder that needs it). Left/top-anchored
         # ("la", Pillow's own default) is unchanged for every existing caller
         # that doesn't pass this.
+        # Font picked by family/weight from the bundled set (app/utils/fonts.py); a family
+        # that isn't bundled keeps DejaVu exactly as before. Characters the font lacks
+        # (often ₦) are drawn in Inter instead of as empty boxes.
         rgba_color = DocumentRendererService._hex_to_rgba(color)
         anchor = layer.get("text_align")
-        draw.text((x, y), content, font=font, fill=rgba_color, anchor=anchor)
+        draw_text(draw, (x, y), content, font_family, font_size, font_weight, fill=rgba_color, anchor=anchor)
 
     @staticmethod
     async def _render_asset(canvas: Image.Image, layer: Dict[str, Any]):
@@ -356,24 +359,9 @@ class DocumentRendererService:
 
     @staticmethod
     def _load_font(font_family: str, font_size: int, font_weight: int) -> ImageFont.FreeTypeFont:
-        """
-        Load font for rendering
-
-        TODO: Support custom uploaded fonts from brand_profiles
-        For now, falls back to default fonts
-        """
-        try:
-            # Try to load system font
-            # This is a simplified version - in production, map font_family to actual font files
-            if font_weight >= 700:
-                font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            else:
-                font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-
-            return ImageFont.truetype(font_path, font_size)
-        except:
-            # Fallback to default font
-            return ImageFont.load_default()
+        """The bundled font for this family and weight (app/utils/fonts.py), or DejaVu Sans when
+        the family isn't bundled — the long-standing default."""
+        return load_font(font_family, font_size, font_weight)
 
     @staticmethod
     def _hex_to_rgba(hex_color: str, alpha: int = 255) -> tuple:
