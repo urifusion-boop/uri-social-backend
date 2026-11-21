@@ -126,6 +126,8 @@ class TestCreateFromCard:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db)
         # The real ContentGenerationService also inserts content_drafts docs
         # as a side effect — seeded here so create_from_card's own
@@ -253,6 +255,8 @@ class TestCreateFromCard:
             db = fresh_db()
             credit_service._db = db
             trial_service._db = db
+            # The same credit gate as Create Content runs first: give the user credits to spend.
+            await _grant_wallet(db, credits_remaining=10)
             await _card(db, action_type=action_type)
             with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
                 "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
@@ -271,6 +275,8 @@ class TestCreateFromCard:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db, action_type="carousel")
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
             "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
@@ -304,6 +310,8 @@ class TestCreateFromCard:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db, action_type="carousel")
         # CarouselGenerationService.generate_multi_platform is mocked below
         # (this test is about the image-task setup, not real carousel
@@ -365,6 +373,8 @@ class TestCreateFromCard:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db)
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, patch(
             "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"
@@ -398,6 +408,8 @@ class TestPlatformAndFormatOverrides:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db, platforms=("instagram",))
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, _patch_connections(
             ["instagram", "facebook", "tiktok"]
@@ -449,6 +461,8 @@ class TestPlatformAndFormatOverrides:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db, action_type="post")
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
             "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
@@ -470,6 +484,8 @@ class TestPlatformAndFormatOverrides:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db, action_type="carousel")
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
             "app.agents.social_media_manager.services.carousel_generation_service.CarouselGenerationService"
@@ -493,6 +509,8 @@ class TestPlatformAndFormatOverrides:
         db = fresh_db()
         credit_service._db = db
         trial_service._db = db
+        # The same credit gate as Create Content runs first: give the user credits to spend.
+        await _grant_wallet(db, credits_remaining=10)
         await _card(db, platforms=("instagram", "tiktok"), action_type="post")
         with _PATCH_PLAYBOOK, _PATCH_TO_BRAND_CONTEXT, _PATCH_IMAGE_BG, patch(
             "app.agents.social_media_manager.services.content_generation_service.ContentGenerationService"

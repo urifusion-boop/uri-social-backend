@@ -19,7 +19,8 @@ from app.agents.market_intelligence.listening import review
 from app.agents.market_intelligence.listening.config import DEFAULTS, _merge
 from app.agents.market_intelligence.listening.router import list_pending_reviews, resolve_pending_review
 
-NOW = datetime(2026, 10, 21, 12, 0)
+# Relative to the real clock: the endpoint calls pending_reviews() without `now`, so fixed dates go stale.
+NOW = datetime.utcnow()
 CFG = _merge(DEFAULTS, {})
 MARKET_KEY = "hair_wigs:NG"
 THRESHOLD = CFG["review"]["confidence_threshold"]

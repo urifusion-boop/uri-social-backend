@@ -19,4 +19,4 @@
 
 ## Checks
 
-PRs run `.github/workflows/pr-checks.yml`: "Backend starts" (compile + import) and "Backend tests" (skips `tests/test_0*_*.py`, which need a running API).
+PRs run `.github/workflows/pr-checks.yml`: "Backend starts" (compile + import) and "Backend tests" (tests that need a running API skip themselves unless TEST_API_URL is set).

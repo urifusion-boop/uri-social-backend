@@ -3,10 +3,30 @@ Shared fixtures for Uri Social API tests.
 """
 
 import asyncio
+import os
 
 import pytest
 import httpx
 from tests.config import BASE_URL, TEST_EMAIL, TEST_PASSWORD, TEST_FIRST, TEST_LAST
+
+# Tests that use the `client` fixture call a running API (tests/config.py BASE_URL).
+# They run only when TEST_API_URL points at one; otherwise they are skipped with that reason
+# instead of failing on a connection error. (A test whose `client` is a parametrize argument
+# is not one of them.)
+LIVE_API = bool(os.getenv("TEST_API_URL"))
+
+
+def pytest_collection_modifyitems(config, items):
+    if LIVE_API:
+        return
+    skip_live = pytest.mark.skip(reason="needs a running API: set TEST_API_URL to run it")
+    for item in items:
+        if "client" not in getattr(item, "fixturenames", ()):
+            continue
+        callspec = getattr(item, "callspec", None)
+        if callspec is not None and "client" in callspec.params:
+            continue
+        item.add_marker(skip_live)
 
 
 @pytest.fixture(autouse=True)

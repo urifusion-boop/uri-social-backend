@@ -873,7 +873,13 @@ Clearly legible at a glance — approximately 45% the size of the headline, not 
 Position: bottom-centre or bottom-right within safe zone.
 Do NOT style it as a button or banner."""
 
-            final_prompt = f"""{style_instructions}
+            # The brand's logo corner is kept plain (Guarantee logo placement never collides, 29 Sep;
+            # this path lost it in the 12 Nov merge). Placed first, highest prompt weight.
+            logo_space_note = ImageContentService.build_logo_space_note(brand_context)
+
+            final_prompt = f"""{logo_space_note}
+
+{style_instructions}
 
 {content_section}
 
@@ -941,27 +947,24 @@ Do NOT style it as a button or banner."""
                         base64_image = base64.b64encode(img_response.content).decode('utf-8')
                         print(f"[V2] Downloaded image from URL and converted to base64")
 
-                # Overlay logo using ImageContentService (expects base64 string).
-                # overlay_logo_smart ranks candidate corners by actual pixel
-                # busyness first, rather than blindly trusting logo_position —
-                # the art-directed prompt above has no way to guarantee the
-                # model won't place the headline in that exact corner.
-                # return_placement=True — same contract the standard
-                # generation path already relies on via _overlay_logo's own
-                # return_geometry — so Move Logo works consistently
-                # regardless of which generation path produced the image.
-                # Previously this call never captured where the logo actually
-                # landed (or the pre-overlay background needed to later move
-                # it), so a V2-guide image could never be repositioned even
-                # though this exact smart-overlay function was already being
-                # called right here.
-                logo_result_b64, chosen_position, chosen_geometry = await ImageContentService.overlay_logo_smart(
-                    b64=base64_image,
-                    logo_url=logo_url,
-                    logo_size=logo_size,
-                    preferred_position=logo_position,
-                    return_placement=True,
+                # Overlay logo using ImageContentService (expects base64 string): the plain
+                # fixed-position overlay at the brand's chosen corner, as on prod before the
+                # 12 Nov merge (the smart overlay adds AI vision calls per image). The prompt
+                # already keeps that corner plain (build_logo_space_note), so the content
+                # adapts to the logo, not the other way round. return_geometry=True keeps
+                # Move Logo working for V2-guide images.
+                import asyncio as _asyncio_logo
+                logo_result_b64, chosen_geometry = await _asyncio_logo.get_running_loop().run_in_executor(
+                    None,
+                    lambda: ImageContentService._overlay_logo(
+                        b64=base64_image,
+                        logo_url=logo_url,
+                        position=logo_position,
+                        logo_size=logo_size,
+                        return_geometry=True,
+                    ),
                 )
+                chosen_position = logo_position
 
                 # Decode base64 back to bytes for upload
                 final_image_bytes = base64.b64decode(logo_result_b64)
@@ -983,10 +986,6 @@ Do NOT style it as a button or banner."""
                     # an already-hosted URL here would silently get dropped
                     # there instead of saved.
                     background_image_url = f"data:image/webp;base64,{base64_image}"
-                    # chosen_position, not logo_position — overlay_logo_smart
-                    # can move off the preferred corner to avoid a busy area,
-                    # and logo_placement needs to reflect where it actually
-                    # landed, not just what was asked for.
                     logo_placement = {**chosen_geometry, "position": chosen_position, "logo_size": logo_size}
 
                 print(f"[V2] ✅ Logo overlaid and uploaded: {final_image_url[:80]}...")
