@@ -516,12 +516,10 @@ class PaymentService:
         billing_cycle = payment_doc.get("billing_cycle", "monthly")
         credits_allocated = payment_doc.get("credits_allocated")
 
-        # Check if user has remaining trial credits - preserve them as bonus credits
-        trial_status = await trial_service.get_trial_status(user_id)
-        remaining_trial_credits = 0
-
-        if trial_status and trial_status.trial_active and trial_status.credits_remaining > 0:
-            remaining_trial_credits = trial_status.credits_remaining
+        # Unused trial credits move to the wallet as bonus credits (they never
+        # expire) and the trial closes: plan 20 + trial 10 shows 30, not 40.
+        remaining_trial_credits = await trial_service.take_trial_credits_for_subscription(user_id)
+        if remaining_trial_credits:
             print(f"💎 Preserving {remaining_trial_credits} trial credits as bonus for user {user_id}")
 
         # Calculate subscription lifecycle dates (PRD 8.3)
