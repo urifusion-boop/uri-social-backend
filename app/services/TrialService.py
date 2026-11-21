@@ -146,7 +146,47 @@ class TrialService:
                 trial_already_used=False,
             )
 
+        # Subscribed during the trial before the trial was closed on subscribing
+        # (see take_trial_credits_for_subscription): the leftover credits are
+        # already in the wallet, so the trial is closed now. Without this they
+        # were counted twice ("20 plan + 10 trial" showed 40, not 30).
+        if not trial_doc.get("converted_to_subscription") and trial_doc.get("credits_remaining", 0) > 0:
+            if await self._subscribed_during_trial(user_id, trial_doc):
+                trial_doc = await self.trials_collection.find_one_and_update(
+                    {"user_id": user_id},
+                    {"$set": {"credits_remaining": 0, "converted_to_subscription": True,
+                              "converted_at": datetime.utcnow()}},
+                    return_document=ReturnDocument.AFTER,
+                ) or trial_doc
+
         return await self._build_status(trial_doc)
+
+    async def _subscribed_during_trial(self, user_id: str, trial_doc: dict) -> bool:
+        """Whether a subscription began while this trial was running. The old
+        subscribe code always carried the trial's unused credits into the wallet
+        in exactly that case (its record of doing so failed to save, so the
+        wallet's start date is what tells)."""
+        wallet = await self.db["user_credits"].find_one(
+            {"user_id": user_id}, {"subscription_tier": 1, "start_date": 1})
+        started = (wallet or {}).get("start_date")
+        if not (wallet and wallet.get("subscription_tier") and started):
+            return False
+        begin, end = trial_doc.get("trial_start_date"), trial_doc.get("trial_end_date")
+        return bool(begin and end and begin <= started <= end)
+
+    async def take_trial_credits_for_subscription(self, user_id: str) -> int:
+        """On subscribing: take the trial's unused credits off the trial (they move
+        to the wallet as bonus credits) and close the trial, in one atomic step, so
+        they can never be counted twice and two payment confirmations racing can't
+        both carry them over. Returns how many credits were taken."""
+        now = datetime.utcnow()
+        before = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id, "trial_end_date": {"$gt": now}, "credits_remaining": {"$gt": 0},
+             "converted_to_subscription": {"$ne": True}},
+            {"$set": {"credits_remaining": 0, "converted_to_subscription": True, "converted_at": now}},
+            return_document=ReturnDocument.BEFORE,
+        )
+        return int(before.get("credits_remaining", 0)) if before else 0
 
     async def _build_status(self, trial_doc: dict) -> TrialStatusResponse:
         """Build TrialStatusResponse from a trial document."""
@@ -167,7 +207,9 @@ class TrialService:
         total_seconds_remaining = max(0, time_remaining.total_seconds())
         days_remaining = ceil(total_seconds_remaining / 86400) if total_seconds_remaining > 0 else 0
         hours_remaining = max(0, int(time_remaining.total_seconds() // 3600))
-        trial_expired = not is_active and trial_doc.get("trial_used", False)
+        # A trial that became a subscription didn't "expire": no trial-ended messaging.
+        trial_expired = (not is_active and trial_doc.get("trial_used", False)
+                         and not trial_doc.get("converted_to_subscription"))
 
         return TrialStatusResponse(
             is_trial=trial_doc.get("is_trial", False),
