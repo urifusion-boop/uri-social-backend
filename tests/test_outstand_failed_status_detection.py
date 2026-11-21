@@ -31,105 +31,74 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
-class FakeCursor:
-    def __init__(self, docs: list[dict]):
-        self._docs = docs
+class FakeDb:
+    """An in-memory MongoDB (mongomock) behind the async calls the publisher makes.
+    The hand-written fake this replaces understood only part of MongoDB's query and
+    update language; the publisher's queries grew past it ($or with $lte/$exists,
+    $unset in find_one_and_update), and the fake silently matched or updated the
+    wrong drafts. `db[name].docs` is the collection's current contents."""
+
+    def __init__(self, collections: dict[str, list[dict]] | None = None):
+        import mongomock
+        self._db = mongomock.MongoClient()["publisher_test"]
+        self._colls: dict = {}
+        for name, docs in (collections or {}).items():
+            if docs:
+                self._db[name].insert_many([dict(d) for d in docs])
+
+    def __getitem__(self, name):
+        if name not in self._colls:
+            self._colls[name] = _AsyncCollection(self._db[name])
+        return self._colls[name]
+
+
+class _AsyncCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
 
     def sort(self, key, direction=1):
-        self._docs = sorted(self._docs, key=lambda d: d.get(key), reverse=(direction == -1))
+        self._cursor = self._cursor.sort(key, direction)
         return self
 
     def limit(self, n):
-        self._docs = self._docs[:n]
+        self._cursor = self._cursor.limit(n)
         return self
 
     async def to_list(self, length=None):
-        return [dict(d) for d in (self._docs[:length] if length is not None else self._docs)]
+        docs = list(self._cursor)
+        return docs[:length] if length is not None else docs
 
 
-class FakeUpdateResult:
-    def __init__(self, modified_count=0, matched_count=0):
-        self.modified_count = modified_count
-        self.matched_count = matched_count
+class _AsyncCollection:
+    def __init__(self, coll):
+        self._c = coll
 
+    @property
+    def docs(self) -> list[dict]:
+        return list(self._c.find({}))
 
-class FakeCollection:
-    def __init__(self, docs=None):
-        self.docs: list[dict] = docs or []
+    async def find_one(self, query=None, projection=None, sort=None, **kw):
+        return self._c.find_one(query or {}, projection, sort=sort)
 
-    def _match(self, query):
-        if "$or" in query:
-            return [d for d in self.docs if any(
-                all(self._field_matches(d, k, v) for k, v in clause.items())
-                for clause in query["$or"]
-            )]
-        return [d for d in self.docs if all(self._field_matches(d, k, v) for k, v in query.items())]
+    def find(self, query=None, projection=None, **kw):
+        return _AsyncCursor(self._c.find(query or {}, projection))
 
-    def _field_matches(self, d, k, v):
-        val = d.get(k)
-        if isinstance(v, dict):
-            if "$lte" in v:
-                return val is not None and val <= v["$lte"]
-            if "$ne" in v:
-                return val != v["$ne"]
-            if "$exists" in v:
-                return (k in d) == v["$exists"]
-            if "$in" in v:
-                return val in v["$in"]
-        return val == v
+    async def find_one_and_update(self, query, update, projection=None, return_document=None, upsert=False, **kw):
+        from pymongo import ReturnDocument
+        return self._c.find_one_and_update(query, update, projection, upsert=upsert,
+                                           return_document=return_document or ReturnDocument.BEFORE)
 
-    async def find_one(self, query, projection=None, sort=None):
-        matches = self._match(query)
-        if sort:
-            key, direction = sort[0]
-            matches.sort(key=lambda d: d.get(key), reverse=(direction == -1))
-        return dict(matches[0]) if matches else None
+    async def update_one(self, query, update, upsert=False, **kw):
+        return self._c.update_one(query, update, upsert=upsert)
 
-    def find(self, query):
-        return FakeCursor(self._match(query))
+    async def update_many(self, query, update, upsert=False, **kw):
+        return self._c.update_many(query, update, upsert=upsert)
 
-    async def find_one_and_update(self, query, update, return_document=None, upsert=False):
-        matches = self._match(query)
-        if not matches:
-            if not upsert:
-                return None
-            d = {}
-            for k, v in query.items():
-                if not isinstance(v, dict):
-                    d[k] = v
-            self.docs.append(d)
-        else:
-            d = matches[0]
-        before = dict(d)
-        d.update(update.get("$set", {}))
-        for k, v in update.get("$inc", {}).items():
-            d[k] = d.get(k, 0) + v
-        # ReturnDocument.AFTER == 1 in pymongo; default (None/BEFORE) returns
-        # the pre-update snapshot, matching real find_one_and_update semantics.
-        return dict(d) if return_document else before
+    async def insert_one(self, doc, **kw):
+        return self._c.insert_one(doc)
 
-    async def update_one(self, query, update, upsert=False):
-        matches = self._match(query)
-        for d in matches:
-            d.update(update.get("$set", {}))
-            for k in update.get("$unset", {}):
-                d.pop(k, None)
-            return FakeUpdateResult(modified_count=1, matched_count=1)
-        return FakeUpdateResult(modified_count=0, matched_count=0)
-
-    async def update_many(self, query, update):
-        matches = self._match(query)
-        for d in matches:
-            d.update(update.get("$set", {}))
-        return FakeUpdateResult(modified_count=len(matches), matched_count=len(matches))
-
-
-class FakeDb:
-    def __init__(self, collections: dict[str, list[dict]] | None = None):
-        self._colls = {name: FakeCollection(docs) for name, docs in (collections or {}).items()}
-
-    def __getitem__(self, name):
-        return self._colls.setdefault(name, FakeCollection())
+    async def count_documents(self, query, **kw):
+        return self._c.count_documents(query)
 
 
 def _outstand_scheduled_draft():
@@ -159,18 +128,22 @@ def _outstand_response_with_failed_account(error="Confirm your identity before y
 def test_a_platform_side_failure_is_detected_and_surfaced():
     db = FakeDb({"content_drafts": [_outstand_scheduled_draft()]})
 
+    get_post = AsyncMock(return_value=_outstand_response_with_failed_account())
     with patch(
-        "app.agents.social_media_manager.services.outstand_service.OutstandService.get_post",
-        new=AsyncMock(return_value=_outstand_response_with_failed_account()),
+        "app.agents.social_media_manager.services.outstand_service.OutstandService.get_post", new=get_post,
     ):
         result = _run(ApprovalWorkflowService.publish_scheduled_content(db))
-
-    draft = db["content_drafts"].docs[0]
-    assert draft["status"] == "publish_failed"
-    assert "Confirm your identity" in draft["error_message"]
-    # Dead submission — must not keep polling the same failed Outstand post.
-    assert draft["platform_post_id"] is None
-    assert result["published_count"] == 0
+        draft = db["content_drafts"].docs[0]
+        assert draft["status"] == "publish_failed"
+        assert "Confirm your identity" in draft["error_message"]
+        assert result["published_count"] == 0
+        # Dead submission: the next run neither polls this failed post again nor
+        # re-publishes it (it is no longer "scheduled"; the post id stays as the
+        # record of what was sent).
+        polls = get_post.await_count
+        _run(ApprovalWorkflowService.publish_scheduled_content(db))
+        assert get_post.await_count == polls
+        assert db["content_drafts"].docs[0]["status"] == "publish_failed"
 
 
 def test_a_post_with_no_failed_accounts_yet_is_left_alone_as_pending():
@@ -193,7 +166,10 @@ def test_a_post_with_no_failed_accounts_yet_is_left_alone_as_pending():
         _run(ApprovalWorkflowService.publish_scheduled_content(db))
 
     draft = db["content_drafts"].docs[0]
-    assert draft["status"] == "scheduled"  # untouched — genuinely still pending
+    # Due, but the network hasn't answered yet: handed to the confirmation step
+    # (publish_confirmation.py), which waits for the answer. Not failed, not
+    # re-published.
+    assert draft["status"] == "confirming"
     assert draft.get("error_message") is None
 
 
