@@ -433,6 +433,25 @@ class CreativeForBrandBody(BaseModel):
     # works exactly as before; Day 1 -> Day 30 itself simply never has content to
     # build without it (fail-open, same as every other format's missing input).
     reference_image_url_2: str = ""
+    # source=existing_post: run a post the owner already published. reference_image_url
+    # is the post's picture (preview only) and description its caption.
+    post_platform: str = ""            # instagram | facebook
+    post_id: str = ""
+
+
+@router.get("/existing-posts")
+async def existing_posts(
+    platform: str = Query("instagram"),
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """The owner's own recent posts on the connected account, to run as an ad."""
+    from . import existing_posts as posts
+    try:
+        return {"posts": await posts.list_posts(
+            db, brand_ctx["user_id"], brand_ctx.get("brand_id"), platform)}
+    except posts.PostsError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
 
 
 @router.post("/creative/for-brand")
@@ -455,7 +474,14 @@ async def creative_for_brand(
     destination_type = _destination["destination_type"]
     destination_cta = _destination["destination_cta"]
 
-    if body.source == "upload":
+    if body.source == "existing_post":
+        if body.post_platform not in ("instagram", "facebook") or not body.post_id:
+            raise HTTPException(status_code=400, detail="post_platform and post_id are required for source=existing_post")
+        from .creative import creative_from_existing_post
+        ad = creative_from_existing_post(
+            body.post_platform, body.post_id, body.reference_image_url, body.description,
+            is_video=body.is_video, destination_type=destination_type, destination_cta=destination_cta)
+    elif body.source == "upload":
         if not body.reference_image_url:
             raise HTTPException(status_code=400, detail="reference_image_url is required for source=upload")
         ad = await creative_from_upload(

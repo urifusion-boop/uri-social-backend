@@ -764,6 +764,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                                 cta_type, ig.get("ig_id", "")),
                             **messaging_ad.creative_extras(),
                         }
+                    if ad_creative.existing_post:
+                        creative_body = await self._existing_post_creative_body(
+                            plan, ad_creative.existing_post, suffix)
                     # Meta's code 2 means "temporarily unavailable, try again": asks are
                     # retried here rather than failing a launch of several ads at the last one.
                     for attempt in range(3):
@@ -867,6 +870,23 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             platforms=[Platform.META],
             launched=True,
         )
+
+    async def _existing_post_creative_body(self, plan, post: dict, suffix: str) -> dict:
+        """Creative that runs a post already published on the Page or its Instagram
+        account, so the ad keeps the post's likes and comments. Instagram posts also
+        need the linked Instagram account; Facebook posts are referenced as pageId_postId."""
+        name = f"JaneAds-{plan.business_id}-creative{suffix}"
+        post_id = str(post.get("post_id") or "")
+        if post.get("platform") == "instagram":
+            ig = await self._instagram_ids(plan.page_id)
+            if not ig.get("id"):
+                raise ValueError("This Page has no linked Instagram account, so its Instagram "
+                                 "posts can't run as an ad. Link it in the Page's settings.")
+            return {"name": name, "source_instagram_media_id": post_id,
+                    "instagram_user_id": ig["id"],
+                    "object_story_spec": {"page_id": plan.page_id, "instagram_user_id": ig["id"]}}
+        story_id = post_id if "_" in post_id else f"{plan.page_id}_{post_id}"
+        return {"name": name, "object_story_id": story_id}
 
     async def _instagram_ids(self, page_id: str) -> dict:
         """The Page's Instagram business id and LEGACY id, or {} if unknowable.

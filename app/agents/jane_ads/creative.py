@@ -1364,3 +1364,17 @@ async def creative_from_recomposite(
         ad.vsg01_format_id = vsg01_result["format_id"]
         ad.vsg01_format_attributes = vsg01_result["attributes"]
     return ad
+
+
+def creative_from_existing_post(platform: str, post_id: str, image_url: str, caption: str = "",
+                                is_video: bool = False,
+                                destination_type: str = DEFAULT_DESTINATION.value,
+                                destination_cta: str = "") -> AdCreative:
+    """An ad that runs a post the owner already published. Nothing is written or
+    generated: the post's own picture and caption are the ad, so the copy shown here is
+    only a preview of what Meta will run."""
+    ad = assemble_creative(AdCopy(headline="", primary_text=(caption or "")[:500]), image_url,
+                           source=CreativeSource.UPLOAD, is_video=is_video,
+                           destination_type=destination_type, destination_cta=destination_cta)
+    ad.existing_post = {"platform": platform, "post_id": post_id}
+    return ad

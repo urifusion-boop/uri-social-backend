@@ -373,6 +373,10 @@ class AdCreative(BaseModel):
     DRAFT and RECOMPOSITE can carry either — `is_video` says which."""
     image_url: str = ""             # final creative media URL, hosted on Cloudinary
     is_video: bool = False           # True when image_url is actually a video
+    # Set when the ad promotes a post the owner already published, by hand or through
+    # URI: {"platform": "instagram"|"facebook", "post_id": "..."}. The ad then runs the
+    # post itself (keeping its likes and comments); image_url is only its preview.
+    existing_post: Optional[dict] = None
     # TikTok-only, additive: 2+ extra photos for a Carousel Ad (TikTok's real image-ad
     # format — a single bare static image isn't a valid TikTok ad unit at all, per
     # TikTok's own Carousel Ads docs). Empty for every Meta plan and every TikTok video
