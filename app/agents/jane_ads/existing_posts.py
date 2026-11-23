@@ -52,30 +52,52 @@ def facebook_post(raw: dict) -> dict:
     }
 
 
-async def _connection(db, user_id: Optional[str], brand_id: Optional[str], platform: str) -> dict:
-    conn = await db[CONNECTIONS].find_one(
+async def _connections(db, user_id: Optional[str], brand_id: Optional[str], platform: str) -> list[dict]:
+    rows = await db[CONNECTIONS].find(
         {"platform": platform, "connection_status": "active", **_brand_scope(user_id, brand_id)},
-        sort=[("connected_at", -1)])
-    if not conn:
+        sort=[("connected_at", -1)]).to_list(20)
+    if not rows:
         raise PostsError(f"Connect your {platform.capitalize()} account first.", 404)
-    return conn
+    return rows
 
 
-async def list_posts(db, user_id: Optional[str], brand_id: Optional[str], platform: str) -> list[dict]:
-    if platform not in ("instagram", "facebook"):
-        raise PostsError("Platform must be instagram or facebook.")
-    conn = await _connection(db, user_id, brand_id, platform)
+async def _posts_of(client: httpx.AsyncClient, conn: dict, platform: str) -> list[dict]:
     token = conn.get("page_access_token") or conn.get("access_token") or ""
     if platform == "instagram":
         owner, edge, fields, shape = conn.get("ig_user_id"), "media", _IG_FIELDS, instagram_post
     else:
         owner, edge, fields, shape = conn.get("page_id"), "published_posts", _FB_FIELDS, facebook_post
     if not (owner and token):
-        raise PostsError(f"Reconnect your {platform.capitalize()} account to list its posts.")
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(f"{_graph()}/{owner}/{edge}",
-                                params={"fields": fields, "limit": LIMIT, "access_token": token})
+        raise PostsError("Reconnect this account to list its posts.")
+    resp = await client.get(f"{_graph()}/{owner}/{edge}",
+                            params={"fields": fields, "limit": LIMIT, "access_token": token})
     data = resp.json()
     if data.get("error"):
+        raise PostsError("Meta wouldn't list this account's posts.", 502)
+    name = conn.get("username") or conn.get("page_name") or conn.get("account_name") or ""
+    return [{**p, "account": name} for p in (shape(r) for r in data.get("data") or [])
+            if p["post_id"] and p["image_url"]]
+
+
+async def list_posts(db, user_id: Optional[str], brand_id: Optional[str], platform: str) -> list[dict]:
+    """Posts from every active account of this platform, newest account first. An
+    account Meta refuses (say, its token lost a permission) is skipped, so one stale
+    connection doesn't hide the others."""
+    if platform not in ("instagram", "facebook"):
+        raise PostsError("Platform must be instagram or facebook.")
+    out: list[dict] = []
+    failure: Optional[PostsError] = None
+    seen: set[str] = set()
+    async with httpx.AsyncClient(timeout=20) as client:
+        for conn in await _connections(db, user_id, brand_id, platform):
+            key = str(conn.get("ig_user_id") if platform == "instagram" else conn.get("page_id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                out += await _posts_of(client, conn, platform)
+            except PostsError as e:
+                failure = failure or e
+    if not out and failure:
         raise PostsError("Meta wouldn't list your posts. Reconnect the account and try again.", 502)
-    return [p for p in (shape(r) for r in data.get("data") or []) if p["post_id"] and p["image_url"]]
+    return out

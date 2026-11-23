@@ -56,3 +56,21 @@ def test_facebook_post_ad_uses_the_story_id():
     body = asyncio.run(_adapter({})._existing_post_creative_body(
         PLAN, {"platform": "facebook", "post_id": "77"}, ""))
     assert body["object_story_id"] == "55_77"
+
+
+def test_a_stale_account_does_not_hide_the_others(monkeypatch):
+    conns = [{"ig_user_id": "1", "page_access_token": "bad", "username": "old"},
+             {"ig_user_id": "2", "page_access_token": "ok", "username": "good"}]
+
+    async def fake_conns(*_a):
+        return conns
+
+    async def fake_posts(_client, conn, _platform):
+        if conn["page_access_token"] == "bad":
+            raise ep.PostsError("no", 502)
+        return [{"post_id": "9", "image_url": "x", "account": conn["username"]}]
+
+    monkeypatch.setattr(ep, "_connections", fake_conns)
+    monkeypatch.setattr(ep, "_posts_of", fake_posts)
+    got = asyncio.run(ep.list_posts(None, "u", "b", "instagram"))
+    assert [p["account"] for p in got] == ["good"]
