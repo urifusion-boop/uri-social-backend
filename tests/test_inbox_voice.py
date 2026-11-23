@@ -398,3 +398,10 @@ def test_everyday_pidgin_is_recognised_as_pidgin():
     for text in ("how i fit get art for my wife", "wetin una dey sell", "we fit meet tomorrow"):
         assert agent._language("pcm", text) == "pcm"
     assert agent._language("pcm", "i'm interested") == "en"
+
+
+def test_a_second_profile_from_the_same_template_gets_its_own_name():
+    assert voice.unique_name("Friendly Nigerian", []) == "Friendly Nigerian"
+    assert voice.unique_name("Friendly Nigerian", ["Friendly Nigerian"]) == "Friendly Nigerian 2"
+    assert voice.unique_name("Friendly Nigerian", ["friendly nigerian", "Friendly Nigerian 2"]) \
+        == "Friendly Nigerian 3"

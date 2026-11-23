@@ -666,10 +666,22 @@ async def _exclusive(db, workspace_id: str, keep_id: ObjectId, clean: dict) -> N
             await db[PROFILES].update_one({"_id": r["_id"]}, {"$set": update})
 
 
+def unique_name(name: str, taken: list[str]) -> str:
+    """Two profiles never share a name, so the editor's picker can tell them apart."""
+    used = {t.strip().lower() for t in taken}
+    if name.strip().lower() not in used:
+        return name
+    n = 2
+    while f"{name} {n}".lower() in used:
+        n += 1
+    return f"{name} {n}"
+
+
 async def create_profile(db, workspace_id: str, fields: dict, actor: str, method: str) -> dict:
     existing = await list_profiles(db, workspace_id)
     # The first profile answers everything until there are others to choose from.
     clean = normalize_profile({**fields, "is_default": bool(fields.get("is_default")) or not existing})
+    clean["name"] = unique_name(clean["name"], [p["name"] for p in existing])
     doc = {"workspace_id": workspace_id, **clean, "status": "draft", "active_version": None,
            "has_unpublished_changes": True, "source_methods": [method],
            "created_at": now(), "updated_at": now(), "created_by": actor}
