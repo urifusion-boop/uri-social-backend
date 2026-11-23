@@ -411,9 +411,70 @@ def test_a_connection_the_inbox_swapped_out_provides_no_rows_for_that_platform()
 
 
 def test_linking_skips_what_the_inbox_swapped_out():
-    db = _seeded_db([{**IG_CONN, "inbox_hidden": ["instagram"]}])
+    # Swapped out FOR another account, which is the one the inbox shows.
+    replacement = {**IG_CONN, "_id": "r", "ig_user_id": "IG_NEW", "page_id": "PAGE_NEW",
+                   "connected_at": "2026-06-01T00:00:00"}
+    db = _seeded_db([{**IG_CONN, "_id": "o", "inbox_hidden": ["instagram"],
+                      "connected_at": "2026-01-01T00:00:00"}, replacement])
     _run(link_workspace_channels(db, "u1", "ws_1"))
-    assert [d["platform"] for d in db[CHANNEL_ACCOUNTS].docs] == ["facebook"]
+    shown = {(d["platform"], d["external_account_id"]) for d in db[CHANNEL_ACCOUNTS].docs}
+    assert ("instagram", "IG99") not in shown
+    assert ("instagram", "IG_NEW") in shown
+
+
+# Reported on staging: Instagram and Facebook both connected, both shown as connected in
+# Connected Accounts, yet the inbox said "0 of 3" and replies asked to reconnect. Earlier
+# swaps had left every connection hidden for both platforms, and a reconnect keeps the flag.
+ALL_HIDDEN = [
+    {**IG_CONN, "brand_id": None, "_id": "ig", "inbox_hidden": ["instagram", "facebook"],
+     "connected_at": "2026-11-23T16:55:37+00:00"},
+    {"user_id": "u1", "brand_id": None, "platform": "facebook", "connection_status": "active",
+     "page_id": "PAGE7", "page_access_token": "tok", "page_name": "Sporteinstein", "_id": "fb",
+     "inbox_hidden": ["instagram", "facebook"], "connected_at": "2026-11-23T16:51:32+00:00"},
+]
+
+
+def test_when_every_account_for_a_platform_is_hidden_the_newest_is_shown():
+    from app.models.brand_account import BrandAccount
+    ws = BrandAccount.personal_brand_id("u1")
+    db = _seeded_db(ALL_HIDDEN)
+    _run(link_workspace_channels(db, "u1", ws))
+    shown = {(d["platform"], d["external_account_id"]) for d in db[CHANNEL_ACCOUNTS].docs}
+    assert shown == {("instagram", "IG99"), ("facebook", "PAGE7")}
+
+
+def test_a_stand_in_account_still_has_its_page_subscribed():
+    """Shown but never subscribed would deliver no messages, and the card would say so."""
+    import app.agents.inbox.channels as ch
+    from app.models.brand_account import BrandAccount
+    ws = BrandAccount.personal_brand_id("u1")
+    db = _seeded_db(ALL_HIDDEN)
+    subscribed = []
+
+    async def fake_resolve(page_id, token):
+        return token
+
+    async def fake_subscribe(page_id, token):
+        subscribed.append(page_id)
+        return True, ""
+
+    original = (ch.resolve_page_token, ch.subscribe_page_to_app)
+    ch.resolve_page_token, ch.subscribe_page_to_app = fake_resolve, fake_subscribe
+    try:
+        _run(ch.link_workspace_channels(db, "u1", ws))
+    finally:
+        ch.resolve_page_token, ch.subscribe_page_to_app = original
+    assert subscribed == ["PAGE7"]
+    assert all(d["subscription"]["ok"] for d in db[CHANNEL_ACCOUNTS].docs)
+
+
+def test_the_inbox_counts_as_in_sync_once_the_stand_in_is_linked():
+    import app.agents.inbox.channels as ch
+    from app.models.brand_account import BrandAccount
+    ws = BrandAccount.personal_brand_id("u1")
+    db = _seeded_db(ALL_HIDDEN)
+    _run(link_workspace_channels(db, "u1", ws))
+    assert _run(ch.in_sync_with_connections(db, ws)) is True
 
 
 class _Coll:

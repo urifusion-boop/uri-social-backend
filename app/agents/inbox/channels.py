@@ -101,14 +101,24 @@ def inbox_rows(conns: list[dict], workspace_id: str) -> list[tuple[dict, dict]]:
     connected one per platform, so a person who connects another account never sees
     the old one left beside it. The others stay connected for everything else."""
     best: dict[str, tuple[tuple, dict, dict]] = {}
+    hidden_best: dict[str, tuple[tuple, dict, dict]] = {}
     for conn in conns:
         if _workspace_of(conn) != workspace_id:
             continue
         rank = (_connected_at(conn), str(conn.get("_id") or ""))
-        for row in visible_rows(conn, workspace_id):
-            held = best.get(row["platform"])
+        shown = {r["platform"] for r in visible_rows(conn, workspace_id)}
+        for row in channel_rows(conn, workspace_id):
+            pool = best if row["platform"] in shown else hidden_best
+            held = pool.get(row["platform"])
             if held is None or rank > held[0]:
-                best[row["platform"]] = (rank, conn, row)
+                pool[row["platform"]] = (rank, conn, row)
+    # A swapped-out account is hidden only so that its replacement is the one shown.
+    # When every account for a platform is hidden (the replacement was disconnected,
+    # or repeated swaps hid them all), hiding them all shows the person "0 connected"
+    # with accounts that are plainly connected, and a reconnect could never fix it
+    # because the flag survives the reconnect. So the newest one stands in.
+    for platform, entry in hidden_best.items():
+        best.setdefault(platform, entry)
     return [(c, r) for _, c, r in best.values()]
 
 
@@ -215,8 +225,12 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
     # tried and the first one Meta accepts is the one the channel keeps.
     tokens_by_page: dict[str, list[str]] = {}
     shown_pages = {str(row.get("page_id") or "") for _c, row in selected}
+    # The connections the inbox actually shows, including one standing in for a
+    # platform whose accounts were all swapped out (see inbox_rows).
+    providing = {id(c) for c, _row in selected}
     for conn in conns:
-        if _workspace_of(conn) != workspace_id or not visible_rows(conn, workspace_id):
+        if _workspace_of(conn) != workspace_id or not (
+                visible_rows(conn, workspace_id) or id(conn) in providing):
             continue
         page_id = str(conn.get("page_id") or "")
         if page_id not in shown_pages:
