@@ -2557,6 +2557,11 @@ class MetaLaunchFromMessageBody(BaseModel):
     # Ignored for every other platform and for a video upload.
     extra_image_urls: list[str] = []
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
+    # creative_source=existing_post: a post already published on the brand's account.
+    # reference_image_url is its picture (preview only).
+    existing_post_platform: str = ""      # instagram | facebook
+    existing_post_id: str = ""
+    existing_post_caption: str = ""
     reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
                                           # regenerating (a targeting/budget tweak shouldn't burn a
                                           # credit or swap the visual). Ignored for upload/draft.
@@ -2864,6 +2869,11 @@ async def _build_campaign_plan(
         raise HTTPException(status_code=400, detail=f"reference_image_url is required for creative_source={body.creative_source}")
     if body.creative_source == "draft" and not body.draft_id:
         raise HTTPException(status_code=400, detail="draft_id is required for creative_source=draft")
+    if body.creative_source == "existing_post" and (
+            body.existing_post_platform not in ("instagram", "facebook")
+            or not body.existing_post_id or not body.reference_image_url):
+        raise HTTPException(status_code=400, detail="existing_post_platform, existing_post_id and "
+                                                    "reference_image_url are required for creative_source=existing_post")
 
     # Tie the campaign to the caller's active brand so it shows up in their
     # campaign list; fall back to a random id only if there's no brand context.
@@ -3666,6 +3676,12 @@ async def _build_campaign_plan(
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta,
         )
+    elif body.creative_source == "existing_post":
+        from .creative import creative_from_existing_post
+        creative = creative_from_existing_post(
+            body.existing_post_platform, body.existing_post_id, body.reference_image_url,
+            body.existing_post_caption, is_video=body.is_video,
+            destination_type=destination_type.value, destination_cta=destination_cta)
     elif body.creative_source == "upload":
         creative = await creative_from_upload(
             business_name, category, body.reference_image_url, req.goal.value, creative_brief,
