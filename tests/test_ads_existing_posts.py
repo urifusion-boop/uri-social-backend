@@ -82,8 +82,34 @@ def test_a_stale_account_does_not_hide_the_others(monkeypatch):
 
     monkeypatch.setattr(ep, "_connections", fake_conns)
     monkeypatch.setattr(ep, "_posts_of", fake_posts)
+    monkeypatch.setattr(ep, "_made_in_uri", _nothing_made_in_uri)
     got = asyncio.run(ep.list_posts(None, "u", "b", "instagram"))
     assert [p["account"] for p in got] == ["good"]
+
+
+async def _nothing_made_in_uri(*_a):
+    return set(), []
+
+
+def test_posts_made_in_uri_are_left_out(monkeypatch):
+    async def fake_conns(*_a):
+        return [{"ig_user_id": "1", "page_access_token": "t", "username": "a"}]
+
+    async def fake_posts(_client, conn, _platform):
+        return [
+            {"post_id": "same-id", "image_url": "x", "created_at": "2026-11-01T10:00:00+0000"},
+            {"post_id": "same-time", "image_url": "x", "created_at": "2026-11-02T09:50:00+0000"},
+            {"post_id": "by-hand", "image_url": "x", "created_at": "2026-11-03T08:00:00+0000"},
+        ]
+
+    async def made_in_uri(*_a):
+        return {"same-id"}, [ep._moment("2026-11-02T10:00:00+00:00")]
+
+    monkeypatch.setattr(ep, "_connections", fake_conns)
+    monkeypatch.setattr(ep, "_posts_of", fake_posts)
+    monkeypatch.setattr(ep, "_made_in_uri", made_in_uri)
+    got = asyncio.run(ep.list_posts(None, "u", "b", "instagram"))
+    assert [p["post_id"] for p in got] == ["by-hand"]
 
 
 def test_the_connected_instagram_account_fills_in_when_the_page_token_cant():

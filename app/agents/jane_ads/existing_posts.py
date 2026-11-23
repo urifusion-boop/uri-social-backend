@@ -3,6 +3,7 @@ ad creative. Read with the tokens they granted when they connected the account â
 extra Meta permission is involved."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -11,6 +12,7 @@ from app.core.config import settings
 from .ads_connection import CONNECTIONS, _brand_scope
 
 LIMIT = 24
+MADE_IN_URI_WINDOW = timedelta(minutes=30)
 _IG_FIELDS = "id,caption,media_type,media_url,thumbnail_url,permalink,timestamp"
 _FB_FIELDS = "id,message,full_picture,permalink_url,created_time,attachments{media_type}"
 
@@ -79,8 +81,36 @@ async def _posts_of(client: httpx.AsyncClient, conn: dict, platform: str) -> lis
             if p["post_id"] and p["image_url"]]
 
 
+def _moment(value) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+async def _made_in_uri(db, user_id: Optional[str], brand_id: Optional[str], platform: str) -> tuple[set[str], list[datetime]]:
+    """Ids and publish times of posts URI published for this workspace. Outstand posts
+    keep their own id rather than Meta's, so the publish time is the second signal."""
+    rows = await db["content_drafts"].find(
+        {**_brand_scope(user_id, brand_id), "status": "published", "platform": platform},
+        {"_id": 0, "platform_post_id": 1, "published_date": 1}).to_list(500)
+    ids = {str(r["platform_post_id"]) for r in rows if r.get("platform_post_id")}
+    times = [t for t in (_moment(r.get("published_date")) for r in rows) if t]
+    return ids, times
+
+
+def _by_hand(post: dict, ids: set[str], times: list[datetime]) -> bool:
+    if post["post_id"] in ids:
+        return False
+    at = _moment(post.get("created_at"))
+    return not (at and any(abs(at - t) <= MADE_IN_URI_WINDOW for t in times))
+
+
 async def list_posts(db, user_id: Optional[str], brand_id: Optional[str], platform: str) -> list[dict]:
-    """Posts from every active account of this platform, newest account first. An
+    """Posts made by hand on every active account of this platform, newest account first.
+    Posts URI published are left out. An
     account Meta refuses (say, its token lost a permission) is skipped, so one stale
     connection doesn't hide the others."""
     if platform not in ("instagram", "facebook"):
@@ -98,6 +128,8 @@ async def list_posts(db, user_id: Optional[str], brand_id: Optional[str], platfo
                 out += await _posts_of(client, conn, platform)
             except PostsError as e:
                 failure = failure or e
+    ids, times = await _made_in_uri(db, user_id, brand_id, platform)
+    out = [p for p in out if _by_hand(p, ids, times)]
     if not out and failure:
         raise PostsError("Meta wouldn't list your posts. Reconnect the account and try again.", 502)
     return out
