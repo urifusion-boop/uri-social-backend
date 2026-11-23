@@ -890,9 +890,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             if not ig.get("id"):
                 raise ValueError("This Page has no linked Instagram account, so its Instagram "
                                  "posts can't run as an ad. Link it in the Page's settings.")
+            # Meta allows one promoted object only: the post, never a story spec beside it.
             return {"name": name, "source_instagram_media_id": post_id,
-                    "instagram_user_id": ig["id"],
-                    "object_story_spec": {"page_id": plan.page_id, "instagram_user_id": ig["id"]}}
+                    "instagram_user_id": ig["id"]}
         story_id = post_id if "_" in post_id else f"{plan.page_id}_{post_id}"
         return {"name": name, "object_story_id": story_id}
 

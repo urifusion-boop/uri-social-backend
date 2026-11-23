@@ -49,6 +49,7 @@ def test_instagram_post_ad_references_the_media_and_account():
     body = asyncio.run(_adapter({"id": "ig1"})._existing_post_creative_body(
         PLAN, {"platform": "instagram", "post_id": "17"}, ""))
     assert body["source_instagram_media_id"] == "17" and body["instagram_user_id"] == "ig1"
+    assert "object_story_spec" not in body
 
 
 def test_instagram_post_without_a_linked_account_is_refused():
