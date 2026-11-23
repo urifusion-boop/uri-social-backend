@@ -880,6 +880,14 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         if post.get("platform") == "instagram":
             ig = await self._instagram_ids(plan.page_id)
             if not ig.get("id"):
+                # The Page's own token may be unusable (an expired ads grant), but the
+                # Instagram account the owner connected here names its Page too.
+                linked = await self._db["social_connections"].find_one(
+                    {"platform": "instagram", "page_id": plan.page_id, "connection_status": "active"},
+                    sort=[("connected_at", -1)]) or {}
+                if linked.get("ig_user_id"):
+                    ig = {"id": str(linked["ig_user_id"])}
+            if not ig.get("id"):
                 raise ValueError("This Page has no linked Instagram account, so its Instagram "
                                  "posts can't run as an ad. Link it in the Page's settings.")
             return {"name": name, "source_instagram_media_id": post_id,

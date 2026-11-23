@@ -24,8 +24,17 @@ def test_creative_carries_the_post_reference():
     assert ad.image_url == "t.jpg" and ad.primary_text == "caption"
 
 
-def _adapter(ig):
+class _Coll:
+    def __init__(self, doc):
+        self.doc = doc
+
+    async def find_one(self, *_a, **_k):
+        return self.doc
+
+
+def _adapter(ig, connected=None):
     a = MetaAdPlatformAdapter.__new__(MetaAdPlatformAdapter)
+    a._db = {"social_connections": _Coll(connected)}
 
     async def ids(_page):
         return ig
@@ -74,3 +83,9 @@ def test_a_stale_account_does_not_hide_the_others(monkeypatch):
     monkeypatch.setattr(ep, "_posts_of", fake_posts)
     got = asyncio.run(ep.list_posts(None, "u", "b", "instagram"))
     assert [p["account"] for p in got] == ["good"]
+
+
+def test_the_connected_instagram_account_fills_in_when_the_page_token_cant():
+    body = asyncio.run(_adapter({}, {"ig_user_id": "ig9"})._existing_post_creative_body(
+        PLAN, {"platform": "instagram", "post_id": "17"}, ""))
+    assert body["instagram_user_id"] == "ig9"
