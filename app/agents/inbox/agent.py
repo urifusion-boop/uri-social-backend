@@ -729,13 +729,22 @@ def _aware(at: Optional[datetime]) -> Optional[datetime]:
     return at.replace(tzinfo=timezone.utc) if at and at.tzinfo is None else at
 
 
-def _activity(history: list[dict], at: datetime) -> tuple[int, bool]:
+def _handoff_since(conv: Optional[dict], at: datetime) -> datetime:
+    """Team-member replies older than this no longer count as a takeover: the last
+    24 hours, or since the owner handed the conversation back to URI if that is later."""
+    since = at - HUMAN_HANDOFF
+    resumed = _aware((conv or {}).get("agent_resumed_at"))
+    return max(since, resumed) if resumed else since
+
+
+def _activity(history: list[dict], at: datetime, conv: Optional[dict] = None) -> tuple[int, bool]:
     outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
     auto_sent = sum(1 for m in outbound if m["actor_id"] == AGENT_ACTOR
                     and (_aware(m.get("received_at")) or at) > at - timedelta(hours=1))
     # Sending URI's draft unchanged is approving it, not taking the conversation over.
     human_replied = any(
-        m["actor_id"] != AGENT_ACTOR and not m.get("approved_draft") and (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF
+        m["actor_id"] != AGENT_ACTOR and not m.get("approved_draft")
+        and (_aware(m.get("received_at")) or at) > _handoff_since(conv, at)
         for m in outbound)
     return auto_sent, human_replied
 
@@ -744,7 +753,7 @@ def verdict(settings: dict, conv: dict, history: list[dict], cls: dict, draft: d
             at: Optional[datetime] = None) -> tuple[bool, str]:
     """The auto-reply decision for this conversation as it stands."""
     at = at or now()
-    return decide_auto_reply(settings, conv, cls, draft, *_activity(history, at), at)
+    return decide_auto_reply(settings, conv, cls, draft, *_activity(history, at, conv), at)
 
 
 # A message the agent can't answer still gets a reply: silence reads as being
@@ -775,7 +784,7 @@ def should_hold(settings: dict, conv: dict, history: list[dict],
     back to you" doesn't need another. After HOLD_AGAIN_AFTER, though, it's a new
     wait — a question two days later deserves its own acknowledgement."""
     at = at or now()
-    if gate(settings, conv, *_activity(history, at), at):
+    if gate(settings, conv, *_activity(history, at, conv), at):
         return False
     outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
     if not outbound:
@@ -858,7 +867,7 @@ async def send_fixed_replies(db, workspace_id: str, conversation_id: str, settin
         {"conversation_id": conversation_id, "direction": Direction.OUTBOUND.value}
     ).to_list(500)
     if any(m.get("actor_id") not in (AGENT_ACTOR, None, "") and not m.get("approved_draft") and
-           (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF for m in outbound):
+           (_aware(m.get("received_at")) or at) > _handoff_since(conv, at) for m in outbound):
         return []
     ident = await db[IDENTITIES].find_one({"_id": ObjectId(conv["contact_identity_id"])}) \
         if ObjectId.is_valid(conv.get("contact_identity_id", "")) else None
@@ -1159,3 +1168,16 @@ def schedule(coro) -> None:
     task = asyncio.create_task(guarded())
     _PENDING.add(task)
     task.add_done_callback(_PENDING.discard)
+
+
+async def hand_back(db, workspace_id: str, conversation_id: str, actor_id: str) -> bool:
+    """Give a conversation back to URI: earlier team-member replies and any assignee
+    stop blocking auto-replies. Only the next customer message is answered; nothing is
+    sent now."""
+    if not ObjectId.is_valid(conversation_id):
+        return False
+    res = await db[CONVERSATIONS].update_one(
+        {"_id": ObjectId(conversation_id), "workspace_id": workspace_id},
+        {"$set": {"agent_resumed_at": now(), "assignee_id": "", "agent_resumed_by": actor_id,
+                  "needs_human": False, "handoff_reason": ""}})
+    return res.matched_count > 0

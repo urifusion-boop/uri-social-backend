@@ -245,6 +245,19 @@ async def create_indexes(
     return {"status": "ok"}
 
 
+@router.post("/conversations/{conversation_id}/hand-back")
+async def hand_back_to_agent(
+    conversation_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Let URI auto-reply in this conversation again, ending a team-member takeover."""
+    if not await agent.hand_back(db, brand_ctx.get("brand_id"), conversation_id,
+                                 brand_ctx.get("user_id", "")):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return {"status": "ok"}
+
+
 @router.post("/conversations/{conversation_id}/reply")
 async def reply_to_conversation(
     conversation_id: str,

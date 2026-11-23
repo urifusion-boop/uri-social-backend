@@ -517,3 +517,15 @@ def test_a_hello_after_an_unanswered_question_is_answered_not_held():
     sent: list = []
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
     assert out["status"] == "auto_sent" and sent == ["Hello! How can I help?"]
+
+
+def test_handing_a_conversation_back_ends_the_takeover():
+    at = OPEN_HOURS
+    history = [{"direction": "outbound", "actor_id": "person_1", "approved_draft": False,
+                "received_at": at - timedelta(hours=2)}]
+    assert agent._activity(history, at)[1] is True
+    handed_back = {"agent_resumed_at": at - timedelta(hours=1)}
+    assert agent._activity(history, at, handed_back)[1] is False
+    later = history + [{"direction": "outbound", "actor_id": "person_1", "approved_draft": False,
+                        "received_at": at - timedelta(minutes=10)}]
+    assert agent._activity(later, at, handed_back)[1] is True
