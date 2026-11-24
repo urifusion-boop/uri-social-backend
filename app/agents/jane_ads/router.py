@@ -634,8 +634,18 @@ async def suggest_ad_format(
         return {"suggested": None, "alternatives": [], "needs_in_brief": {}}
     # Fact-led styles this brief can't support (no event date, no offer, no price...): still listed so
     # the picker can show them greyed with the reason, never suggested.
+    from .creative import get_brand_context
     from .vsg01_orchestrator import brief_unmet_needs
-    needs = await brief_unmet_needs(body.description or "")
+    user_id = brand_ctx.get("user_id") or ""
+    try:
+        brand_context = await get_brand_context(user_id, db, brand_ctx.get("brand_id")) if user_id else {}
+    except Exception:
+        brand_context = {}
+    needs = await brief_unmet_needs(
+        body.description or "", (brand_context or {}).get("brand_name", ""),
+        (brand_context or {}).get("industry", ""), brand_context,
+        only={f["format_id"] for f in serialized},
+    )
     ready = [f for f in serialized if f["format_id"] not in needs]
     suggested = ready[0] if ready else None
     from . import ad_image_billing
