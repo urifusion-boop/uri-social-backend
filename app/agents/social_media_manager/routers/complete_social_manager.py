@@ -98,6 +98,18 @@ def video_draft_platform(target: str) -> str:
     return target[: -len("_reels")] if target.endswith("_reels") else target
 
 
+
+def _own_job(job, user_id, legacy_ok: bool = False):
+    """The job if the caller owns it, else None (callers answer 404 either way, so a
+    stranger can't tell a real job id from a made-up one). legacy_ok admits jobs created
+    before owners were recorded on that job type; those carry no user_id."""
+    if not job or not user_id:
+        return None
+    owner = job.get("user_id")
+    if owner == user_id or (legacy_ok and owner is None):
+        return job
+    return None
+
 def _get_user_id(token: dict) -> str | None:
     """
     Extract user_id from JWT payload.
@@ -7592,11 +7604,8 @@ async def trigger_publish_scheduled(
     Cron endpoint — called every 5 minutes to check and update scheduled posts.
     Protected by X-Cron-Secret header.
     """
-    from app.core.config import settings as _cfg
-    expected = getattr(_cfg, "CRON_SECRET", "") or ""
-    cron_secret = request.headers.get("X-Cron-Secret", "")
-    if expected and cron_secret != expected:
-        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    from app.core.shared_secret import require_cron_secret
+    require_cron_secret(request)
 
     result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
     return result
@@ -7636,7 +7645,7 @@ async def generate_storyboard(
 
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    job_id = await VideoStoryboardService.create_storyboard_job()
+    job_id = await VideoStoryboardService.create_storyboard_job(ctx.get("user_id"))
     background_tasks.add_task(
         VideoStoryboardService.run_storyboard_job,
         job_id,
@@ -7659,9 +7668,9 @@ async def get_storyboard_job(
     """Poll for storyboard-script generation progress (Upload Images flow)."""
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
 
-    job = await VideoStoryboardService.get_storyboard_job(job_id)
+    job = _own_job(await VideoStoryboardService.get_storyboard_job(job_id), user_id, legacy_ok=True)
     if not job:
         raise HTTPException(status_code=404, detail="Storyboard job not found")
 
@@ -7772,9 +7781,9 @@ async def get_video_job(
     """
     from app.agents.social_media_manager.services.video_generation_service import get_job
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
 
-    job = await get_job(job_id)
+    job = _own_job(await get_job(job_id), user_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -7803,9 +7812,9 @@ async def generate_storyboard_frames(
     """
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
 
-    job_id = await VideoStoryboardService.create_frame_job(request.scenes)
+    job_id = await VideoStoryboardService.create_frame_job(request.scenes, user_id)
     background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes, request.brand_images)
 
     return UriResponse.get_single_data_response(
@@ -7822,9 +7831,9 @@ async def get_storyboard_frame_job(
     """Poll for storyboard frame image generation progress."""
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
 
-    job = await VideoStoryboardService.get_frame_job(job_id)
+    job = _own_job(await VideoStoryboardService.get_frame_job(job_id), user_id, legacy_ok=True)
     if not job:
         raise HTTPException(status_code=404, detail="Frame job not found")
 
@@ -7877,7 +7886,7 @@ async def generate_creative_storyboard(
         )
 
     try:
-        job_id = await VideoCreativeService.create_storyboard_job(started["job_id"])
+        job_id = await VideoCreativeService.create_storyboard_job(started["job_id"], ctx.get("user_id"))
     except Exception:
         # The job could not even be created after the credit was taken: give it straight back.
         await billing.settle_storyboard(started["job_id"], False)
@@ -7920,9 +7929,9 @@ async def get_creative_storyboard_job(
     """Poll for "describe it" storyboard-script generation progress."""
     from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
 
-    job = await VideoCreativeService.get_storyboard_job(job_id)
+    job = _own_job(await VideoCreativeService.get_storyboard_job(job_id), user_id, legacy_ok=True)
     if not job:
         raise HTTPException(status_code=404, detail="Storyboard job not found")
 
@@ -7956,7 +7965,7 @@ async def generate_creative_frames(
     # The scene images are drawn knowing whose video this is: its colours, and no invented brand names.
     brand_context = await _video_brand_context(ctx, db)
 
-    job_id = await VideoCreativeService.create_frame_job(request.scenes)
+    job_id = await VideoCreativeService.create_frame_job(request.scenes, ctx.get("user_id"))
     background_tasks.add_task(
         VideoCreativeService.run_frame_job, job_id, request.scenes, request.reference_images, brand_context
     )
@@ -7986,9 +7995,9 @@ async def merge_video_job(
     from app.agents.social_media_manager.services.video_generation_service import get_job
     from app.agents.social_media_manager.services.video_merge_service import VideoMergeService
 
-    _get_user_id(token)  # auth check
+    user_id = _get_user_id(token)
 
-    job = await get_job(job_id)
+    job = _own_job(await get_job(job_id), user_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.get("status") != "complete":
@@ -9460,7 +9469,7 @@ async def polish_video_clip_action(
                 upsert=True,
             )
 
-    await db["clip_action_jobs"].insert_one({"action_job_id": action_job_id, "status": "processing"})
+    await db["clip_action_jobs"].insert_one({"action_job_id": action_job_id, "status": "processing", "user_id": user_id})
     background_tasks.add_task(_run)
 
     return UriResponse.get_single_data_response(
@@ -9479,7 +9488,8 @@ async def get_polish_video_clip_action(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    doc = await db["clip_action_jobs"].find_one({"action_job_id": action_job_id}, {"_id": 0})
+    doc = _own_job(await db["clip_action_jobs"].find_one({"action_job_id": action_job_id}, {"_id": 0}), user_id, legacy_ok=True)
+    doc = {k: v for k, v in doc.items() if k != "user_id"} if doc else None
     if not doc:
         raise HTTPException(status_code=404, detail="Action job not found")
 
@@ -11848,7 +11858,7 @@ async def zapcap_job_status(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id, "user_id": user_id})  # owner only
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
 
@@ -12226,7 +12236,7 @@ async def zapcap_job_transcript(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id, "user_id": user_id})  # owner only
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
 
@@ -12286,7 +12296,7 @@ async def zapcap_job_rerender(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id, "user_id": user_id})  # owner only
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
     if job.get("render_type") == "no_captions":
@@ -12434,7 +12444,7 @@ async def zapcap_job_custom_broll(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id, "user_id": user_id})  # owner only
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
 
