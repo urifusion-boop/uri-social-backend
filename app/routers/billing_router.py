@@ -274,7 +274,7 @@ async def get_subscription_tiers():
     - Growth: ₦25,000 / 35 credits
     - Pro: ₦40,000 / 50 credits
     - Agency: ₦80,000 / 100 credits
-    - Custom: ₦750 per credit
+    - Custom: credits at the Starter plan's rate
     """
     try:
         tiers = await subscription_service.get_all_tiers(active_only=True)

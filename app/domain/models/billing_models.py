@@ -174,14 +174,14 @@ class SubscriptionTier(BaseModel):
             "example": {
                 "tier_id": "starter",
                 "name": "Starter Plan",
-                "price_ngn_monthly": 15000,
-                "price_ngn_3months": 42750,
-                "price_ngn_6months": 85500,
-                "price_ngn_12months": 171000,
-                "credits_monthly": 20,
-                "price_ngn": 15000,
+                "price_ngn_monthly": 30000,
+                "price_ngn_3months": 85500,
+                "price_ngn_6months": 171000,
+                "price_ngn_12months": 342000,
+                "credits_monthly": 45,
+                "price_ngn": 30000,
                 "credits": 20,
-                "price_per_credit": 750,
+                "price_per_credit": 667,
                 "features": ["20 Campaigns/Month", "Basic Support"],
                 "is_active": True
             }

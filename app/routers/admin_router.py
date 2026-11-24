@@ -1268,6 +1268,16 @@ async def admin_reconcile_published_posts(
     return {"status": True, **result}
 
 
+@router.post("/billing/sync-plans")
+async def sync_subscription_plans(admin_user: dict = Depends(verify_admin)):
+    """Bring the stored subscription plans in line with the prices and credits in SubscriptionService.PLANS
+    (the seed only ever runs on an empty collection, so a price change never reached an existing database).
+    Admin-only and idempotent: a second call changes nothing. Returns each plan that changed, from → to."""
+    from app.services.SubscriptionService import subscription_service
+    changed = await subscription_service.sync_tiers_to_defaults()
+    return {"changed": changed}
+
+
 # ── Delete an account permanently ────────────────────────────────────────────
 # See app/services/account_deletion.py for what is deleted and how.
 
