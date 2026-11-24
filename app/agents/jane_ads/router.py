@@ -10,6 +10,8 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import html
+
 import json
 import re
 from typing import Optional
@@ -1454,7 +1456,7 @@ async def jane_google_ads_admin_connect_callback(
         return RedirectResponse(url)
 
     if error:
-        return HTMLResponse(f"<p>Google Ads admin connect failed: {error}</p>", status_code=400)
+        return HTMLResponse(f"<p>Google Ads admin connect failed: {html.escape(str(error))}</p>", status_code=400)
     if not code:
         return HTMLResponse("<p>Google Ads admin connect failed: missing code.</p>", status_code=400)
 
@@ -1547,7 +1549,7 @@ async def jane_tiktok_ads_admin_connect_callback(
     from app.core.config import settings
 
     if error:
-        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {error}</p>", status_code=400)
+        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {html.escape(str(error))}</p>", status_code=400)
     grant_code = auth_code or code
     if not grant_code:
         return HTMLResponse("<p>TikTok Ads admin connect failed: missing auth_code.</p>", status_code=400)
