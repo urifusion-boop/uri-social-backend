@@ -2,14 +2,24 @@
 TikTok ad groups also target Video interactions, Creator interactions and Hashtag interactions (and Purchase
 intention where the objective allows it), not only Interests. All of it is best effort: it must never cost a launch.
 """
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.agents.jane_ads.adapters import tiktok_behavior_targeting as bt
+
 from app.agents.jane_ads.adapters.tiktok import _best_tiktok_interest
 from tests.test_jane_ads_tiktok_adapter import _adapter, _auth, _plan, _run
 from tests.test_jane_ads_tiktok_launch_fixes import _RoutedClient
+
+
+@contextmanager
+def _ads_key(value: str):
+    """Set the OpenAI key Jane Ads sees. `jane_ads_openai_key` is a read-only property on Settings
+    (dedicated key, else the shared one), so set the two fields it reads."""
+    with patch.object(bt.settings, "ADS_OPENAI_API_KEY", value), patch.object(bt.settings, "OPENAI_API_KEY", value):
+        yield
 
 # TikTok lists video and creator categories together; each says which it is, and ids are only unique within a scene.
 ACTION_CATEGORIES = {"action_categories": [
@@ -24,7 +34,7 @@ HASHTAGS = {"hashtags": [{"hashtag_id": "h1", "hashtag_name": "learnontiktok"}, 
 @pytest.fixture(autouse=True)
 def _no_model_calls():
     """No test reaches a real model: with no key, the category choice answers nothing."""
-    with patch.object(bt.settings, "jane_ads_openai_key", "", create=True):
+    with _ads_key(""):
         yield
 
 
@@ -114,10 +124,10 @@ def test_a_model_answer_is_trusted_only_for_ids_that_are_in_the_list():
 
     import sys, types
     fake_openai = types.ModuleType("openai"); fake_openai.AsyncOpenAI = _Client
-    with patch.dict(sys.modules, {"openai": fake_openai}), patch.object(bt.settings, "jane_ads_openai_key", "k", create=True):
+    with patch.dict(sys.modules, {"openai": fake_openai}), _ads_key("k"):
         assert _run(bt._choose_categories(["x"], scoped, 2)) == ["6", "5"]
         assert _run(bt._choose_categories(["x"], [], 2)) == []
-    with patch.object(bt.settings, "jane_ads_openai_key", "", create=True):
+    with _ads_key(""):
         assert _run(bt._choose_categories(["x"], scoped, 2)) == []              # no key: caller falls back
 
 

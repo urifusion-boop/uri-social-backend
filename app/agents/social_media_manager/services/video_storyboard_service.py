@@ -338,10 +338,11 @@ class VideoStoryboardService:
             return None
 
     @staticmethod
-    async def create_frame_job(scenes: list) -> str:
+    async def create_frame_job(scenes: list, user_id: Optional[str] = None) -> str:
         job_id = uuid.uuid4().hex
         await _frame_jobs_collection().insert_one({
             "job_id": job_id,
+            "user_id": user_id,
             "status": "generating",
             "total_scenes": len(scenes),
             "frames": [],
@@ -559,10 +560,11 @@ class VideoStoryboardService:
     #    things with different lifetimes. ──
 
     @staticmethod
-    async def create_storyboard_job() -> str:
+    async def create_storyboard_job(user_id: Optional[str] = None) -> str:
         job_id = uuid.uuid4().hex
         await _storyboard_jobs_collection().insert_one({
             "job_id": job_id,
+            "user_id": user_id,
             "status": "generating",
             "storyboard": None,
             "error": None,

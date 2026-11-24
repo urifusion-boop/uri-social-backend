@@ -275,9 +275,15 @@ class TestCategoryContentPerformance:
 class TestMetricsRouter:
     @pytest.mark.asyncio
     async def test_endpoint_delegates_correctly(self):
+        # The endpoint looks back from the real clock (it passes no `now`), so this
+        # card and its action are dated yesterday by the real clock, not by NOW:
+        # dated from NOW they fell out of its 30-day window a month after NOW.
         db = fresh_db()
-        await _card(db, "c1")
-        await _action(db, "c1", "saved")
+        yesterday = datetime.utcnow() - timedelta(days=1)
+        await db["mi_listen_cards"].insert_one({"id": "c1", "brand_id": "b1", "market": MARKET_KEY,
+                                                "created_at": yesterday})
+        await db["mi_listen_card_actions"].insert_one({"card_id": "c1", "market": MARKET_KEY, "action": "saved",
+                                                       "reason": None, "at": yesterday})
         result = await product_metrics_endpoint(market=None, window_days=30, admin=ADMIN, db=db)
         assert result["responseData"]["cards_shown"] == 1
         assert result["responseData"]["useful_or_acted_on_rate"] == 1.0

@@ -20,6 +20,7 @@ Options:
     --skip-large: Skip collections with >5000 documents for quick testing
 """
 
+import os
 import asyncio
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -28,8 +29,8 @@ import argparse
 from typing import Dict, List, Set
 
 # Database connection strings
-OLD_MONGODB_URI = "mongodb://urifusion:***REMOVED***!@REMOVED_HOST:27018/Uri_Insight?authSource=admin"
-NEW_MONGODB_URI = "mongodb+srv://urisocial:***REMOVED***%40@cluster0.qomenuh.mongodb.net/urisocial?appName=Cluster0"
+OLD_MONGODB_URI = os.environ["OLD_MONGODB_URI"]  # never hard-code a connection string
+NEW_MONGODB_URI = os.environ["NEW_MONGODB_URI"]
 
 # URISocial collections to sync (verified by analyzing codebase collection usage)
 URISOCIAL_COLLECTIONS = [

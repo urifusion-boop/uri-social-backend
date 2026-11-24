@@ -11,21 +11,21 @@ import os
 
 import pytest
 import pytest_asyncio
-from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.services.BrandAccountService import BrandAccountService
 
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb://urifusion:***REMOVED***%21@REMOVED_HOST:27018/Uri_Insight?authSource=admin",
-)
 
 _SCOPED_COLLECTIONS = ["brand_accounts", "brand_profiles", "writing_dna",
                        "social_connections", "member_brand_access"]
 
 
+# An in-memory MongoDB per test: no real database is touched, and no connection string
+# lives in the code.
+mongomock_motor = pytest.importorskip("mongomock_motor")
+
+
 def _db():
-    return AsyncIOMotorClient(MONGODB_URI)["Uri_Insight"]
+    return mongomock_motor.AsyncMongoMockClient()["Uri_Insight"]
 
 
 @pytest_asyncio.fixture

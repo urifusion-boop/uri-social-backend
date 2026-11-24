@@ -28,15 +28,38 @@ async def list_drafts(db, brand_id: str) -> list[dict]:
     return [doc async for doc in cursor]
 
 
-async def save_draft(db, brand_id: str, draft_id: str, payload: dict) -> None:
+class DraftOwnedElsewhere(Exception):
+    """The draft_id is already saved under a different brand."""
+
+
+async def save_draft(db, brand_id: str, draft_id: str, payload: dict, user_id: str | None = None) -> None:
+    """Upsert one draft for this brand.
+
+    Refuses (DraftOwnedElsewhere) when the same draft_id already belongs to a
+    different brand. draft_ids are random and made by the browser, so the only
+    way one turns up under a second brand is a browser that still held another
+    account's unfinished ad. Live-reported 2026-11: ads started on one account
+    appeared in another account signed in on the same browser, and editing one
+    copied it into the second account. The browser now keeps its copies per user
+    and wipes them on sign-out; this makes the database refuse the copy even if a
+    browser ever gets that wrong.
+    """
+    elsewhere = await db[DRAFTS].find_one(
+        {"draft_id": draft_id, "brand_id": {"$ne": brand_id}}, {"_id": 1}
+    )
+    if elsewhere:
+        raise DraftOwnedElsewhere(draft_id)
+    fields = {
+        "payload": payload,
+        "brand_id": brand_id,
+        "draft_id": draft_id,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if user_id:
+        fields["user_id"] = user_id   # who last saved it
     await db[DRAFTS].update_one(
         {"brand_id": brand_id, "draft_id": draft_id},
-        {"$set": {
-            "payload": payload,
-            "brand_id": brand_id,
-            "draft_id": draft_id,
-            "updated_at": datetime.now(timezone.utc),
-        }},
+        {"$set": fields},
         upsert=True,
     )
 

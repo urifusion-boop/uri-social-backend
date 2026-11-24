@@ -239,6 +239,10 @@ class Settings(BaseSettings):
 
     # Env flags
     ENV: str = "Development"
+    # Shared secrets for machine-to-machine endpoints. Empty = the endpoints refuse every
+    # caller (see app/core/shared_secret.py); set them in SSM to enable a caller.
+    CRON_SECRET: str = ""
+    INTERNAL_SERVICE_SECRET: str = ""
     DEV_ENV: str = "Development"
     WEB_APP_URL: str = ""
 

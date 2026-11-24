@@ -364,10 +364,8 @@ async def x_daily_push(
     """
     import asyncio
 
-    cron_secret = request.headers.get("X-Cron-Secret", "")
-    expected = getattr(settings, "CRON_SECRET", "")
-    if expected and cron_secret != expected:
-        raise HTTPException(status_code=403, detail="Forbidden.")
+    from app.core.shared_secret import require_cron_secret
+    require_cron_secret(request)
 
     asyncio.create_task(_send_x_daily_push(db))
     return {

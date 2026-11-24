@@ -10,6 +10,8 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import html
+
 import json
 import re
 from typing import Optional
@@ -668,8 +670,13 @@ async def save_wizard_draft(
     save. See wizard_draft.py and the frontend's campaign-wizard/
     wizardDraft.ts, which calls this as a backstop behind its own (faster,
     free) localStorage copy."""
-    from .wizard_draft import save_draft
-    await save_draft(db, _wizard_draft_key(brand_ctx), draft_id, body.payload)
+    from .wizard_draft import DraftOwnedElsewhere, save_draft
+    try:
+        await save_draft(db, _wizard_draft_key(brand_ctx), draft_id, body.payload,
+                         user_id=brand_ctx.get("user_id"))
+    except DraftOwnedElsewhere:
+        # 409, not 403: the frontend signs people out on most 403s.
+        raise HTTPException(status_code=409, detail="This unfinished ad belongs to another account.")
     return {"ok": True}
 
 
@@ -1405,7 +1412,7 @@ async def jane_google_ads_admin_connect_callback(
         return RedirectResponse(url)
 
     if error:
-        return HTMLResponse(f"<p>Google Ads admin connect failed: {error}</p>", status_code=400)
+        return HTMLResponse(f"<p>Google Ads admin connect failed: {html.escape(str(error))}</p>", status_code=400)
     if not code:
         return HTMLResponse("<p>Google Ads admin connect failed: missing code.</p>", status_code=400)
 
@@ -1498,7 +1505,7 @@ async def jane_tiktok_ads_admin_connect_callback(
     from app.core.config import settings
 
     if error:
-        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {error}</p>", status_code=400)
+        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {html.escape(str(error))}</p>", status_code=400)
     grant_code = auth_code or code
     if not grant_code:
         return HTMLResponse("<p>TikTok Ads admin connect failed: missing auth_code.</p>", status_code=400)

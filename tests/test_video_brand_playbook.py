@@ -61,7 +61,7 @@ def routes(monkeypatch):
         seen["get_calls"].append((user_id, brand_id))
         return {"status": True, "responseData": dict(PROFILE)}
 
-    async def fake_create_job(job_id=None):
+    async def fake_create_job(job_id=None, user_id=None):
         return job_id or "job1"
 
     async def fake_run(*args):
@@ -365,7 +365,7 @@ def test_a_scene_image_without_a_playbook_still_forbids_invented_brands(monkeypa
 def test_the_frames_route_loads_the_active_brand_and_hands_it_to_the_job(monkeypatch, routes):
     seen = {}
 
-    async def create_frame_job(scenes):
+    async def create_frame_job(scenes, user_id=None):
         return "F1"
 
     async def run_frame_job(*a):
