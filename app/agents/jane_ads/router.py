@@ -4932,9 +4932,11 @@ async def meta_launch_plan(
     require_whatsapp = (
         plan.goal != Goal.FOLLOWERS and destination_type == DestinationType.WHATSAPP
     )
-    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
-        # Google runs in the brand's own Google Ads account — there is no Meta Page.
-        # Its own gate (linked account, re-checked with Google) runs in _do_launch.
+    if plan.platforms and plan.platforms[0].platform in (Platform.GOOGLE, Platform.TIKTOK):
+        # Google runs in the brand's own Google Ads account, TikTok under URI's own
+        # advertiser and identity — neither has a Meta Page, so a lapsed Facebook
+        # connection must not block them (plan time already skips it for TikTok).
+        # Google's own gate (linked account, re-checked with Google) runs in _do_launch.
         from .whatsapp import get_brand_whatsapp
         ads_conn = {"page_id": "", "whatsapp_number": await get_brand_whatsapp(db, brand_id) or ""}
     else:
