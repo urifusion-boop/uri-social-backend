@@ -8,6 +8,7 @@ Handles payment processing:
 - Webhook handling (PRD 6.3)
 - Failure handling (PRD 6.4)
 """
+import secrets
 import httpx
 import hashlib
 import hmac
@@ -26,6 +27,10 @@ from app.services.SubscriptionService import subscription_service
 from app.services.TrialService import trial_service
 from app.services.CreditService import credit_service
 from app.core.config import settings
+
+
+class WebhookSignatureError(ValueError):
+    """The webhook could not be proven to come from Squad."""
 
 
 class PaymentService:
@@ -159,7 +164,7 @@ class PaymentService:
             print(f"💰 Payment: {tier.name} - {billing_cycle} - {currency_symbol}{amount:,} {currency} ({credits} credits)")
 
         # Generate unique transaction reference
-        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{currency}_{int(datetime.utcnow().timestamp())}"
+        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{currency}_{int(datetime.utcnow().timestamp())}_{secrets.token_hex(6)}"
 
         # Create pending payment transaction (PRD Section 8.1 & 8.2)
         payment = PaymentTransaction(
@@ -267,7 +272,7 @@ class PaymentService:
 
         # Generate unique transaction reference (CREDITS-prefixed so it's
         # visually distinguishable from subscription refs in payment history/logs)
-        transaction_ref = f"URI_CREDITS_{user_id[:8]}_{quantity}_{int(datetime.utcnow().timestamp())}"
+        transaction_ref = f"URI_CREDITS_{user_id[:8]}_{quantity}_{int(datetime.utcnow().timestamp())}_{secrets.token_hex(6)}"
 
         # Create pending payment transaction
         payment = PaymentTransaction(
@@ -347,7 +352,7 @@ class PaymentService:
         amount = int(plan["price_ngn"])
         if amount < 1:
             raise ValueError("This plan has no price set.")
-        transaction_ref = f"URI_OBX_{workspace_id[-8:]}_{plan['plan_id'].upper()}_{int(datetime.utcnow().timestamp())}"
+        transaction_ref = f"URI_OBX_{workspace_id[-8:]}_{plan['plan_id'].upper()}_{int(datetime.utcnow().timestamp())}_{secrets.token_hex(6)}"
         payment = PaymentTransaction(
             user_id=user_id, transaction_ref=transaction_ref, amount=amount, currency="NGN",
             status="pending", gateway="squad", purchase_type="onebox",
@@ -654,7 +659,8 @@ class PaymentService:
     async def handle_webhook(
         self,
         payload: Dict,
-        signature: Optional[str] = None
+        signature: Optional[str] = None,
+        raw_body: Optional[bytes] = None,
     ) -> bool:
         """
         Handle SQUAD webhook callback
@@ -673,10 +679,11 @@ class PaymentService:
             }
         }
         """
-        # Verify webhook signature (SQUAD HMAC-SHA512 via x-squad-encrypted-body header)
-        if signature and self.squad_secret_key:
-            if not self._verify_webhook_signature(payload, signature):
-                raise ValueError("Invalid webhook signature")
+        # Fail closed. This route has no login (Squad calls it), and the check used to
+        # run only when a signature was supplied: omitting the header skipped it, so
+        # anyone could POST a fake "success" for their own checkout and get a plan free.
+        if not await self.webhook_signature_valid(raw_body, signature):
+            raise WebhookSignatureError("Invalid or missing webhook signature")
 
         # SQUAD webhook structure: Event + TransactionRef + Body
         transaction_ref = payload.get("TransactionRef") or payload.get("transaction_ref")
@@ -696,28 +703,32 @@ class PaymentService:
 
         # Handle based on status
         if transaction_status == "success":
-            if payment_doc.get("purchase_type") == "onebox":
-                await self._complete_onebox_purchase(transaction_ref, payload)
-            elif payment_doc.get("purchase_type") == "custom_credits":
-                await self._complete_custom_credit_purchase(
-                    transaction_ref=transaction_ref,
-                    user_id=payment_doc["user_id"],
-                    quantity=payment_doc.get("credit_quantity") or 0,
-                    squad_response=payload
-                )
-            else:
-                await self._complete_payment(
-                    transaction_ref=transaction_ref,
-                    user_id=payment_doc["user_id"],
-                    tier_id=payment_doc.get("subscription_tier"),
-                    squad_response=payload
-                )
-            return True
+            # The webhook body is a claim, not proof: credit only once Squad itself
+            # confirms the transaction (verify_payment asks Squad, then completes it
+            # exactly once — an already-completed payment just returns True).
+            return await self.verify_payment(transaction_ref)
         elif transaction_status in ["failed", "cancelled"]:
             await self._mark_payment_failed(transaction_ref, payload)
             return False
 
         return False
+
+    async def webhook_signature_valid(self, raw_body: Optional[bytes], signature: Optional[str]) -> bool:
+        """Whether the webhook really came from Squad.
+
+        Squad signs the RAW body with HMAC-SHA512 keyed on the merchant secret key and
+        sends uppercase hex in `x-squad-encrypted-body`. The raw bytes are hashed, never
+        a re-serialised dict (key order and spacing would change the digest). Missing
+        body, signature or key all mean "not verified".
+        """
+        if not raw_body or not signature:
+            return False
+        creds = await self._get_squad_credentials()
+        secret = (creds or {}).get("secret_key") or ""
+        if not secret:
+            return False
+        expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha512).hexdigest().upper()
+        return hmac.compare_digest(expected, signature.strip().upper())
 
     def _verify_webhook_signature(self, payload: Dict, signature: str) -> bool:
         """

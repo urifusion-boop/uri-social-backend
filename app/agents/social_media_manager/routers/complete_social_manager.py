@@ -7958,11 +7958,8 @@ async def trigger_publish_scheduled(
     Cron endpoint — called every 5 minutes to check and update scheduled posts.
     Protected by X-Cron-Secret header.
     """
-    from app.core.config import settings as _cfg
-    expected = getattr(_cfg, "CRON_SECRET", "") or ""
-    cron_secret = request.headers.get("X-Cron-Secret", "")
-    if expected and cron_secret != expected:
-        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    from app.core.shared_secret import require_cron_secret
+    require_cron_secret(request)
 
     result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
     return result

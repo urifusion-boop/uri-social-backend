@@ -284,10 +284,8 @@ async def daily_push(
     """
     from app.core.config import settings
 
-    cron_secret = request.headers.get("X-Cron-Secret", "")
-    expected = getattr(settings, "CRON_SECRET", "")
-    if expected and cron_secret != expected:
-        raise HTTPException(status_code=403, detail="Forbidden.")
+    from app.core.shared_secret import require_cron_secret
+    require_cron_secret(request)
 
     result = await WhatsAppFlowService.send_daily_push(db)
     return {

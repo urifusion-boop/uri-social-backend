@@ -66,8 +66,8 @@ async def cron_reset_hourly_limits(
     ```
     """
     # Verify cron secret
-    expected_secret = getattr(settings, "CRON_SECRET", None) or "your-cron-secret-here"
-    if not x_cron_secret or x_cron_secret != expected_secret:
+    from app.core.shared_secret import secret_matches
+    if not secret_matches(x_cron_secret or "", settings.CRON_SECRET):
         raise HTTPException(status_code=401, detail="Invalid cron secret")
 
     await reset_hourly_limits()
@@ -97,8 +97,8 @@ async def cron_reset_daily_limits(
     ```
     """
     # Verify cron secret
-    expected_secret = getattr(settings, "CRON_SECRET", None) or "your-cron-secret-here"
-    if not x_cron_secret or x_cron_secret != expected_secret:
+    from app.core.shared_secret import secret_matches
+    if not secret_matches(x_cron_secret or "", settings.CRON_SECRET):
         raise HTTPException(status_code=401, detail="Invalid cron secret")
 
     await reset_daily_limits()
