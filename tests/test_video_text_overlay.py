@@ -116,7 +116,7 @@ def test_the_merge_route_passes_each_finished_clips_text(monkeypatch):
     seen = {}
 
     async def fake_get_job(job_id):
-        return {"status": "complete", "clips": [
+        return {"user_id": "u1", "status": "complete", "clips": [
             {"scene_number": 1, "video_url": "u1", "text_overlay": "Fresh today"},
             {"scene_number": 2, "video_url": None, "text_overlay": "failed scene"},
             {"scene_number": 3, "video_url": "u3", "text_overlay": None},
@@ -136,7 +136,7 @@ def test_the_merge_route_hands_over_the_brands_logo_when_the_playbook_has_one(mo
     seen = {}
 
     async def fake_get_job(job_id):
-        return {"status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
+        return {"user_id": "u1", "status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
 
     async def fake_context(ctx, db):
         return {"logo_url": "https://cdn/logo.png", "logo_position": "top_left", "logo_size": "medium"}
@@ -156,7 +156,7 @@ def test_the_merge_route_merges_without_a_logo_when_the_playbook_has_none_or_can
     seen = []
 
     async def fake_get_job(job_id):
-        return {"status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
+        return {"user_id": "u1", "status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
 
     async def merge(urls, texts=None, logo=None):
         seen.append(logo)

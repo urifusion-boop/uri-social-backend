@@ -425,10 +425,11 @@ class VideoCreativeService:
     #    a frame-generation job are different things with different lifetimes. ──
 
     @staticmethod
-    async def create_storyboard_job(job_id: Optional[str] = None) -> str:
+    async def create_storyboard_job(job_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
         job_id = job_id or uuid.uuid4().hex
         await _creative_storyboard_jobs_collection().insert_one({
             "job_id": job_id,
+            "user_id": user_id,
             "status": "generating",
             "storyboard": None,
             "error": None,
@@ -493,8 +494,8 @@ class VideoCreativeService:
     #    scenes when there's no single real photo to anchor every edit to. ──
 
     @staticmethod
-    async def create_frame_job(scenes: list) -> str:
-        return await VideoStoryboardService.create_frame_job(scenes)
+    async def create_frame_job(scenes: list, user_id: Optional[str] = None) -> str:
+        return await VideoStoryboardService.create_frame_job(scenes, user_id)
 
     @staticmethod
     async def run_frame_job(job_id: str, scenes: list, reference_images: List[str] = None,
