@@ -3,13 +3,13 @@ import httpx
 import asyncio
 from typing import Annotated
 from app.core.shared_secret import require_internal_service_secret
+from app.core.one_time_codes import check_one_time_code, new_code
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, BeforeValidator, EmailStr
 from passlib.context import CryptContext
 from bson import ObjectId
 import secrets
-import random
 from datetime import datetime, timedelta
 
 from app.core.auth_handler import sign_jwt
@@ -87,7 +87,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
     now = datetime.utcnow()
 
     # Generate 6-digit verification code
-    verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+    verification_code = new_code()
     verification_code_expires = now + timedelta(minutes=15)  # Code expires in 15 minutes
 
     try:
@@ -106,6 +106,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
             "email_verified": False,
             "verification_code": verification_code,
             "verification_code_expires": verification_code_expires,
+            "verification_attempts": 0,
             "verification_code_sent_at": now,
             "account_status": "pending_verification",
             "last_login_at": None,
@@ -195,6 +196,10 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
     if not email:
         raise HTTPException(status_code=400, detail="Could not retrieve email from Google account.")
     email = _normalize_email(email)  # same canonical form as every other lookup in this file
+    # Only an address Google has verified proves the person owns it; otherwise a Google
+    # account claiming someone else's email would be logged into that person's account.
+    if userinfo.get("verified_email") is False:
+        raise HTTPException(status_code=400, detail="Your Google email address isn't verified. Verify it with Google and try again.")
 
     first_name = userinfo.get("given_name", "")
     last_name = userinfo.get("family_name", "")
@@ -208,10 +213,16 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
         first_name = existing.get("first_name", first_name)
         last_name = existing.get("last_name", last_name)
         # Update last_login_at for existing users
-        await db["users"].update_one(
-            {"email": email},
-            {"$set": {"last_login_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()}}
-        )
+        update = {"$set": {"last_login_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()}}
+        if not existing.get("email_verified"):
+            # Someone may have signed up with this address without owning it (signup
+            # needs no proof). Google has now proven the real owner, so the unverified
+            # account becomes theirs: drop the password whoever registered it set, and
+            # mark the email verified.
+            update["$set"].update({"email_verified": True, "is_active": True,
+                                   "account_status": "active", "password": None})
+            update["$unset"] = {"verification_code": "", "verification_code_expires": ""}
+        await db["users"].update_one({"email": email}, update)
         PostHogService.track_login(user_id, email=email, method="google")
     else:
         user_id = str(uuid.uuid4())
@@ -324,7 +335,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         )
 
         if not within_cooldown:
-            verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+            verification_code = new_code()
             verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
 
             await db["users"].update_one(
@@ -333,6 +344,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
                     "$set": {
                         "verification_code": verification_code,
                         "verification_code_expires": verification_code_expires,
+                        "verification_attempts": 0,
                         "verification_code_sent_at": datetime.utcnow(),
                         "updated_at": datetime.utcnow(),
                     }
@@ -408,13 +420,8 @@ async def verify_email(body: VerifyEmailRequest, db: AsyncIOMotorDatabase = Depe
     if user.get("email_verified"):
         raise HTTPException(status_code=400, detail="Email is already verified.")
 
-    # Check verification code
-    if user.get("verification_code") != body.code:
-        raise HTTPException(status_code=400, detail="Invalid verification code.")
-
-    # Check if code has expired
-    if user.get("verification_code_expires") and user["verification_code_expires"] < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Verification code has expired. Please request a new one.")
+    await check_one_time_code(db, user, body.code, "verification_code",
+                              "verification_code_expires", "verification_attempts", "verification")
 
     user_id = user.get("userId") or str(user["_id"])
     now = datetime.utcnow()
@@ -523,7 +530,7 @@ async def resend_verification(body: ResendVerificationRequest, db: AsyncIOMotorD
         }
 
     # Generate new verification code
-    verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+    verification_code = new_code()
     verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
 
     await db["users"].update_one(
@@ -532,6 +539,7 @@ async def resend_verification(body: ResendVerificationRequest, db: AsyncIOMotorD
             "$set": {
                 "verification_code": verification_code,
                 "verification_code_expires": verification_code_expires,
+                "verification_attempts": 0,
                 "verification_code_sent_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
@@ -603,7 +611,7 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncIOMotorDatabase 
     # Google sign-in working too since nothing here touches auth_provider.
 
     # Generate 6-digit reset code
-    reset_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+    reset_code = new_code()
     reset_code_expires = datetime.utcnow() + timedelta(minutes=15)
 
     await db["users"].update_one(
@@ -612,6 +620,7 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncIOMotorDatabase 
             "$set": {
                 "password_reset_code": reset_code,
                 "password_reset_code_expires": reset_code_expires,
+                "password_reset_attempts": 0,
                 "updated_at": datetime.utcnow(),
             }
         }
@@ -648,13 +657,8 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncIOMotorDatabase = 
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    # Check reset code
-    if user.get("password_reset_code") != body.code:
-        raise HTTPException(status_code=400, detail="Invalid reset code.")
-
-    # Check if code has expired
-    if user.get("password_reset_code_expires") and user["password_reset_code_expires"] < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Reset code has expired. Please request a new one.")
+    await check_one_time_code(db, user, body.code, "password_reset_code",
+                              "password_reset_code_expires", "password_reset_attempts", "reset")
 
     # Hash new password
     hashed_password = pwd_context.hash(body.new_password)
