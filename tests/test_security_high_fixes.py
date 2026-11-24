@@ -81,3 +81,31 @@ def test_jobs_from_before_owners_were_recorded_stay_readable_only_where_allowed(
     legacy = {"job_id": "j1"}
     assert _own_job(legacy, "alice", legacy_ok=True) is legacy
     assert _own_job(legacy, "alice") is None
+
+
+# ── API hardening (findings 9 and 12) ────────────────────────────────────────
+
+def test_api_responses_carry_baseline_security_headers():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    r = TestClient(app).get("/__no_such_route__")
+    assert r.headers.get("strict-transport-security", "").startswith("max-age=")
+    assert r.headers.get("x-content-type-options") == "nosniff"
+    assert r.headers.get("x-frame-options") == "DENY"
+
+
+def test_api_docs_are_switched_off_in_production(monkeypatch):
+    import importlib
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "ENV", "Production")
+    import app.main as main
+    prod_app = importlib.reload(main).app
+    try:
+        assert prod_app.docs_url is None and prod_app.openapi_url is None
+    finally:
+        monkeypatch.setattr(settings, "ENV", "Development")
+        importlib.reload(main)

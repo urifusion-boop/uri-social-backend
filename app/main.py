@@ -51,7 +51,24 @@ app = FastAPI(
     version="v1",
     contact={"name": "Uri Fusion", "email": "urifusion@gmail.com"},
     license_info={"name": "MIT License"},
+    # In production the interactive docs and full schema were public, handing anyone a
+    # map of every route (an API scanner used it in Nov 2026). Staging keeps them.
+    docs_url=None if settings.ENV == "Production" else "/docs",
+    redoc_url=None if settings.ENV == "Production" else "/redoc",
+    openapi_url=None if settings.ENV == "Production" else "/openapi.json",
 )
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    """Baseline headers on every API response: HTTPS only, no MIME sniffing, never
+    framed. setdefault so a route that deliberately sets its own value keeps it."""
+    response = await call_next(request)
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 
 @app.on_event("startup")

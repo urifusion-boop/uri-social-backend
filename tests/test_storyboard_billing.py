@@ -241,7 +241,7 @@ def endpoint(monkeypatch):
     async def fake_get(user_id, db, brand_id=None):
         return {"status": True, "responseData": {"brand_name": "Uri"}}
 
-    async def fake_create(job_id=None):
+    async def fake_create(job_id=None, user_id=None):
         seen["created"].append(job_id)
         return job_id
 
@@ -318,7 +318,7 @@ def test_a_repeated_request_returns_the_first_job_and_starts_no_second_writer(mo
 def test_if_the_job_cannot_be_created_the_credit_goes_straight_back(monkeypatch, endpoint):
     endpoint["start"]({"job_id": "J", "billing": CHARGED, "existing": False})
 
-    async def boom(job_id=None):
+    async def boom(job_id=None, user_id=None):
         raise RuntimeError("db down")
     monkeypatch.setattr(vcs.VideoCreativeService, "create_storyboard_job", staticmethod(boom))
     with pytest.raises(RuntimeError):
