@@ -2,6 +2,7 @@ import uuid
 import httpx
 import asyncio
 from typing import Annotated
+from app.core.shared_secret import require_internal_service_secret
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, BeforeValidator, EmailStr
@@ -766,7 +767,11 @@ class MagicLinkResponse(BaseModel):
 async def generate_magic_link(
     body: MagicLinkRequest,
     request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    # Mints a working login for any user_id, so only our own services may call it (the
+    # WhatsApp agent sends X-Internal-Secret). Without this, anyone who learned a user
+    # id could log in as that user.
+    _internal: None = Depends(require_internal_service_secret),
 ):
     """
     Generate a magic link for passwordless authentication from WhatsApp.
