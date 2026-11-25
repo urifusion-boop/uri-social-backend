@@ -32,7 +32,7 @@ class WalletStore(ABC):
 
     @abstractmethod
     async def try_debit(
-        self, business_id: str, amount_ngn: float, now: datetime
+        self, business_id: str, amount_ngn: float, now: datetime, spend: bool = True
     ) -> Optional[Wallet]:
         """Atomically debit `amount_ngn` if (and only if) the wallet is ACTIVE and
         balance_ngn >= amount_ngn — the balance check and the decrement happen as one
@@ -63,7 +63,7 @@ class InMemoryWalletStore(WalletStore):
         self._wallets[wallet.business_id] = wallet.model_copy(deep=True)
 
     async def try_debit(
-        self, business_id: str, amount_ngn: float, now: datetime
+        self, business_id: str, amount_ngn: float, now: datetime, spend: bool = True
     ) -> Optional[Wallet]:
         # asyncio is single-threaded so there's no real race here, but the
         # guard-then-mutate happens with no `await` in between, keeping the
@@ -76,7 +76,8 @@ class InMemoryWalletStore(WalletStore):
         ):
             return None
         wallet.balance_ngn = round(wallet.balance_ngn - amount_ngn, 2)
-        wallet.total_spent_ngn = round(wallet.total_spent_ngn + amount_ngn, 2)
+        if spend:
+            wallet.total_spent_ngn = round(wallet.total_spent_ngn + amount_ngn, 2)
         wallet.updated_at = now
         self._wallets[business_id] = wallet.model_copy(deep=True)
         return wallet.model_copy(deep=True)
@@ -114,7 +115,7 @@ class MongoWalletStore(WalletStore):
         )
 
     async def try_debit(
-        self, business_id: str, amount_ngn: float, now: datetime
+        self, business_id: str, amount_ngn: float, now: datetime, spend: bool = True
     ) -> Optional[Wallet]:
         from pymongo import ReturnDocument
 
@@ -125,10 +126,7 @@ class MongoWalletStore(WalletStore):
                 "balance_ngn": {"$gte": amount_ngn},
             },
             {
-                "$inc": {
-                    "balance_ngn": -amount_ngn,
-                    "total_spent_ngn": amount_ngn,
-                },
+                "$inc": {"balance_ngn": -amount_ngn, **({"total_spent_ngn": amount_ngn} if spend else {})},
                 "$set": {"updated_at": now},
             },
             projection={"_id": 0},

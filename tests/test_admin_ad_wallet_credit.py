@@ -61,3 +61,21 @@ def test_details_list_brand_account_wallets_not_brand_profiles(store, monkeypatc
 
     assert _run(ar._ad_wallets(_Db(), "billing-1")) == [
         {"brand_id": BRAND, "name": "Uri Social", "ad_wallet_ngn": 7_500}]
+
+
+def test_debit_takes_money_out_with_an_adjustment_row(store):
+    _run(ar.credit_brand_ad_wallet("u1", BRAND, ar.AdWalletCreditRequest(amount_ngn=3_000), ADMIN, _Db()))
+    res = _run(ar.debit_brand_ad_wallet("u1", BRAND, ar.AdWalletCreditRequest(amount_ngn=1_000), ADMIN, _Db()))
+
+    assert res["ad_wallet_ngn"] == 2_000
+    last = _run(WalletService(store).list_transactions(BRAND))[-1]
+    assert last.type.value == "adjustment" and last.amount_ngn == -1_000
+    assert _run(store.get_wallet(BRAND)).total_spent_ngn == 0
+
+
+def test_debit_cannot_take_more_than_the_balance(store):
+    _run(ar.credit_brand_ad_wallet("u1", BRAND, ar.AdWalletCreditRequest(amount_ngn=500), ADMIN, _Db()))
+    with pytest.raises(HTTPException) as e:
+        _run(ar.debit_brand_ad_wallet("u1", BRAND, ar.AdWalletCreditRequest(amount_ngn=1_000), ADMIN, _Db()))
+    assert e.value.status_code == 400
+    assert _run(WalletService(store).get_balance(BRAND)) == 500

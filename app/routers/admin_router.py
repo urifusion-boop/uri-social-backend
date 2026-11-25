@@ -490,6 +490,18 @@ class AdWalletCreditRequest(BaseModel):
     reason: Optional[str] = None
 
 
+async def _admin_wallet_change(user_id: str, brand_id: str, admin_user: dict, db: AsyncIOMotorDatabase):
+    from app.agents.jane_ads.store import MongoWalletStore
+    from app.agents.jane_ads.wallet import WalletService
+    from app.services.AgencyService import AgencyService
+
+    billing_id = await _resolve_billing_id(user_id, db)
+    if brand_id not in await AgencyService.accessible_brand_ids(billing_id, db):
+        raise HTTPException(status_code=404, detail="That brand doesn't belong to this user")
+    actor = (admin_user.get("email") or (admin_user.get("claims") or {}).get("email") or "admin").lower()
+    return WalletService(MongoWalletStore(db)), actor
+
+
 @router.post("/users/{user_id}/brands/{brand_id}/ad-wallet/credit")
 async def credit_brand_ad_wallet(
     user_id: str,
@@ -502,20 +514,34 @@ async def credit_brand_ad_wallet(
     WalletService.top_up so balance and ledger move together, with the admin on the
     reference so it is never mistaken for a real payment."""
     import uuid
-    from app.agents.jane_ads.store import MongoWalletStore
-    from app.agents.jane_ads.wallet import WalletService
 
-    from app.services.AgencyService import AgencyService
-
-    billing_id = await _resolve_billing_id(user_id, db)
-    if brand_id not in await AgencyService.accessible_brand_ids(billing_id, db):
-        raise HTTPException(status_code=404, detail="That brand doesn't belong to this user")
-
-    actor = (admin_user.get("email") or (admin_user.get("claims") or {}).get("email") or "admin").lower()
-    wallet = WalletService(MongoWalletStore(db))
+    wallet, actor = await _admin_wallet_change(user_id, brand_id, admin_user, db)
     await wallet.top_up(brand_id, body.amount_ngn, reference=f"manual:{actor}:{uuid.uuid4().hex[:12]}",
                         enforce_minimum=False)
     print(f"[admin] {actor} added NGN{body.amount_ngn:,.0f} to ad wallet {brand_id} "
+          f"— {body.reason or 'no reason'}", flush=True)
+    return {"brand_id": brand_id, "ad_wallet_ngn": await wallet.get_balance(brand_id)}
+
+
+@router.post("/users/{user_id}/brands/{brand_id}/ad-wallet/debit")
+async def debit_brand_ad_wallet(
+    user_id: str,
+    brand_id: str,
+    body: AdWalletCreditRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Take money out of a brand's ad wallet (a correction). Refused if the wallet holds
+    less than the amount; recorded in the ledger as an adjustment with the admin on it."""
+    import uuid
+    from app.agents.jane_ads.wallet import InsufficientFundsError
+
+    wallet, actor = await _admin_wallet_change(user_id, brand_id, admin_user, db)
+    try:
+        await wallet.remove_funds(brand_id, body.amount_ngn, reference=f"manual:{actor}:{uuid.uuid4().hex[:12]}")
+    except InsufficientFundsError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    print(f"[admin] {actor} removed NGN{body.amount_ngn:,.0f} from ad wallet {brand_id} "
           f"— {body.reason or 'no reason'}", flush=True)
     return {"brand_id": brand_id, "ad_wallet_ngn": await wallet.get_balance(brand_id)}
 

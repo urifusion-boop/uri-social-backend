@@ -96,6 +96,32 @@ class WalletService:
         await self._store.add_transaction(txn)
         return txn
 
+    async def remove_funds(
+        self, business_id: str, amount_ngn: float, reference: str = "", now: Optional[datetime] = None,
+    ) -> Transaction:
+        """Take money back out (an admin correction). Never below ₦0, and not counted as
+        ad spend."""
+        now = now or _now()
+        amount = round(amount_ngn, 2)
+        if amount <= 0:
+            raise ValueError("The amount must be more than ₦0.")
+        await self.get_or_create(business_id)
+        wallet = await self._store.try_debit(business_id, amount, now, spend=False)
+        if wallet is None:
+            balance = await self.get_balance(business_id)
+            raise InsufficientFundsError(f"Balance ₦{balance:,.2f} is less than ₦{amount:,.2f}.")
+        txn = Transaction(
+            transaction_id=f"txn_{uuid.uuid4().hex[:16]}",
+            business_id=business_id,
+            type=TransactionType.ADJUSTMENT,
+            amount_ngn=-amount,
+            balance_after_ngn=wallet.balance_ngn,
+            reference=reference,
+            created_at=now,
+        )
+        await self._store.add_transaction(txn)
+        return txn
+
     async def refund_ad_spend(
         self, business_id: str, amount_ngn: float, campaign_id: str, now: Optional[datetime] = None,
     ) -> Transaction:
