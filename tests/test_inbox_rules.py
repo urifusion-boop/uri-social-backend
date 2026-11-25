@@ -87,6 +87,20 @@ def test_a_comment_rule_replies_publicly_to_that_comment():
     run(go())
 
 
+def test_a_thread_from_before_a_reconnect_still_gets_rules():
+    async def go():
+        db, t = AsyncMongoMockClient()["t"], Transport()
+        await rules.create_rule(db, WS, raw(kind="dm", public_reply="", dm="Open 9 to 6", match={"keywords": ["hours"]}), "u")
+        cid, mid = await seed(db, kind="dm", text="hours")
+        fresh = (await db[CHANNEL_ACCOUNTS].insert_one(
+            {"workspace_id": WS, "platform": "instagram", "external_account_id": "NEW", "page_id": "NEWP"})).inserted_id
+        await db[CHANNEL_ACCOUNTS].delete_many({"external_account_id": "PAGE"})
+        out = await rules.run_rules(db, WS, cid, mid, no_llm, t, Private())
+        assert out["actions"] == ["dm"] and t.sent[0][1] == "Open 9 to 6"
+        assert (await db[CONVERSATIONS].find_one({}))["channel_account_id"] == str(fresh)
+    run(go())
+
+
 def test_comment_to_dm_sends_both_and_files_the_dm_thread():
     async def go():
         db, t, p = AsyncMongoMockClient()["t"], Transport(), Private()

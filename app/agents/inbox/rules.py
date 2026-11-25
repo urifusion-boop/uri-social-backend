@@ -250,6 +250,11 @@ async def run_rules(db, workspace_id: str, conversation_id: str, message_id: str
         return None
     account = await db[CHANNEL_ACCOUNTS].find_one({"_id": ObjectId(conv["channel_account_id"])}) \
         if ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+    if not account:        # the account was reconnected since this thread began
+        account = await db[CHANNEL_ACCOUNTS].find_one(
+            {"workspace_id": workspace_id, "platform": conv.get("platform")}, sort=[("connected_at", -1)])
+        if account:
+            await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {"channel_account_id": str(account["_id"])}})
     contact = await db[IDENTITIES].find_one({"_id": ObjectId(conv["contact_identity_id"])}) \
         if ObjectId.is_valid(conv.get("contact_identity_id", "")) else None
     contact = contact or {}
