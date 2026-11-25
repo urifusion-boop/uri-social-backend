@@ -132,7 +132,7 @@ _ANALYSIS_PROMPT = (
 )
 
 
-async def _vision(image_url: str) -> dict:
+async def _vision(image_url: str, prompt: str = "") -> dict:
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -142,7 +142,7 @@ async def _vision(image_url: str) -> dict:
             resp = await client.chat.completions.create(
                 model=model, response_format={"type": "json_object"}, timeout=60,
                 messages=[{"role": "user", "content": [
-                    {"type": "text", "text": _ANALYSIS_PROMPT},
+                    {"type": "text", "text": prompt or _ANALYSIS_PROMPT},
                     {"type": "image_url", "image_url": {"url": image_url}}]}])
             return json.loads(resp.choices[0].message.content or "{}")
         except (openai.NotFoundError, openai.PermissionDeniedError) as e:
@@ -154,6 +154,30 @@ async def _vision(image_url: str) -> dict:
                 continue
             raise
     raise RuntimeError(str(last))
+
+
+# The reference's look, for "Make one like this". The one-line `layout` above is for the owner to
+# read; drawn from alone (with Jane's own angle layouts on top) the versions came out as her stock
+# Problem/Fix list instead of the ad they picked (staging, 2026-11-25). This is what the image
+# model is shown instead: the design in detail, with nothing that belongs to the other brand.
+_RECIPE_PROMPT = (
+    "This is an advertisement. Another business wants its own ad with the SAME visual design, for "
+    "its own product. Describe the design so a designer could rebuild its structure without copying "
+    "anything that belongs to this brand.\n"
+    'Return ONLY JSON: {"recipe": "90-160 words"} covering, in this order: the background (colours, '
+    "texture, shapes); the headline's position, size, number of lines and whether one key word is in a "
+    "different colour; the main subject described generically (who or what, age group, clothing, pose, "
+    "expression, framing, where it sits); every graphic device around it (floating symbols, short labels, "
+    "arrows, badges, buttons, app-store style buttons), how many and where, saying what KIND of words "
+    "they hold, never the words; the overall mood and colour contrast.\n"
+    "Never include the ad's own words, brand or product names, logos, social handles, prices or "
+    "a real person's identity. Do not describe where the logo is."
+)
+
+
+async def read_recipe(image_url: str) -> str:
+    raw = await _vision(image_url, _RECIPE_PROMPT)
+    return " ".join(str(raw.get("recipe") or "").split())[:1400]
 
 
 def clean_analysis(raw: dict) -> dict:
@@ -264,8 +288,48 @@ def recreation_brief(analysis: dict, product: str, description: str) -> str:
     return " ".join(bits)
 
 
+def recreation_layout(analysis: dict, recipe: str) -> str:
+    """What the image model is told about the picture: the reference's own design, in detail when
+    Jane could study it, else its one-line layout. Never one of Jane's stock angle layouts."""
+    edges = " Keep every word well inside the edges, with wide margins on all sides."
+    if recipe:
+        return ("Design this ad like the reference ad, keeping its structure and composition: "
+                f"{recipe} Use this business's own words, colours and people, not the reference's." + edges)
+    if analysis.get("layout"):
+        return f"Use a similar composition to the reference ad: {analysis['layout']}." + edges
+    return edges.strip()
+
+
+def version_brief(brief: str, index: int, count: int) -> str:
+    if count <= 1:
+        return brief
+    return (f"{brief}\n\nThis is version {index + 1} of {count}: the same idea and design, but its headline "
+            "and opening line must not read like the other versions.")
+
+
+async def ensure_recipe(db, rec: dict) -> str:
+    """The reference's design, read once and kept on the saved ad and on this request. Best
+    effort: without it the versions still follow the one-line layout."""
+    ref = rec.get("reference") or {}
+    if ref.get("recipe"):
+        return ref["recipe"]
+    ad = await db[ADS].find_one({"ad_id": rec.get("ad_id")}, {"recipe": 1}) or {}
+    recipe = ad.get("recipe") or ""
+    if not recipe and ref.get("image_url"):
+        try:
+            recipe = await read_recipe(ref["image_url"])
+        except Exception as e:
+            print(f"[recreate] couldn't read the reference's design: {e!r}", flush=True)
+            return ""
+        if recipe:
+            await db[ADS].update_one({"ad_id": rec.get("ad_id")}, {"$set": {"recipe": recipe}})
+    if recipe:
+        await db[RECREATIONS].update_one({"recreation_id": rec["recreation_id"]},
+                                         {"$set": {"reference.recipe": recipe}})
+    return recipe
+
+
 async def recreate_job(db, job: dict, ctx) -> dict:
-    from app.agents.jane_ads import concepts as concepts_mod
     from app.agents.jane_ads.creative import generate_ad_creative
     from app.services.CreditService import credit_service
 
@@ -276,7 +340,6 @@ async def recreate_job(db, job: dict, ctx) -> dict:
     profile = await _profile(db, rec["user_id"], rec["brand_id"])
     analysis = (rec.get("reference") or {}).get("analysis") or {}
     angle = _LAYOUT_ANGLE.get(analysis.get("angle", ""), "outcome")
-    angles = [angle] + [a for a, _, _ in concepts_mod.ANGLES if a != angle]
     brief = recreation_brief(analysis, rec.get("product", ""), profile.get("product_description", ""))
     redo = job["payload"].get("redo_index")
     if redo is not None:
@@ -294,14 +357,20 @@ async def recreate_job(db, job: dict, ctx) -> dict:
             await db[RECREATIONS].update_one({"recreation_id": rid},
                                              {"$set": {"status": "failed", "error": message}})
 
+    # Every version keeps the reference's design; they differ in wording. Cycling Jane's stock
+    # angle layouts made versions 2 and 3 look nothing like the ad the owner picked.
+    if done < rec["count"]:
+        await ctx.step("look", "Studying the reference's design")
+        layout = recreation_layout(analysis, await ensure_recipe(db, rec))
+        await ctx.step("look", "Studying the reference's design", "done")
     for i in range(done, rec["count"]):
-        a = angles[i % len(angles)]
+        a = angle
         await ctx.step(f"ad{i}", f"Making version {i + 1} of {rec['count']}")
         try:
             ad = await generate_ad_creative(
                 profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
-                concepts_mod.brief_for(brief, a), user_id=rec["user_id"], db=db, brand_id=rec["brand_id"],
-                city=profile.get("customer_location") or "", image_layout=concepts_mod.layout_for(a))
+                version_brief(brief, i, rec["count"]), user_id=rec["user_id"], db=db, brand_id=rec["brand_id"],
+                city=profile.get("customer_location") or "", image_layout=layout)
         except Exception as e:
             print(f"[recreate] {rid} version {i + 1} failed: {e}", flush=True)
             await _give_up(unavailable)
@@ -446,7 +515,6 @@ async def redo_version(db, *, brand_id: str, user_id: str, recreation_id: str, i
 
 
 async def _redo_one(db, rec: dict, index: int, ctx) -> dict:
-    from app.agents.jane_ads import concepts as concepts_mod
     from app.agents.jane_ads.creative import generate_ad_creative
     from app.services.CreditService import credit_service
 
@@ -461,11 +529,12 @@ async def _redo_one(db, rec: dict, index: int, ctx) -> dict:
     angle = old.get("angle") or _LAYOUT_ANGLE.get(analysis.get("angle", ""), "outcome")
     brief = recreation_brief(analysis, rec.get("product", ""), profile.get("product_description", ""))
     await ctx.step(f"redo{index}", f"Making version {index + 1} again")
+    layout = recreation_layout(analysis, await ensure_recipe(db, rec))
     ad = await generate_ad_creative(
         profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
-        concepts_mod.brief_for(brief + " Make it clearly different from the last attempt.", angle),
+        brief + " Keep the same design, but make the words and the scene clearly different from the last attempt.",
         user_id=rec["user_id"], db=db, brand_id=rec["brand_id"], city=profile.get("customer_location") or "",
-        image_layout=concepts_mod.layout_for(angle))
+        image_layout=layout)
     if not ad.image_url:
         await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done", f"results.{index}.redoing": False,
                                                                            "error": "Jane couldn't make that one again just now."}})
