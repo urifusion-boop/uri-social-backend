@@ -222,6 +222,9 @@ async def startup_event():
         await _competitor_ads.ensure_indexes(get_db())
         _job_worker.register(_competitor_ads.ANALYSIS_JOB, _competitor_ads.analysis_job)
         _job_worker.register(_competitor_ads.RECREATE_JOB, _competitor_ads.recreate_job)
+        from app.agents.jane_ads import ad_previews as _ad_previews
+        await _ad_previews.ensure_indexes(get_db())
+        _job_worker.register(_ad_previews.JOB, _ad_previews.preview_job)
         _job_worker.start(get_db)
         print("✅ Background job worker started")
     except Exception as e:

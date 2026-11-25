@@ -441,6 +441,92 @@ class CreativeForBrandBody(BaseModel):
     post_id: str = ""
 
 
+# ── The wizard's Ads step: the ads before the plan (ad_previews.py) ───────────
+
+class AdPreviewBody(BaseModel):
+    count: int = 1
+    description: str                 # what is advertised, and to whom (the Audience step)
+    city: str = ""
+    objective: str = ""              # the Goal step's objective (sales, leads, traffic, …)
+    destination_type: str = ""       # whatsapp | website | instagram_dm; blank = the brand's own
+    budget_ngn: float = 0
+    vsg01_format_id: str = ""        # the Style step's pick, for a single ad
+    platform: str = "meta"
+
+
+class AdPreviewEditBody(BaseModel):
+    headline: str = ""
+    primary_text: str = ""
+
+
+def _preview_error(e: Exception) -> HTTPException:
+    if isinstance(e, PermissionError):
+        return HTTPException(status_code=402, detail=str(e))
+    if isinstance(e, LookupError):
+        return HTTPException(status_code=404, detail=str(e))
+    return HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/ad-previews")
+async def start_ad_preview(body: AdPreviewBody, brand_ctx: dict = Depends(get_active_brand_context),
+                           db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+    """Jane starts making the campaign's ads; GET the preview to see each as it arrives."""
+    from . import ad_previews
+    try:
+        inputs = ad_previews.clean_inputs(
+            description=body.description, city=body.city, objective=body.objective,
+            destination_type=body.destination_type, budget_ngn=body.budget_ngn,
+            vsg01_format_id=body.vsg01_format_id, platform=body.platform)
+        return await ad_previews.start(db, brand_id=brand_ctx.get("brand_id") or "",
+                                       user_id=brand_ctx["user_id"], count=body.count, inputs=inputs)
+    except (PermissionError, LookupError, ValueError) as e:
+        raise _preview_error(e)
+
+
+@router.get("/ad-previews/{preview_id}")
+async def get_ad_preview(preview_id: str, brand_ctx: dict = Depends(get_active_brand_context),
+                         db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+    from . import ad_previews
+    doc = await ad_previews.get(db, brand_ctx.get("brand_id") or "", preview_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Those ads weren't found.")
+    return doc
+
+
+@router.patch("/ad-previews/{preview_id}/ads/{index}")
+async def edit_ad_preview(preview_id: str, index: int, body: AdPreviewEditBody,
+                          brand_ctx: dict = Depends(get_active_brand_context),
+                          db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+    from . import ad_previews
+    try:
+        return await ad_previews.edit(db, brand_id=brand_ctx.get("brand_id") or "", preview_id=preview_id,
+                                      index=index, headline=body.headline, primary_text=body.primary_text)
+    except (LookupError, ValueError) as e:
+        raise _preview_error(e)
+
+
+@router.delete("/ad-previews/{preview_id}/ads/{index}")
+async def remove_ad_preview(preview_id: str, index: int, brand_ctx: dict = Depends(get_active_brand_context),
+                            db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+    from . import ad_previews
+    try:
+        return await ad_previews.remove(db, brand_id=brand_ctx.get("brand_id") or "", preview_id=preview_id,
+                                        index=index)
+    except (LookupError, ValueError) as e:
+        raise _preview_error(e)
+
+
+@router.post("/ad-previews/{preview_id}/ads/{index}/redo")
+async def redo_ad_preview(preview_id: str, index: int, brand_ctx: dict = Depends(get_active_brand_context),
+                          db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+    from . import ad_previews
+    try:
+        return await ad_previews.redo(db, brand_id=brand_ctx.get("brand_id") or "", user_id=brand_ctx["user_id"],
+                                      preview_id=preview_id, index=index)
+    except (PermissionError, LookupError, ValueError) as e:
+        raise _preview_error(e)
+
+
 @router.get("/existing-posts")
 async def existing_posts(
     platform: str = Query("instagram"),
@@ -2569,6 +2655,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     # Ignored for every other platform and for a video upload.
     extra_image_urls: list[str] = []
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
+    # creative_source=preview: the ads the owner already saw and approved on the wizard's Ads step
+    # (POST /jane-ads/ad-previews). The plan runs exactly those; nothing is made or charged again.
+    preview_id: str = ""
     # creative_source=existing_post: a post already published on the brand's account.
     # reference_image_url is its picture (preview only).
     existing_post_platform: str = ""      # instagram | facebook
@@ -2776,6 +2865,27 @@ async def _resolve_creative_path(body: MetaLaunchFromMessageBody, brand_ctx: dic
         raise HTTPException(status_code=400, detail="Say who is in the video.")
     body.creative_source = "upload"
     return cp.provenance("ugc", ugc_kind=body.ugc_kind, rights_confirmed=body.ugc_rights_confirmed)
+
+
+async def _preview_creative(db, brand_ctx: dict, preview_id: str, plan, creative_platform: str,
+                            destination_type, destination_cta: str):
+    """The plan's ads, when the owner already saw them on the wizard's Ads step: the first is the
+    plan's ad and, on Meta, the rest are the others it tests. Nothing is made or charged here."""
+    from . import ad_previews
+    from .destination import coerce_type, cta_label
+    ready = await ad_previews.ads_for_plan(db, brand_ctx.get("brand_id") or "", preview_id)
+    if not ready:
+        raise HTTPException(status_code=400, detail="Those ads aren't ready yet. Go back to the Ads step and "
+                                                    "wait for Jane to finish them.")
+    # Made before the plan settled where the button goes: say what this plan's tap does.
+    cta = cta_label(coerce_type(getattr(destination_type, "value", destination_type)), destination_cta)
+    for ad in ready:
+        ad.cta = cta
+    creative = ready[0]
+    if creative_platform == Platform.META.value and len(ready) > 1:
+        creative.concept = creative.concept or "ad-1"
+        plan.concepts = ready[1:]
+    return creative
 
 
 def _listed_areas(names: list[str]) -> str:
@@ -3755,6 +3865,9 @@ async def _build_campaign_plan(
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
+    elif body.creative_source == "preview":
+        creative = await _preview_creative(db, brand_ctx, body.preview_id, plan, creative_platform,
+                                           destination_type, destination_cta)
     elif body.reuse_image_url:
         # Refinement of an existing plan (e.g. "target lagos and abuja", "make it ₦10k") —
         # keep the image from the prior plan. Copy is still rewritten to match any changed
