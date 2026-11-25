@@ -26,7 +26,7 @@ def route(monkeypatch):
     seen = SimpleNamespace(context_reads=0, logo="unset")
 
     async def fake_get_job(job_id):
-        return {"status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
+        return {"user_id": "u1", "status": "complete", "clips": [{"scene_number": 1, "video_url": "u1", "text_overlay": None}]}
 
     async def fake_context(ctx, db):
         seen.context_reads += 1

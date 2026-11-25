@@ -10,6 +10,8 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import html
+
 import json
 import re
 from typing import Optional
@@ -632,8 +634,18 @@ async def suggest_ad_format(
         return {"suggested": None, "alternatives": [], "needs_in_brief": {}}
     # Fact-led styles this brief can't support (no event date, no offer, no price...): still listed so
     # the picker can show them greyed with the reason, never suggested.
+    from .creative import get_brand_context
     from .vsg01_orchestrator import brief_unmet_needs
-    needs = await brief_unmet_needs(body.description or "")
+    user_id = brand_ctx.get("user_id") or ""
+    try:
+        brand_context = await get_brand_context(user_id, db, brand_ctx.get("brand_id")) if user_id else {}
+    except Exception:
+        brand_context = {}
+    needs = await brief_unmet_needs(
+        body.description or "", (brand_context or {}).get("brand_name", ""),
+        (brand_context or {}).get("industry", ""), brand_context,
+        only={f["format_id"] for f in serialized},
+    )
     ready = [f for f in serialized if f["format_id"] not in needs]
     suggested = ready[0] if ready else None
     from . import ad_image_billing
@@ -1454,7 +1466,7 @@ async def jane_google_ads_admin_connect_callback(
         return RedirectResponse(url)
 
     if error:
-        return HTMLResponse(f"<p>Google Ads admin connect failed: {error}</p>", status_code=400)
+        return HTMLResponse(f"<p>Google Ads admin connect failed: {html.escape(str(error))}</p>", status_code=400)
     if not code:
         return HTMLResponse("<p>Google Ads admin connect failed: missing code.</p>", status_code=400)
 
@@ -1547,7 +1559,7 @@ async def jane_tiktok_ads_admin_connect_callback(
     from app.core.config import settings
 
     if error:
-        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {error}</p>", status_code=400)
+        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {html.escape(str(error))}</p>", status_code=400)
     grant_code = auth_code or code
     if not grant_code:
         return HTMLResponse("<p>TikTok Ads admin connect failed: missing auth_code.</p>", status_code=400)
@@ -4930,9 +4942,11 @@ async def meta_launch_plan(
     require_whatsapp = (
         plan.goal != Goal.FOLLOWERS and destination_type == DestinationType.WHATSAPP
     )
-    if plan.platforms and plan.platforms[0].platform == Platform.GOOGLE:
-        # Google runs in the brand's own Google Ads account — there is no Meta Page.
-        # Its own gate (linked account, re-checked with Google) runs in _do_launch.
+    if plan.platforms and plan.platforms[0].platform in (Platform.GOOGLE, Platform.TIKTOK):
+        # Google runs in the brand's own Google Ads account, TikTok under URI's own
+        # advertiser and identity — neither has a Meta Page, so a lapsed Facebook
+        # connection must not block them (plan time already skips it for TikTok).
+        # Google's own gate (linked account, re-checked with Google) runs in _do_launch.
         from .whatsapp import get_brand_whatsapp
         ads_conn = {"page_id": "", "whatsapp_number": await get_brand_whatsapp(db, brand_id) or ""}
     else:

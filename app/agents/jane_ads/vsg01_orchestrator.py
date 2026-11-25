@@ -367,7 +367,9 @@ FACT_NEEDS: dict[str, tuple[str, str]] = {
 }
 
 
-async def brief_unmet_needs(description: str) -> dict[str, str]:
+async def brief_unmet_needs(description: str, business_name: str = "", category: str = "",
+                            brand_context: Optional[dict] = None, only: Optional[set] = None,
+                            verify: bool = True) -> dict[str, str]:
     """{format_id: reason} for the fact-led styles this brief can't support, asked BEFORE generation
     so the Style step can say so up front (each style's own content step refuses the same briefs,
     and the client only found out afterwards: "Couldn't build Event Promo for this one").
@@ -390,7 +392,49 @@ async def brief_unmet_needs(description: str) -> dict[str, str]:
     )
     if not isinstance(d, dict):
         return {}
-    return {fid: reason for fid, (fact, reason) in FACT_NEEDS.items() if d.get(fact) is False}
+    unmet = {fid: reason for fid, (fact, reason) in FACT_NEEDS.items() if d.get(fact) is False}
+    # The quick yes/no above is a different question from the one each style's own content step
+    # asks, so they disagreed: on staging a bakery's price list ("Loaf [8,000], Celebration cakes
+    # [15,000 and above]") passed as "has items with prices" and "has an offer", The Receipt was
+    # even Jane's pick, and both styles then fell back to Us vs Them at generation (the Receipt
+    # needs a total those prices can't make; Offer Spotlight found no actual deal). So a style the
+    # quick check lets through is confirmed by the same content step its builder runs.
+    if verify:
+        checks = {fid: _fact_style_content(fid, business_name, category, text, brand_context)
+                  for fid in FACT_NEEDS if fid not in unmet and (only is None or fid in only)}
+        if checks:
+            results = await asyncio.gather(*checks.values(), return_exceptions=True)
+            for fid, ok in zip(checks, results):
+                # Only a definite "not in this brief" greys a style out; a step that errored (an
+                # outage) leaves it available, the same fail-open rule as the quick check.
+                if ok is False:
+                    unmet[fid] = FACT_NEEDS[fid][1]
+                elif isinstance(ok, Exception):
+                    print(f"[VSG01] style content check for {fid} failed: {ok}", flush=True)
+    return unmet
+
+
+async def _fact_style_content(fid: str, business_name: str, category: str, description: str,
+                              brand_context: Optional[dict]) -> bool:
+    """Whether this fact-led style's own content step finds what it needs in the brief — the exact
+    gate its builder applies before rendering (no image generation, no rendering)."""
+    if fid == "SEED-081":
+        c = await _content_receipt(description)
+        return bool(c and c.get("total_amount"))
+    if fid == "SEED-096":
+        return bool(await _content_price_led_offer(description))
+    if fid == "SEED-093":
+        return bool(await _extract_real_quote(description))
+    if fid == "SEED-074":
+        quote, offer = await asyncio.gather(
+            _extract_real_quote(description),
+            _content_offer(business_name, category, description, brand_context))
+        return bool(quote and offer)
+    step = {"SEED-099": _content_event_promo, "SEED-100": _content_offer_spotlight,
+            "SEED-104": _content_enrol_signup}.get(fid)
+    if step is None:
+        return True
+    return bool(await step(business_name, category, description, brand_context))
 
 
 async def _content_fit_boost(description: str, eligible: list[Strategy]) -> dict[str, float]:

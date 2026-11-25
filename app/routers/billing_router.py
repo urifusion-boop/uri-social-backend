@@ -1,3 +1,4 @@
+import json
 """
 Billing & Credit System API Router
 Strictly aligned with PRICING PRD V1
@@ -13,6 +14,7 @@ Endpoints:
 - GET /billing/subscription/tiers - Available plans (PRD 5)
 - POST /billing/subscription/cancel - Cancel subscription (PRD 13)
 """
+from app.services.PaymentService import WebhookSignatureError
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -155,7 +157,8 @@ async def verify_payment(
 @router.post("/webhook")
 async def squad_webhook(
     request: Request,
-    x_squad_signature: Optional[str] = Header(None)
+    x_squad_encrypted_body: Optional[str] = Header(None),
+    x_squad_signature: Optional[str] = Header(None),
 ):
     """
     SQUAD webhook callback
@@ -163,13 +166,19 @@ async def squad_webhook(
     This endpoint should be publicly accessible (no JWT required)
     """
     try:
-        payload = await request.json()
+        # The signature covers the exact bytes Squad sent, so read them before parsing.
+        raw_body = await request.body()
+        payload = json.loads(raw_body or b"{}")
 
-        # Handle webhook
-        success = await payment_service.handle_webhook(
-            payload=payload,
-            signature=x_squad_signature
-        )
+        try:
+            success = await payment_service.handle_webhook(
+                payload=payload,
+                # Squad's documented header; the old name is still accepted.
+                signature=x_squad_encrypted_body or x_squad_signature,
+                raw_body=raw_body,
+            )
+        except WebhookSignatureError:
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
         if success:
             return {
@@ -184,6 +193,8 @@ async def squad_webhook(
                 "responseMessage": "Webhook processing failed"
             }
 
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
