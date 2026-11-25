@@ -18,6 +18,12 @@ from app.jobs import queue
 from app.jobs.worker import JobError
 
 
+@pytest.fixture(autouse=True)
+def _no_live_design_read(monkeypatch):
+    """Reading the reference's design is a vision call: never a live one in tests."""
+    monkeypatch.setattr(A, "read_recipe", AsyncMock(return_value=""))
+
+
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -135,8 +141,66 @@ def test_versions_are_made_from_the_idea_not_the_words_and_charged_one_by_one():
     assert made[0]["business"] == "Magen" and "Advertise: Airport runs." in made[0]["brief"]
     assert "Never reuse the reference's words" in made[0]["brief"]
     assert "Never miss a flight" not in made[0]["brief"] and "₦20,000" not in made[0]["brief"]   # not its words or price
-    assert made[0]["layout"]   # the reference's problem-first layout
+    assert "bold headline band at the bottom" in made[0]["layout"]   # the reference's own layout
+    assert "Notes-app" not in made[0]["layout"]   # never Jane's stock problem/fix list
     assert out["reference"]["competitor_name"] == "RideEasy"
+
+
+RECIPE = ("Deep green background with soft diagonal shapes. A huge two-line headline across the top, one key "
+          "word in yellow. A young man in a hoodie, chin on hand, puzzled, waist-up in the centre, with yellow "
+          "question marks above his head and six short jargon labels floating around him.")
+
+
+def _make(db, count=3, read=None):
+    made = []
+
+    async def fake_generate(business_name, category, goal, description, **kw):
+        made.append({"brief": description, "layout": kw.get("image_layout")})
+        return AdCreative(image_url=f"https://cdn.uri/v{len(made)}.png", headline=f"Version {len(made)}",
+                          primary_text="Text.")
+
+    reader = read or AsyncMock(return_value=RECIPE)
+    with patch("app.services.CreditService.credit_service", new=_Credits()), \
+         patch("app.agents.jane_ads.creative.generate_ad_creative", new=fake_generate), \
+         patch.object(A, "read_recipe", new=reader), \
+         patch.object(A, "_profile", new=AsyncMock(return_value={"brand_name": "Uri"})):
+        rec = _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_1", count=count))
+        job = _run(queue.claim(db, [A.RECREATE_JOB]))
+        _run(A.recreate_job(db, job, _Ctx()))
+    return rec, made, reader
+
+
+def test_every_version_is_drawn_in_the_references_own_design():
+    """Live-found on staging 2026-11-25: a "confused about trading" poster came back as Jane's
+    stock Problem/Fix list, and versions 2 and 3 used other stock layouts altogether."""
+    db = _db()
+    _ready_ad(db)
+    rec, made, reader = _make(db, count=3)
+    assert len(made) == 3 and reader.await_count == 1    # the design is studied once
+    for m in made:
+        assert RECIPE in m["layout"] and "Notes-app" not in m["layout"] and "two-column" not in m["layout"]
+    assert len({m["layout"] for m in made}) == 1          # same design ...
+    assert "version 2 of 3" in made[1]["brief"]           # ... different words
+    out = _run(A.get_recreation(db, "b1", rec["id"]))
+    assert {r["angle"] for r in out["results"]} == {"problem"}
+    # Kept on the saved ad, so the next request for it doesn't read it again.
+    assert _run(db[A.ADS].find_one({"ad_id": "cad_1"}))["recipe"] == RECIPE
+    _, _, again = _make(db, count=1)
+    assert again.await_count == 0
+
+
+def test_when_the_design_cant_be_read_the_versions_still_follow_its_layout():
+    db = _db()
+    _ready_ad(db)
+    _, made, _ = _make(db, count=2, read=AsyncMock(side_effect=RuntimeError("vision down")))
+    assert len(made) == 2
+    assert all("bold headline band at the bottom" in m["layout"] for m in made)
+
+
+def test_the_design_never_carries_the_references_words():
+    assert "Never include the ad's own words" in A._RECIPE_PROMPT
+    layout = A.recreation_layout({"layout": "x"}, RECIPE)
+    assert "not the reference's" in layout and "inside the edges" in layout
 
 
 def test_a_retry_carries_on_from_the_versions_already_made():

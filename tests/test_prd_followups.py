@@ -383,8 +383,12 @@ def test_making_one_version_again_replaces_it_in_place_for_one_credit():
         async def deduct_credit(self, user_id, **kw):
             Credits.deducted += 1
 
+    # The design read for the first versions is reused: a redo keeps the same look.
+    _run(db[A.RECREATIONS].update_one({"recreation_id": "rec_1"}, {"$set": {"reference.recipe": "Green poster."}}))
+
     async def gen(*a, **kw):
         assert "clearly different from the last attempt" in a[3]
+        assert "Green poster." in kw["image_layout"]
         return AdCreative(image_url="https://v2b", headline="Two again", primary_text="New second.")
 
     with patch("app.services.CreditService.credit_service", new=Credits()), \
@@ -424,6 +428,7 @@ def test_every_new_version_is_kept_in_creatives_as_soon_as_its_made():
     with patch("app.services.CreditService.credit_service", new=Credits()), \
          patch("app.agents.jane_ads.creative.generate_ad_creative",
                new=AsyncMock(return_value=AdCreative(image_url="https://v", headline="H", primary_text="T"))), \
+         patch.object(A, "read_recipe", new=AsyncMock(return_value="")), \
          patch.object(A, "_profile", new=AsyncMock(return_value={"brand_name": "Magen"})):
         rec = _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_1", count=1))
         job = _run(queue.claim(db, [A.RECREATE_JOB]))
