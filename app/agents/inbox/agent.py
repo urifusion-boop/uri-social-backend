@@ -812,6 +812,13 @@ async def process_inbound(db, workspace_id: str, conversation_id: str, message_i
     """After a message is stored: label it, draft a reply, and auto-send if allowed."""
     settings = await load_settings(db, workspace_id)
     try:
+        from . import rules
+        handled = await rules.run_rules(db, workspace_id, conversation_id, message_id, llm, transport)
+        if handled:
+            return {"status": "rule", **handled}
+    except Exception as e:                      # a broken rule must never stop the inbox
+        print(f"[Inbox] rules failed for {conversation_id}: {e}", flush=True)
+    try:
         await send_fixed_replies(db, workspace_id, conversation_id, settings, transport)
     except Exception as e:                      # a fixed reply must never stop the inbox
         print(f"[Inbox] fixed reply failed for {conversation_id}: {e}", flush=True)

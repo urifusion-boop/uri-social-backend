@@ -24,7 +24,7 @@ from .channels import (
     begin_replace, finish_replace, in_sync_with_connections, link_workspace_channels,
     release_channels, subscription_issue,
 )
-from . import agent
+from . import agent, rules
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -506,6 +506,68 @@ async def put_agent_settings(
     saved = await agent.save_settings(
         db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id", ""))
     return {"settings": saved}
+
+
+@router.get("/rules")
+async def list_automation_rules(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    return {"rules": [rules.public_rule(r) for r in await rules.list_rules(db, brand_ctx.get("brand_id"))]}
+
+
+@router.get("/rules/ads")
+async def ads_for_rules(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The workspace's launched ads, for limiting a rule to one campaign's ads."""
+    rows = await db["jane_ads_meta_campaigns"].find(
+        {"brand_id": brand_ctx.get("brand_id")}, {"_id": 0, "campaign_id": 1, "display_name": 1, "ad_ids": 1, "ad_id": 1}
+    ).sort("created_at", -1).to_list(100)
+    return {"campaigns": [
+        {"id": r["campaign_id"], "name": r.get("display_name") or "Campaign",
+         "ad_ids": [a for a in dict.fromkeys([*(r.get("ad_ids") or []), r.get("ad_id")]) if a]}
+        for r in rows if r.get("campaign_id")]}
+
+
+@router.post("/rules")
+async def create_automation_rule(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    try:
+        return {"rule": await rules.create_rule(db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id", ""))}
+    except rules.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/rules/{rule_id}")
+async def update_automation_rule(
+    rule_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    try:
+        rule = await rules.update_rule(db, brand_ctx.get("brand_id"), rule_id, payload)
+    except rules.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not rule:
+        raise HTTPException(status_code=404, detail="No such rule.")
+    return {"rule": rule}
+
+
+@router.delete("/rules/{rule_id}")
+async def delete_automation_rule(
+    rule_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    if not await rules.delete_rule(db, brand_ctx.get("brand_id"), rule_id):
+        raise HTTPException(status_code=404, detail="No such rule.")
+    return {"deleted": True}
 
 
 @router.get("/knowledge")
