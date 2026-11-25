@@ -177,3 +177,20 @@ def test_ad_rules_only_fire_for_that_ad_and_example_questions_match_by_meaning()
         assert (await rules.run_rules(db, WS, c2, m2, llm, t))["actions"] == ["dm"]
         assert t.sent == [(None, "Ad price: N25,000")]
     run(go())
+
+
+def test_account_for_follows_a_reconnect_but_never_guesses_a_whatsapp_number():
+    from app.agents.inbox.accounts import account_for
+
+    async def go():
+        db = AsyncMongoMockClient()["t"]
+        new = (await db[CHANNEL_ACCOUNTS].insert_one(
+            {"workspace_id": WS, "platform": "instagram", "connected_at": datetime.now(timezone.utc)})).inserted_id
+        await db[CHANNEL_ACCOUNTS].insert_one({"workspace_id": WS, "platform": "whatsapp"})
+        conv_id = (await db[CONVERSATIONS].insert_one(
+            {"workspace_id": WS, "platform": "instagram", "channel_account_id": str(ObjectId())})).inserted_id
+        old = {"_id": conv_id, "workspace_id": WS, "platform": "instagram", "channel_account_id": str(ObjectId())}
+        assert (await account_for(db, old))["_id"] == new
+        assert (await db[CONVERSATIONS].find_one({"_id": conv_id}))["channel_account_id"] == str(new)
+        assert await account_for(db, {**old, "platform": "whatsapp"}) is None
+    run(go())

@@ -32,7 +32,7 @@ from bson import ObjectId
 
 from . import situation as sit
 from . import voice
-from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, Direction, Kind, now
+from .entities import CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, Direction, Kind, now
 from . import onebox
 from .send import SendRefused, check_eligibility
 
@@ -882,8 +882,8 @@ async def send_fixed_replies(db, workspace_id: str, conversation_id: str, settin
 
     from .meta_transport import meta_transport
     from .send import send_reply
-    account = await db[CHANNEL_ACCOUNTS].find_one({"_id": ObjectId(conv["channel_account_id"])}) \
-        if ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+    from .accounts import account_for
+    account = await account_for(db, conv)
 
     sent: list[str] = []
 
@@ -948,9 +948,8 @@ async def _process_inbound(db, workspace_id: str, conversation_id: str, message_
     from .meta_transport import meta_transport
     from .send import send_reply
 
-    account = await db[CHANNEL_ACCOUNTS].find_one(
-        {"_id": ObjectId(conv["channel_account_id"])}
-    ) if ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+    from .accounts import account_for
+    account = await account_for(db, conv)
 
     if not send:
         await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {

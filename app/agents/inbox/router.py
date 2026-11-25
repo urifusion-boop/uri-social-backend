@@ -278,9 +278,8 @@ async def reply_to_conversation(
     conv = await db[CONVERSATIONS].find_one(
         {"_id": ObjectId(conversation_id), "workspace_id": workspace_id}
     ) if ObjectId.is_valid(conversation_id) else None
-    account = await db[CHANNEL_ACCOUNTS].find_one(
-        {"_id": ObjectId(conv["channel_account_id"])}
-    ) if conv and ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+    from .accounts import account_for
+    account = await account_for(db, conv)
 
     try:
         record = await send_reply(
