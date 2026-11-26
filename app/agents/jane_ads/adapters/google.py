@@ -339,6 +339,11 @@ Rules:
     return result
 
 
+def _clean_title(title: str) -> str:
+    """YouTube titles: up to 100 characters, no angle brackets."""
+    return (" ".join((title or "Ad video").replace("<", "").replace(">", "").split()) or "Ad video")[:100]
+
+
 class GoogleAdsAdapter(AdPlatformAdapter):
     """One instance per request/job. customer_id/login_customer_id/access_token are
     ALWAYS caller-supplied — resolved per-brand by
@@ -374,6 +379,62 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             "developer-token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
             "login-customer-id": self._login_customer_id,
         }
+
+    @property
+    def customer_id(self) -> str:
+        return self._customer_id
+
+    # ── video: onto YouTube through Google Ads (see google_video.py) ──────────────
+
+    async def upload_youtube_video(self, video_url: str, title: str) -> str:
+        """Upload a hosted video to the Google-managed YouTube channel of this ad account, unlisted
+        (YouTubeVideoUploadService, resumable REST). Returns the upload's resource name; YouTube
+        then processes it (youtube_upload_state)."""
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
+            media = await client.get(video_url)
+            if media.status_code != 200 or not media.content:
+                raise GoogleAdsAPIError("The video couldn't be loaded. Upload it again.")
+            data = media.content
+            start = await client.post(
+                f"https://googleads.googleapis.com/resumable/upload/{settings.GOOGLE_ADS_API_VERSION}"
+                f"/customers/{self._customer_id}/youTubeVideoUploads:create",
+                headers={**self._headers(), "Content-Type": "application/json",
+                         "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+                         "X-Goog-Upload-Header-Content-Length": str(len(data))},
+                json={"customer_id": self._customer_id,
+                      "you_tube_video_upload": {"video_title": _clean_title(title),
+                                                "video_privacy": "UNLISTED"}},
+            )
+            upload_url = start.headers.get("x-goog-upload-url")
+            if start.status_code >= 400 or not upload_url:
+                raise GoogleAdsAPIError(f"YouTube upload didn't start ({start.status_code}): {start.text[:300]}")
+            done = await client.put(
+                upload_url,
+                headers={"Authorization": f"Bearer {self._access_token}", "X-Goog-Upload-Offset": "0",
+                         "X-Goog-Upload-Command": "upload, finalize"},
+                content=data,
+            )
+        if done.status_code >= 400:
+            raise GoogleAdsAPIError(f"YouTube upload failed ({done.status_code}): {done.text[:300]}")
+        body = done.json() if done.content else {}
+        resource = body.get("resourceName") or body.get("resource_name") or ""
+        if not resource:
+            raise GoogleAdsAPIError(f"YouTube upload gave no resource name: {str(body)[:300]}")
+        return resource
+
+    async def youtube_upload_state(self, resource_name: str) -> tuple[str, str]:
+        """(state, YouTube video id) of an upload: PENDING, UPLOADED, PROCESSED, FAILED, ..."""
+        query = ("SELECT you_tube_video_upload.resource_name, you_tube_video_upload.video_id, "
+                 "you_tube_video_upload.state FROM you_tube_video_upload "
+                 f"WHERE you_tube_video_upload.resource_name = '{resource_name}'")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{self._api_base}/customers/{self._customer_id}/googleAds:search",
+                                     headers=self._headers(), json={"query": query})
+        data = resp.json()
+        _raise_for_error(data, "YouTube upload status")
+        rows = data.get("results") or []
+        upload = (rows[0].get("youTubeVideoUpload") or {}) if rows else {}
+        return upload.get("state", ""), upload.get("videoId", "")
 
     async def launch_campaign(
         self,
@@ -603,18 +664,36 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         google_visual), so a failure leaves nothing behind in the account."""
         from . import google_visual as gv
 
+        from .. import google_video
+
         creative = plan.creative
-        if not creative or not creative.image_url or creative.is_video:
-            raise GoogleAdsAPIError(
-                f"{gv.PLACEMENT_LABELS[placement]} ads need a picture. Add or generate an image, then try again.")
-        image = await gv.fetch_bytes(creative.image_url)
-        if not image:
-            raise GoogleAdsAPIError("The ad's picture couldn't be loaded. Try again, or upload it again.")
         business_name = kw_context.get("business_name") or kw_context.get("category") or "Our business"
-        try:
-            images = gv.marketing_images(image)
-        except Exception as e:
-            raise GoogleAdsAPIError(f"The ad's picture couldn't be prepared for Google: {e}")
+        # A video: one already on YouTube (a pasted link), or the owner's upload, which goes to YouTube
+        # through this ad account first (google_video). Display and Everywhere still show a picture
+        # beside it: the still the owner picked, else one taken from the video.
+        video_id = ""
+        picture_url = creative.image_url if creative else ""
+        if creative and (creative.youtube_video_id or creative.is_video):
+            if creative.youtube_video_id:
+                video_id = creative.youtube_video_id
+                picture_url = creative.video_still_url or google_video.thumbnail_for(video_id)
+            else:
+                video_id = await google_video.ensure_ready(self._db, self, creative.image_url,
+                                                           creative.headline or business_name)
+                picture_url = creative.video_still_url or await _first_still(creative.image_url)
+        needs_picture = not (placement == "demand_gen" and video_id)
+        images = None
+        if needs_picture:
+            if not picture_url:
+                raise GoogleAdsAPIError(
+                    f"{gv.PLACEMENT_LABELS[placement]} ads need a picture. Add or generate an image, then try again.")
+            image = await gv.fetch_bytes(picture_url)
+            if not image:
+                raise GoogleAdsAPIError("The ad's picture couldn't be loaded. Try again, or upload it again.")
+            try:
+                images = gv.marketing_images(image)
+            except Exception as e:
+                raise GoogleAdsAPIError(f"The ad's picture couldn't be prepared for Google: {e}")
         logo_b64 = gv.logo_image(await gv.fetch_bytes(kw_context.get("logo_url", "")), business_name,
                                  kw_context.get("brand_color") or "#C2185B")
         copy = gv.ad_copy(creative.headline, creative.primary_text, business_name, rsa_assets,
@@ -626,6 +705,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             placement, self._customer_id, name=name,
             daily_micros=budget_micros(daily_budget_ngn, self._currency_code),
             geo_constant=geo_constant, final_url=dest_link, copy=copy, images=images, logo_b64=logo_b64,
+            youtube_video_id=video_id,
         )
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
@@ -650,6 +730,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "ad_id": ad_id,
                 "asset_group": made.get("assetGroup", ""),
                 "placement": placement,
+                "youtube_video_id": video_id,
                 "days": days,
                 "business_id": plan.business_id,
                 "customer_id": self._customer_id,
@@ -1034,3 +1115,15 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         data = resp.json()
         _raise_for_error(data, "pause ad")
         return bool(data.get("results"))
+
+
+async def _first_still(video_url: str) -> str:
+    """A picture from the video, for placements that show one beside it."""
+    from .. import google_video
+    try:
+        meta = await google_video.probe(video_url)
+        shots = await google_video.stills(video_url, meta["duration"], count=1)
+        return shots[0] if shots else ""
+    except Exception as e:
+        print(f"[GoogleAdsAdapter] still from video failed: {e!r}", flush=True)
+        return ""

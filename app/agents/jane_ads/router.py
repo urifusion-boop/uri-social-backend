@@ -452,6 +452,12 @@ class AdPreviewBody(BaseModel):
     budget_ngn: float = 0
     vsg01_format_id: str = ""        # the Style step's pick, for a single ad
     platform: str = "meta"
+    # Several ads: what each says (an angle) and its style ("" = Jane's pick). Sets the count.
+    ads: list[dict] = []
+
+
+class AdPreviewRedoBody(BaseModel):
+    vsg01_format_id: str = ""        # make it again in this style; "" keeps the ad's style
 
 
 class AdPreviewEditBody(BaseModel):
@@ -476,7 +482,7 @@ async def start_ad_preview(body: AdPreviewBody, brand_ctx: dict = Depends(get_ac
         inputs = ad_previews.clean_inputs(
             description=body.description, city=body.city, objective=body.objective,
             destination_type=body.destination_type, budget_ngn=body.budget_ngn,
-            vsg01_format_id=body.vsg01_format_id, platform=body.platform)
+            vsg01_format_id=body.vsg01_format_id, platform=body.platform, ads=body.ads)
         return await ad_previews.start(db, brand_id=brand_ctx.get("brand_id") or "",
                                        user_id=brand_ctx["user_id"], count=body.count, inputs=inputs)
     except (PermissionError, LookupError, ValueError) as e:
@@ -517,12 +523,14 @@ async def remove_ad_preview(preview_id: str, index: int, brand_ctx: dict = Depen
 
 
 @router.post("/ad-previews/{preview_id}/ads/{index}/redo")
-async def redo_ad_preview(preview_id: str, index: int, brand_ctx: dict = Depends(get_active_brand_context),
+async def redo_ad_preview(preview_id: str, index: int, body: Optional[AdPreviewRedoBody] = None,
+                          brand_ctx: dict = Depends(get_active_brand_context),
                           db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
     from . import ad_previews
     try:
         return await ad_previews.redo(db, brand_id=brand_ctx.get("brand_id") or "", user_id=brand_ctx["user_id"],
-                                      preview_id=preview_id, index=index)
+                                      preview_id=preview_id, index=index,
+                                      vsg01_format_id=(body.vsg01_format_id if body else ""))
     except (PermissionError, LookupError, ValueError) as e:
         raise _preview_error(e)
 
@@ -735,7 +743,14 @@ async def suggest_ad_format(
     ready = [f for f in serialized if f["format_id"] not in needs]
     suggested = ready[0] if ready else None
     from . import ad_image_billing
+    from . import concepts as concepts_mod
+    listed_ids = {f["format_id"] for f in serialized}
     return {
+        # Several ads: the styles that best carry each angle (what each ad says), best first. Ones this
+        # brief can't support yet are included (the picker shows them greyed, with what's missing);
+        # Jane's pick takes the first one this brief supports that no other ad is using.
+        "for_angles": {a: [f for f in concepts_mod.ANGLE_STYLES.get(a, []) if f in listed_ids]
+                       for a in concepts_mod.angle_keys()},
         "suggested": suggested,
         "alternatives": [f for f in serialized if f is not suggested],
         "needs_in_brief": needs,
@@ -924,6 +939,29 @@ async def creative_upload(
     if not url:
         raise HTTPException(status_code=502, detail="Upload failed, please try again.")
     return {"url": url, "is_video": is_video}
+
+
+class VideoCheckBody(BaseModel):
+    video_url: str = ""              # a video uploaded through /creative/upload or saved in Uri
+    youtube_link: str = ""           # or a video already on YouTube
+    placement: str = "demand_gen"    # display | demand_gen | pmax
+
+
+@router.post("/video/check")
+async def check_ad_video(body: VideoCheckBody, brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """What Google will make of a video before it's used (google_video.py): its length against this
+    placement's rules, its shape, its sound, and stills for placements that also show a picture."""
+    from . import google_video
+    from .adapters.google_visual import normalize_placement
+    placement = normalize_placement(body.placement)
+    try:
+        if body.youtube_link.strip():
+            return await google_video.check_youtube(body.youtube_link, placement)
+        if not body.video_url.strip():
+            raise ValueError("Add a video first.")
+        return await google_video.check_upload(body.video_url.strip(), placement)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 _VIDEO_MIME_EXT = {
@@ -2642,6 +2680,10 @@ class MetaLaunchFromMessageBody(BaseModel):
     reference_image_url: str = ""         # required for creative_source=upload/recomposite (from
                                           # /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
+    # Google video ads: a video already on YouTube (reference_image_url is then its thumbnail),
+    # and the picture shown beside a video on Display and Everywhere (google_video.py).
+    youtube_video_id: str = ""
+    video_still_url: str = ""
     # TikTok-only, additive: 2+ extra photos for a TikTok Carousel Ad, alongside (never
     # instead of) reference_image_url/is_video above — a lone static image isn't a valid
     # TikTok ad unit at all (TikTok is video OR carousel, never single-image), so this is
@@ -3952,6 +3994,21 @@ async def _build_campaign_plan(
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
+    if google_visual and body.creative_source == "upload":
+        # Google video ads (google_video.py): a pasted YouTube video runs by its id; an uploaded
+        # video starts its trip to YouTube now, so it's ready (or nearly) by the time of launch.
+        if body.youtube_video_id:
+            from . import google_video
+            creative.youtube_video_id = google_video.youtube_id(body.youtube_video_id)
+        creative.video_still_url = body.video_still_url or creative.video_still_url
+        if creative.is_video and not creative.youtube_video_id:
+            try:
+                from . import google_flow, google_video
+                _adapter, _ = await google_flow.adapter_for_launch(db, brand_ctx)
+                await google_video.prepare(db, _adapter, creative.image_url, creative.headline or business_name)
+            except Exception as e:   # the launch tries again; never fail a plan over this
+                print(f"[google_video] early upload not started: {e!r}", flush=True)
+
     if creative_prov:
         from .creative_paths import disclose
         creative.provenance = creative_prov
@@ -4350,9 +4407,15 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
     else:
         adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    from .google_video import VideoFailed, VideoNotReady
     try:
         launch = await adapter.launch_campaign(plan, auth)
     except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except VideoNotReady as e:
+        # Still being processed by YouTube: the page waits and launches again (WizardReviewStep).
+        raise HTTPException(status_code=409, detail=str(e))
+    except VideoFailed as e:
         raise HTTPException(status_code=400, detail=str(e))
     except google_flow.GoogleAdsAPIError as e:
         google_flow.raise_http(e)

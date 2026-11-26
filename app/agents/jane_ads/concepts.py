@@ -31,6 +31,38 @@ ANGLES = [
 ]
 
 MAX_ADS = len(ANGLES)  # most ads one campaign can test
+
+# The ad styles (VSG-01 formats) that best carry each angle, best first. When several ads let Jane
+# choose, each gets the first of its angle's styles the brief can support and no other ad is using.
+ANGLE_STYLES = {
+    "problem": ["SEED-080", "SEED-101", "SEED-081"],
+    "offer": ["SEED-100", "SEED-096", "SEED-105"],
+    "outcome": ["SEED-103", "SEED-102", "SEED-098"],
+    "versus": ["SEED-075", "SEED-081", "SEED-101"],
+    "announcement": ["SEED-077", "SEED-099", "SEED-105"],
+    "post": ["SEED-087", "SEED-097", "SEED-089"],
+}
+
+
+def angle_keys() -> list[str]:
+    return [key for key, _, _ in ANGLES]
+
+
+def jane_styles(angles: list[str], ready: list[str]) -> list[str]:
+    """Jane's style for each ad, in order: its angle's best style the brief supports (`ready`, best
+    ranked first) that no earlier ad has taken, else the best-ranked one not yet taken, else a repeat
+    of its angle's best. "" when nothing is ready."""
+    taken: set[str] = set()
+    out = []
+    for angle in angles:
+        prefs = [f for f in ANGLE_STYLES.get(angle, []) if f in ready]
+        pick = next((f for f in prefs if f not in taken), None) \
+            or next((f for f in ready if f not in taken), None) \
+            or (prefs[0] if prefs else (ready[0] if ready else ""))
+        if pick:
+            taken.add(pick)
+        out.append(pick)
+    return out
 MAX_JANE_MADE = MAX_ADS
 
 SINGLE_AD_SET = "single_ad_set"
