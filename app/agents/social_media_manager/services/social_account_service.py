@@ -48,6 +48,28 @@ async def _release_inbox_claim(
                   flush=True)
 
 
+def _as_utc(value: Any) -> Optional[datetime]:
+    """A stored time (a datetime, or an ISO string with or without a zone) as naive UTC."""
+    from datetime import timezone
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _connected_since(doc: Dict[str, Any], disconnected_at: Any) -> bool:
+    """Whether this connection was made (or remade) after the account was disconnected."""
+    gone = _as_utc(disconnected_at)
+    made = _as_utc(doc.get("connected_at")) or _as_utc(doc.get("updated_at"))
+    return bool(gone and made and made > gone)
+
+
 class SocialAccountService:
 
     # -------------------------------------------------------------------------
@@ -339,12 +361,13 @@ class SocialAccountService:
         # behind indefinitely. See disconnect_account for where this is
         # written; a fresh reconnect through finalize_connection clears it.
         tombstone_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
-        disconnected_ids = {
-            doc["outstand_account_id"]
+        disconnected_at = {
+            doc["outstand_account_id"]: doc.get("disconnected_at")
             async for doc in db["disconnected_accounts"].find(
-                tombstone_scope, {"outstand_account_id": 1}
+                tombstone_scope, {"outstand_account_id": 1, "disconnected_at": 1}
             )
         }
+        disconnected_ids = set(disconnected_at)
 
         # 1. Outstand-managed accounts — failures must not prevent direct connections
         try:
@@ -396,7 +419,15 @@ class SocialAccountService:
                 if doc_outstand_id and doc_outstand_id in outstand_ids_seen:
                     continue
                 if doc_outstand_id and doc_outstand_id in disconnected_ids:
-                    continue
+                    # Disconnecting deletes the connection, so one connected after it was
+                    # disconnected is the owner connecting it again (a direct Facebook Page or
+                    # Instagram account keeps its id): show it, and drop the mark. Live-reported:
+                    # "Facebook connected", yet the card stayed "Not connected".
+                    if not _connected_since(doc, disconnected_at.get(doc_outstand_id)):
+                        continue
+                    await db["disconnected_accounts"].delete_many(
+                        {**tombstone_scope, "outstand_account_id": doc_outstand_id})
+                    disconnected_ids.discard(doc_outstand_id)
                 by_platform.setdefault(platform, []).append({
                     "id": doc.get("id"),
                     "platform": platform,
