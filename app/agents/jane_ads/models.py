@@ -373,6 +373,11 @@ class AdCreative(BaseModel):
     DRAFT and RECOMPOSITE can carry either — `is_video` says which."""
     image_url: str = ""             # final creative media URL, hosted on Cloudinary
     is_video: bool = False           # True when image_url is actually a video
+    # Google video ads (google_video.py): a video already on YouTube (a pasted link) runs by
+    # this id; image_url is then only its thumbnail. video_still_url is the picture Display and
+    # Everywhere show beside a video (a still from it, or the owner's photo).
+    youtube_video_id: str = ""
+    video_still_url: str = ""
     # Set when the ad promotes a post the owner already published, by hand or through
     # URI: {"platform": "instagram"|"facebook", "post_id": "..."}. The ad then runs the
     # post itself (keeping its likes and comments); image_url is only its preview.
