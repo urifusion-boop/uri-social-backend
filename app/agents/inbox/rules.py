@@ -152,7 +152,10 @@ async def ai_match(text: str, candidates: list[dict], llm: Llm) -> Optional[dict
 
 
 async def find_rule(rules: list[dict], conv: dict, text: str, llm: Llm) -> Optional[dict]:
-    usable = [r for r in rules if applies_to(r, conv)]
+    # When several rules match one comment, the one that also sends a DM wins over a plain
+    # public reply, and an ad-specific rule over a general one.
+    usable = sorted((r for r in rules if applies_to(r, conv)),
+                    key=lambda r: (r["kind"] != "comment_to_dm", not r["ad_ids"]))
     for r in usable:
         if keyword_match(r, text) or (r["match"]["any"] and r["ad_ids"]):
             return r

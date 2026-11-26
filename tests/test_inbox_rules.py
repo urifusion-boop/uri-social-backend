@@ -101,6 +101,18 @@ def test_a_thread_from_before_a_reconnect_still_gets_rules():
     run(go())
 
 
+def test_a_comment_to_dm_rule_beats_a_plain_comment_rule_on_the_same_word():
+    async def go():
+        db, t, pr = AsyncMongoMockClient()["t"], Transport(), Private()
+        await rules.create_rule(db, WS, raw(match={"keywords": ["webinar"]}, public_reply="Check your DM"), "u")
+        await rules.create_rule(db, WS, raw(kind="comment_to_dm", match={"keywords": ["webinar"]},
+                                            public_reply="Check your DM", dm="Here is the link"), "u")
+        cid, mid = await seed(db, text="Webinar")
+        out = await rules.run_rules(db, WS, cid, mid, no_llm, t, pr)
+        assert out["actions"] == ["public_reply", "dm"] and pr.sent == [("c1", "Here is the link")]
+    run(go())
+
+
 def test_comment_to_dm_sends_both_and_files_the_dm_thread():
     async def go():
         db, t, p = AsyncMongoMockClient()["t"], Transport(), Private()
