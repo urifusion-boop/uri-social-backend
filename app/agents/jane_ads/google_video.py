@@ -168,7 +168,9 @@ async def stills(video_url: str, duration: float, count: int = 3) -> list[str]:
 async def check_upload(video_url: str, placement: str) -> dict:
     meta = await probe(video_url)
     out = facts_for(meta["duration"], meta["width"], meta["height"], meta["has_audio"], placement)
-    out["stills"] = await stills(video_url, meta["duration"]) if placement in ("display", "pmax") else []
+    # Display and Everywhere show a picture beside the video: three to choose from. YouTube & Discover
+    # doesn't, but one still is the video's picture in the plan's preview (a browser can't always play it).
+    out["stills"] = await stills(video_url, meta["duration"], count=3 if placement in ("display", "pmax") else 1)
     return out
 
 
@@ -244,6 +246,7 @@ async def _set(db, upload_id: str, **change: Any) -> None:
 
 async def _upload_and_wait(db, adapter, doc: dict) -> None:
     uid = doc["upload_id"]
+    print(f"[google_video] {uid} uploading to YouTube for customer {doc['customer_id']}", flush=True)
     try:
         resource = await adapter.upload_youtube_video(doc["video_url"], doc["title"])
     except Exception as e:
@@ -252,7 +255,9 @@ async def _upload_and_wait(db, adapter, doc: dict) -> None:
                                                      "or paste a YouTube link instead.")
         return
     await _set(db, uid, status="processing", resource_name=resource)
+    print(f"[google_video] {uid} uploaded ({resource}); waiting for YouTube to process it", flush=True)
     deadline = _now() + PROCESS_TIMEOUT
+    last_state = ""
     while _now() < deadline:
         await asyncio.sleep(POLL_SECONDS)
         try:
@@ -260,12 +265,17 @@ async def _upload_and_wait(db, adapter, doc: dict) -> None:
         except Exception as e:
             print(f"[google_video] status check {uid} failed: {e!r}", flush=True)
             continue
+        if state != last_state:
+            print(f"[google_video] {uid} state {state or '?'}", flush=True)
+            last_state = state
         if state in READY_STATES and video_id:
             await _set(db, uid, status="ready", youtube_video_id=video_id)
+            print(f"[google_video] {uid} ready: youtube video {video_id}", flush=True)
             return
         if state in FAILED_STATES:
             await _set(db, uid, status="failed", error=_failed_words(state))
             return
+    print(f"[google_video] {uid} still processing after {PROCESS_TIMEOUT}; the launch will ask again", flush=True)
     # Still processing at the deadline: left as "processing"; the launch asks Google again.
 
 
