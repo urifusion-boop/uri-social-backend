@@ -42,6 +42,12 @@ PREPARING = ("Getting your video ready on YouTube. This usually takes a few minu
 
 _YT = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|embed/|live/|v/))([A-Za-z0-9_-]{11})")
 _BARE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_WATCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en",
+    "Cookie": "CONSENT=YES+1; SOCS=CAI",
+}
 
 
 class VideoNotReady(Exception):
@@ -185,13 +191,17 @@ async def check_youtube(link: str, placement: str) -> dict:
         info = r.json()
         duration = 0.0
         try:
-            page = await client.get(watch, headers={"Accept-Language": "en"})
+            # A server in Europe gets YouTube's cookie-consent page instead of the video's, so it
+            # asks as a browser that already answered it.
+            page = await client.get(watch, headers=_WATCH_HEADERS)
             m = re.search(r'"lengthSeconds":"(\d+)"', page.text)
             duration = float(m.group(1)) if m else 0.0
         except Exception:
             pass
     shorts = "/shorts/" in link
     out = facts_for(duration, 9 if shorts else 0, 16 if shorts else 0, None, placement)
+    if not duration:
+        out["facts"].append({"tone": "ok", "text": "YouTube didn't show its length; Google checks it when the ad runs"})
     if not shorts and not any("Upright" in f["text"] or "Sideways" in f["text"] for f in out["facts"]):
         out["facts"].append({"tone": "ok", "text": "Google decides whether it also runs in Shorts"})
     out["facts"].insert(0, {"tone": "ok", "text": "Found on YouTube"})
