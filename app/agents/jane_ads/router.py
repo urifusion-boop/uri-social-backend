@@ -744,11 +744,12 @@ async def suggest_ad_format(
     suggested = ready[0] if ready else None
     from . import ad_image_billing
     from . import concepts as concepts_mod
-    ready_ids = [f["format_id"] for f in ready]
+    listed_ids = {f["format_id"] for f in serialized}
     return {
-        # Several ads: the styles that best carry each angle (what each ad says), best first, among
-        # those this brief supports. The wizard gives each ad the first one no other ad is using.
-        "for_angles": {a: [f for f in concepts_mod.ANGLE_STYLES.get(a, []) if f in ready_ids]
+        # Several ads: the styles that best carry each angle (what each ad says), best first. Ones this
+        # brief can't support yet are included (the picker shows them greyed, with what's missing);
+        # Jane's pick takes the first one this brief supports that no other ad is using.
+        "for_angles": {a: [f for f in concepts_mod.ANGLE_STYLES.get(a, []) if f in listed_ids]
                        for a in concepts_mod.angle_keys()},
         "suggested": suggested,
         "alternatives": [f for f in serialized if f is not suggested],
