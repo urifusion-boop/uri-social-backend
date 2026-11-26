@@ -58,6 +58,28 @@ def _brand_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
     return {"brand_id": brand_id}
 
 
+def _as_utc(value: Any) -> Optional[datetime]:
+    """A stored time (a datetime, or an ISO string with or without a zone) as naive UTC."""
+    from datetime import timezone
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _connected_since(doc: Dict[str, Any], disconnected_at: Any) -> bool:
+    """Whether this connection was made (or remade) after the account was disconnected."""
+    gone = _as_utc(disconnected_at)
+    made = _as_utc(doc.get("connected_at")) or _as_utc(doc.get("updated_at"))
+    return bool(gone and made and made > gone)
+
+
 def _tombstone_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
     from app.models.brand_account import BrandAccount
     if (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id):
@@ -121,12 +143,13 @@ class SocialAccountService:
 
         # Accounts the customer explicitly disconnected (see disconnect_account).
         tombstone_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
-        disconnected_ids = {
-            doc.get("account_id") or doc.get("outstand_account_id")
+        disconnected_at = {
+            (doc.get("account_id") or doc.get("outstand_account_id")): doc.get("disconnected_at")
             async for doc in db["disconnected_accounts"].find(
-                tombstone_scope, {"account_id": 1, "outstand_account_id": 1}
+                tombstone_scope, {"account_id": 1, "outstand_account_id": 1, "disconnected_at": 1}
             )
         }
+        disconnected_ids = set(disconnected_at)
 
         try:
             # Every connection is a direct one held in our own database. An account still
@@ -139,7 +162,14 @@ class SocialAccountService:
                 platform = doc.get("platform", "unknown")
                 key = doc.get("id") or doc.get("outstand_account_id")
                 if key and key in disconnected_ids:
-                    continue
+                    # Disconnecting deletes the connection, so one connected after it was
+                    # disconnected is the owner connecting it again: show it, and drop the mark.
+                    # Live-reported: "Facebook connected", yet the card stayed "Not connected"
+                    # after a Disconnect All, because the reconnected Page kept being hidden.
+                    if not _connected_since(doc, disconnected_at.get(key)):
+                        continue
+                    await db["disconnected_accounts"].delete_many({**tombstone_scope, "account_id": key})
+                    disconnected_ids.discard(key)
                 entry = {
                     "id": doc.get("id"),
                     "platform": platform,
