@@ -404,6 +404,8 @@ class SocialAccountService:
                     "outstand_account_id": doc.get("outstand_account_id"),
                     "username": doc.get("username"),
                     "account_name": doc.get("account_name"),
+                    # The Facebook person a Facebook/Instagram connection came through.
+                    "connected_by": doc.get("connected_by") or "",
                     "profile_picture_url": doc.get("profile_picture_url"),
                     "is_active": True,
                     "connected_at": doc.get("connected_at"),
