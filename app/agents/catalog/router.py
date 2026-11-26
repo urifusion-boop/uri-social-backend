@@ -48,6 +48,25 @@ def _ser(doc: Optional[dict]) -> Optional[dict]:
     return items.serialise(doc, "owner")
 
 
+# ── images ───────────────────────────────────────────────────────────────────
+
+_IMAGE_TYPES = ("data:image/png;", "data:image/jpeg;", "data:image/jpg;", "data:image/webp;")
+
+
+@router.post("/images", status_code=201)
+async def upload_image(body: dict = Body(...), ctx: Ctx = Depends(_ctx)) -> dict:
+    _manager(ctx)
+    data_url = str(body.get("data_url") or "")
+    if not data_url.startswith(_IMAGE_TYPES):
+        raise HTTPException(status_code=400, detail="Use a PNG, JPG or WEBP image.")
+    from app.agents.social_media_manager.services.user_media_storage_service import UserMediaStorageService
+    try:
+        uploaded = await UserMediaStorageService.upload_user_media([data_url], f"catalog/{ctx['business_id']}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"url": uploaded[0]["url"]}
+
+
 # ── items ────────────────────────────────────────────────────────────────────
 
 @router.post("/items", status_code=201)

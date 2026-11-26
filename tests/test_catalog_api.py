@@ -187,3 +187,13 @@ def test_changing_availability_with_open_reservations_is_refused(env):
     res = env.patch(f"/catalog/items/{item['id']}", json={"availability_type": "unlimited"})
     assert res.status_code == 409 and "open reservations" in res.json()["detail"]
     assert env.patch(f"/catalog/items/{item['id']}", json={"price": 50000}).json()["price"] == 50000
+
+
+def test_image_upload_accepts_images_only(env, monkeypatch):
+    async def fake(data, folder, resource_type):
+        return f"https://cdn.test/{resource_type}/x.png"
+    monkeypatch.setattr("app.agents.social_media_manager.services.user_media_storage_service.upload_bytes", fake)
+    ok = env.post("/catalog/images", json={"data_url": "data:image/png;base64,aGVsbG8="})
+    assert ok.status_code == 201 and ok.json()["url"].endswith("x.png")
+    assert env.post("/catalog/images", json={"data_url": "data:video/mp4;base64,aGVsbG8="}).status_code == 400
+    assert env.post("/catalog/images", json={"data_url": "nope"}).status_code == 400
