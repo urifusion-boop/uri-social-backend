@@ -319,3 +319,56 @@ def test_using_a_version_makes_one_content_draft_the_builder_can_start_from():
     assert _run(get_draft_image(first["draft_id"], "u1", db))["image_url"] == "https://cdn.uri/v1.png"
     with pytest.raises(LookupError):
         _run(A.use_version(db, brand_id="b2", user_id="u2", recreation_id="rec_1", index=0))
+
+
+def test_a_version_takes_the_brands_colours_and_its_own_call_to_action():
+    """Live-reported on staging 2026-11-26: a version came back in the reference's green with its
+    App Store and Google Play badges; only the logo had changed."""
+    layout = A.recreation_layout({"layout": "x"}, RECIPE, ["#C2185B", "#1A0A12"], "Visit our website")
+    assert "ONLY this business's brand colours (#C2185B, #1A0A12)" in layout
+    assert "none of the reference's colours" in layout
+    assert 'exactly one button that reads "Visit our website"' in layout
+    assert "No App Store, Google Play" in layout
+    plain = A.recreation_layout({}, "", [], "")
+    assert "never the reference's colour scheme" in plain and "No App Store" in plain
+
+
+def test_the_design_is_read_by_colour_role_and_without_store_badges():
+    prompt = A._RECIPE_PROMPT
+    assert "never by name or value" in prompt and "never describe app store, Google Play" in prompt
+    assert "app-store style buttons" not in prompt
+
+
+def test_a_design_read_the_old_way_is_read_again(monkeypatch):
+    db = _db()
+    _ready_ad(db)
+    _run(db[A.ADS].update_one({"ad_id": "cad_1"}, {"$set": {"recipe": "deep green background, App Store badges"}}))
+    _, made, reader = _make(db, count=1)
+    assert reader.await_count == 1 and "deep green" not in made[0]["layout"]
+    assert _run(db[A.ADS].find_one({"ad_id": "cad_1"}))["recipe_v"] == A.RECIPE_VERSION
+
+
+def test_each_version_is_made_for_the_brands_own_destination(monkeypatch):
+    db = _db()
+    _ready_ad(db)
+    seen = []
+
+    async def look(db_, rec):
+        return {"colours": ["#C2185B"], "cta": "Chat on WhatsApp", "destination_type": "whatsapp",
+                "destination_cta": "Chat with us"}
+
+    monkeypatch.setattr(A, "brand_look", look)
+    import app.agents.jane_ads.creative as C
+
+    async def fake(business_name, category, goal, description, **kw):
+        seen.append(kw)
+        return AdCreative(image_url="https://cdn.uri/v.png", headline="V", primary_text="T.")
+
+    with patch("app.services.CreditService.credit_service", new=_Credits()), \
+         patch.object(C, "generate_ad_creative", new=fake), \
+         patch.object(A, "read_recipe", new=AsyncMock(return_value=RECIPE)), \
+         patch.object(A, "_profile", new=AsyncMock(return_value={"brand_name": "Uri"})):
+        _run(A.start_recreate(db, brand_id="b1", user_id="u1", ad_id="cad_1", count=1))
+        _run(A.recreate_job(db, _run(queue.claim(db, [A.RECREATE_JOB])), _Ctx()))
+    assert seen[0]["destination_type"] == "whatsapp" and seen[0]["destination_cta"] == "Chat with us"
+    assert "#C2185B" in seen[0]["image_layout"] and '"Chat on WhatsApp"' in seen[0]["image_layout"]

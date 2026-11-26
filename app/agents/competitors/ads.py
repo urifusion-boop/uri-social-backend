@@ -164,15 +164,21 @@ _RECIPE_PROMPT = (
     "This is an advertisement. Another business wants its own ad with the SAME visual design, for "
     "its own product. Describe the design so a designer could rebuild its structure without copying "
     "anything that belongs to this brand.\n"
-    'Return ONLY JSON: {"recipe": "90-160 words"} covering, in this order: the background (colours, '
-    "texture, shapes); the headline's position, size, number of lines and whether one key word is in a "
-    "different colour; the main subject described generically (who or what, age group, clothing, pose, "
-    "expression, framing, where it sits); every graphic device around it (floating symbols, short labels, "
-    "arrows, badges, buttons, app-store style buttons), how many and where, saying what KIND of words "
-    "they hold, never the words; the overall mood and colour contrast.\n"
+    'Return ONLY JSON: {"recipe": "90-160 words"} covering, in this order: the background (texture, '
+    "shapes, whether it is dark or light, plain or busy); the headline's position, size, number of lines "
+    "and whether one key word is in an accent colour; the main subject described generically (who or "
+    "what, age group, pose, expression, framing, where it sits); every graphic device around it "
+    "(floating symbols, short labels, arrows, badges), how many and where, saying what KIND of words they "
+    "hold, never the words; where the call-to-action button sits; the overall mood and contrast.\n"
+    "Colours: describe them only by role (a dark background, a light headline, one bright accent colour "
+    "on a key word), never by name or value: the new ad uses its own brand's colours. Clothing likewise "
+    "without colours. Call to action: one button, described only by where it sits; never describe app "
+    "store, Google Play or other store badges, payment logos or QR codes.\n"
     "Never include the ad's own words, brand or product names, logos, social handles, prices or "
     "a real person's identity. Do not describe where the logo is."
 )
+# Recipes read before colours and store badges were left out (version 1) are read again.
+RECIPE_VERSION = 2
 
 
 async def read_recipe(image_url: str) -> str:
@@ -288,16 +294,47 @@ def recreation_brief(analysis: dict, product: str, description: str) -> str:
     return " ".join(bits)
 
 
-def recreation_layout(analysis: dict, recipe: str) -> str:
+def recreation_layout(analysis: dict, recipe: str, colours: Optional[list] = None, cta: str = "") -> str:
     """What the image model is told about the picture: the reference's own design, in detail when
-    Jane could study it, else its one-line layout. Never one of Jane's stock angle layouts."""
+    Jane could study it, else its one-line layout. Never one of Jane's stock angle layouts.
+
+    The design is the reference's; the look is the brand's. Live-reported (staging 2026-11-26): a
+    version came back in the reference's green with its App Store and Google Play badges, the logo
+    the only thing changed. So the brand's own colours and its own call to action are spelled out."""
     edges = " Keep every word well inside the edges, with wide margins on all sides."
+    palette = ", ".join(c for c in (colours or [])[:3] if c)
+    look = (f" Colours: use ONLY this business's brand colours ({palette}) for the background, the accent "
+            "word and the button; none of the reference's colours." if palette else
+            " Colours: use this business's own brand colours, never the reference's colour scheme.")
+    button = (f' Call to action: exactly one button that reads "{cta}".' if cta else
+              " Call to action: one button with this business's own call to action.")
+    button += " No App Store, Google Play or other store badges, payment logos or QR codes."
     if recipe:
         return ("Design this ad like the reference ad, keeping its structure and composition: "
-                f"{recipe} Use this business's own words, colours and people, not the reference's." + edges)
+                f"{recipe} Use this business's own words and people, not the reference's." + look + button + edges)
     if analysis.get("layout"):
-        return f"Use a similar composition to the reference ad: {analysis['layout']}." + edges
-    return edges.strip()
+        return f"Use a similar composition to the reference ad: {analysis['layout']}." + look + button + edges
+    return (look + button + edges).strip()
+
+
+async def brand_look(db, rec: dict) -> dict:
+    """The brand's colours and where its ads send people, for drawing a version in the brand's look."""
+    from app.agents.jane_ads.creative import get_brand_context
+    from app.agents.jane_ads.destination import coerce_type, get_brand_destination, image_cta
+    out: dict[str, Any] = {"colours": [], "cta": "", "destination_type": "", "destination_cta": ""}
+    try:
+        bc = await get_brand_context(rec["user_id"], db, rec.get("brand_id")) or {}
+        out["colours"] = [str(c) for c in (bc.get("brand_colors") or []) if c][:3]
+    except Exception as e:
+        print(f"[recreate] brand colours unavailable: {e!r}", flush=True)
+    try:
+        dest = await get_brand_destination(db, rec.get("brand_id"))
+        out["destination_type"] = dest.get("destination_type") or ""
+        out["destination_cta"] = dest.get("destination_cta") or ""
+        out["cta"] = image_cta(coerce_type(out["destination_type"]))
+    except Exception as e:
+        print(f"[recreate] brand destination unavailable: {e!r}", flush=True)
+    return out
 
 
 def version_brief(brief: str, index: int, count: int) -> str:
@@ -311,10 +348,10 @@ async def ensure_recipe(db, rec: dict) -> str:
     """The reference's design, read once and kept on the saved ad and on this request. Best
     effort: without it the versions still follow the one-line layout."""
     ref = rec.get("reference") or {}
-    if ref.get("recipe"):
+    if ref.get("recipe") and ref.get("recipe_v") == RECIPE_VERSION:
         return ref["recipe"]
-    ad = await db[ADS].find_one({"ad_id": rec.get("ad_id")}, {"recipe": 1}) or {}
-    recipe = ad.get("recipe") or ""
+    ad = await db[ADS].find_one({"ad_id": rec.get("ad_id")}, {"recipe": 1, "recipe_v": 1}) or {}
+    recipe = ad.get("recipe") or "" if ad.get("recipe_v") == RECIPE_VERSION else ""
     if not recipe and ref.get("image_url"):
         try:
             recipe = await read_recipe(ref["image_url"])
@@ -322,10 +359,11 @@ async def ensure_recipe(db, rec: dict) -> str:
             print(f"[recreate] couldn't read the reference's design: {e!r}", flush=True)
             return ""
         if recipe:
-            await db[ADS].update_one({"ad_id": rec.get("ad_id")}, {"$set": {"recipe": recipe}})
+            await db[ADS].update_one({"ad_id": rec.get("ad_id")},
+                                     {"$set": {"recipe": recipe, "recipe_v": RECIPE_VERSION}})
     if recipe:
         await db[RECREATIONS].update_one({"recreation_id": rec["recreation_id"]},
-                                         {"$set": {"reference.recipe": recipe}})
+                                         {"$set": {"reference.recipe": recipe, "reference.recipe_v": RECIPE_VERSION}})
     return recipe
 
 
@@ -361,7 +399,8 @@ async def recreate_job(db, job: dict, ctx) -> dict:
     # angle layouts made versions 2 and 3 look nothing like the ad the owner picked.
     if done < rec["count"]:
         await ctx.step("look", "Studying the reference's design")
-        layout = recreation_layout(analysis, await ensure_recipe(db, rec))
+        look = await brand_look(db, rec)
+        layout = recreation_layout(analysis, await ensure_recipe(db, rec), look["colours"], look["cta"])
         await ctx.step("look", "Studying the reference's design", "done")
     for i in range(done, rec["count"]):
         a = angle
@@ -370,7 +409,8 @@ async def recreate_job(db, job: dict, ctx) -> dict:
             ad = await generate_ad_creative(
                 profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
                 version_brief(brief, i, rec["count"]), user_id=rec["user_id"], db=db, brand_id=rec["brand_id"],
-                city=profile.get("customer_location") or "", image_layout=layout)
+                city=profile.get("customer_location") or "", image_layout=layout,
+                destination_type=look["destination_type"], destination_cta=look["destination_cta"])
         except Exception as e:
             print(f"[recreate] {rid} version {i + 1} failed: {e}", flush=True)
             await _give_up(unavailable)
@@ -529,12 +569,13 @@ async def _redo_one(db, rec: dict, index: int, ctx) -> dict:
     angle = old.get("angle") or _LAYOUT_ANGLE.get(analysis.get("angle", ""), "outcome")
     brief = recreation_brief(analysis, rec.get("product", ""), profile.get("product_description", ""))
     await ctx.step(f"redo{index}", f"Making version {index + 1} again")
-    layout = recreation_layout(analysis, await ensure_recipe(db, rec))
+    look = await brand_look(db, rec)
+    layout = recreation_layout(analysis, await ensure_recipe(db, rec), look["colours"], look["cta"])
     ad = await generate_ad_creative(
         profile.get("brand_name") or "Your business", profile.get("industry") or "", "traffic",
         brief + " Keep the same design, but make the words and the scene clearly different from the last attempt.",
         user_id=rec["user_id"], db=db, brand_id=rec["brand_id"], city=profile.get("customer_location") or "",
-        image_layout=layout)
+        image_layout=layout, destination_type=look["destination_type"], destination_cta=look["destination_cta"])
     if not ad.image_url:
         await db[RECREATIONS].update_one({"recreation_id": rid}, {"$set": {"status": "done", f"results.{index}.redoing": False,
                                                                            "error": "Jane couldn't make that one again just now."}})
