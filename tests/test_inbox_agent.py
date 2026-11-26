@@ -529,3 +529,36 @@ def test_handing_a_conversation_back_ends_the_takeover():
     later = history + [{"direction": "outbound", "actor_id": "person_1", "approved_draft": False,
                         "received_at": at - timedelta(minutes=10)}]
     assert agent._activity(later, at, handed_back)[1] is True
+
+
+@pytest.mark.parametrize("text", ["What's this about? How can I get started?", "what do you do", "how do I get started",
+                                  "Tell me more about uri", "who are you"])
+def test_orientation_questions_are_recognised(text):
+    assert agent.is_orientation(text)
+
+
+@pytest.mark.parametrize("text", ["what is the price of the large pack", "do you deliver to Ikeja", "I want a refund"])
+def test_specific_questions_are_not_orientation(text):
+    assert not agent.is_orientation(text)
+
+
+def test_an_orientation_question_is_never_held_as_unanswered():
+    async def llm(system, user):
+        return {"reply": "URI Social is an AI social media manager. Tell me what you need!", "cited": [],
+                "confidence": 90, "unanswered": ["what this is about"]}
+    out = _run(agent.draft_reply("What's this about? How can I get started?", [], [], "dm", "instagram",
+                                        "URI Social", llm))
+    assert out["unanswered"] is False
+
+
+def test_a_draft_citing_sources_by_their_short_ids_keeps_its_confidence():
+    sources = [{"id": "faq:6ad24197d57ad8e51b544ee8", "label": "FAQ · What is it?", "text": "Q: What is it?\nA: A tool.",
+                "approved": True, "price_or_stock": False}]
+    seen = {}
+
+    async def llm(system, user):
+        seen["user"] = user
+        return {"reply": "It is a tool.", "cited": ["S1"], "confidence": 95, "unanswered": []}
+    out = _run(agent.draft_reply("what is it", [], sources, "dm", "instagram", "Biz", llm))
+    assert out["confidence"] == 95 and out["sources"][0]["id"] == "faq:6ad24197d57ad8e51b544ee8"
+    assert "faq:6ad24197" not in seen["user"]

@@ -246,7 +246,7 @@ class TestInboxSoundsLikeTheBrand:
                                     language_rule="English.", length_rule="Short.",
                                     brand_style="10. Sound like this business.\n")
         assert "10. Sound like this business." in text
-        assert "come ONLY from the numbered SOURCES" in text      # facts only from the sources
+        assert "come ONLY from the sources" in text      # hard facts only from the sources
 
     def test_banned_word_in_draft_is_never_auto_sent(self):
         import inspect
