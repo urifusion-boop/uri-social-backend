@@ -276,6 +276,30 @@ def _job_market_intelligence_scheduled_scans():
     _run_async("market_intelligence_scheduled_scans", _run)
 
 
+def _job_catalog_expire():
+    """Release catalog reservations whose time is up, and hand pending catalog events to subscribers."""
+    async def _run():
+        from app.agents.catalog import events, reservations
+        from app.database import get_db
+        db = get_db()
+        released = await reservations.expire_due(db)
+        delivered = await events.dispatch_pending(db)
+        if released or delivered["delivered"] or delivered["failed"]:
+            print(f"📦 Catalog: released {released} expired reservation(s), events {delivered}")
+    _run_async("catalog_expire", _run)
+
+
+def _job_catalog_alerts():
+    """Tell owners about low stock, empty stock and thin capacity (once a day per alert)."""
+    async def _run():
+        from app.agents.catalog import alerts
+        from app.database import get_db
+        sent = await alerts.send_alerts(get_db())
+        if sent:
+            print(f"📦 Catalog: sent {sent} alert(s)")
+    _run_async("catalog_alerts", _run)
+
+
 def _job_market_intelligence_outbox():
     """Uri Market Intelligence immediate-notification delivery worker (PRD
     §14) — drains queued immediate outbox entries every 15 minutes. Same
@@ -560,6 +584,19 @@ def start_notification_scheduler():
         _job_market_intelligence_scheduled_scans,
         CronTrigger(minute=20),
         id="market_intelligence_scheduled_scans",
+        **_JOB_DEFAULTS,
+    )
+
+    _scheduler.add_job(
+        _job_catalog_expire,
+        CronTrigger(minute="*/5"),
+        id="catalog_expire",
+        **_JOB_DEFAULTS,
+    )
+    _scheduler.add_job(
+        _job_catalog_alerts,
+        CronTrigger(minute=40),
+        id="catalog_alerts",
         **_JOB_DEFAULTS,
     )
 
