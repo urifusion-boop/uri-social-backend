@@ -210,3 +210,81 @@ def test_the_plan_runs_exactly_these_ads_and_makes_or_charges_nothing():
     # Someone else's ads, or none ready yet: refused.
     with pytest.raises(HTTPException):
         _run(R._preview_creative(db, {"brand_id": "b2"}, rec["id"], plan, "meta", DestinationType.WEBSITE, ""))
+
+
+# ── Several ads, each in a style (the Style step for several ads) ───────────────
+
+STYLED = P.clean_inputs(description="Airport runs (from ₦25,000) — for frequent flyers in Lekki", city="Lagos",
+                        objective="leads", destination_type="website", budget_ngn=40_000,
+                        ads=[{"angle": "problem", "vsg01_format_id": "SEED-080"},
+                             {"angle": "offer", "vsg01_format_id": ""},
+                             {"angle": "outcome", "vsg01_format_id": "SEED-080"}])
+
+
+def test_each_ad_is_drawn_in_its_own_style_and_says_its_own_thing():
+    db, credits, calls = _db(), _Credits(), []
+    rec = _start(db, credits, count=9, inputs=STYLED)          # the plan sets the count, not `count`
+    assert rec["count"] == 3 and [a["angle"] for a in rec["ads"]] == ["problem", "offer", "outcome"]
+    _work(db, credits, _maker(calls))
+    # Drawn from the style library: no free-form layout, the owner's style where they chose one.
+    assert [c["image_layout"] for c in calls] == ["", "", ""]
+    assert [c["vsg01_format_id"] for c in calls] == ["SEED-080", None, "SEED-080"]
+    # Jane's pick for the middle ad steers clear of the style the first ad already has.
+    assert "SEED-080" in (calls[1]["exclude_format_ids"] or [])
+    assert calls[2]["exclude_format_ids"] in (None, [])         # the owner chose it: nothing excluded
+    # Each still says its own thing.
+    assert "problem" in calls[0]["brief"].lower() and "offer" in calls[1]["brief"].lower()
+    out = _run(P.get(db, "b1", rec["id"]))
+    assert [a["style"] for a in out["results"]] == ["SEED-080", "", "SEED-080"]
+    assert [a["angle"] for a in out["results"]] == ["problem", "offer", "outcome"]
+
+
+def test_a_message_jane_doesnt_know_is_refused_and_one_ad_is_a_single_ad():
+    with pytest.raises(ValueError):
+        P.clean_inputs(description="x", ads=[{"angle": "problem"}, {"angle": "made-up"}])
+    one = P.clean_inputs(description="x", vsg01_format_id="SEED-100", ads=[{"angle": "offer"}])
+    assert one["ads"] == [] and one["vsg01_format_id"] == "SEED-100"
+
+
+def test_an_ad_can_be_made_again_in_another_style():
+    db, credits, calls = _db(), _Credits(), []
+    rec = _start(db, credits, inputs=STYLED)
+    _work(db, credits, _maker(calls))
+    with patch("app.services.CreditService.credit_service", new=credits):
+        _run(P.redo(db, brand_id="b1", user_id="u1", preview_id=rec["id"], index=1, vsg01_format_id="SEED-100"))
+    _work(db, credits, _maker(calls))
+    assert calls[-1]["vsg01_format_id"] == "SEED-100" and calls[-1]["image_layout"] == ""
+    assert "different from this earlier attempt" not in calls[-1]["brief"]   # a new style is different already
+    out = _run(P.get(db, "b1", rec["id"]))
+    assert out["ads"][1]["vsg01_format_id"] == "SEED-100" and out["results"][1]["angle"] == "offer"
+    assert credits.charged == [1, 1, 1, 1]
+
+
+def test_an_older_several_ads_request_can_take_a_style_too():
+    db, credits, calls = _db(), _Credits(), []
+    rec = _start(db, credits, count=2)                          # made before the Style step had several ads
+    _work(db, credits, _maker(calls))
+    with patch("app.services.CreditService.credit_service", new=credits):
+        _run(P.redo(db, brand_id="b1", user_id="u1", preview_id=rec["id"], index=0, vsg01_format_id="SEED-105"))
+    _work(db, credits, _maker(calls))
+    assert calls[-1]["vsg01_format_id"] == "SEED-105" and calls[-1]["image_layout"] == ""
+    out = _run(P.get(db, "b1", rec["id"]))
+    assert [a["angle"] for a in out["ads"]] == ["problem", "offer"]
+
+
+def test_removing_an_ad_keeps_each_remaining_ad_with_its_style():
+    db, credits = _db(), _Credits()
+    rec = _start(db, credits, inputs=STYLED)
+    _work(db, credits, _maker([]))
+    out = _run(P.remove(db, brand_id="b1", preview_id=rec["id"], index=0))
+    assert [a["angle"] for a in out["ads"]] == ["offer", "outcome"] and out["count"] == 2
+
+
+def test_jane_gives_each_ad_a_different_fitting_style():
+    from app.agents.jane_ads import concepts as C
+    ready = ["SEED-105", "SEED-080", "SEED-100", "SEED-103", "SEED-097"]
+    assert C.jane_styles(["problem", "offer", "outcome"], ready) == ["SEED-080", "SEED-100", "SEED-103"]
+    # Two ads saying the same thing still look different.
+    assert C.jane_styles(["problem", "problem"], ready) == ["SEED-080", "SEED-105"]
+    # Nothing the brief supports: Jane picks while making it.
+    assert C.jane_styles(["offer"], []) == [""]

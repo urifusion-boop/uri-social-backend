@@ -45,21 +45,36 @@ async def ensure_indexes(db) -> None:
 
 def public(doc: dict) -> dict:
     return {"id": doc["preview_id"], "count": doc["count"], "status": doc["status"],
+            "ads": (doc.get("inputs") or {}).get("ads") or [],
             "error": doc.get("error", ""), "results": [_public_ad(r) for r in doc.get("results") or []]}
 
 
 def _public_ad(r: dict) -> dict:
     return {"image_url": r.get("image_url", ""), "headline": r.get("headline", ""),
             "primary_text": r.get("primary_text", ""), "cta": r.get("cta", ""), "angle": r.get("concept", ""),
-            "draft_id": r.get("draft_id", ""), "redoing": bool(r.get("redoing"))}
+            "draft_id": r.get("draft_id", ""), "redoing": bool(r.get("redoing")),
+            "style": r.get("vsg01_format_id") or ""}
 
 
 def clean_inputs(*, description: str, city: str = "", objective: str = "", destination_type: str = "",
-                 budget_ngn: float = 0, vsg01_format_id: str = "", platform: str = "meta") -> dict:
+                 budget_ngn: float = 0, vsg01_format_id: str = "", platform: str = "meta",
+                 ads: Optional[list] = None) -> dict:
+    from . import concepts as concepts_mod
     description = " ".join((description or "").split())[:600]
     if not description:
         raise ValueError("Say what you're advertising first.")
+    # Several ads, each with what it says (an angle) and its style ("" = Jane picks when making it).
+    plan = []
+    for a in (ads or [])[:MAX_ADS]:
+        a = a if isinstance(a, dict) else {}
+        angle = str(a.get("angle") or "").strip()
+        if angle not in concepts_mod.angle_keys():
+            raise ValueError("One of the ads has a message Jane doesn't know. Pick it again.")
+        plan.append({"angle": angle, "vsg01_format_id": str(a.get("vsg01_format_id") or "").strip()[:40]})
+    if len(plan) == 1:
+        plan = []   # one ad is a single ad: its style is vsg01_format_id
     return {
+        "ads": plan,
         "description": description,
         "city": " ".join((city or "").split())[:120],
         "goal": _GOAL_FOR_OBJECTIVE.get((objective or "").strip().lower(), "messages"),
@@ -75,8 +90,12 @@ async def start(db, *, brand_id: str, user_id: str, count: int, inputs: dict) ->
     from app.services.CreditService import credit_service
 
     from . import ad_image_billing
-    count = max(1, min(MAX_ADS, int(count or 1)))
-    needed = count if count > 1 else ad_image_billing.credits_needed(inputs.get("vsg01_format_id") or None)
+    plan = inputs.get("ads") or []
+    count = len(plan) if plan else max(1, min(MAX_ADS, int(count or 1)))
+    if plan:
+        needed = sum(ad_image_billing.credits_needed(a["vsg01_format_id"] or None) for a in plan)
+    else:
+        needed = count if count > 1 else ad_image_billing.credits_needed(inputs.get("vsg01_format_id") or None)
     if not await credit_service.check_sufficient_credits(user_id, required=needed):
         raise PermissionError(f"Making {count} ad{'s' if count != 1 else ''} takes {needed} content credit"
                               f"{'s' if needed != 1 else ''}. Top up, or make fewer.")
@@ -135,7 +154,15 @@ def angle_for(index: int, count: int) -> str:
     return concepts_mod.ANGLES[index % len(concepts_mod.ANGLES)][0]
 
 
-async def _make_one(db, doc: dict, angle: str, *, avoid: str = ""):
+def plan_for(doc: dict, index: int) -> tuple[str, str]:
+    """What ad `index` says and the style it is made in ("" = Jane picks)."""
+    plan = (doc.get("inputs") or {}).get("ads") or []
+    if 0 <= index < len(plan):
+        return plan[index]["angle"], plan[index].get("vsg01_format_id") or ""
+    return angle_for(index, doc["count"]), ""
+
+
+async def _make_one(db, doc: dict, angle: str, *, avoid: str = "", style: str = "", others: tuple = ()):
     """One ad, made exactly the way the plan makes one (generate_ad_creative, the plan's angles
     and layouts, the brand's destination), and charged the same way once it exists."""
     from app.services.CreditService import credit_service
@@ -156,16 +183,26 @@ async def _make_one(db, doc: dict, angle: str, *, avoid: str = ""):
         brief += f" Make it clearly different from this earlier attempt: {avoid}"
     wallet = await credit_service.get_user_wallet(user_id)
     unaffordable = ad_image_billing.styles_costing_more_than(wallet.credits_remaining if wallet else 0)
+    # Several ads with styles: drawn from the style library in the style the owner (or Jane) chose,
+    # carrying this ad's message. Jane's own pick avoids the styles the other ads use.
+    styled = bool(angle and (doc.get("inputs") or {}).get("ads"))
+    if styled:
+        layout, format_id = "", (style or None)
+        exclude = list(unaffordable or []) + ([] if style else [f for f in others if f])
+    else:
+        layout = concepts_mod.layout_for(angle) if angle else ""
+        format_id = None if angle else (style or inputs.get("vsg01_format_id") or None)
+        exclude = list(unaffordable or [])
     with counting_images() as image_calls:
         ad = await generate_ad_creative(
             profile.get("brand_name") or "Your business", profile.get("industry") or "", inputs["goal"],
             concepts_mod.brief_for(brief, angle) if angle else brief,
-            image_layout=concepts_mod.layout_for(angle) if angle else "",
+            image_layout=layout,
             user_id=user_id, db=db, brand_id=brand_id, city=inputs.get("city") or "",
             service_area=inputs.get("city") or "", budget_ngn=float(inputs.get("budget_ngn") or 0),
             destination_type=destination_type, destination_cta=saved["destination_cta"],
-            vsg01_format_id=None if angle else (inputs.get("vsg01_format_id") or None),
-            platform=inputs.get("platform") or "meta", exclude_format_ids=unaffordable or None)
+            vsg01_format_id=format_id,
+            platform=inputs.get("platform") or "meta", exclude_format_ids=exclude or None)
     if not ad.image_url:
         return None
     ad.concept = angle
@@ -224,9 +261,14 @@ async def preview_job(db, job: dict, ctx) -> dict:
             await db[PREVIEWS].update_one({"preview_id": pid}, {"$set": {"status": "done"}})
             return {"preview_id": pid}
         old = results[index]
+        angle, style = plan_for(doc, index)
+        restyled = bool(style and style != (old.get("vsg01_format_id") or ""))
         await ctx.step(f"redo{index}", f"Making ad {index + 1} again")
         try:
-            made = await _make_one(db, doc, old.get("concept") or "", avoid=old.get("headline") or "")
+            made = await _make_one(db, doc, old.get("concept") or angle,
+                                   avoid="" if restyled else (old.get("headline") or ""), style=style,
+                                   others=tuple(r.get("vsg01_format_id") or "" for i, r in enumerate(results)
+                                                if i != index))
         except Exception as e:
             print(f"[ad preview] {pid} redo {index + 1} failed: {e!r}", flush=True)
             made = None
@@ -243,7 +285,11 @@ async def preview_job(db, job: dict, ctx) -> dict:
     for i in range(done, doc["count"]):
         await ctx.step(f"ad{i}", f"Making ad {i + 1} of {doc['count']}")
         try:
-            made = await _make_one(db, doc, angle_for(i, doc["count"]))
+            angle, style = plan_for(doc, i)
+            made = await _make_one(db, doc, angle, style=style,
+                                   others=tuple(r.get("vsg01_format_id") or ""
+                                                for r in (await db[PREVIEWS].find_one({"preview_id": pid}) or {})
+                                                .get("results") or []))
         except Exception as e:
             print(f"[ad preview] {pid} ad {i + 1} failed: {e!r}", flush=True)
             made = None
@@ -299,22 +345,44 @@ async def remove(db, *, brand_id: str, preview_id: str, index: int) -> dict:
     if len(doc["results"]) <= 1:
         raise ValueError("The campaign needs at least one ad. Make it again instead.")
     results = [r for i, r in enumerate(doc["results"]) if i != index]
-    await db[PREVIEWS].update_one({"preview_id": preview_id}, {"$set": {"results": results,
-                                                                        "count": len(results)}})
+    change = {"results": results, "count": len(results)}
+    plan = (doc.get("inputs") or {}).get("ads") or []
+    if plan:
+        doc = {**doc, "inputs": {**doc["inputs"], "ads": [a for i, a in enumerate(plan) if i != index]}}
+        change["inputs.ads"] = doc["inputs"]["ads"]
+    await db[PREVIEWS].update_one({"preview_id": preview_id}, {"$set": change})
     if ad.get("draft_id"):
         await db["content_drafts"].delete_one({"id": ad["draft_id"], "content_source": DRAFT_SOURCE})
     return public({**doc, "results": results, "count": len(results)})
 
 
-async def redo(db, *, brand_id: str, user_id: str, preview_id: str, index: int) -> dict:
-    """Make one ad again, in its place, at the same price as making it was. Checked first."""
+async def redo(db, *, brand_id: str, user_id: str, preview_id: str, index: int,
+               vsg01_format_id: str = "") -> dict:
+    """Make one ad again, in its place, at the price of the style it is made in. Checked first.
+    With a style, it is made again in that style ("Change style" on the Ads step)."""
     from app.services.CreditService import credit_service
 
     from . import ad_image_billing
     doc, ad = await _ad(db, brand_id, preview_id, index)
     if doc["status"] == "running":
         raise ValueError("Jane is still making these. Try again when she's done.")
-    needed = 1 if ad.get("concept") else ad_image_billing.credits_needed(doc["inputs"].get("vsg01_format_id") or None)
+    new_style = (vsg01_format_id or "").strip()[:40]
+    plan = (doc.get("inputs") or {}).get("ads") or []
+    if new_style:
+        if plan and 0 <= index < len(plan):
+            await db[PREVIEWS].update_one({"preview_id": preview_id},
+                                          {"$set": {f"inputs.ads.{index}.vsg01_format_id": new_style}})
+        elif not ad.get("concept"):
+            await db[PREVIEWS].update_one({"preview_id": preview_id},
+                                          {"$set": {"inputs.vsg01_format_id": new_style}})
+        else:   # an older several-ads request, made before styles: keep its style choice per ad
+            new_plan = [{"angle": r.get("concept") or angle_for(i, doc["count"]),
+                         "vsg01_format_id": r.get("vsg01_format_id") or ""} for i, r in enumerate(doc["results"])]
+            new_plan[index]["vsg01_format_id"] = new_style
+            await db[PREVIEWS].update_one({"preview_id": preview_id}, {"$set": {"inputs.ads": new_plan}})
+    style = new_style or (plan[index].get("vsg01_format_id") if plan and index < len(plan) else "") \
+        or ("" if ad.get("concept") else (doc["inputs"].get("vsg01_format_id") or ""))
+    needed = ad_image_billing.credits_needed(style or None) if (style or not ad.get("concept")) else 1
     if not await credit_service.check_sufficient_credits(user_id, required=needed):
         raise PermissionError(f"Making it again takes {needed} content credit{'s' if needed != 1 else ''}. "
                               "Top up first.")

@@ -452,6 +452,12 @@ class AdPreviewBody(BaseModel):
     budget_ngn: float = 0
     vsg01_format_id: str = ""        # the Style step's pick, for a single ad
     platform: str = "meta"
+    # Several ads: what each says (an angle) and its style ("" = Jane's pick). Sets the count.
+    ads: list[dict] = []
+
+
+class AdPreviewRedoBody(BaseModel):
+    vsg01_format_id: str = ""        # make it again in this style; "" keeps the ad's style
 
 
 class AdPreviewEditBody(BaseModel):
@@ -476,7 +482,7 @@ async def start_ad_preview(body: AdPreviewBody, brand_ctx: dict = Depends(get_ac
         inputs = ad_previews.clean_inputs(
             description=body.description, city=body.city, objective=body.objective,
             destination_type=body.destination_type, budget_ngn=body.budget_ngn,
-            vsg01_format_id=body.vsg01_format_id, platform=body.platform)
+            vsg01_format_id=body.vsg01_format_id, platform=body.platform, ads=body.ads)
         return await ad_previews.start(db, brand_id=brand_ctx.get("brand_id") or "",
                                        user_id=brand_ctx["user_id"], count=body.count, inputs=inputs)
     except (PermissionError, LookupError, ValueError) as e:
@@ -517,12 +523,14 @@ async def remove_ad_preview(preview_id: str, index: int, brand_ctx: dict = Depen
 
 
 @router.post("/ad-previews/{preview_id}/ads/{index}/redo")
-async def redo_ad_preview(preview_id: str, index: int, brand_ctx: dict = Depends(get_active_brand_context),
+async def redo_ad_preview(preview_id: str, index: int, body: Optional[AdPreviewRedoBody] = None,
+                          brand_ctx: dict = Depends(get_active_brand_context),
                           db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
     from . import ad_previews
     try:
         return await ad_previews.redo(db, brand_id=brand_ctx.get("brand_id") or "", user_id=brand_ctx["user_id"],
-                                      preview_id=preview_id, index=index)
+                                      preview_id=preview_id, index=index,
+                                      vsg01_format_id=(body.vsg01_format_id if body else ""))
     except (PermissionError, LookupError, ValueError) as e:
         raise _preview_error(e)
 
@@ -735,7 +743,13 @@ async def suggest_ad_format(
     ready = [f for f in serialized if f["format_id"] not in needs]
     suggested = ready[0] if ready else None
     from . import ad_image_billing
+    from . import concepts as concepts_mod
+    ready_ids = [f["format_id"] for f in ready]
     return {
+        # Several ads: the styles that best carry each angle (what each ad says), best first, among
+        # those this brief supports. The wizard gives each ad the first one no other ad is using.
+        "for_angles": {a: [f for f in concepts_mod.ANGLE_STYLES.get(a, []) if f in ready_ids]
+                       for a in concepts_mod.angle_keys()},
         "suggested": suggested,
         "alternatives": [f for f in serialized if f is not suggested],
         "needs_in_brief": needs,
