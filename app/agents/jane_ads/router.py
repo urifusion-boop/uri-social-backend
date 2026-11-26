@@ -4005,7 +4005,9 @@ async def _build_campaign_plan(
             try:
                 from . import google_flow, google_video
                 _adapter, _ = await google_flow.adapter_for_launch(db, brand_ctx)
-                await google_video.prepare(db, _adapter, creative.image_url, creative.headline or business_name)
+                _up = await google_video.prepare(db, _adapter, creative.image_url, creative.headline or business_name)
+                print(f"[google_video] plan {business_id}: video upload {_up.get('upload_id')} "
+                      f"is {_up.get('status')}", flush=True)
             except Exception as e:   # the launch tries again; never fail a plan over this
                 print(f"[google_video] early upload not started: {e!r}", flush=True)
 
