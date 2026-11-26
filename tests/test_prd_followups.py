@@ -384,7 +384,7 @@ def test_making_one_version_again_replaces_it_in_place_for_one_credit():
             Credits.deducted += 1
 
     # The design read for the first versions is reused: a redo keeps the same look.
-    _run(db[A.RECREATIONS].update_one({"recreation_id": "rec_1"}, {"$set": {"reference.recipe": "Green poster."}}))
+    _run(db[A.RECREATIONS].update_one({"recreation_id": "rec_1"}, {"$set": {"reference.recipe": "Green poster.", "reference.recipe_v": A.RECIPE_VERSION}}))
 
     async def gen(*a, **kw):
         assert "clearly different from the last attempt" in a[3]
