@@ -26,7 +26,7 @@ from ..services.social_account_service import SocialAccountService
 from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
-from ..services.meta_oauth import build_authorize_url as build_meta_authorize_url, facebook_person_name
+from ..services.meta_oauth import build_authorize_url as build_meta_authorize_url
 from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
@@ -1707,9 +1707,7 @@ async def get_download_url(
 # ==============================================================================
 
 @router.get("/connect/facebook-direct/initiate")
-async def facebook_direct_initiate(
-    source: Optional[str] = Query("settings"), rerequest: int = Query(0), switch: int = Query(0),
-):
+async def facebook_direct_initiate(source: Optional[str] = Query("settings"), rerequest: int = Query(0)):
     """
     Redirect the user's browser to Facebook's OAuth page to connect a Facebook Page
     directly (without Outstand). On completion, Facebook redirects to
@@ -1743,9 +1741,7 @@ async def facebook_direct_initiate(
     if rerequest:
         state = f"{state}|rerequested"
     return RedirectResponse(
-        build_meta_authorize_url(app_id, redirect_uri, scopes, state, settings.FACEBOOK_API_VERSION, extra,
-                                 # "Use a different account": the password screen, where they can switch.
-                                 switch_account=bool(switch) and not rerequest)
+        build_meta_authorize_url(app_id, redirect_uri, scopes, state, settings.FACEBOOK_API_VERSION, extra)
     )
 
 
@@ -1902,8 +1898,6 @@ async def facebook_direct_callback(
             if declined:
                 print(f"[FBDirectOAuth] inbox permission(s) still declined after re-asking: {declined}", flush=True)
 
-            connected_by = await facebook_person_name(client, graph_base, long_token)
-
             # Step 3: get the user's Facebook Pages (their own and their Business portfolios')
             pages = await fetch_all_facebook_pages(client, graph_base, long_token)
 
@@ -1933,7 +1927,6 @@ async def facebook_direct_callback(
                         }
                         for p in pages if p.get("id") and p.get("access_token")
                     ],
-                    "connected_by": connected_by,
                     "created_at": datetime.utcnow(),
                 })
                 print(f"[FBDirectOAuth] {len(pages)} Pages — awaiting the owner's pick (token={token})")
@@ -1958,7 +1951,6 @@ async def facebook_direct_callback(
                 "page_id": page_id,
                 "page_access_token": page_token,
                 "account_name": page_name,
-                "connected_by": connected_by,
                 "profile_picture_url": profile_pic,
                 "connection_status": "pending_user_match",
                 "connected_at": now,
@@ -2074,7 +2066,6 @@ async def facebook_direct_finalize_pending(
             "page_id": p["page_id"],
             "page_access_token": p["page_access_token"],
             "account_name": p.get("page_name") or "Facebook Page",
-            "connected_by": pending.get("connected_by") or "",
             "profile_picture_url": p.get("profile_picture_url") or "",
             "connection_status": "active",
             "connected_at": now,
@@ -2650,7 +2641,7 @@ async def facebook_ads_finalize(
 
 
 @router.get("/connect/instagram-direct/initiate")
-async def instagram_direct_initiate(source: Optional[str] = Query("settings"), switch: int = Query(0)):
+async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
     Redirect the user's browser to Facebook's OAuth page to connect Instagram
     via the Instagram API with Facebook Login. On completion, Facebook redirects to
@@ -2693,8 +2684,7 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings"), s
         # native-app handoff. NOT yet confirmed against a live affected device.
         "display": "page",
     }
-    return RedirectResponse(build_meta_authorize_url(app_id, redirect_uri, scopes, source or "settings", "v20.0", extra,
-                                                     switch_account=bool(switch)))
+    return RedirectResponse(build_meta_authorize_url(app_id, redirect_uri, scopes, source or "settings", "v20.0", extra))
 
 
 @router.get("/connect/instagram-direct/callback")
@@ -2768,7 +2758,6 @@ async def instagram_direct_callback(
             ll_data = ll_resp.json()
             print(f"[IGDirectOAuth] long-lived token response: {ll_data}")
             long_token = ll_data.get("access_token", short_token)
-            connected_by = await facebook_person_name(client, "https://graph.facebook.com/v20.0", long_token)
 
             # Step 3: get the user's Facebook Pages (each has a page access token)
             pages_resp = await client.get(
@@ -2816,7 +2805,6 @@ async def instagram_direct_callback(
                     # Store the user's long-lived token instead of the page token —
                     # it carries instagram_content_publish permission.
                     "page_access_token": long_token,
-                    "connected_by": connected_by,
                 })
 
             if not candidates:
@@ -2839,7 +2827,6 @@ async def instagram_direct_callback(
                 "page_access_token": c["page_access_token"],
                 "username": c["username"],
                 "account_name": c["username"],
-                "connected_by": c.get("connected_by") or "",
                 "profile_picture_url": c["profile_picture_url"],
                 "connection_status": "pending_user_match",
                 "connected_at": now,
@@ -2988,7 +2975,6 @@ async def instagram_direct_finalize_pending(
             "page_access_token": chosen["page_access_token"],
             "username": chosen["username"],
             "account_name": chosen["username"],
-            "connected_by": chosen.get("connected_by") or "",
             "profile_picture_url": chosen.get("profile_picture_url"),
             "connection_status": "active",
             "connected_at": now,
