@@ -941,6 +941,29 @@ async def creative_upload(
     return {"url": url, "is_video": is_video}
 
 
+class VideoCheckBody(BaseModel):
+    video_url: str = ""              # a video uploaded through /creative/upload or saved in Uri
+    youtube_link: str = ""           # or a video already on YouTube
+    placement: str = "demand_gen"    # display | demand_gen | pmax
+
+
+@router.post("/video/check")
+async def check_ad_video(body: VideoCheckBody, brand_ctx: dict = Depends(get_active_brand_context)) -> dict:
+    """What Google will make of a video before it's used (google_video.py): its length against this
+    placement's rules, its shape, its sound, and stills for placements that also show a picture."""
+    from . import google_video
+    from .adapters.google_visual import normalize_placement
+    placement = normalize_placement(body.placement)
+    try:
+        if body.youtube_link.strip():
+            return await google_video.check_youtube(body.youtube_link, placement)
+        if not body.video_url.strip():
+            raise ValueError("Add a video first.")
+        return await google_video.check_upload(body.video_url.strip(), placement)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 _VIDEO_MIME_EXT = {
     "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
     "video/x-matroska": "mkv", "video/x-msvideo": "avi", "video/3gpp": "3gp",
@@ -2657,6 +2680,10 @@ class MetaLaunchFromMessageBody(BaseModel):
     reference_image_url: str = ""         # required for creative_source=upload/recomposite (from
                                           # /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
+    # Google video ads: a video already on YouTube (reference_image_url is then its thumbnail),
+    # and the picture shown beside a video on Display and Everywhere (google_video.py).
+    youtube_video_id: str = ""
+    video_still_url: str = ""
     # TikTok-only, additive: 2+ extra photos for a TikTok Carousel Ad, alongside (never
     # instead of) reference_image_url/is_video above — a lone static image isn't a valid
     # TikTok ad unit at all (TikTok is video OR carousel, never single-image), so this is
@@ -3967,6 +3994,21 @@ async def _build_campaign_plan(
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
+    if google_visual and body.creative_source == "upload":
+        # Google video ads (google_video.py): a pasted YouTube video runs by its id; an uploaded
+        # video starts its trip to YouTube now, so it's ready (or nearly) by the time of launch.
+        if body.youtube_video_id:
+            from . import google_video
+            creative.youtube_video_id = google_video.youtube_id(body.youtube_video_id)
+        creative.video_still_url = body.video_still_url or creative.video_still_url
+        if creative.is_video and not creative.youtube_video_id:
+            try:
+                from . import google_flow, google_video
+                _adapter, _ = await google_flow.adapter_for_launch(db, brand_ctx)
+                await google_video.prepare(db, _adapter, creative.image_url, creative.headline or business_name)
+            except Exception as e:   # the launch tries again; never fail a plan over this
+                print(f"[google_video] early upload not started: {e!r}", flush=True)
+
     if creative_prov:
         from .creative_paths import disclose
         creative.provenance = creative_prov
@@ -4365,9 +4407,15 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
     else:
         adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    from .google_video import VideoFailed, VideoNotReady
     try:
         launch = await adapter.launch_campaign(plan, auth)
     except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except VideoNotReady as e:
+        # Still being processed by YouTube: the page waits and launches again (WizardReviewStep).
+        raise HTTPException(status_code=409, detail=str(e))
+    except VideoFailed as e:
         raise HTTPException(status_code=400, detail=str(e))
     except google_flow.GoogleAdsAPIError as e:
         google_flow.raise_http(e)

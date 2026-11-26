@@ -183,9 +183,13 @@ class _Temp:
 
 
 def build_operations(placement: str, customer_id: str, *, name: str, daily_micros: str, geo_constant: str,
-                     final_url: str, copy: dict, images: dict, logo_b64: str) -> list[dict]:
+                     final_url: str, copy: dict, images: Optional[dict], logo_b64: str,
+                     youtube_video_id: str = "") -> list[dict]:
     """Every operation for one paused campaign of this placement, in the order
-    Google needs them (each item may only reference ones before it)."""
+    Google needs them (each item may only reference ones before it).
+
+    With a YouTube video: YouTube & Discover runs it as a video ad (no pictures needed);
+    Display and Everywhere run it beside the pictures."""
     tid = _Temp(customer_id)
     budget, campaign = tid("campaignBudgets"), tid("campaigns")
     ops: list[dict] = [{"campaignBudgetOperation": {"create": {
@@ -224,10 +228,20 @@ def build_operations(placement: str, customer_id: str, *, name: str, daily_micro
             "imageAsset": {"data": data}}}})
         return res
 
-    landscape = image_asset("landscape", images["landscape"])
-    square = image_asset("square", images["square"])
+    video = ""
+    if youtube_video_id:
+        video = tid("assets")
+        ops.append({"assetOperation": {"create": {
+            "resourceName": video, "name": f"{name} video {uuid.uuid4().hex[:6]}",
+            "youtubeVideoAsset": {"youtubeVideoId": youtube_video_id}}}})
+    video_ad = placement == "demand_gen" and bool(video)
+    if not video_ad and not images:
+        raise ValueError("A picture is needed for this placement")
+    landscape = image_asset("landscape", images["landscape"]) if not video_ad else ""
+    square = image_asset("square", images["square"]) if not video_ad else ""
     logo = image_asset("logo", logo_b64)
-    portrait = image_asset("portrait", images["portrait"]) if placement in ("demand_gen", "pmax") else ""
+    portrait = image_asset("portrait", images["portrait"]) if placement in ("demand_gen", "pmax") and not video_ad \
+        else ""
 
     if placement in ("display", "demand_gen"):
         ad_group = tid("adGroups")
@@ -249,6 +263,17 @@ def build_operations(placement: str, customer_id: str, *, name: str, daily_micro
                 "longHeadline": {"text": copy["long_headline"]},
                 "descriptions": texts(copy["descriptions"]),
                 "businessName": copy["business_name"],
+            }}
+            if video:
+                ad["responsiveDisplayAd"]["youtubeVideos"] = [{"asset": video}]
+        elif video_ad:
+            ad = {"demandGenVideoResponsiveAd": {
+                "videos": [{"asset": video}],
+                "logoImages": [{"asset": logo}],
+                "headlines": texts(copy["headlines"]),
+                "longHeadlines": [{"text": copy["long_headline"]}],
+                "descriptions": texts(copy["descriptions"]),
+                "businessName": {"text": copy["business_name"]},
             }}
         else:
             ad = {"demandGenMultiAssetAd": {
@@ -277,6 +302,8 @@ def build_operations(placement: str, customer_id: str, *, name: str, daily_micro
     links.append((text_asset(copy["business_name"]), "BUSINESS_NAME"))
     links += [(landscape, "MARKETING_IMAGE"), (square, "SQUARE_MARKETING_IMAGE"),
               (portrait, "PORTRAIT_MARKETING_IMAGE"), (logo, "LOGO")]
+    if video:
+        links.append((video, "YOUTUBE_VIDEO"))
     asset_group = tid("assetGroups")
     ops.append({"assetGroupOperation": {"create": {
         "resourceName": asset_group, "name": f"{name} assets", "campaign": campaign,
