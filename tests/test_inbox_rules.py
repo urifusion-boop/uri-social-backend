@@ -113,6 +113,21 @@ def test_a_comment_to_dm_rule_beats_a_plain_comment_rule_on_the_same_word():
     run(go())
 
 
+def test_a_second_commenter_on_the_same_post_is_answered_as_themselves():
+    async def go():
+        db, t, pr = AsyncMongoMockClient()["t"], Transport(), Private()
+        await rules.create_rule(db, WS, raw(kind="comment_to_dm", match={"keywords": ["webinar"]}, dm="Hi {first_name}"), "u")
+        cid, mid = await seed(db, text="Webinar", user="U1", mid="c1")
+        assert (await rules.run_rules(db, WS, cid, mid, no_llm, t, pr))["actions"] == ["public_reply", "dm"]
+        other = (await db[IDENTITIES].insert_one({"external_user_id": "U2", "display_name": "Ada Obi"})).inserted_id
+        mid2 = (await db[MESSAGES].insert_one({
+            "workspace_id": WS, "conversation_id": cid, "provider_message_id": "c2", "direction": "inbound",
+            "text": "Webinar", "contact_identity_id": str(other), "received_at": datetime.now(timezone.utc)})).inserted_id
+        out = await rules.run_rules(db, WS, cid, str(mid2), no_llm, t, pr)
+        assert out and pr.sent[-1] == ("c2", "Hi Ada")
+    run(go())
+
+
 def test_comment_to_dm_sends_both_and_files_the_dm_thread():
     async def go():
         db, t, p = AsyncMongoMockClient()["t"], Transport(), Private()

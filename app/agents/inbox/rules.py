@@ -253,8 +253,8 @@ async def run_rules(db, workspace_id: str, conversation_id: str, message_id: str
         return None
     from .accounts import account_for
     account = await account_for(db, conv)
-    contact = await db[IDENTITIES].find_one({"_id": ObjectId(conv["contact_identity_id"])}) \
-        if ObjectId.is_valid(conv.get("contact_identity_id", "")) else None
+    who = msg.get("contact_identity_id") or conv.get("contact_identity_id", "")   # the author of THIS comment
+    contact = await db[IDENTITIES].find_one({"_id": ObjectId(who)}) if ObjectId.is_valid(who) else None
     contact = contact or {}
     own = {str((account or {}).get("external_account_id") or ""), str((account or {}).get("page_id") or "")} - {""}
     if not account or contact.get("external_user_id") in own:
