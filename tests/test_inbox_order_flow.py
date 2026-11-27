@@ -138,3 +138,67 @@ def test_a_size_in_words_picks_the_variant_and_a_yes_with_no_order_confirms_noth
         out = await order_flow.step(db, W, conv, cid, "yes", [msg("inbound", "hoodie"), msg("inbound", "yes")], "m2", llm_says("accept"))
         assert "NO ORDER EXISTS" in out[0]["text"] and await db[ORDERS].count_documents({}) == 0
     run(go())
+
+
+async def _confirmed_by_chat(db, cid, conv, qty=1):
+    await order_flow.step(db, W, conv, cid, "air max", [msg("inbound", "air max")], "m1",
+                          llm_says("order", [{"name": "Air Max", "quantity": qty}]))
+    sent = [msg("outbound", "Summary", now() + timedelta(seconds=5)), msg("inbound", "yes")]
+    await order_flow.step(db, W, conv, cid, "yes", sent, "m2", llm_says("accept"))
+
+
+def test_a_customer_can_cancel_a_confirmed_unpaid_order_and_the_stock_comes_back():
+    async def go():
+        db, shoe, conv, cid = await setup()
+        await _confirmed_by_chat(db, cid, conv, 2)
+        stock = lambda: db["catalog_stock"].find_one({"item_id": shoe["_id"]})
+        assert (await stock())["reserved"] == 2
+        out = await order_flow.step(db, W, conv, cid, "cancel it", [msg("inbound", "cancel it")], "m3", llm_says("decline"))
+        assert "CANCELLED" in out[0]["text"]
+        assert (await db[ORDERS].find_one({}))["status"] == "cancelled" and (await stock())["reserved"] == 0
+        out = await order_flow.step(db, W, conv, cid, "actually yes", [msg("inbound", "air max"), msg("inbound", "actually yes")], "m4",
+                                    llm_says("accept"))
+        assert "NO ORDER EXISTS" in out[0]["text"], "a yes after cancelling confirms nothing"
+        again = await order_flow.step(db, W, conv, cid, "air max again", [msg("inbound", "air max again")], "m5",
+                                      llm_says("order", [{"name": "Air Max", "quantity": 1}]))
+        assert "ORDER SUMMARY ORD-00002" in again[0]["text"], "a fresh order starts cleanly after a cancellation"
+    run(go())
+
+
+def test_a_customer_cannot_cancel_an_order_that_already_has_a_payment():
+    async def go():
+        db, shoe, conv, cid = await setup()
+        await _confirmed_by_chat(db, cid, conv)
+        from app.agents.orders import service
+        order = await db[ORDERS].find_one({})
+        await service.record_payment(db, W, order["_id"], 1000, "merchant_recorded", "u")
+        out = await order_flow.step(db, W, conv, cid, "cancel", [msg("inbound", "cancel")], "m3", llm_says("decline"))
+        assert "NOT cancelled" in out[0]["text"] and "team will review" in out[0]["text"]
+        assert (await db[ORDERS].find_one({}))["status"] == "confirmed"
+    run(go())
+
+
+def test_two_customers_get_their_own_orders_and_one_cannot_confirm_the_others():
+    async def go():
+        db, shoe, conv, cid = await setup()
+        from bson import ObjectId
+        other = {"_id": ObjectId(), "display_name": "Bola", "platform": "instagram", "kind": "dm"}
+        oid = str(other["_id"])
+        await order_flow.step(db, W, conv, cid, "air max", [msg("inbound", "air max")], "a1", llm_says("order", [{"name": "Air Max", "quantity": 1}]))
+        out = await order_flow.step(db, W, other, oid, "yes", [msg("outbound", "x", now() + timedelta(seconds=5)), msg("inbound", "yes")], "b1",
+                                    llm_says("accept"))
+        assert out == [] or "NO ORDER EXISTS" in out[0]["text"]
+        assert (await db[ORDERS].find_one({}))["status"] == "awaiting_customer", "Bola's yes did not confirm Ada's order"
+    run(go())
+
+
+def test_asking_for_more_than_is_in_stock_is_reported_not_confirmed():
+    async def go():
+        db, shoe, conv, cid = await setup()
+        await order_flow.step(db, W, conv, cid, "5 air max", [msg("inbound", "5 air max")], "m1",
+                              llm_says("order", [{"name": "Air Max", "quantity": 5}]))
+        sent = [msg("outbound", "Summary", now() + timedelta(seconds=5)), msg("inbound", "yes")]
+        out = await order_flow.step(db, W, conv, cid, "yes", sent, "m2", llm_says("accept"))
+        assert "COULD NOT BE CONFIRMED" in out[0]["text"]
+        assert (await db["catalog_stock"].find_one({"item_id": shoe["_id"]}))["reserved"] == 0
+    run(go())

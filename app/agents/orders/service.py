@@ -17,7 +17,7 @@ from app.agents.catalog.models import CatalogError, utcnow
 
 from . import notify
 from .models import (
-    AUDIT, AWAITING_CUSTOMER, CANCELLED, COMPLETED, CONFIRMED, COUNTERS, DEFAULT_PAYMENT_WINDOW_HOURS, DRAFT, EDITABLE,
+    AUDIT, AWAITING_CUSTOMER, CANCELLED, COMPLETED, CONFIRMED, COUNTERS, DEFAULT_PAYMENT_WINDOW_HOURS, DELIVERY_FAILED, DRAFT, EDITABLE,
     EXPIRED, FAILED, FULFILLED, IN_PROGRESS, LINE_FULFILMENT, MAX_LINES, NOT_STARTED, ORDERS, OPEN, PARTIALLY_FULFILLED,
     PARTIALLY_PAID, PARTIALLY_REFUNDED, PAID, PAYMENT_SOURCES, PAYMENTS, PENDING, PROCESSING, QUEUED, REFUNDED, REFUNDS, SOURCES, UNPAID, OrderError,
     positive_int, to_minor,
@@ -74,7 +74,10 @@ def _money(order: dict) -> dict:
 
 async def _snapshot_line(db, business_id: str, raw: dict, now: datetime) -> dict:
     qty = positive_int(raw.get("quantity", 1), "Quantity")
-    item = await get_item(db, business_id, str(raw.get("catalog_item_id") or raw.get("item_id") or ""))
+    try:
+        item = await get_item(db, business_id, str(raw.get("catalog_item_id") or raw.get("item_id") or ""))
+    except CatalogError as e:
+        raise OrderError("One of those items isn't in the catalog.", 404, "item_not_found") from e
     if item["status"] != "active":
         raise OrderError(f"{item['name']} isn't for sale right now.", 409, "not_for_sale")
     variant = None
@@ -317,7 +320,8 @@ async def record_payment(db, business_id: str, order_id: str, amount: int, sourc
         raise OrderError("Payment must come from the provider or be recorded by the business.", 400, "bad_source")
     amount = positive_int(amount, "Amount")
     order = await get_order(db, business_id, order_id)
-    if order["status"] not in OPEN:
+    late = source == "provider" and order["status"] in (CANCELLED, EXPIRED)
+    if order["status"] not in OPEN and not late:
         raise OrderError("This order isn't open for payment.", 409, "not_open")
     key = (transaction_id or "").strip()[:120]
     if key:
@@ -325,7 +329,7 @@ async def record_payment(db, business_id: str, order_id: str, amount: int, sourc
         if again:
             return await get_order(db, business_id, order_id)
     due = order["total"] - order["paid_amount"]
-    if amount > due:
+    if amount > due and not late:
         await _log(db, order, "payment_mismatch", actor, {"amount": amount, "due": due, "reference": reference})
         raise OrderError("That payment is more than the balance due and needs a manual review.", 409, "payment_mismatch")
     pay = await db[PAYMENTS].find_one({"order_id": order_id, "reference": reference, "status": PENDING}) if reference else None
@@ -342,6 +346,12 @@ async def record_payment(db, business_id: str, order_id: str, amount: int, sourc
     except DuplicateKeyError:
         return await get_order(db, business_id, order_id)
     order = await _recompute_payment(db, order, actor)
+    if late:
+        # The customer paid for an order that was already cancelled: keep the record and owe them the money back.
+        await db[ORDERS].update_one({"_id": order_id}, {"$set": {"refund_due": True}})
+        order = await get_order(db, business_id, order_id)
+        await _log(db, order, "payment_after_cancel", actor, {"amount": amount, "status": order["status"]})
+        return order
     await _log(db, order, "payment_status_changed", actor, {"payment_status": order["payment_status"], "amount": amount,
                                                            "source": source})
     return await _commit_if_paid(db, order, actor)
@@ -378,7 +388,14 @@ async def _commit_if_paid(db, order: dict, actor: str) -> dict:
         if not line.get("reservation_id"):
             continue
         try:
-            await reservations.commit(db, order["business_id"], line["reservation_id"], actor, order["_id"])
+            try:
+                await reservations.commit(db, order["business_id"], line["reservation_id"], actor, order["_id"])
+            except CatalogError as e:
+                if e.reason != "needs_approval":
+                    raise
+                # A request-to-book item waits for the team's yes. A verified payment in full on a confirmed order is that yes.
+                await reservations.approve(db, order["business_id"], line["reservation_id"], actor)
+                await reservations.commit(db, order["business_id"], line["reservation_id"], actor, order["_id"])
         except CatalogError as e:
             flags.append({"line_id": line["id"], "reason": e.reason or e.detail})
     if flags:
@@ -431,6 +448,8 @@ def _summarise(lines: list[dict]) -> str:
     states = [line["fulfilment_status"] for line in lines]
     if all(s == FULFILLED for s in states):
         return FULFILLED
+    if any(s == DELIVERY_FAILED for s in states):
+        return DELIVERY_FAILED
     if any(s == FULFILLED for s in states):
         return PARTIALLY_FULFILLED
     if any(s == PROCESSING for s in states):

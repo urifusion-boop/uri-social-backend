@@ -23,7 +23,8 @@ Reply with JSON: {"intent": "none"|"order"|"accept"|"decline", "items": [{"name"
 - order: the customer clearly wants to buy, book or subscribe to specific things from CATALOG_ITEMS (use the names exactly as listed; quantity defaults to 1; option is a size, colour, plan variant or empty).
 - accept: OPEN_ORDER is present and the customer clearly says yes to going ahead with exactly what OPEN_ORDER contains. A yes that goes with a different item, size or quantity than OPEN_ORDER is not accept.
 - If OPEN_ORDER is present and the customer now asks for something different from it (another item, option or quantity), the intent is "order", and items lists everything they now want, using the recent conversation for any item or option they refer to as "it" or "that".
-- decline: OPEN_ORDER is present and the customer says no, cancel it, or never mind.
+- decline: OPEN_ORDER is present (awaiting their yes, or already confirmed) and the customer says no, wants to cancel it, or never mind.
+- accept applies only when OPEN_ORDER_STATE is awaiting_customer; a confirmed order needs no yes.
 - Without OPEN_ORDER, a customer who says they want an item just discussed, or picks its size, option or quantity ("yes, in large"), is placing an order: intent "order", with that item and option taken from the recent conversation.
 - none: anything else, including questions, browsing, and "maybe". When unsure, none."""
 
@@ -125,13 +126,20 @@ async def step(db, workspace_id: str, conv: dict, conversation_id: str, text: st
         return []
     data = await llm(_SYSTEM, json.dumps({
         "message": text, "recent_conversation": [{"from": m["direction"], "text": m["text"]} for m in history[-6:]],
-        "CATALOG_ITEMS": candidates, "OPEN_ORDER": _text(order) if order and order["status"] == AWAITING_CUSTOMER else None}))
+        "CATALOG_ITEMS": candidates, "OPEN_ORDER": _text(order) if order and order["status"] in (AWAITING_CUSTOMER, CONFIRMED) else None,
+        "OPEN_ORDER_STATE": order["status"] if order else None}))
     intent = str(data.get("intent") or "none")
     if intent == "accept" and order and order["status"] == AWAITING_CUSTOMER and _seen_summary(order, history):
         return await _accept(db, workspace_id, order)
     if intent == "decline" and order and order["status"] in (DRAFT, AWAITING_CUSTOMER):
         await service.cancel(db, workspace_id, order["_id"], "Customer declined", ACTOR, "customer")
         return [_source(f"ORDER {order['order_number']} CANCELLED at the customer's request. Nothing was held or charged.")]
+    if intent == "decline" and order and order["status"] == CONFIRMED:
+        if order["paid_amount"] > 0:
+            return [_source(f"ORDER {order['order_number']} already has a payment on it, so it was NOT cancelled. Tell the customer "
+                            "the team will review the cancellation and any refund and reply here. Do not promise a refund or say it is cancelled.")]
+        await service.cancel(db, workspace_id, order["_id"], "Customer cancelled", ACTOR, "customer")
+        return [_source(f"ORDER {order['order_number']} CANCELLED at the customer's request. The items are released and nothing was charged.")]
     if intent == "order":
         waiting = order if order and order["status"] == AWAITING_CUSTOMER else None
         return await _start(db, workspace_id, conv, conversation_id, data.get("items") or [], message_id, waiting)
