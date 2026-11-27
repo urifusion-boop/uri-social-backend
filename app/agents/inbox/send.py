@@ -96,6 +96,7 @@ async def send_reply(
     transport: Transport,
     account: Optional[dict] = None,
     template: bool = False,
+    reply_to: str = "",
 ) -> dict:
     """Send one reply. Returns the outbox record. `template`: a pre-approved WhatsApp
     template, the one kind of message allowed outside the 24-hour window.
@@ -128,7 +129,9 @@ async def send_reply(
 
     # A comment reply goes to the specific comment, not the post. Resolved here so the
     # transport stays a thin provider call with no queries of its own.
-    if conv.get("kind") == Kind.COMMENT.value:
+    if conv.get("kind") == Kind.COMMENT.value and reply_to:
+        conv = {**conv, "_reply_to": reply_to}
+    elif conv.get("kind") == Kind.COMMENT.value:
         latest = await db[MESSAGES].find(
             {"workspace_id": workspace_id, "conversation_id": conversation_id,
              "direction": Direction.INBOUND.value},

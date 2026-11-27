@@ -21,9 +21,10 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
-    in_sync_with_connections, link_workspace_channels, release_channels, subscription_issue,
+    begin_replace, finish_replace, in_sync_with_connections, link_workspace_channels,
+    release_channels, subscription_issue,
 )
-from . import agent
+from . import agent, rules
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -176,6 +177,9 @@ async def list_conversations(
             "source_ad_id": r.get("source_ad_id", ""),
             "lead_stage": r.get("lead_stage", ""),
             "lead_value": r.get("lead_value"),
+            "lead_interest": r.get("lead_interest", ""),
+            "starred": bool(r.get("starred")),
+            "notes_count": len(r.get("notes") or []),
             "last_direction": (last[0].get("direction") if last else ""),
             **_agent_view(r),
         })
@@ -241,6 +245,19 @@ async def create_indexes(
     return {"status": "ok"}
 
 
+@router.post("/conversations/{conversation_id}/hand-back")
+async def hand_back_to_agent(
+    conversation_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Let URI auto-reply in this conversation again, ending a team-member takeover."""
+    if not await agent.hand_back(db, brand_ctx.get("brand_id"), conversation_id,
+                                 brand_ctx.get("user_id", "")):
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return {"status": "ok"}
+
+
 @router.post("/conversations/{conversation_id}/reply")
 async def reply_to_conversation(
     conversation_id: str,
@@ -261,9 +278,8 @@ async def reply_to_conversation(
     conv = await db[CONVERSATIONS].find_one(
         {"_id": ObjectId(conversation_id), "workspace_id": workspace_id}
     ) if ObjectId.is_valid(conversation_id) else None
-    account = await db[CHANNEL_ACCOUNTS].find_one(
-        {"_id": ObjectId(conv["channel_account_id"])}
-    ) if conv and ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+    from .accounts import account_for
+    account = await account_for(db, conv)
 
     try:
         record = await send_reply(
@@ -290,6 +306,34 @@ async def reply_to_conversation(
         "provider_message_id": record.get("provider_message_id", ""),
         "failure_reason": record.get("failure_reason", ""),
     }
+
+
+@router.post("/channels/replace/begin")
+async def replace_begin(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Called before the person connects another account from the inbox, so that the
+    accounts the inbox shows for that platform can be swapped for the new one."""
+    platform = str(payload.get("platform") or "")
+    if platform not in ("instagram", "facebook"):
+        raise HTTPException(status_code=400, detail="Platform must be instagram or facebook.")
+    return {"replacing": await begin_replace(db, brand_ctx.get("brand_id"), platform)}
+
+
+@router.post("/channels/replace/finish")
+async def replace_finish(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Called once the new account is connected. The inbox then shows it instead of the
+    accounts it showed before; Connected Accounts and publishing are untouched."""
+    platform = str(payload.get("platform") or "")
+    if platform not in ("instagram", "facebook"):
+        raise HTTPException(status_code=400, detail="Platform must be instagram or facebook.")
+    return await finish_replace(db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"), platform)
 
 
 @router.post("/channels/link")
@@ -461,6 +505,68 @@ async def put_agent_settings(
     saved = await agent.save_settings(
         db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id", ""))
     return {"settings": saved}
+
+
+@router.get("/rules")
+async def list_automation_rules(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    return {"rules": [rules.public_rule(r) for r in await rules.list_rules(db, brand_ctx.get("brand_id"))]}
+
+
+@router.get("/rules/ads")
+async def ads_for_rules(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The workspace's launched ads, for limiting a rule to one campaign's ads."""
+    rows = await db["jane_ads_meta_campaigns"].find(
+        {"brand_id": brand_ctx.get("brand_id")}, {"_id": 0, "campaign_id": 1, "display_name": 1, "ad_ids": 1, "ad_id": 1}
+    ).sort("created_at", -1).to_list(100)
+    return {"campaigns": [
+        {"id": r["campaign_id"], "name": r.get("display_name") or "Campaign",
+         "ad_ids": [a for a in dict.fromkeys([*(r.get("ad_ids") or []), r.get("ad_id")]) if a]}
+        for r in rows if r.get("campaign_id")]}
+
+
+@router.post("/rules")
+async def create_automation_rule(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    try:
+        return {"rule": await rules.create_rule(db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id", ""))}
+    except rules.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/rules/{rule_id}")
+async def update_automation_rule(
+    rule_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    try:
+        rule = await rules.update_rule(db, brand_ctx.get("brand_id"), rule_id, payload)
+    except rules.RuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not rule:
+        raise HTTPException(status_code=404, detail="No such rule.")
+    return {"rule": rule}
+
+
+@router.delete("/rules/{rule_id}")
+async def delete_automation_rule(
+    rule_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    if not await rules.delete_rule(db, brand_ctx.get("brand_id"), rule_id):
+        raise HTTPException(status_code=404, detail="No such rule.")
+    return {"deleted": True}
 
 
 @router.get("/knowledge")

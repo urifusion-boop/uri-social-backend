@@ -109,7 +109,7 @@ def normalize_profile(raw: Optional[dict]) -> dict:
     sales = raw.get("sales") or {}
     situ = raw.get("situational") or {}
     allowed = [a for a in (lang.get("allowed") or ["en"]) if a in ("en", "en-NG", "pcm")] or ["en"]
-    default = lang.get("default") if lang.get("default") in ("en", "en-NG") else "en"
+    default = lang.get("default") if lang.get("default") in ("en", "en-NG", "pcm") else "en"
     if default not in allowed:
         allowed = [default] + allowed
     pidgin = lang.get("pidgin") if lang.get("pidgin") in ("switch", "light", "english", "ask") \
@@ -471,6 +471,13 @@ def language_rule(p: Optional[dict], customer_language: str) -> tuple[str, bool]
     if not p:
         return ENGLISH_RULE, False
     lang = p["language"]
+    if lang["default"] == "pcm":
+        degree = {"light": "light, easy-to-read", "moderate": "natural",
+                  "full": "full"}[lang["pidgin_degree"]]
+        examples = "; ".join(f'"{e}"' for e in lang.get("pidgin_examples") or [])
+        sample = f" Examples of how the business writes Pidgin (style only): {examples}." if examples else ""
+        return (f"Always reply in {degree} Nigerian Pidgin, whatever language the customer writes in — "
+                f"respectful, natural, never a caricature. Keep every fact exact.{sample}"), True
     base = NIGERIAN_ENGLISH_RULE if lang["default"] == "en-NG" else ENGLISH_RULE
     if customer_language != "pcm" or "pcm" not in lang["allowed"]:
         return base, False
@@ -659,10 +666,22 @@ async def _exclusive(db, workspace_id: str, keep_id: ObjectId, clean: dict) -> N
             await db[PROFILES].update_one({"_id": r["_id"]}, {"$set": update})
 
 
+def unique_name(name: str, taken: list[str]) -> str:
+    """Two profiles never share a name, so the editor's picker can tell them apart."""
+    used = {t.strip().lower() for t in taken}
+    if name.strip().lower() not in used:
+        return name
+    n = 2
+    while f"{name} {n}".lower() in used:
+        n += 1
+    return f"{name} {n}"
+
+
 async def create_profile(db, workspace_id: str, fields: dict, actor: str, method: str) -> dict:
     existing = await list_profiles(db, workspace_id)
     # The first profile answers everything until there are others to choose from.
     clean = normalize_profile({**fields, "is_default": bool(fields.get("is_default")) or not existing})
+    clean["name"] = unique_name(clean["name"], [p["name"] for p in existing])
     doc = {"workspace_id": workspace_id, **clean, "status": "draft", "active_version": None,
            "has_unpublished_changes": True, "source_methods": [method],
            "created_at": now(), "updated_at": now(), "created_by": actor}

@@ -169,6 +169,14 @@ async def edit(profile_id: str, payload: dict = Body(...),
         except voice.VoiceError as e:
             _raise(e)
         payload = {**payload, "traits": tpl["traits"], "language": tpl["language"]}
+        try:
+            current = await voice.get_profile(db, _ws(ctx), profile_id)
+        except voice.VoiceError as e:
+            _raise(e)
+        # A profile still carrying a template's own name takes the new template's name,
+        # so the editor doesn't keep saying "Friendly Nigerian" over a Luxury voice.
+        if current.get("name") in {t["name"] for t in voice.TEMPLATE_BY_ID.values()} | {"Brand Voice"}:
+            payload["name"] = tpl["name"]
     try:
         return {"profile": await voice.update_profile(db, _ws(ctx), profile_id, payload,
                                                       ctx.get("user_id", ""))}

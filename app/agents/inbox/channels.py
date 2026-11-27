@@ -16,6 +16,7 @@ same Page would be asking the user to grant what they have already granted.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.models.brand_account import BrandAccount
@@ -72,6 +73,53 @@ def channel_rows(conn: dict, workspace_id: str = "") -> list[dict]:
             "name": conn.get("page_name") or conn.get("account_name") or "",
         })
     return rows
+
+
+def visible_rows(conn: dict, workspace_id: str = "") -> list[dict]:
+    """The channel rows of a connection that the inbox still shows.
+
+    A connection stays active for publishing when the inbox swaps it out for another
+    account, so the swap is recorded on the connection (`inbox_hidden`: the channel
+    platforms it no longer provides to the inbox) instead of disconnecting it."""
+    hidden = set(conn.get("inbox_hidden") or [])
+    return [r for r in channel_rows(conn, workspace_id) if r["platform"] not in hidden]
+
+
+def _connected_at(conn: dict) -> datetime:
+    for k in ("connected_at", "updated_at"):
+        t = _naive_utc(conn.get(k))
+        if t is not None:
+            return t
+    return datetime.min
+
+
+def inbox_rows(conns: list[dict], workspace_id: str) -> list[tuple[dict, dict]]:
+    """(connection, channel row) for the ONE account per platform the inbox shows.
+
+    A workspace can end up with several connected Instagram accounts or Pages (earlier
+    ones, ones connected for publishing or ads). The inbox shows the most recently
+    connected one per platform, so a person who connects another account never sees
+    the old one left beside it. The others stay connected for everything else."""
+    best: dict[str, tuple[tuple, dict, dict]] = {}
+    hidden_best: dict[str, tuple[tuple, dict, dict]] = {}
+    for conn in conns:
+        if _workspace_of(conn) != workspace_id:
+            continue
+        rank = (_connected_at(conn), str(conn.get("_id") or ""))
+        shown = {r["platform"] for r in visible_rows(conn, workspace_id)}
+        for row in channel_rows(conn, workspace_id):
+            pool = best if row["platform"] in shown else hidden_best
+            held = pool.get(row["platform"])
+            if held is None or rank > held[0]:
+                pool[row["platform"]] = (rank, conn, row)
+    # A swapped-out account is hidden only so that its replacement is the one shown.
+    # When every account for a platform is hidden (the replacement was disconnected,
+    # or repeated swaps hid them all), hiding them all shows the person "0 connected"
+    # with accounts that are plainly connected, and a reconnect could never fix it
+    # because the flag survives the reconnect. So the newest one stands in.
+    for platform, entry in hidden_best.items():
+        best.setdefault(platform, entry)
+    return [(c, r) for _, c, r in best.values()]
 
 
 async def release_channels(db, workspace_id: str, platform: str = "",
@@ -153,36 +201,40 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
     # Why a link found nothing matters: no connections at all is a different
     # problem from connections that belong to another workspace, and without
     # this the caller cannot tell them apart.
-    skipped: list[str] = []
-    for conn in conns:
-        if _workspace_of(conn) != workspace_id:
-            skipped.append(_workspace_of(conn))
-            continue
-        for row in channel_rows(conn, workspace_id):
-            key = {"workspace_id": row["workspace_id"],
-                   "platform": row["platform"],
-                   "external_account_id": row["external_account_id"]}
-            # Before claiming, clear any abandoned claim on the same account:
-            # an account moved between workspaces (support hand-over, a review
-            # test account) is otherwise claimed twice and routes nowhere.
-            await prune_stale_claims(db, workspace_id, row["external_account_id"])
-            await db[CHANNEL_ACCOUNTS].update_one(
-                key,
-                {"$set": {**row, "updated_at": now()},
-                 "$setOnInsert": {"connected_at": now()}},
-                upsert=True,
-            )
-            linked.append(key)
+    skipped: list[str] = [_workspace_of(c) for c in conns if _workspace_of(c) != workspace_id]
+    selected = inbox_rows(conns, workspace_id)
+    for _conn, row in selected:
+        key = {"workspace_id": row["workspace_id"],
+               "platform": row["platform"],
+               "external_account_id": row["external_account_id"]}
+        # Before claiming, clear any abandoned claim on the same account:
+        # an account moved between workspaces (support hand-over, a review
+        # test account) is otherwise claimed twice and routes nowhere.
+        await prune_stale_claims(db, workspace_id, row["external_account_id"])
+        await db[CHANNEL_ACCOUNTS].update_one(
+            key,
+            {"$set": {**row, "updated_at": now()},
+             "$setOnInsert": {"connected_at": now()}},
+            upsert=True,
+        )
+        linked.append(key)
 
     # Subscribe each distinct Page once, after the rows are stored. A Page can be backed
     # by several connections (Facebook through one provider, Instagram through another)
     # and only some of their tokens carry the messaging permissions, so every token is
     # tried and the first one Meta accepts is the one the channel keeps.
     tokens_by_page: dict[str, list[str]] = {}
+    shown_pages = {str(row.get("page_id") or "") for _c, row in selected}
+    # The connections the inbox actually shows, including one standing in for a
+    # platform whose accounts were all swapped out (see inbox_rows).
+    providing = {id(c) for c, _row in selected}
     for conn in conns:
-        if _workspace_of(conn) != workspace_id:
+        if _workspace_of(conn) != workspace_id or not (
+                visible_rows(conn, workspace_id) or id(conn) in providing):
             continue
         page_id = str(conn.get("page_id") or "")
+        if page_id not in shown_pages:
+            continue
         token = conn.get("page_access_token") or ""
         if page_id and token and token not in tokens_by_page.setdefault(page_id, []):
             tokens_by_page[page_id].append(token)
@@ -241,9 +293,7 @@ async def in_sync_with_connections(db, workspace_id: str) -> bool:
     it can run on every inbox load and trigger a full link only when they differ."""
     conns = await db[SOCIAL_CONNECTIONS].find(
         {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}}).to_list(200)
-    expected = {(r["platform"], r["external_account_id"])
-                for c in conns if _workspace_of(c) == workspace_id
-                for r in channel_rows(c, workspace_id)}
+    expected = {(r["platform"], r["external_account_id"]) for _c, r in inbox_rows(conns, workspace_id)}
     have = {(r.get("platform"), r.get("external_account_id"))
             for r in await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(200)
             if r.get("platform") in ("instagram", "facebook")}
@@ -475,3 +525,76 @@ async def account_for_event(db, external_account_id: str) -> Optional[dict]:
                   f"claimed by {len(workspaces)} workspaces {workspaces}", flush=True)
             return None
     return rows[0]
+
+
+# ── Replacing an inbox account ───────────────────────────────────────────────
+# Connecting another Instagram/Facebook account from the inbox can swap out the one it
+# shows. The inbox mirrors Connected Accounts, so the swap is recorded on the old
+# connection (see visible_rows) and publishing keeps using it.
+
+REPLACE_PENDING = "inbox_replace_pending"
+REPLACE_WINDOW_MINUTES = 30
+
+
+def _naive_utc(value: Any) -> Optional[datetime]:
+    try:
+        t = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t.astimezone(timezone.utc).replace(tzinfo=None) if t.tzinfo else t
+
+
+def _touched_since(conn: dict, since: datetime) -> bool:
+    return any((t := _naive_utc(conn.get(k))) is not None and t >= since
+               for k in ("updated_at", "connected_at"))
+
+
+async def _workspace_connections(db, workspace_id: str) -> list[dict]:
+    conns = await db[SOCIAL_CONNECTIONS].find(
+        {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}}).to_list(200)
+    return [c for c in conns if _workspace_of(c) == workspace_id]
+
+
+async def begin_replace(db, workspace_id: str, platform: str) -> list[str]:
+    """Remember which accounts the inbox shows for `platform` before the person connects
+    another. Returns their names, for the confirmation."""
+    rows = await db[CHANNEL_ACCOUNTS].find(
+        {"workspace_id": workspace_id, "platform": platform}).to_list(50)
+    await db[REPLACE_PENDING].update_one(
+        {"workspace_id": workspace_id},
+        {"$set": {"platform": platform, "existing": [str(r["external_account_id"]) for r in rows],
+                  "at": now()}},
+        upsert=True)
+    return [r.get("name") or "" for r in rows]
+
+
+async def finish_replace(db, user_id: str, workspace_id: str, platform: str) -> dict:
+    """After a new account was connected: the inbox shows it instead of the accounts it
+    showed before. Reconnecting an account it already showed changes nothing."""
+    pending = await db[REPLACE_PENDING].find_one_and_delete({"workspace_id": workspace_id})
+    began = _naive_utc(pending.get("at")) if pending else None
+    if (not pending or pending.get("platform") != platform or not began
+            or _naive_utc(now()) - began > timedelta(minutes=REPLACE_WINDOW_MINUTES)):
+        return {"replaced": []}
+
+    existing = set(pending.get("existing") or [])
+    conns = await _workspace_connections(db, workspace_id)
+    for c in conns:     # connected again during this flow, so shown again
+        if platform in (c.get("inbox_hidden") or []) and _touched_since(c, began):
+            await db[SOCIAL_CONNECTIONS].update_one({"_id": c["_id"]}, {"$pull": {"inbox_hidden": platform}})
+            c["inbox_hidden"] = [p for p in c["inbox_hidden"] if p != platform]
+
+    def shown(c: dict) -> list[dict]:
+        return [r for r in visible_rows(c, workspace_id) if r["platform"] == platform]
+
+    if not {r["external_account_id"] for c in conns for r in shown(c)} - existing:
+        return {"replaced": []}
+
+    replaced: list[str] = []
+    for c in conns:
+        rows = shown(c)
+        if rows and all(r["external_account_id"] in existing for r in rows):
+            await db[SOCIAL_CONNECTIONS].update_one({"_id": c["_id"]}, {"$addToSet": {"inbox_hidden": platform}})
+            replaced += [r.get("name") or "" for r in rows]
+    await link_workspace_channels(db, user_id, workspace_id)
+    return {"replaced": replaced}

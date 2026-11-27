@@ -262,6 +262,16 @@ QUESTIONS: list[dict[str, Any]] = [
        placeholder="Customer: …\nUs: …"),
 ]
 
+# The questions that actually move the reply: tone, length, language, phrasing and the
+# two moments that matter most (price pushback, not knowing). The rest repeated these
+# or described things the profile already infers, so owners are asked only these.
+CORE_QUESTION_IDS = ("q3", "q6", "q7", "q9", "q10", "q13", "q15", "q17", "q18", "q20", "q27", "q39")
+CORE_FOLLOW_UP_IDS = ("fu_pidgin_degree", "fu_pidgin_examples", "fu_pidgin_review",
+                      "fu_regulated_rules", "fu_regulated_escalate")
+QUESTIONS = [q for q in QUESTIONS if q["id"] in CORE_QUESTION_IDS]
+_USED_SECTIONS = {q["section"] for q in QUESTIONS}
+SECTIONS = [s for s in SECTIONS if s["id"] in _USED_SECTIONS]
+
 QUESTION_BY_ID = {q["id"]: q for q in QUESTIONS}
 
 # ── Adaptive follow-ups (§5) ─────────────────────────────────────────────────
@@ -340,7 +350,7 @@ def follow_ups_for(answers: dict, industry: str = "") -> list[dict[str, Any]]:
         ids += ["fu_sales_boundaries", "fu_sales_followups", "fu_sales_never"]
     if any(w in (industry or "").lower() for w in REGULATED_INDUSTRIES):
         ids += ["fu_regulated_rules", "fu_regulated_escalate"]
-    return [FOLLOW_UPS[i] for i in ids]
+    return [FOLLOW_UPS[i] for i in ids if i in CORE_FOLLOW_UP_IDS]
 
 
 # Answers that pull in opposite directions. Averaging them gives a voice nobody

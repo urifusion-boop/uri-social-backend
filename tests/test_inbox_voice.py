@@ -39,24 +39,24 @@ def test_eight_templates_each_scored_on_every_trait():
         assert set(t["traits"]) == set(TRAITS)
 
 
-def test_the_assessment_has_42_core_questions_in_eight_sections():
-    assert len(QUESTIONS) == 42
-    assert {q["section"] for q in QUESTIONS} == set("ABCDEFGH")
+def test_the_assessment_asks_only_the_core_questions():
+    assert len(QUESTIONS) == 12
+    assert {q["section"] for q in QUESTIONS} == set("ABCEG")
+    assert all(q["id"] in ("q3", "q6", "q7", "q9", "q13") for q in QUESTIONS if q["required"])
 
 
 def test_answers_keep_only_known_questions_and_valid_values():
     clean = voice.clean_answers({"q3": "premium_adviser", "q6": "250", "q9": "sometimes",
                                  "q1": ["friendly", "evil", "calm", "bold", "caring", "playful",
                                         "professional"], "admin": True})
-    assert clean == {"q3": "premium_adviser", "q6": 100,
-                     "q1": ["friendly", "calm", "bold", "caring", "playful"]}
+    assert clean == {"q3": "premium_adviser", "q6": 100}
 
 
 def test_answers_unlock_the_matching_follow_ups():
     ids = lambda a, ind="": [q["id"] for q in follow_ups_for(a, ind)]
-    assert "fu_premium_discounts" in ids({"q3": "premium_adviser"})
+    assert ids({"q3": "premium_adviser"}) == []
     assert "fu_pidgin_degree" in ids({"q13": ["en", "pidgin"]})
-    assert "fu_sales_never" in ids({"q26": 85})
+    assert ids({"q26": 85}) == []
     assert "fu_regulated_rules" in ids({}, "Healthcare clinic")
     assert ids({"q3": "calm_problem_solver"}) == []
 
@@ -384,3 +384,24 @@ def test_without_a_voice_the_agent_behaves_as_before():
 def test_follow_up_ids_are_all_defined():
     for q in FOLLOW_UPS.values():
         assert q["id"] in FOLLOW_UPS
+
+
+def test_a_pidgin_default_replies_in_pidgin_even_to_english():
+    p = voice.normalize_profile({"language": {"default": "pcm", "allowed": ["pcm"],
+                                              "pidgin_degree": "moderate"}})
+    rule, pidgin = voice.language_rule(p, "en")
+    assert pidgin and "Always reply in natural Nigerian Pidgin" in rule
+
+
+def test_everyday_pidgin_is_recognised_as_pidgin():
+    from app.agents.inbox import agent
+    for text in ("how i fit get art for my wife", "wetin una dey sell", "we fit meet tomorrow"):
+        assert agent._language("pcm", text) == "pcm"
+    assert agent._language("pcm", "i'm interested") == "en"
+
+
+def test_a_second_profile_from_the_same_template_gets_its_own_name():
+    assert voice.unique_name("Friendly Nigerian", []) == "Friendly Nigerian"
+    assert voice.unique_name("Friendly Nigerian", ["Friendly Nigerian"]) == "Friendly Nigerian 2"
+    assert voice.unique_name("Friendly Nigerian", ["friendly nigerian", "Friendly Nigerian 2"]) \
+        == "Friendly Nigerian 3"
