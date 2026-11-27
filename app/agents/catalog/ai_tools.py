@@ -84,11 +84,43 @@ async def alternatives(db, business_id: str, item: dict, limit: int = 3) -> list
     return out
 
 
-def _slots_line(res: dict) -> str:
+def _threshold(item: dict) -> Optional[int]:
+    configured = item.get("low_stock_threshold")
+    return configured if configured is not None else (item.get("availability_config") or {}).get("low_capacity_threshold")
+
+
+def stock_phrase(item: dict, quantity: Optional[int]) -> str:
+    """What a customer may be told about how much is left, per the owner's stock visibility choice."""
+    if quantity is None:
+        return ""
+    if quantity <= 0:
+        return "out of stock"
+    mode = item.get("stock_visibility") or "low_only"
+    if mode == "exact":
+        return f"{quantity} available"
+    threshold = _threshold(item)
+    return "limited stock" if mode == "low_only" and threshold is not None and quantity <= threshold else "in stock"
+
+
+def customer_message(item: dict, res: dict) -> str:
+    """The availability sentence with the count removed unless the owner chose to show it."""
+    if (item.get("stock_visibility") or "low_only") == "exact":
+        return res["message"]
+    if res.get("reason") == "not_enough_stock":
+        return "There isn't enough available for that quantity."
+    quantity = res.get("available_quantity")
+    if res["available"] and quantity is not None and not res.get("requires_confirmation"):
+        return "Available, but stock is limited." if stock_phrase(item, quantity) == "limited stock" else "Available."
+    return res["message"]
+
+
+def _slots_line(item: dict, res: dict) -> str:
     slots = res.get("slots") or []
     if not slots:
         return ""
-    shown = "; ".join(f"{s['start_at'][:16].replace('T', ' ')} UTC ({s['remaining']} left)" for s in slots[:5])
+    shown = "; ".join(
+        f"{s['start_at'][:16].replace('T', ' ')} UTC ({stock_phrase(item, s['remaining']).replace('available', 'left')})"
+        for s in slots[:5])
     return f" Next open times: {shown}."
 
 
@@ -103,17 +135,17 @@ def _facts(item: dict, res: dict, asked: Optional[dict], alts: list[dict]) -> st
             parts.append("Includes: " + "; ".join(item["plan_features"][:10]) + ".")
         if item.get("trial_eligible"):
             parts.append("A trial is available.")
-    status = f"Availability (checked live just now): {res['message']}"
+    status = f"Availability (checked live just now): {customer_message(item, res)}"
     if res.get("variant_required") and res.get("variants"):
         rows = []
         for row in res["variants"][:12]:
             vp = row.get("price")
-            label = f"{row['name']}: " + (f"{row['available_quantity']} available" if row["available"] else "out of stock")
+            label = f"{row['name']}: " + (stock_phrase(item, row["available_quantity"]) if row["available"] else "out of stock")
             rows.append(label + (f" at {money(vp, currency)}" if vp is not None and vp != price else ""))
         status += " By option: " + "; ".join(rows) + "."
-    parts.append(status + _slots_line(res))
+    parts.append(status + _slots_line(item, res))
     if asked:
-        parts.append(f"The option the customer named, {asked['name']}: {asked['res']['message']}")
+        parts.append(f"The option the customer named, {asked['name']}: {customer_message(item, asked['res'])}")
     if res.get("source") == "manual" and res.get("last_updated"):
         parts.append(f"This availability is kept by hand and was last updated {res['last_updated'][:10]}; it is not a live provider feed.")
     if res.get("requires_confirmation"):
@@ -204,7 +236,19 @@ async def ai_details(db, business_id: str, item_id: str) -> dict:
 
 async def ai_check(db, business_id: str, item_id: str, variant_id: Optional[str] = None, quantity: int = 1,
                    start_at: Any = None, end_at: Any = None) -> dict:
-    return await availability.check(db, business_id, item_id, variant_id, quantity, start_at, end_at)
+    res = await availability.check(db, business_id, item_id, variant_id, quantity, start_at, end_at)
+    item = await get_item(db, business_id, item_id)
+    return _hide_counts(item, res)
+
+
+def _hide_counts(item: dict, res: dict) -> dict:
+    if (item.get("stock_visibility") or "low_only") == "exact":
+        return res
+    shown = {**res, "message": customer_message(item, res), "available_quantity": None}
+    shown["variants"] = [{**v, "available_quantity": stock_phrase(item, v["available_quantity"])}
+                         for v in res.get("variants") or []]
+    shown["slots"] = [{k: v for k, v in slot.items() if k not in ("remaining", "total")} for slot in res.get("slots") or []]
+    return shown
 
 
 async def ai_compare(db, business_id: str, item_ids: list[str]) -> list[dict]:
@@ -214,7 +258,7 @@ async def ai_compare(db, business_id: str, item_ids: list[str]) -> list[dict]:
         res = await availability.check(db, business_id, item_id)
         price, currency = effective_price(item)
         out.append({"item_id": item_id, "name": item["name"], "price": price, "currency": currency,
-                    "available": res["available"], "message": res["message"]})
+                    "available": res["available"], "message": customer_message(item, res)})
     return out
 
 

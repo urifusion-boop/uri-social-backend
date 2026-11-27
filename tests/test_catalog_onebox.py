@@ -46,7 +46,8 @@ def test_a_stock_question_gets_live_numbers_the_price_and_no_secrets():
         src = (await ai_tools.catalog_sources(db, B, "Do you have the air max in black size 42?", message_id="m1"))[0]
         text = src["text"]
         assert src["approved"] and src["id"].startswith("catalog:") and src["price_or_stock"] is False
-        assert "₦45,000" in text and "Black / 42: 3 available" in text and "Black / 43: out of stock" in text
+        assert "₦45,000" in text and "Black / 42: in stock" in text and "Black / 43: out of stock" in text
+        assert "3 available" not in text, "the default hides exact counts from customers"
         assert "20000" not in text and "20,000" not in text, "cost price must never reach a customer-facing prompt"
         assert "push the black pair" in text and "never quote" in text
     run(go())
@@ -70,7 +71,7 @@ def test_a_follow_up_without_the_name_still_finds_the_item():
         await with_sizes(db)
         earlier = [{"direction": "inbound", "text": "I'm looking at the Air Max"}, {"direction": "outbound", "text": "Great!"}]
         found = await ai_tools.catalog_sources(db, B, "do you have it in 42?", earlier, message_id="m2")
-        assert found and "Black / 42: 3 available" in found[0]["text"]
+        assert found and "Black / 42: Available." in found[0]["text"]
         assert await ai_tools.catalog_sources(db, B, "what time do you close?", [], message_id="m3") == []
     run(go())
 
@@ -128,3 +129,27 @@ def test_draft_orders_reserve_all_lines_or_none():
         except CatalogError as e:
             assert e.reason == "not_confirmed"
     run(go())
+
+
+def test_stock_visibility_controls_what_a_customer_can_be_told():
+    async def go():
+        db = await fresh()
+        item = await with_sizes(db)
+        ask = "Do you have the air max in black size 42?"
+        exact = await items.update_item(db, B, item["_id"], {"stock_visibility": "exact"}, "u1")
+        assert "Black / 42: 3 available" in (await ai_tools.catalog_sources(db, B, ask))[0]["text"]
+        await items.update_item(db, B, item["_id"], {"stock_visibility": "low_only", "low_stock_threshold": 3}, "u1")
+        assert "Black / 42: limited stock" in (await ai_tools.catalog_sources(db, B, ask))[0]["text"]
+        await items.update_item(db, B, item["_id"], {"stock_visibility": "never"}, "u1")
+        text = (await ai_tools.catalog_sources(db, B, ask))[0]["text"]
+        assert "Black / 42: in stock" in text and "limited" not in text and "3" not in text.split("By option")[1].split("Black / 43")[0]
+        res = await ai_tools.ai_check(db, B, item["_id"], quantity=2)
+        assert res["available_quantity"] is None
+        too_many = await ai_tools.ai_check(db, B, item["_id"], res_variant(await items.list_variants(db, B, item["_id"])), 9)
+        assert "isn't enough" in too_many["message"] and not any(ch.isdigit() for ch in too_many["message"])
+        assert exact["stock_visibility"] == "exact"
+    run(go())
+
+
+def res_variant(variants):
+    return next(v["_id"] for v in variants if v["name"] == "Black / 42")

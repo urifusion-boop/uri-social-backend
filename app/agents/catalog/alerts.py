@@ -21,11 +21,15 @@ async def compute_alerts(db, business_id: str, now: Optional[datetime] = None) -
     items = await db[ITEMS].find({"business_id": business_id, "status": "active"}).to_list(5000)
     by_id = {i["_id"]: i for i in items}
     out: list[dict] = []
-    names = {v["_id"]: v["name"] for v in await db[VARIANTS].find({"business_id": business_id}).to_list(10000)}
+    variants = await db[VARIANTS].find({"business_id": business_id}).to_list(10000)
+    names = {v["_id"]: v["name"] for v in variants}
+    has_options = {v["item_id"] for v in variants if v.get("status", "active") == "active"}
     for row in await db[STOCK].find({"business_id": business_id, "period_key": ""}).to_list(20000):
         item = by_id.get(row["item_id"])
         if not item or item["availability_type"] != "quantity":
             continue
+        if not row.get("variant_id") and row["item_id"] in has_options:
+            continue                            # an item sold by option has no stock of its own to run out
         label = item["name"] + (f" ({names[row['variant_id']]})" if row.get("variant_id") in names else "")
         if row["available"] <= 0:
             out.append(_alert("out_of_stock", "high", item, f"{label} is out of stock",

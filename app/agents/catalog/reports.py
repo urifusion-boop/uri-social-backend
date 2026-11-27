@@ -35,8 +35,11 @@ async def summary(db, business_id: str, days: int = 30, now: Optional[datetime] 
     stock_rows = await db[STOCK].find({"business_id": business_id, "period_key": ""}).to_list(50000)
     remaining: dict[str, int] = {}
     low: list[dict] = []
+    with_options = {s["item_id"] for s in stock_rows if s.get("variant_id")}
     for s in stock_rows:
         remaining[s["item_id"]] = remaining.get(s["item_id"], 0) + s["available"]
+        if not s.get("variant_id") and s["item_id"] in with_options:
+            continue
         if s.get("low_stock_threshold") is not None and s["available"] <= s["low_stock_threshold"]:
             low.append({"item_id": s["item_id"], "name": name(s["item_id"]), "available": s["available"]})
 

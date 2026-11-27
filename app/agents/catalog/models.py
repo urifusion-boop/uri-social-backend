@@ -58,6 +58,9 @@ DEFAULT_TIMEZONE = "Africa/Lagos"
 SKU_RE = re.compile(r"^[A-Za-z0-9._\-/ ]{1,64}$")
 
 
+STOCK_VISIBILITY = ("exact", "low_only", "never")
+
+
 class CatalogError(Exception):
     def __init__(self, detail: str, status: int = 400, reason: str = "", **extra: Any):
         super().__init__(detail)
@@ -255,6 +258,7 @@ def normalize_item(raw: dict, existing: Optional[dict] = None) -> dict:
         "trial_eligible": _flag(merged.get("trial_eligible")) if kind == "digital" else False,
         "cancellation_policy": _text(merged, "cancellation_policy", 600),
         "low_stock_threshold": _opt_int(merged, "low_stock_threshold", "Low stock threshold", 0),
+        "stock_visibility": _choice(merged.get("stock_visibility"), STOCK_VISIBILITY, "Stock visibility", "low_only"),
     }
 
 
@@ -262,6 +266,7 @@ _ITEM_FIELDS = {
     "name", "description", "item_type", "category", "images", "sku", "pricing_model", "price", "currency",
     "availability_type", "availability_source", "external_provider", "status", "sales_notes", "cost_price",
     "requires_confirmation", "reservation_minutes", "confirmation_hours", "billing_interval", "plan_features",
+    "stock_visibility",
     "usage_limits", "trial_eligible", "cancellation_policy", "low_stock_threshold",
 }
 

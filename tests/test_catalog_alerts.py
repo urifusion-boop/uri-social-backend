@@ -76,3 +76,16 @@ def test_thin_capacity_expiring_holds_and_stale_availability_show_in_the_dashboa
 
 def test_unusually_large_adjustments_are_flagged():
     assert alerts.is_unusual(10, 60) and alerts.is_unusual(200, -100) and not alerts.is_unusual(200, -20)
+
+
+def test_an_item_sold_by_option_is_not_called_out_of_stock_when_an_option_has_stock():
+    async def go():
+        db = AsyncMongoMockClient()["t"]
+        indexes.reset()
+        await indexes.ensure_indexes(db)
+        item = await items.create_item(db, "b1", {"name": "Air Max", "description": "Shoe", "item_type": "physical", "category": "shoes",
+                                                  "price": 100, "sku": "AM"}, "u1")
+        await items.create_variant(db, "b1", item["_id"], {"name": "42", "initial_quantity": 4}, "u1")
+        found = await alerts.compute_alerts(db, "b1")
+        assert not [a for a in found if a["type"] == "out_of_stock"]
+    asyncio.run(go())
