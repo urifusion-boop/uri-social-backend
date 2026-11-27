@@ -95,6 +95,7 @@ def test_payment_request_never_marks_paid_and_paying_commits_stock(env):
     assert env.post(f"/orders/{oid}/payments", json={"amount": 9_000_000}).status_code == 409, "overpayment is a mismatch"
     full = env.post(f"/orders/{oid}/payments", json={"amount": 2_500_000}).json()
     assert full["payment_status"] == "paid" and full["status"] == "confirmed" and full["due_amount"] == 0
+    assert {p["status"] for p in env.get(f"/orders/{oid}").json()["payments"]} == {"paid"}
     row = stock_of(env, shoe["id"])
     assert row["on_hand"] == 1 and row["reserved"] == 0, "payment turned the hold into a sale"
 

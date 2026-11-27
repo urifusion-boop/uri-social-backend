@@ -344,6 +344,8 @@ async def record_payment(db, business_id: str, order_id: str, amount: int, sourc
 async def _recompute_payment(db, order: dict, actor: str) -> dict:
     paid = sum(p["amount"] for p in await db[PAYMENTS].find({"order_id": order["_id"], "status": PAID}).to_list(500))
     status = PAID if paid >= order["total"] else PARTIALLY_PAID if paid else order["payment_status"]
+    if status == PAID:
+        await db[PAYMENTS].update_many({"order_id": order["_id"], "status": PENDING}, {"$set": {"status": "closed", "closed_at": utcnow()}})
     await db[ORDERS].update_one({"_id": order["_id"]}, {"$set": {"paid_amount": paid, "due_amount": order["total"] - paid,
                                                                   "payment_status": status, "updated_at": utcnow()}})
     return await get_order(db, order["business_id"], order["_id"])
