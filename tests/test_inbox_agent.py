@@ -568,3 +568,20 @@ def test_a_draft_citing_sources_by_their_short_ids_keeps_its_confidence():
     out = _run(agent.draft_reply("what is it", [], sources, "dm", "instagram", "Biz", llm))
     assert out["confidence"] == 95 and out["sources"][0]["id"] == "faq:6ad24197d57ad8e51b544ee8"
     assert "faq:6ad24197" not in seen["user"]
+
+
+def test_a_sent_reply_keeps_the_sources_it_relied_on():
+    import asyncio
+    from mongomock_motor import AsyncMongoMockClient
+    db = AsyncMongoMockClient()["t"]
+
+    async def go():
+        await db[agent.MESSAGES].insert_one({"workspace_id": "w", "provider_message_id": "pm1", "text": "hi"})
+        draft = {"sources": [{"id": "faq:1", "label": "FAQ · Pricing", "approved": True}], "confidence": 91}
+        await agent._record_grounding(db, "w", {"provider_message_id": "pm1"}, draft)
+        await agent._record_grounding(db, "w", {"provider_message_id": ""}, draft)
+        return await db[agent.MESSAGES].find_one({"provider_message_id": "pm1"})
+
+    row = asyncio.get_event_loop().run_until_complete(go())
+    assert row["grounding"] == [{"id": "faq:1", "label": "FAQ · Pricing", "approved": True}]
+    assert row["draft_confidence"] == 91

@@ -249,6 +249,7 @@ async def list_messages(
         "attachments": r.get("attachments", []),
         "delivery": r.get("delivery"),
         "by_agent": r.get("actor_id") == agent.AGENT_ACTOR,
+        "grounding": r.get("grounding"),
         "provider_timestamp": r.get("provider_timestamp"),
         "received_at": r.get("received_at"),
     } for r in rows]}
