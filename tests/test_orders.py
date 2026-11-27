@@ -208,3 +208,119 @@ def test_adjustments_need_a_reason_leave_a_revision_and_never_undercut_payments(
     assert paid["payment_status"] == "paid"
     kinds = [e["type"] for e in env.get(f"/orders/{oid}/events").json()["events"]]
     assert kinds.count("adjusted") == 2
+
+
+def _paid_order(env, qty=1, stock_qty=3):
+    shoe = item(env, initial_quantity=stock_qty)
+    order = draft(env, shoe["id"], qty)
+    oid, line = order["id"], order["lines"][0]["id"]
+    env.post(f"/orders/{oid}/confirm", json={"customer_accepted": True})
+    env.post(f"/orders/{oid}/payments", json={"amount": 4_500_000 * qty})
+    return shoe, oid, line
+
+
+def _hook(env, event, secret="s3cret", sign=True):
+    import hashlib
+    import hmac
+    import json
+    raw = json.dumps(event).encode()
+    sig = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest() if sign else "sha256=bad"
+    return env.post("/orders/webhooks/payments", content=raw, headers={"x-uri-signature": sig, "content-type": "application/json"})
+
+
+def test_the_payment_webhook_needs_a_valid_signature_and_counts_a_transaction_once(env, monkeypatch):
+    shoe = item(env)
+    oid = draft(env, shoe["id"])["id"]
+    env.post(f"/orders/{oid}/confirm", json={"customer_accepted": True})
+    ev = {"type": "payment.succeeded", "business_id": "b1", "order_id": oid, "amount": 4_500_000, "transaction_id": "t1", "provider": "psp"}
+    assert _hook(env, ev).status_code == 503, "not configured: refuse rather than trust"
+    monkeypatch.setenv("ORDERS_PAYMENT_WEBHOOK_SECRET", "s3cret")
+    assert _hook(env, ev, sign=False).status_code == 401
+    assert env.get(f"/orders/{oid}").json()["paid_amount"] == 0
+    assert _hook(env, ev).json()["payment_status"] == "paid"
+    assert _hook(env, ev).status_code == 200
+    got = env.get(f"/orders/{oid}").json()
+    assert got["paid_amount"] == 4_500_000 and len(got["payments"]) == 1 and got["payments"][0]["source"] == "provider"
+    assert _hook(env, {"type": "nope", "business_id": "b1", "order_id": oid}).status_code == 400
+
+
+def test_a_refund_completes_only_on_confirmation_and_moves_the_payment_status(env, monkeypatch):
+    monkeypatch.setenv("ORDERS_PAYMENT_WEBHOOK_SECRET", "s3cret")
+    shoe, oid, line = _paid_order(env)
+    env.post(f"/orders/{oid}/cancel", json={"reason": "x"})
+    refund = env.post(f"/orders/{oid}/refund-requests", json={"amount": 1_000_000, "reason": "part"}).json()
+    assert env.get(f"/orders/{oid}").json()["payment_status"] == "paid", "a request changes nothing"
+    ev = {"type": "refund.completed", "business_id": "b1", "order_id": oid, "refund_id": refund["id"], "provider_reference": "rf1"}
+    _hook(env, ev)
+    _hook(env, ev)
+    got = env.get(f"/orders/{oid}").json()
+    assert got["payment_status"] == "partially_refunded" and got["refunded_amount"] == 1_000_000
+    second = env.post(f"/orders/{oid}/refund-requests", json={"amount": 3_500_000}).json()
+    out = env.post(f"/orders/{oid}/refunds/{second['id']}/complete", json={"reference": "cash"}).json()
+    assert out["payment_status"] == "refunded" and out["refund_due"] is False
+
+
+def test_returns_go_back_on_sale_only_when_inspected_resellable(env):
+    shoe, oid, line = _paid_order(env, qty=2, stock_qty=3)
+    assert env.post(f"/orders/{oid}/returns", json={"line_id": line, "quantity": 1}).status_code == 409, "not delivered yet"
+    env.post(f"/orders/{oid}/fulfilments", json={"line_id": line, "status": "fulfilled"})
+    base = stock_of(env, shoe["id"])["available"]
+    assert env.post(f"/orders/{oid}/returns", json={"line_id": line, "quantity": 5}).status_code == 409
+    r1 = env.post(f"/orders/{oid}/returns", json={"line_id": line, "quantity": 1, "reason": "too small"}).json()
+    assert env.post(f"/orders/returns/{r1['id']}/receive").status_code == 409, "must be approved first"
+    env.post(f"/orders/returns/{r1['id']}/approve")
+    env.post(f"/orders/returns/{r1['id']}/receive")
+    assert stock_of(env, shoe["id"])["available"] == base, "received but not inspected: not resellable yet"
+    assert env.post(f"/orders/returns/{r1['id']}/resolve", json={"disposition": "bogus"}).status_code == 400
+    env.post(f"/orders/returns/{r1['id']}/resolve", json={"disposition": "restock"})
+    assert stock_of(env, shoe["id"])["available"] == base + 1
+    r2 = env.post(f"/orders/{oid}/returns", json={"line_id": line, "quantity": 1}).json()
+    for step in ("approve", "receive"):
+        env.post(f"/orders/returns/{r2['id']}/{step}")
+    env.post(f"/orders/returns/{r2['id']}/resolve", json={"disposition": "damaged"})
+    assert stock_of(env, shoe["id"])["available"] == base + 1, "damaged goods never return to stock"
+    assert env.get(f"/orders/{oid}").json()["lines"][0]["fulfilment_status"] == "returned"
+    rejected = env.post(f"/orders/{oid}/returns", json={"line_id": line, "quantity": 1})
+    assert rejected.status_code == 409
+
+
+def test_customers_are_messaged_once_per_event_and_unreachable_ones_are_logged(env):
+    shoe, oid, line = _paid_order(env)
+    notes = env.get(f"/orders/{oid}/notifications").json()["notifications"]
+    assert [n["kind"] for n in notes] == ["confirmed", "payment_status_changed"]
+    assert all(n["result"] == "no_channel" for n in notes) and "received your payment" in notes[1]["text"]
+    env.post(f"/orders/{oid}/fulfilments", json={"line_id": line, "status": "processing"})
+    env.post(f"/orders/{oid}/fulfilments", json={"line_id": line, "status": "processing"})
+    kinds = [n["text"] for n in env.get(f"/orders/{oid}/notifications").json()["notifications"]]
+    assert sum("being prepared" in t for t in kinds) == 1
+
+
+def test_a_chat_customer_gets_the_message_in_their_conversation_and_a_closed_window_is_logged(env, monkeypatch):
+    import asyncio
+    from datetime import timedelta
+    from bson import ObjectId
+    from app.agents.inbox.entities import CONVERSATIONS, now
+    from app.agents.orders import service
+    sent = []
+
+    async def transport(conv, account, text):
+        sent.append(text)
+        return "mid1"
+    monkeypatch.setattr(service, "_transport", transport)
+
+    def convo(hours):
+        doc = {"_id": ObjectId(), "workspace_id": "b1", "kind": "dm", "platform": "instagram", "channel_account_id": "a",
+               "external_thread_id": "U1", "status": "open", "reply_window_expires_at": now() + timedelta(hours=hours)}
+        asyncio.run(env.db[CONVERSATIONS].insert_one(doc))
+        return str(doc["_id"])
+
+    shoe = item(env, initial_quantity=5)
+    for hours, expect_sent in ((6, True), (-1, False)):
+        conv = convo(hours)
+        order = env.post("/orders", json={"source": "onebox", "source_ref": conv, "items": [{"catalog_item_id": shoe["id"], "quantity": 1}]}).json()
+        env.post(f"/orders/{order['id']}/confirm", json={"customer_accepted": True})
+        env.post(f"/orders/{order['id']}/payments", json={"amount": 4_500_000})
+        note = env.get(f"/orders/{order['id']}/notifications").json()["notifications"][-1]
+        assert note["channel"] == "instagram"
+        assert (note["result"] == "sent") is expect_sent, note
+    assert len(sent) == 2 and "is confirmed" in sent[0] and "received your payment" in sent[1]

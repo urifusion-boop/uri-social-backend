@@ -14,21 +14,29 @@ from app.agents.catalog import events, reservations
 from app.agents.catalog.items import effective_price, get_item, list_variants
 from app.agents.catalog.models import CatalogError, utcnow
 
+from . import notify
 from .models import (
     AUDIT, AWAITING_CUSTOMER, CANCELLED, COMPLETED, CONFIRMED, COUNTERS, DEFAULT_PAYMENT_WINDOW_HOURS, DRAFT, EDITABLE,
     EXPIRED, FAILED, FULFILLED, IN_PROGRESS, LINE_FULFILMENT, MAX_LINES, NOT_STARTED, ORDERS, OPEN, PARTIALLY_FULFILLED,
-    PARTIALLY_PAID, PAID, PAYMENT_SOURCES, PAYMENTS, PENDING, PROCESSING, QUEUED, REFUNDS, SOURCES, UNPAID, OrderError,
+    PARTIALLY_PAID, PARTIALLY_REFUNDED, PAID, PAYMENT_SOURCES, PAYMENTS, PENDING, PROCESSING, QUEUED, REFUNDED, REFUNDS, SOURCES, UNPAID, OrderError,
     positive_int, to_minor,
 )
 
 
 # ── audit and events ─────────────────────────────────────────────────────────
 
+_transport = None      # tests swap in a fake chat transport
+
 async def _log(db, order: dict, kind: str, actor: str, payload: Optional[dict] = None, dedupe: str = "") -> None:
     await db[AUDIT].insert_one({"_id": uuid.uuid4().hex, "business_id": order["business_id"], "order_id": order["_id"],
                                 "type": kind, "actor": actor, "payload": payload or {}, "created_at": utcnow()})
     await events.emit(db, order["business_id"], f"order.{kind}", {"order_id": order["_id"], **(payload or {})},
                       dedupe_key=dedupe or f"{kind}:{order['_id']}:{uuid.uuid4().hex[:8]}")
+    if order["_id"] != "export":
+        try:
+            await notify.maybe(db, order["_id"], kind, actor, payload or {}, _transport)
+        except Exception as e:
+            print(f"[Orders] notification for {kind} failed: {e}", flush=True)
 
 
 async def get_order(db, business_id: str, order_id: str) -> dict:
@@ -403,7 +411,7 @@ async def add_adjustment(db, business_id: str, order_id: str, kind: str, amount:
                                                     "$push": {"adjustments": entry, "revisions": revision}})
     order = await get_order(db, business_id, order_id)
     await _log(db, order, "adjusted", actor, {"kind": kind, "amount": amount, "reason": entry["reason"], "revision": revision["number"]})
-    if order["status"] in OPEN and order["paid_amount"] >= order["total"] and order["payment_status"] != PAID:
+    if order["status"] in OPEN and order["paid_amount"] >= order["total"] and order["payment_status"] not in (PAID, REFUNDED, PARTIALLY_REFUNDED):
         order = await _recompute_payment(db, order, actor)
         order = await _commit_if_paid(db, order, actor)
     return order
@@ -477,7 +485,7 @@ async def cancel(db, business_id: str, order_id: str, reason: str, actor: str, r
         "cancel_requested_by": requested_by, "refund_due": paid > 0, "updated_at": utcnow()}})
     order = await get_order(db, business_id, order_id)
     await _log(db, order, "cancelled", actor, {"reason": reason[:300], "released": released, "fulfilled_kept": kept,
-                                                "refund_due": paid}, f"cancelled:{order_id}")
+                                                "refund_due": paid, "requested_by": requested_by}, f"cancelled:{order_id}")
     return order
 
 
@@ -494,6 +502,25 @@ async def request_refund(db, business_id: str, order_id: str, amount: int, reaso
     await db[REFUNDS].insert_one(doc)
     await _log(db, order, "refund_status_changed", actor, {"status": "requested", "amount": amount})
     return doc
+
+
+async def complete_refund(db, business_id: str, order_id: str, refund_id: str, provider_reference: str, actor: str) -> dict:
+    """The provider has sent the money back. Only now does the order's payment position change."""
+    order = await get_order(db, business_id, order_id)
+    won = await db[REFUNDS].find_one_and_update(
+        {"_id": refund_id, "order_id": order_id, "business_id": business_id, "status": "requested"},
+        {"$set": {"status": "completed", "provider_reference": provider_reference[:120], "completed_at": utcnow()}})
+    if not won:
+        return order
+    refunded = order.get("refunded_amount", 0) + won["amount"]
+    full = refunded >= order["paid_amount"]
+    await db[ORDERS].update_one({"_id": order_id}, {"$set": {
+        "refunded_amount": refunded, "payment_status": REFUNDED if full else PARTIALLY_REFUNDED,
+        "refund_due": not full and order.get("refund_due", False), "updated_at": utcnow()}})
+    order = await get_order(db, business_id, order_id)
+    await _log(db, order, "refund_status_changed", actor, {"status": "completed", "amount": won["amount"], "refund_id": refund_id},
+               f"refund:{refund_id}")
+    return order
 
 
 async def expire_due(db, business_id: Optional[str] = None, now: Optional[datetime] = None) -> int:

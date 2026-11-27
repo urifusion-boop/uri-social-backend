@@ -10,7 +10,14 @@ from app.agents.catalog.models import iso
 from app.agents.catalog.router import Ctx, _ctx, _manager
 from app.dependencies import get_db_dependency
 
-from . import service
+import hashlib
+import hmac
+import json
+import os
+
+from fastapi import Request
+
+from . import notify, returns, service
 from .indexes import ensure_indexes
 from .models import OrderError
 
@@ -43,6 +50,41 @@ def _public(order: dict) -> dict:
 async def _db_ready(db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> AsyncIOMotorDatabase:
     await ensure_indexes(db)
     return db
+
+
+def _signed(secret: str, raw: bytes, header: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header or "")
+
+
+@router.post("/webhooks/payments")
+async def payment_webhook(request: Request, x_uri_signature: str = Header(default=""),
+                          db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    """Verified provider events are the only way a payment or refund is confirmed from outside."""
+    secret = os.getenv("ORDERS_PAYMENT_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Payment webhooks are not configured.")
+    raw = await request.body()
+    if not _signed(secret, raw, x_uri_signature):
+        raise HTTPException(status_code=401, detail="Bad signature.")
+    try:
+        event = json.loads(raw)
+        biz, kind, order_id = str(event["business_id"]), str(event["type"]), str(event["order_id"])
+        actor = f"provider:{str(event.get('provider') or 'psp')[:30]}"
+        if kind == "payment.succeeded":
+            order = await service.record_payment(db, biz, order_id, event["amount"], "provider", actor, reference=str(event.get("reference") or ""),
+                                                 transaction_id=str(event.get("transaction_id") or ""), method=str(event.get("method") or ""))
+        elif kind == "payment.failed":
+            order = await service.mark_payment_failed(db, biz, order_id, str(event.get("reference") or ""), actor)
+        elif kind == "refund.completed":
+            order = await service.complete_refund(db, biz, order_id, str(event["refund_id"]), str(event.get("provider_reference") or ""), actor)
+        else:
+            raise HTTPException(status_code=400, detail="Unknown event type.")
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Malformed event.")
+    except OrderError as e:
+        _fail(e)
+    return {"status": "ok", "payment_status": order["payment_status"]}
 
 
 @router.get("/public/{token}")
@@ -89,7 +131,8 @@ async def get_order(order_id: str, ctx: Ctx = Depends(_ctx), db: AsyncIOMotorDat
     except OrderError as e:
         _fail(e)
     payments = await db["order_payments"].find({"order_id": order_id}).sort("created_at", 1).to_list(100)
-    return {**order, "payments": _clean(payments)}
+    refunds = await db["order_refunds"].find({"order_id": order_id}).sort("created_at", 1).to_list(100)
+    return {**order, "payments": _clean(payments), "refunds": _clean(refunds)}
 
 
 @router.patch("/{order_id}")
@@ -190,6 +233,55 @@ async def refund_request(order_id: str, body: dict = Body(...), ctx: Ctx = Depen
                                                    str(body.get("reason") or ""), ctx["user_id"]))
     except OrderError as e:
         _fail(e)
+
+
+@router.post("/{order_id}/returns", status_code=201)
+async def request_return(order_id: str, body: dict = Body(...), ctx: Ctx = Depends(_ctx),
+                         db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    try:
+        return _clean(await returns.request_return(db, ctx["business_id"], order_id, str(body.get("line_id") or ""),
+                                                   body.get("quantity", 1), str(body.get("reason") or ""), ctx["user_id"]))
+    except OrderError as e:
+        _fail(e)
+
+
+@router.get("/{order_id}/returns")
+async def order_returns(order_id: str, ctx: Ctx = Depends(_ctx), db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    return {"returns": _clean(await returns.list_returns(db, ctx["business_id"], order_id))}
+
+
+@router.post("/returns/{return_id}/{action}")
+async def return_action(return_id: str, action: str, body: dict = Body(default={}), ctx: Ctx = Depends(_ctx),
+                        db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    _manager(ctx)
+    biz, actor = ctx["business_id"], ctx["user_id"]
+    try:
+        if action in ("approve", "reject"):
+            return _clean(await returns.decide(db, biz, return_id, action == "approve", str(body.get("note") or ""), actor))
+        if action == "receive":
+            return _clean(await returns.receive(db, biz, return_id, actor))
+        if action == "resolve":
+            return _clean(await returns.resolve(db, biz, return_id, str(body.get("disposition") or ""), actor))
+    except OrderError as e:
+        _fail(e)
+    raise HTTPException(status_code=404, detail="Unknown action.")
+
+
+@router.post("/{order_id}/refunds/{refund_id}/complete")
+async def complete_refund(order_id: str, refund_id: str, body: dict = Body(default={}), ctx: Ctx = Depends(_ctx),
+                          db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    """For a refund the business paid out itself (cash or a manual transfer); marked as such, not provider-confirmed."""
+    _manager(ctx)
+    try:
+        return _clean(await service.complete_refund(db, ctx["business_id"], order_id, refund_id,
+                                                    "manual:" + str(body.get("reference") or ""), ctx["user_id"]))
+    except OrderError as e:
+        _fail(e)
+
+
+@router.get("/{order_id}/notifications")
+async def order_notifications(order_id: str, ctx: Ctx = Depends(_ctx), db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    return {"notifications": _clean(await notify.history(db, ctx["business_id"], order_id))}
 
 
 @router.get("/{order_id}/events")
