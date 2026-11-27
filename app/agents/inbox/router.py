@@ -25,6 +25,7 @@ from .channels import (
     release_channels, subscription_issue,
 )
 from . import agent, rules
+from .forward import FORWARD_HEADER, forward_delivery, owned_by_forward_target
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -69,6 +70,12 @@ async def receive_meta_webhook(
         print("[Inbox] rejected a webhook with a missing/invalid signature", flush=True)
         raise HTTPException(status_code=401, detail="invalid signature")
 
+    if not request.headers.get(FORWARD_HEADER):
+        remote = await forward_delivery(raw_body, signature)
+        if owned_by_forward_target(remote):
+            print(f"[Inbox] webhook handled by the forward target: {remote}", flush=True)
+            return {"status": "forwarded", "events": remote.get("events", 0), "stored": 0, "matched": 0}
+
     await store_raw(db, "meta", raw_body, dict(request.headers))
 
     try:
@@ -90,8 +97,11 @@ async def receive_meta_webhook(
         print(f"[Inbox] nothing to store from that delivery: "
               f"{describe_unparsed(payload)}", flush=True)
     stored = 0
+    matched = 0
     for ev in events:
         account = await account_for_event(db, ev.get("external_account_id"))
+        if account:
+            matched += 1
         if not account:
             # An event for an account nobody connected. Dropping it is right: there is
             # no workspace to file it under, and guessing one would put a stranger's
@@ -125,7 +135,7 @@ async def receive_meta_webhook(
                 agent.schedule(agent.process_inbound(
                     db, account["workspace_id"], stored_msg["conversation_id"], msg_id))
     print(f"[Inbox] webhook stored {stored}/{len(events)} event(s)", flush=True)
-    return {"status": "ok", "events": len(events), "stored": stored}
+    return {"status": "ok", "events": len(events), "stored": stored, "matched": matched}
 
 
 @router.get("/conversations")
