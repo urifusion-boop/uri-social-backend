@@ -413,6 +413,18 @@ def _job_reconcile_published_posts():
     _run_async("reconcile_published_posts", _run)
 
 
+def _job_background_jobs_check():
+    """Every 15 minutes: alert admins if a background job type is failing a lot or jobs are
+    waiting too long to start (app/jobs/monitor.py)."""
+    async def _run():
+        from app.database import get_db
+        from app.jobs import monitor
+        found = await monitor.check(get_db())
+        if found:
+            print(f"🚨 Background jobs: {found}")
+    _run_async("background_jobs_check", _run)
+
+
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
     global _scheduler, _main_loop
@@ -658,8 +670,16 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Alert admins when background jobs (website reads, ...) fail a lot or wait too long.
+    _scheduler.add_job(
+        _job_background_jobs_check,
+        CronTrigger(minute="*/15"),
+        id="background_jobs_check",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 24 jobs")
+    print("📅 Notification scheduler started with 25 jobs")
 
 
 def stop_notification_scheduler():

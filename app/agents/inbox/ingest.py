@@ -296,6 +296,8 @@ async def record_event(db, workspace_id: str, channel_account_id: str,
     msg = {
         "workspace_id": workspace_id,
         "conversation_id": conversation_id,
+        # A comment thread is the post, so the conversation only knows its first commenter.
+        "contact_identity_id": identity_id,
         "provider_message_id": ev["provider_message_id"],
         "direction": Direction.INBOUND.value,
         "text": ev.get("text") or "",

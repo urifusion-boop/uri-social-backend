@@ -79,3 +79,26 @@ async def meta_transport(conv: dict, account: dict, text: str) -> str:
 
     body = r.json()
     return body.get("message_id") or body.get("id") or ""
+
+
+async def meta_private_reply(account: dict, comment_id: str, text: str) -> dict:
+    """Send one private DM to the author of a public comment. Meta allows a single
+    private reply per comment, within 7 days of it. Returns {message_id, recipient_id}."""
+    token = account.get("access_token") or ""
+    page_id = account.get("page_id") or account.get("external_account_id") or ""
+    if not (token and page_id and comment_id):
+        raise Exception("missing token, page or comment for a private reply")
+    payload = {"recipient": {"comment_id": comment_id}, "message": {"text": text}, "access_token": token}
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.post(f"{_graph_base()}/{page_id}/messages", json=payload)
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        raise ProviderTimeout(str(e)) from e
+    if r.status_code >= 400:
+        try:
+            detail = (r.json().get("error") or {}).get("message", "")
+        except ValueError:
+            detail = r.text[:200]
+        raise Exception(f"Meta rejected the private reply: {detail or r.status_code}")
+    body = r.json()
+    return {"message_id": body.get("message_id") or "", "recipient_id": body.get("recipient_id") or ""}
