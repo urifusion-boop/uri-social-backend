@@ -199,14 +199,25 @@ async def catalog_sources(db, business_id: str, text: str, earlier: Optional[lis
     return out
 
 
+_SIZES = {"small": "s", "medium": "m", "large": "l"}
+
+
+def _option_words(text: str) -> set[str]:
+    """Words naming an option. Sizes match however written (large = L), and "I'm" is not size M."""
+    t = re.sub(r"['’]\w*", "", (text or "").lower())
+    t = re.sub(r"\b(?:extra|x)[\s-]+(small|large)\b", lambda m: "x" + m.group(1)[0], t)
+    words = [_SIZES.get(w, w) for w in re.findall(r"[a-z0-9]+", t)]
+    return {w for w in words if w not in STOP and (len(w) >= 2 or w in ("s", "m", "l"))}
+
+
 async def _variant_named(db, business_id: str, item: dict, text: str) -> Optional[dict]:
     """The option the customer named, when exactly one fits (e.g. "black size 42")."""
-    words = _tokens(text, keep_short=True)
+    words = _option_words(text)
     best, best_score, tie = None, 0, False
     for v in await list_variants(db, business_id, item["_id"]):
         if v["status"] != "active":
             continue
-        have = _tokens(v["name"], True) | {w for val in v["attributes"].values() for w in _tokens(val, True)}
+        have = _option_words(v["name"]) | {w for val in v["attributes"].values() for w in _option_words(str(val))}
         score = len(words & have)
         if score > best_score:
             best, best_score, tie = v, score, False

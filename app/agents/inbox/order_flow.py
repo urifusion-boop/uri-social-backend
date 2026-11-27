@@ -24,6 +24,7 @@ Reply with JSON: {"intent": "none"|"order"|"accept"|"decline", "items": [{"name"
 - accept: OPEN_ORDER is present and the customer clearly says yes to going ahead with exactly what OPEN_ORDER contains. A yes that goes with a different item, size or quantity than OPEN_ORDER is not accept.
 - If OPEN_ORDER is present and the customer now asks for something different from it (another item, option or quantity), the intent is "order", and items lists everything they now want, using the recent conversation for any item or option they refer to as "it" or "that".
 - decline: OPEN_ORDER is present and the customer says no, cancel it, or never mind.
+- Without OPEN_ORDER, a customer who says they want an item just discussed, or picks its size, option or quantity ("yes, in large"), is placing an order: intent "order", with that item and option taken from the recent conversation.
 - none: anything else, including questions, browsing, and "maybe". When unsure, none."""
 
 
@@ -138,4 +139,7 @@ async def step(db, workspace_id: str, conv: dict, conversation_id: str, text: st
         return [_source(f"OPEN ORDER {order['order_number']} awaiting the customer's yes: {_text(order)}")]
     if order and order["status"] == CONFIRMED:
         return [_source(f"ORDER {order['order_number']} is confirmed, payment status: {order['payment_status']}.")]
+    if intent == "accept":
+        return [_source("NO ORDER EXISTS for this conversation yet, so there is nothing to confirm. Never say an order is placed, "
+                        "confirmed or being processed; ask the customer exactly what they want to order.")]
     return []

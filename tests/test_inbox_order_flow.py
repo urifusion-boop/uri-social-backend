@@ -122,3 +122,19 @@ def test_asking_for_something_else_replaces_the_open_order_instead_of_confirming
         assert (await db[ORDERS].find_one({"order_number": "ORD-00002"}))["status"] == "awaiting_customer"
         assert hoodie
     run(go())
+
+
+def test_a_size_in_words_picks_the_variant_and_a_yes_with_no_order_confirms_nothing():
+    async def go():
+        db, shoe, conv, cid = await setup()
+        hoodie = await items.create_item(db, W, {"name": "Hoodie", "description": "Black hoodie", "item_type": "physical", "category": "wear",
+                                                 "price": 18000, "initial_quantity": None, "sku": "HD"}, "u")
+        for name, qty in (("Black / M", 3), ("Black / L", 2)):
+            await items.create_variant(db, W, hoodie["_id"], {"name": name, "initial_quantity": qty}, "u")
+        out = await order_flow.step(db, W, conv, cid, "large", [msg("inbound", "i want the hoodie"), msg("inbound", "large")], "m1",
+                                    llm_says("order", [{"name": "Hoodie", "quantity": 1, "option": "large"}]))
+        assert "Black / L" in out[0]["text"] and "ORDER SUMMARY" in out[0]["text"]
+        await db[ORDERS].delete_many({})
+        out = await order_flow.step(db, W, conv, cid, "yes", [msg("inbound", "hoodie"), msg("inbound", "yes")], "m2", llm_says("accept"))
+        assert "NO ORDER EXISTS" in out[0]["text"] and await db[ORDERS].count_documents({}) == 0
+    run(go())
