@@ -53,6 +53,9 @@ REQUIRED = {
     # Minimum seconds between two TikTok posts to the same account (rate_limit.py). The code defaults to 12
     # when it is absent, but the SSM parameter must EXIST before this line ships or the task cannot start.
     "TIKTOK_MIN_GAP_S": f"{SSM_PREFIX}/TIKTOK_MIN_GAP_S",
+    # Signs the provider's payment webhook (POST /orders/webhooks/payments, HMAC-SHA256 over the raw
+    # body). Without it the endpoint answers 503; the SSM parameter must EXIST before this line ships.
+    "ORDERS_PAYMENT_WEBHOOK_SECRET": f"{SSM_PREFIX}/ORDERS_PAYMENT_WEBHOOK_SECRET",
 }
 
 
