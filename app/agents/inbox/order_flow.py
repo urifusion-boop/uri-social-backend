@@ -21,7 +21,8 @@ ACTOR = "jane"
 _SYSTEM = """You read the customer's latest message in a sales chat and say whether they want to place an order.
 Reply with JSON: {"intent": "none"|"order"|"accept"|"decline", "items": [{"name": str, "quantity": int, "option": str}]}
 - order: the customer clearly wants to buy, book or subscribe to specific things from CATALOG_ITEMS (use the names exactly as listed; quantity defaults to 1; option is a size, colour, plan variant or empty).
-- accept: OPEN_ORDER is present and the customer clearly says yes to going ahead with it.
+- accept: OPEN_ORDER is present and the customer clearly says yes to going ahead with exactly what OPEN_ORDER contains. A yes that goes with a different item, size or quantity than OPEN_ORDER is not accept.
+- If OPEN_ORDER is present and the customer now asks for something different from it (another item, option or quantity), the intent is "order", and items lists everything they now want, using the recent conversation for any item or option they refer to as "it" or "that".
 - decline: OPEN_ORDER is present and the customer says no, cancel it, or never mind.
 - none: anything else, including questions, browsing, and "maybe". When unsure, none."""
 
@@ -67,14 +68,17 @@ async def _resolve(db, workspace_id: str, entry: dict) -> tuple[Optional[dict], 
     return {"catalog_item_id": item["_id"], "variant_id": variant["_id"] if variant else None, "quantity": min(qty, 50)}, ""
 
 
-async def _start(db, workspace_id: str, conv: dict, conversation_id: str, entries: list, message_id: str) -> list[dict]:
+async def _start(db, workspace_id: str, conv: dict, conversation_id: str, entries: list, message_id: str,
+                 replacing: Optional[dict] = None) -> list[dict]:
     lines, problems = [], []
     for entry in entries[:10]:
         line, problem = await _resolve(db, workspace_id, entry)
         (lines.append(line) if line else problems.append(problem))
     if problems or not lines:
+        kept = (f" OPEN ORDER {replacing['order_number']} ({_text(replacing)}) is unchanged and still not confirmed; "
+                "do not treat a yes as confirming it unless the customer means that order.") if replacing else ""
         return [_source("ORDER NOT STARTED: " + "; ".join(problems or ["nothing to order was identified"]) +
-                        ". Ask the customer for what is missing. Do not say an order was made.")]
+                        ". Ask the customer for what is missing. Do not say an order was made." + kept)]
     try:
         order = await service.create_order(db, workspace_id, {
             "source": "onebox", "source_ref": conversation_id, "items": lines,
@@ -84,7 +88,14 @@ async def _start(db, workspace_id: str, conv: dict, conversation_id: str, entrie
     except OrderError as e:
         return [_source(f"ORDER NOT STARTED: {e.detail} Do not say an order was made; offer alternatives or say the team will follow up.")]
     await db[ORDERS].update_one({"_id": order["_id"]}, {"$set": {"awaiting_at": ai_tools.utcnow()}})
-    return [_source(f"ORDER SUMMARY {order['order_number']} (not confirmed yet, nothing is held or paid): {_text(order)} "
+    swapped = ""
+    if replacing:
+        try:
+            await service.cancel(db, workspace_id, replacing["_id"], "Customer changed the order", ACTOR, "customer")
+            swapped = f" This replaces {replacing['order_number']} ({_text(replacing)}), which was cancelled because they changed the order."
+        except OrderError:
+            swapped = ""
+    return [_source(f"ORDER SUMMARY {order['order_number']} (not confirmed yet, nothing is held or paid): {_text(order)}{swapped} "
                     "Read this back to the customer and ask them to reply yes to confirm. Do not say it is booked or reserved.")]
 
 
@@ -120,8 +131,9 @@ async def step(db, workspace_id: str, conv: dict, conversation_id: str, text: st
     if intent == "decline" and order and order["status"] in (DRAFT, AWAITING_CUSTOMER):
         await service.cancel(db, workspace_id, order["_id"], "Customer declined", ACTOR, "customer")
         return [_source(f"ORDER {order['order_number']} CANCELLED at the customer's request. Nothing was held or charged.")]
-    if intent == "order" and not (order and order["status"] == AWAITING_CUSTOMER):
-        return await _start(db, workspace_id, conv, conversation_id, data.get("items") or [], message_id)
+    if intent == "order":
+        waiting = order if order and order["status"] == AWAITING_CUSTOMER else None
+        return await _start(db, workspace_id, conv, conversation_id, data.get("items") or [], message_id, waiting)
     if order and order["status"] == AWAITING_CUSTOMER:
         return [_source(f"OPEN ORDER {order['order_number']} awaiting the customer's yes: {_text(order)}")]
     if order and order["status"] == CONFIRMED:

@@ -101,3 +101,24 @@ def test_an_unmatched_item_starts_no_order():
                                     llm_says("order", [{"name": "Rocket Boots", "quantity": 1}]))
         assert "ORDER NOT STARTED" in out[0]["text"] and await db[ORDERS].count_documents({}) == 0
     run(go())
+
+
+def test_asking_for_something_else_replaces_the_open_order_instead_of_confirming_it():
+    async def go():
+        db, shoe, conv, cid = await setup()
+        hoodie = await items.create_item(db, W, {"name": "Hoodie", "description": "Black hoodie", "item_type": "physical", "category": "wear",
+                                                 "price": 18000, "initial_quantity": 3, "sku": "HD"}, "u")
+        await order_flow.step(db, W, conv, cid, "air max", [msg("inbound", "air max")], "m1",
+                              llm_says("order", [{"name": "Air Max", "quantity": 1}]))
+        sent = [msg("inbound", "air max"), msg("outbound", "Summary", now() + timedelta(seconds=5)), msg("inbound", "the hoodie, yes")]
+        out = await order_flow.step(db, W, conv, cid, "the hoodie, yes", sent, "m2", llm_says("order", [{"name": "Hoodie", "quantity": 1}]))
+        assert "ORDER SUMMARY ORD-00002" in out[0]["text"] and "Hoodie" in out[0]["text"] and "replaces ORD-00001" in out[0]["text"]
+        statuses = {o["order_number"]: o["status"] for o in await db[ORDERS].find({}).to_list(None)}
+        assert statuses == {"ORD-00001": "cancelled", "ORD-00002": "awaiting_customer"}
+        for stock in await db["catalog_stock"].find({}).to_list(None):
+            assert stock["reserved"] == 0
+        out = await order_flow.step(db, W, conv, cid, "rocket", sent, "m3", llm_says("order", [{"name": "Rocket Boots", "quantity": 1}]))
+        assert "ORD-00002" in out[0]["text"] and "unchanged" in out[0]["text"]
+        assert (await db[ORDERS].find_one({"order_number": "ORD-00002"}))["status"] == "awaiting_customer"
+        assert hoodie
+    run(go())
