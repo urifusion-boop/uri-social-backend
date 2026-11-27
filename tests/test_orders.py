@@ -325,6 +325,10 @@ def test_a_chat_customer_gets_the_message_in_their_conversation_and_a_closed_win
         assert note["channel"] == "instagram"
         assert (note["result"] == "sent") is expect_sent, note
     assert len(sent) == 2 and "is confirmed" in sent[0] and "received your payment" in sent[1]
+    from app.agents.inbox.agent import _activity
+    from app.agents.inbox.entities import MESSAGES
+    history = asyncio.run(env.db[MESSAGES].find({}).to_list(None))
+    assert history and _activity(history, now())[1] is False, "an order update is not a team member taking over, so Jane keeps replying"
 
 
 def test_two_businesses_with_the_same_order_number_can_both_ask_for_payment(env):

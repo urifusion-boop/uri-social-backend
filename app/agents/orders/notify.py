@@ -15,7 +15,6 @@ from app.agents.catalog.models import utcnow
 from .models import ORDERS
 
 NOTIFICATIONS = "order_notifications"
-ACTOR = "orders"
 
 
 def _money(minor: int, currency: str) -> str:
@@ -30,7 +29,7 @@ def message_for(kind: str, order: dict, payload: dict, actor: str) -> tuple[str,
         return "", f"Your order {n} is confirmed. Total {_money(order['total'], cur)}. We'll send payment details shortly."
     if kind == "payment_status_changed":
         if order["payment_status"] == "paid":
-            return f"paid", f"We've received your payment for order {n}. Thank you! Next we'll get it to you."
+            return f"paid", f"We've received your payment for order {n}. Thank you! We'll update you as it's prepared."
         if order["payment_status"] == "partially_paid":
             return f"part:{order['paid_amount']}", (f"We've received {_money(order['paid_amount'], cur)} for order {n}. "
                                                     f"The balance of {_money(order['due_amount'], cur)} is still due.")
@@ -84,9 +83,10 @@ async def maybe(db, order_id: str, kind: str, actor: str, payload: dict, transpo
     try:
         from app.agents.inbox.accounts import account_for
         from app.agents.inbox.meta_transport import meta_transport
+        from app.agents.inbox.agent import AGENT_ACTOR
         from app.agents.inbox.send import send_reply
         record = await send_reply(db, order["business_id"], channel["conversation_id"], text, idempotency_key=f"order:{note['dedupe']}"[:120],
-                                  actor_id=ACTOR, transport=transport or meta_transport, account=await account_for(db, conv) or {})
+                                  actor_id=AGENT_ACTOR, transport=transport or meta_transport, account=await account_for(db, conv) or {})
         return await _finish(db, note, "sent" if record.get("delivery") == "accepted" else f"not_sent:{record.get('failure_reason') or record.get('delivery')}")
     except Exception as e:                      # a message that can't go (closed window, bad token) never breaks the order
         return await _finish(db, note, f"not_sent:{str(e)[:120]}")
