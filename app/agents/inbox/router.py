@@ -25,7 +25,7 @@ from .channels import (
     release_channels, subscription_issue,
 )
 from . import agent, rules
-from .forward import FORWARD_HEADER, claimed_by_staging, forward_delivery, forward_url, owned_by_forward_target
+from .forward import FORWARD_HEADER, claimed_by_staging, forward_delivery, forward_url, handled_remotely
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -78,9 +78,10 @@ async def receive_meta_webhook(
         print("[Inbox] rejected a webhook with a missing/invalid signature", flush=True)
         raise HTTPException(status_code=401, detail="invalid signature")
 
-    if not request.headers.get(FORWARD_HEADER) and forward_url() and not await _claimed_here(db, raw_body):
-        remote = await forward_delivery(raw_body, signature)
-        if owned_by_forward_target(remote):
+    if not request.headers.get(FORWARD_HEADER):
+        target = forward_url(await _claimed_here(db, raw_body))
+        remote = await forward_delivery(target, raw_body, signature) if target else None
+        if handled_remotely(remote):
             print(f"[Inbox] webhook handled by the forward target: {remote}", flush=True)
             return {"status": "forwarded", "events": remote.get("events", 0), "stored": 0, "matched": 0}
 

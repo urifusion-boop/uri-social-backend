@@ -5,6 +5,7 @@ import httpx
 
 FORWARD_HEADER = "x-uri-forwarded"
 PROD_WEBHOOK_URL = "https://api.urisocial.com/inbox/webhooks/meta"
+STAGING_WEBHOOK_URL = "https://api-social-dev.urisocial.com/inbox/webhooks/meta"
 TIMEOUT_SECONDS = 6.0
 # Workspaces staging answers itself even when production has the same account connected,
 # so the Uri test workspace can exercise code that has not been released.
@@ -27,14 +28,34 @@ async def claimed_by_staging(events: list, lookup) -> bool:
     return False
 
 
-def forward_url() -> str:
-    """Meta has one webhook address per app, and it points at staging. Staging passes
-    every delivery on to production, so an account connected in production works without
-    anyone re-pointing Meta. Only the development environment forwards."""
+def environment() -> str:
+    return os.getenv("APP_ENV", "").lower()
+
+
+def forward_url(claimed: bool = False) -> str:
+    """Where a delivery goes next, or "" to handle it here.
+
+    Meta has one webhook address per app. Production is the front door: it handles every
+    delivery itself except those for a staging-owned workspace, which it passes to staging
+    so unreleased code can be tested on real accounts. If Meta still points at staging,
+    staging does the reverse and passes everything else to production.
+    """
     explicit = os.getenv("META_WEBHOOK_FORWARD_URL", "").strip()
     if explicit:
         return explicit
-    return PROD_WEBHOOK_URL if os.getenv("APP_ENV", "").lower() == "development" else ""
+    if environment() == "production":
+        return STAGING_WEBHOOK_URL if claimed else ""
+    if environment() == "development":
+        return "" if claimed else PROD_WEBHOOK_URL
+    return ""
+
+
+def handled_remotely(remote: Optional[dict]) -> bool:
+    """Production only forwards what staging owns, so any answer means staging took it.
+    Staging forwards speculatively, so it needs production to say it had a connected account."""
+    if environment() == "production":
+        return remote is not None
+    return owned_by_forward_target(remote)
 
 
 def owned_by_forward_target(result: Optional[dict]) -> bool:
@@ -47,10 +68,7 @@ def owned_by_forward_target(result: Optional[dict]) -> bool:
     return bool(matched)
 
 
-async def forward_delivery(raw_body: bytes, signature: str) -> Optional[dict]:
-    url = forward_url()
-    if not url:
-        return None
+async def forward_delivery(url: str, raw_body: bytes, signature: str) -> Optional[dict]:
     headers = {"content-type": "application/json", "x-hub-signature-256": signature, FORWARD_HEADER: "1"}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
