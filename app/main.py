@@ -370,6 +370,8 @@ from app.agents.inbox.workdesk import router as inbox_desk_router
 app.include_router(inbox_desk_router)
 from app.agents.catalog.router import router as catalog_router
 app.include_router(catalog_router)
+from app.agents.orders.router import router as orders_router
+app.include_router(orders_router)
 from app.agents.jane_ads.growth.router import router as jane_ads_growth_router
 app.include_router(jane_ads_growth_router)
 app.include_router(whatsapp_router)
