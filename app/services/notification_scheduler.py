@@ -283,9 +283,13 @@ def _job_catalog_expire():
         from app.database import get_db
         db = get_db()
         released = await reservations.expire_due(db)
+        from app.agents.orders import service as orders
+        from app.agents.orders.indexes import ensure_indexes
+        await ensure_indexes(db)
+        expired = await orders.expire_due(db)
         delivered = await events.dispatch_pending(db)
-        if released or delivered["delivered"] or delivered["failed"]:
-            print(f"📦 Catalog: released {released} expired reservation(s), events {delivered}")
+        if released or expired or delivered["delivered"] or delivered["failed"]:
+            print(f"📦 Catalog: released {released} expired reservation(s), {expired} unpaid order(s) expired, events {delivered}")
     _run_async("catalog_expire", _run)
 
 

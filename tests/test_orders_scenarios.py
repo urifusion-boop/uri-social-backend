@@ -353,3 +353,65 @@ def test_staff_can_cancel_unpaid_but_not_paid_orders_or_take_manager_actions(env
         assert env.patch(f"/orders/{paid}", json={"assignee": "someone"}).status_code == 403
         assert env.get(f"/orders/{paid}").status_code == 200, "staff can still read and work orders"
     assert get(env, paid)["status"] == "confirmed"
+
+
+# ── the rest of the surface ──────────────────────────────────────────────────
+
+def test_assigning_and_searching_and_paging(env):
+    shoe = item(env, initial_quantity=9)
+    ids = [draft(env, shoe["id"], customer={"name": f"Cust{i}", "phone": f"+234{i}"})["id"] if False else draft(env, shoe["id"])["id"] for i in range(5)]
+    assert env.patch(f"/orders/{ids[0]}", json={"assignee": "Tolu"}).json()["assignee"] == "Tolu"
+    assert env.patch(f"/orders/{ids[0]}", json={"assignee": ""}).json()["assignee"] == ""
+    assert env.get("/orders", params={"limit": 2}).json()["total"] == 5 and len(env.get("/orders", params={"limit": 2}).json()["orders"]) == 2
+    assert len(env.get("/orders", params={"limit": 2, "skip": 4}).json()["orders"]) == 1
+    assert env.get("/orders", params={"q": "ORD-00003"}).json()["total"] == 1
+    assert env.get("/orders", params={"q": "air max"}).json()["total"] == 5
+    assert env.get("/orders", params={"q": "(.*"}).status_code == 200, "search text is never treated as a pattern"
+
+
+def test_the_customer_link_follows_the_order_to_the_end(env):
+    shoe, oid, line = _paid_order(env)
+    token = get(env, oid)["public_token"]
+    assert env.get(f"/orders/public/{token}").json()["payment_status"] == "paid"
+    env.post(f"/orders/{oid}/fulfilments", json={"line_id": line, "status": "fulfilled"})
+    assert env.get(f"/orders/public/{token}").json()["status"] == "completed"
+    assert env.get(f"/orders/public/{token}x").status_code == 404
+
+
+def test_the_export_is_safe_to_open_in_a_spreadsheet(env):
+    shoe = item(env)
+    env.post("/orders", json={"source": "dashboard", "customer": {"name": "=HYPERLINK(\"x\")", "phone": "+1"},
+                              "items": [{"catalog_item_id": shoe["id"], "quantity": 1}]})
+    text = env.get("/orders/export").text
+    assert "'=HYPERLINK" in text and ",=HYPERLINK" not in text
+
+
+def test_the_same_idempotency_key_never_makes_two_orders_even_in_a_burst(env):
+    shoe = item(env, initial_quantity=9)
+    body = {"source": "dashboard", "items": [{"catalog_item_id": shoe["id"], "quantity": 1}]}
+    ids = {env.post("/orders", json=body, headers={"Idempotency-Key": "k1"}).json()["id"] for _ in range(4)}
+    assert len(ids) == 1 and env.get("/orders").json()["total"] == 1
+
+
+def test_a_refund_after_a_return_and_the_whole_story_reads_in_the_timeline(env, monkeypatch):
+    monkeypatch.setenv("ORDERS_PAYMENT_WEBHOOK_SECRET", "s3cret")
+    shoe, oid, line = _paid_order(env, qty=1, stock_qty=3)
+    env.post(f"/orders/{oid}/fulfilments", json={"line_id": line, "status": "fulfilled"})
+    r = env.post(f"/orders/{oid}/returns", json={"line_id": line, "quantity": 1, "reason": "faulty"}).json()
+    for step in ("approve", "receive"):
+        env.post(f"/orders/returns/{r['id']}/{step}")
+    env.post(f"/orders/returns/{r['id']}/resolve", json={"disposition": "restock"})
+    refund = env.post(f"/orders/{oid}/refund-requests", json={"amount": 4_500_000, "reason": "return"}).json()
+    ev = {"type": "refund.completed", "business_id": "b1", "order_id": oid, "refund_id": refund["id"], "provider_reference": "rf9"}
+    assert _hook(env, ev).status_code == 200
+    got = get(env, oid)
+    assert got["payment_status"] == "refunded" and got["status"] == "completed"
+    types = [e.get("type") or e.get("kind") for e in env.get(f"/orders/{oid}/events").json()["events"]]
+    for expected in ("created", "confirmed", "completed"):
+        assert expected in types
+
+
+def test_the_webhook_ignores_events_for_orders_it_does_not_know(env, monkeypatch):
+    monkeypatch.setenv("ORDERS_PAYMENT_WEBHOOK_SECRET", "s3cret")
+    ev = {"type": "payment.succeeded", "business_id": "b1", "order_id": "ghost", "amount": 100, "transaction_id": "t9", "provider": "psp"}
+    assert _hook(env, ev).status_code in (200, 404), "never a 500"
