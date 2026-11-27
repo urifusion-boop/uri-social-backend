@@ -87,7 +87,7 @@ def test_payment_request_never_marks_paid_and_paying_commits_stock(env):
     confirmed = env.post(f"/orders/{oid}/confirm", json={"customer_accepted": True}).json()
     assert confirmed["status"] == "confirmed" and stock_of(env, shoe["id"])["available"] == 1
     req = env.post(f"/orders/{oid}/payment-requests", json={"amount": 2_000_000}).json()
-    assert req["status"] == "pending" and req["reference"] == "ORD-00001-P1"
+    assert req["status"] == "pending" and req["reference"].startswith("ORD-00001-P1-")
     got = env.get(f"/orders/{oid}").json()
     assert got["payment_status"] == "pending" and got["paid_amount"] == 0
     part = env.post(f"/orders/{oid}/payments", json={"amount": 2_000_000, "reference": req["reference"], "method": "transfer"}).json()
@@ -325,3 +325,16 @@ def test_a_chat_customer_gets_the_message_in_their_conversation_and_a_closed_win
         assert note["channel"] == "instagram"
         assert (note["result"] == "sent") is expect_sent, note
     assert len(sent) == 2 and "is confirmed" in sent[0] and "received your payment" in sent[1]
+
+
+def test_two_businesses_with_the_same_order_number_can_both_ask_for_payment(env):
+    refs = []
+    for brand in ("b1", "b2"):
+        env.who["brand_id"] = brand
+        shoe = item(env)
+        oid = draft(env, shoe["id"])["id"]
+        env.post(f"/orders/{oid}/confirm", json={"customer_accepted": True})
+        res = env.post(f"/orders/{oid}/payment-requests", json={})
+        assert res.status_code == 201, res.text
+        refs.append(res.json()["reference"])
+    assert refs[0] != refs[1] and all(r.startswith("ORD-00001-P1-") for r in refs)

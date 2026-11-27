@@ -3,6 +3,7 @@ payment is only ever recorded from a verified source; the three status dimension
 from __future__ import annotations
 
 import secrets
+import hashlib
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -282,6 +283,11 @@ async def confirm(db, business_id: str, order_id: str, customer_accepted: Any, a
 
 # ── payment: attempts, verified events, balances ─────────────────────────────
 
+def _tag(business_id: str) -> str:
+    """Order numbers repeat across businesses, but a payment reference is looked up by the provider alone."""
+    return hashlib.sha1(str(business_id).encode()).hexdigest()[:6]
+
+
 async def request_payment(db, business_id: str, order_id: str, amount: Optional[int], actor: str) -> dict:
     """Creates a reference to pay against. It never marks anything paid."""
     order = await get_order(db, business_id, order_id)
@@ -294,7 +300,7 @@ async def request_payment(db, business_id: str, order_id: str, amount: Optional[
     if amount > due:
         raise OrderError("That's more than the balance due.", 409, "over_balance")
     count = await db[PAYMENTS].count_documents({"order_id": order_id}) + 1
-    pay = {"_id": uuid.uuid4().hex, "business_id": business_id, "order_id": order_id, "reference": f"{order['order_number']}-P{count}",
+    pay = {"_id": uuid.uuid4().hex, "business_id": business_id, "order_id": order_id, "reference": f"{order['order_number']}-P{count}-{_tag(business_id)}",
            "amount": amount, "currency": order["currency"], "status": PENDING, "source": "", "requested_by": actor,
            "created_at": utcnow()}
     await db[PAYMENTS].insert_one(pay)
