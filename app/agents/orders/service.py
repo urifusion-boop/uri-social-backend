@@ -371,6 +371,44 @@ async def _commit_if_paid(db, order: dict, actor: str) -> dict:
     return await get_order(db, order["business_id"], order["_id"])
 
 
+# ── adjustments and revisions ────────────────────────────────────────────────
+
+ADJUSTMENT_KINDS = ("discount", "fee")
+
+
+async def add_adjustment(db, business_id: str, order_id: str, kind: str, amount: int, reason: str, actor: str) -> dict:
+    """A documented change to the total. On a confirmed order it leaves a revision with before and after."""
+    if kind not in ADJUSTMENT_KINDS:
+        raise OrderError(f"Adjustment must be one of: {', '.join(ADJUSTMENT_KINDS)}.")
+    amount = positive_int(amount, "Amount")
+    if not (reason or "").strip():
+        raise OrderError("Say why this is being adjusted.")
+    order = await get_order(db, business_id, order_id)
+    if order["status"] in (CANCELLED, EXPIRED, COMPLETED):
+        raise OrderError(f"This order is {order['status']}.", 409)
+    discount = order["discount_total"] + (amount if kind == "discount" else 0)
+    fees = order["fees_total"] + (amount if kind == "fee" else 0)
+    totals = compute_totals(order["lines"], fees, discount, order["tax_total"])
+    if totals["total"] < order["paid_amount"]:
+        raise OrderError("That would bring the total below what has already been paid. Refund the difference instead.", 409,
+                         "below_paid")
+    entry = {"id": uuid.uuid4().hex[:10], "kind": kind, "amount": amount, "reason": reason.strip()[:300], "actor": actor,
+             "created_at": utcnow()}
+    revision = {"number": len(order.get("revisions", [])) + 1, "reason": entry["reason"], "actor": actor, "created_at": utcnow(),
+                "before": {"total": order["total"], "fees_total": order["fees_total"], "discount_total": order["discount_total"]},
+                "after": {"total": totals["total"], "fees_total": fees, "discount_total": totals["discount_total"]},
+                "customer_acceptance_needed": order["status"] in OPEN and totals["total"] > order["total"]}
+    await db[ORDERS].update_one({"_id": order_id}, {"$set": {**totals, "fees_total": fees, "due_amount": totals["total"] - order["paid_amount"],
+                                                             "updated_at": utcnow()},
+                                                    "$push": {"adjustments": entry, "revisions": revision}})
+    order = await get_order(db, business_id, order_id)
+    await _log(db, order, "adjusted", actor, {"kind": kind, "amount": amount, "reason": entry["reason"], "revision": revision["number"]})
+    if order["status"] in OPEN and order["paid_amount"] >= order["total"] and order["payment_status"] != PAID:
+        order = await _recompute_payment(db, order, actor)
+        order = await _commit_if_paid(db, order, actor)
+    return order
+
+
 # ── fulfilment ───────────────────────────────────────────────────────────────
 
 def _summarise(lines: list[dict]) -> str:

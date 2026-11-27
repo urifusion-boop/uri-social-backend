@@ -147,6 +147,17 @@ async def record_offline_payment(order_id: str, body: dict = Body(...), ctx: Ctx
         _fail(e)
 
 
+@router.post("/{order_id}/adjustments")
+async def adjustment(order_id: str, body: dict = Body(...), ctx: Ctx = Depends(_ctx),
+                     db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:
+    _manager(ctx)
+    try:
+        return _clean(await service.add_adjustment(db, ctx["business_id"], order_id, str(body.get("kind") or ""), body.get("amount"),
+                                                   str(body.get("reason") or ""), ctx["user_id"]))
+    except OrderError as e:
+        _fail(e)
+
+
 @router.post("/{order_id}/fulfilments")
 async def fulfilment(order_id: str, body: dict = Body(...), ctx: Ctx = Depends(_ctx),
                      db: AsyncIOMotorDatabase = Depends(_db_ready)) -> dict:

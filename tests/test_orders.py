@@ -191,3 +191,20 @@ def test_list_filters_search_and_csv(env):
     csv = env.get("/orders/export")
     assert csv.status_code == 200 and "ORD-00001" in csv.text and csv.text.splitlines()[0].startswith("order_number")
     assert b
+
+
+def test_adjustments_need_a_reason_leave_a_revision_and_never_undercut_payments(env):
+    shoe = item(env)
+    oid = draft(env, shoe["id"])["id"]
+    env.post(f"/orders/{oid}/confirm", json={"customer_accepted": True})
+    assert env.post(f"/orders/{oid}/adjustments", json={"kind": "discount", "amount": 500_000}).status_code == 400
+    out = env.post(f"/orders/{oid}/adjustments", json={"kind": "discount", "amount": 500_000, "reason": "loyal customer"}).json()
+    assert out["total"] == 4_000_000 and out["due_amount"] == 4_000_000
+    rev = out["revisions"][0]
+    assert rev["before"]["total"] == 4_500_000 and rev["after"]["total"] == 4_000_000 and rev["reason"] == "loyal customer"
+    env.post(f"/orders/{oid}/payments", json={"amount": 3_900_000})
+    assert env.post(f"/orders/{oid}/adjustments", json={"kind": "discount", "amount": 200_000, "reason": "x"}).status_code == 409
+    paid = env.post(f"/orders/{oid}/adjustments", json={"kind": "discount", "amount": 100_000, "reason": "sorry for delay"}).json()
+    assert paid["payment_status"] == "paid"
+    kinds = [e["type"] for e in env.get(f"/orders/{oid}/events").json()["events"]]
+    assert kinds.count("adjusted") == 2
