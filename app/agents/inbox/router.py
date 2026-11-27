@@ -25,6 +25,7 @@ from .channels import (
     release_channels, subscription_issue,
 )
 from . import agent, rules
+from .forward import FORWARD_HEADER, claimed_by_staging, forward_delivery, forward_url, handled_remotely
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -52,6 +53,14 @@ async def verify_meta_webhook(
     raise HTTPException(status_code=403, detail="verification failed")
 
 
+async def _claimed_here(db, raw_body: bytes) -> bool:
+    try:
+        events = parse_meta_event(json.loads(raw_body))
+    except ValueError:
+        return False
+    return await claimed_by_staging(events, lambda account_id: account_for_event(db, account_id))
+
+
 @router.post("/webhooks/meta")
 async def receive_meta_webhook(
     request: Request,
@@ -68,6 +77,13 @@ async def receive_meta_webhook(
     if not verify_signature(raw_body, signature, settings.META_APP_SECRET):
         print("[Inbox] rejected a webhook with a missing/invalid signature", flush=True)
         raise HTTPException(status_code=401, detail="invalid signature")
+
+    if not request.headers.get(FORWARD_HEADER):
+        target = forward_url(await _claimed_here(db, raw_body))
+        remote = await forward_delivery(target, raw_body, signature) if target else None
+        if handled_remotely(remote):
+            print(f"[Inbox] webhook handled by the forward target: {remote}", flush=True)
+            return {"status": "forwarded", "events": remote.get("events", 0), "stored": 0, "matched": 0}
 
     await store_raw(db, "meta", raw_body, dict(request.headers))
 
@@ -90,8 +106,11 @@ async def receive_meta_webhook(
         print(f"[Inbox] nothing to store from that delivery: "
               f"{describe_unparsed(payload)}", flush=True)
     stored = 0
+    matched = 0
     for ev in events:
         account = await account_for_event(db, ev.get("external_account_id"))
+        if account:
+            matched += 1
         if not account:
             # An event for an account nobody connected. Dropping it is right: there is
             # no workspace to file it under, and guessing one would put a stranger's
@@ -125,7 +144,7 @@ async def receive_meta_webhook(
                 agent.schedule(agent.process_inbound(
                     db, account["workspace_id"], stored_msg["conversation_id"], msg_id))
     print(f"[Inbox] webhook stored {stored}/{len(events)} event(s)", flush=True)
-    return {"status": "ok", "events": len(events), "stored": stored}
+    return {"status": "ok", "events": len(events), "stored": stored, "matched": matched}
 
 
 @router.get("/conversations")
