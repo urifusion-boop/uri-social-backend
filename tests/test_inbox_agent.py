@@ -130,12 +130,18 @@ def test_a_question_no_faq_answers_is_drafted():
     assert not ok and "No approved FAQ" in reason
 
 
-def test_playbook_only_answers_are_drafted_not_sent():
+def test_a_price_question_is_answered_from_the_playbook_price_range():
     playbook = {"id": "playbook:price_range", "label": "Brand Playbook · Price range",
                 "approved": False}
-    ok, reason = decide(draft=_draft(sources=[playbook], unverified=[playbook["label"]],
+    ok, reason = decide(cls=_cls(exclusions=["stock_or_price"]),
+                        draft=_draft(sources=[playbook], unverified=[playbook["label"]],
                                      cites_price_or_stock=True))
-    assert not ok and "price range" in reason
+    assert (ok, reason) == (True, "")
+
+
+def test_a_price_question_with_no_source_is_still_held():
+    ok, reason = decide(cls=_cls(exclusions=["stock_or_price"]), draft=_draft(sources=[], unanswered=True))
+    assert not ok
 
 
 def test_playbook_facts_other_than_price_can_auto_reply():

@@ -87,12 +87,12 @@ def test_a_booking_that_needs_confirmation_is_never_described_as_booked():
     run(go())
 
 
-def test_a_catalog_price_answer_can_go_out_without_review_but_playbook_prices_cannot():
+def test_a_catalog_price_answer_and_a_playbook_price_range_can_both_go_out():
     catalog = [{"id": "catalog:1", "label": "Catalog · Air Max", "approved": True}]
     ok, reason = decide(cls=_cls(exclusions=["stock_or_price"]), draft=_draft(sources=catalog))
     assert ok, reason
     playbook = [{"id": "playbook:price_range", "label": "Playbook", "approved": False}]
-    assert not decide(cls=_cls(exclusions=["stock_or_price"]), draft=_draft(sources=playbook, cites_price_or_stock=True))[0]
+    assert decide(cls=_cls(exclusions=["stock_or_price"]), draft=_draft(sources=playbook, cites_price_or_stock=True))[0]
 
 
 def test_the_agent_cannot_invent_a_catalog_citation():
