@@ -6,6 +6,25 @@ import httpx
 FORWARD_HEADER = "x-uri-forwarded"
 PROD_WEBHOOK_URL = "https://api.urisocial.com/inbox/webhooks/meta"
 TIMEOUT_SECONDS = 6.0
+# Workspaces staging answers itself even when production has the same account connected,
+# so the Uri test workspace can exercise code that has not been released.
+DEFAULT_STAGING_WORKSPACES = ("brnd_personal_1f38e754-f879-4c57-8faa-9d1da592fee1",)
+
+
+def staging_workspaces() -> set[str]:
+    raw = os.getenv("META_STAGING_WORKSPACES", "")
+    listed = [w.strip() for w in raw.split(",") if w.strip()]
+    return set(listed or DEFAULT_STAGING_WORKSPACES)
+
+
+async def claimed_by_staging(events: list, lookup) -> bool:
+    """True when any event is for an account that belongs to a staging-owned workspace."""
+    owned = staging_workspaces()
+    for ev in events:
+        account = await lookup(ev.get("external_account_id"))
+        if account and str(account.get("workspace_id")) in owned:
+            return True
+    return False
 
 
 def forward_url() -> str:
