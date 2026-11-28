@@ -2771,7 +2771,9 @@ async def instagram_direct_callback(
                 },
             )
             token_data = token_resp.json()
-            print(f"[IGDirectOAuth] short-lived token response: {token_data}")
+            # Never log Meta's responses whole: they carry the person's access tokens.
+            print(f"[IGDirectOAuth] code exchange: got_token={bool(token_data.get('access_token'))} "
+                  f"error={(token_data.get('error') or {}).get('message')}")
             if "error" in token_data:
                 err = token_data["error"].get("message", "token exchange failed")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err)}")
@@ -2788,7 +2790,8 @@ async def instagram_direct_callback(
                 },
             )
             ll_data = ll_resp.json()
-            print(f"[IGDirectOAuth] long-lived token response: {ll_data}")
+            print(f"[IGDirectOAuth] long-lived exchange: got_token={bool(ll_data.get('access_token'))} "
+                  f"error={(ll_data.get('error') or {}).get('message')}")
             long_token = ll_data.get("access_token", short_token)
 
             # Step 3: get the user's Facebook Pages (each has a page access token)
@@ -2797,10 +2800,33 @@ async def instagram_direct_callback(
                 params={"access_token": long_token},
             )
             pages_data = pages_resp.json()
-            print(f"[IGDirectOAuth] pages: {pages_data}")
             pages = pages_data.get("data", [])
+            # What the person allowed on Meta's screen. A permission left off there (Instagram above
+            # all) is the usual reason Meta shares a Page but not its Instagram account.
+            declined: list[str] = []
+            try:
+                perms_resp = await client.get(
+                    "https://graph.facebook.com/v20.0/me/permissions",
+                    params={"access_token": long_token},
+                )
+                declined = [
+                    p.get("permission") for p in perms_resp.json().get("data", [])
+                    if p.get("status") != "granted"
+                ]
+            except Exception as perm_err:  # only used to explain a failure
+                print(f"[IGDirectOAuth] could not read granted permissions: {perm_err}")
+            print(
+                f"[IGDirectOAuth] pages shared: "
+                f"{[(pg.get('name'), pg.get('id'), pg.get('tasks')) for pg in pages]} "
+                f"error={(pages_data.get('error') or {}).get('message')} declined={declined}"
+            )
             if not pages:
-                err_msg = "No Facebook Pages found. Link your Instagram Business Account to a Facebook Page first."
+                if "pages_show_list" in declined:
+                    err_msg = ("Uri Social wasn't allowed to see your Facebook Pages. Connect again and allow "
+                               "access to your Pages on Facebook's screen.")
+                else:
+                    err_msg = ("Facebook didn't share any Pages with Uri Social. Connect again and, on Facebook's "
+                               "screen, choose the Page your Instagram account is linked to.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err_msg)}")
 
             # Step 4: find every Instagram Business Account linked to any of the
@@ -2814,10 +2840,21 @@ async def instagram_direct_callback(
                 ptok = page.get("access_token", long_token)
                 ig_resp = await client.get(
                     f"https://graph.facebook.com/v20.0/{pid}",
-                    params={"fields": "instagram_business_account,name", "access_token": ptok},
+                    params={
+                        "fields": "instagram_business_account,connected_instagram_account,name",
+                        "access_token": ptok,
+                    },
                 )
                 ig_data = ig_resp.json()
-                ig_account = ig_data.get("instagram_business_account")
+                # Same lookup as the inbox's (instagram_direct_service): the business link first, then
+                # the Page's connected Instagram account.
+                ig_account = ig_data.get("instagram_business_account") or ig_data.get("connected_instagram_account")
+                print(
+                    f"[IGDirectOAuth] page {pid} ({page.get('name')}): "
+                    f"instagram_business_account={(ig_data.get('instagram_business_account') or {}).get('id')} "
+                    f"connected_instagram_account={(ig_data.get('connected_instagram_account') or {}).get('id')} "
+                    f"error={(ig_data.get('error') or {}).get('message')}"
+                )
                 if not ig_account:
                     continue
                 ig_user_id = str(ig_account["id"])
@@ -2827,7 +2864,8 @@ async def instagram_direct_callback(
                     params={"fields": "id,username,name,profile_picture_url", "access_token": long_token},
                 )
                 profile = profile_resp.json()
-                print(f"[IGDirectOAuth] ig profile for page {pid}: {profile}")
+                print(f"[IGDirectOAuth] ig profile for page {pid}: @{profile.get('username')} "
+                      f"error={(profile.get('error') or {}).get('message')}")
                 candidates.append({
                     "ig_user_id": ig_user_id,
                     "page_id": pid,
@@ -2840,7 +2878,15 @@ async def instagram_direct_callback(
                 })
 
             if not candidates:
-                err_msg = "No Instagram Business Account found linked to your Facebook Pages."
+                names = ", ".join(pg.get("name") or pg.get("id") for pg in pages)
+                if "instagram_basic" in declined:
+                    err_msg = ("Instagram access wasn't allowed on Facebook's screen. Connect again and allow "
+                               "Uri Social to access your Instagram account.")
+                else:
+                    err_msg = (f"Facebook shared your Page{'s' if len(pages) > 1 else ''} ({names}) but no Instagram "
+                               "account. Connect again and, on Facebook's screen, tick your Instagram account. If it "
+                               "isn't listed there, link it to your Page first: Page settings > Linked accounts > "
+                               "Instagram.")
                 return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err_msg)}")
 
         now = datetime.now(timezone.utc).isoformat()
